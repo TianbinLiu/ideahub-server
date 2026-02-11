@@ -26,8 +26,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-if (typeof req.query.keyword !== "string") return;
-
 app.use("/api", healthRoutes);
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/auth", authRoutes);
