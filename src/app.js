@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 
 const healthRoutes = require("./routes/health.routes");
 const ideaRoutes = require("./routes/ideas.routes");
@@ -13,6 +14,23 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+app.use(helmet());
+app.use((err, req, res, next) => {
+  const status = err.status || 500;
+  res.status(status).json({
+    ok: false,
+    message:
+      process.env.NODE_ENV === "production"
+        ? "Server error"
+        : err.message,
+  });
+});
+
+jwt.sign(payload, process.env.JWT_SECRET, {
+  expiresIn: "7d",
+});
+
+if (typeof req.query.keyword !== "string") return;
 
 app.use("/api", healthRoutes);
 app.use("/api/ideas", ideaRoutes);
