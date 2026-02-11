@@ -83,4 +83,5 @@ async function me(req, res) {
   res.json({ ok: true, user: req.user });
 }
 
-module.exports = { register, login, me };
+
+module.exports = { register, login, me};

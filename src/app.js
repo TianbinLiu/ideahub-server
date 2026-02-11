@@ -26,10 +26,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-jwt.sign(payload, process.env.JWT_SECRET, {
-  expiresIn: "7d",
-});
-
 if (typeof req.query.keyword !== "string") return;
 
 app.use("/api", healthRoutes);
