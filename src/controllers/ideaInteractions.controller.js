@@ -3,6 +3,8 @@ const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
+const { createNotification } = require("../services/notification.service");
+
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -47,6 +49,17 @@ async function toggleLike(req, res, next) {
     }
 
     await idea.save();
+
+    if (liked) {
+      await createNotification({
+        userId: idea.author,     // 你的 idea 作者字段在 interest.controller 里用的是 idea.author
+        actorId: userId,
+        ideaId: idea._id,
+        type: "LIKE",
+        payload: {},
+      });
+    }
+
     res.json({ ok: true, liked, likeCount: idea.stats.likeCount });
   } catch (err) {
     // 唯一索引并发下可能抛 duplicate key → 当成 liked=true
@@ -79,6 +92,17 @@ async function toggleBookmark(req, res, next) {
     }
 
     await idea.save();
+
+    if (bookmarked) {
+      await createNotification({
+        userId: idea.author,
+        actorId: userId,
+        ideaId: idea._id,
+        type: "BOOKMARK",
+        payload: {},
+      });
+    }
+
     res.json({ ok: true, bookmarked, bookmarkCount: idea.stats.bookmarkCount });
   } catch (err) {
     if (err?.code === 11000) return res.json({ ok: true, bookmarked: true });
@@ -131,6 +155,16 @@ async function addComment(req, res, next) {
     await idea.save();
 
     const populated = await Comment.findById(comment._id).populate("author", "username role");
+
+    await createNotification({
+      userId: idea.author,
+      actorId: req.user._id,
+      ideaId: idea._id,
+      type: "COMMENT",
+      payload: { commentId: comment._id },
+    });
+
+
     res.status(201).json({ ok: true, comment: populated, commentCount: idea.stats.commentCount });
   } catch (err) {
     next(err);

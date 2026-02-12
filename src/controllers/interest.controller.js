@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
 const Interest = require("../models/Interest");
+const { createNotification } = require("../services/notification.service");
+
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -41,6 +43,20 @@ async function toggleInterest(req, res, next) {
       companyUser: req.user._id,
       idea: idea._id,
       message,
+    });
+
+    const row = await Interest.create({
+      companyUser: req.user._id,
+      idea: idea._id,
+      message,
+    });
+
+    await createNotification({
+      userId: idea.author,
+      actorId: req.user._id,
+      ideaId: idea._id,
+      type: "INTEREST",
+      payload: { interestId: row._id, message },
     });
 
     res.json({ ok: true, interested: true });
