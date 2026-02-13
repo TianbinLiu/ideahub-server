@@ -4,8 +4,8 @@ const bcrypt = require("bcryptjs");
 const User = require("../src/models/User");
 
 async function main() {
-  const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
-  if (!uri) throw new Error("Missing MONGODB_URI (or MONGO_URI)");
+  const uri = process.env.MONGODB_URI || process.env.MONGODB_URI;
+  if (!uri) throw new Error("Missing MONGODB_URI (or MONGODB_URI)");
 
   await mongoose.connect(uri);
 
