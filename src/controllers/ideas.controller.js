@@ -21,10 +21,6 @@ function isValidId(id) {
   return mongoose.isValidObjectId(id);
 }
 
-function isOwner(idea, user) {
-  return idea.author.toString() === user._id.toString();
-}
-
 /**
  * POST /api/ideas
  * 需要登录：req.user
