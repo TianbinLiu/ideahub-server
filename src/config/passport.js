@@ -1,3 +1,5 @@
+//passport.js
+
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const GitHubStrategy = require("passport-github2").Strategy;
@@ -49,9 +51,6 @@ function initPassport() {
     );
   }
 
-  // 这里不做持久 session 登录，所以 serialize/deserialize 不必写复杂
-  passport.serializeUser((obj, done) => done(null, obj));
-  passport.deserializeUser((obj, done) => done(null, obj));
 }
 
 module.exports = { initPassport };

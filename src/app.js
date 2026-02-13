@@ -3,7 +3,6 @@
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const cookieSession = require("cookie-session");
 const passport = require("passport");
 
 const healthRoutes = require("./routes/health.routes");
@@ -24,21 +23,10 @@ app.use(cors());
 app.use(express.json());
 app.use(helmet());
 
-// ✅ cookie session for OAuth state
-app.use(
-  cookieSession({
-    name: "ideahub_oauth",
-    keys: [process.env.COOKIE_SESSION_KEY || process.env.JWT_SECRET || "dev_key"],
-    maxAge: 10 * 60 * 1000, // 10 minutes
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-  })
-);
 
 // ✅ passport
 initPassport();
 app.use(passport.initialize());
-app.use(passport.session());
 
 app.use("/api", healthRoutes);
 app.use("/api/ideas", ideaRoutes);

@@ -74,7 +74,7 @@ router.get("/oauth/google", (req, res, next) => {
   const state = encodeState({ next: nextPath, provider: "google" });
 
   passport.authenticate("google", {
-    session: true,
+    session: false,
     scope: ["profile", "email"],
     prompt: "select_account",
     state,
@@ -83,7 +83,7 @@ router.get("/oauth/google", (req, res, next) => {
 
 router.get(
   "/oauth/google/callback",
-  passport.authenticate("google", { session: true, failureRedirect: "/api/auth/oauth/fail?provider=google" }),
+  passport.authenticate("google", { session: false, failureRedirect: "/api/auth/oauth/fail?provider=google" }),
   async (req, res) => {
     const st = decodeState(req.query.state);
     const nextPath = safeNextPath(st.next);
@@ -140,12 +140,12 @@ router.get("/oauth/github", (req, res, next) => {
   const nextPath = safeNextPath(req.query.next);
   const state = encodeState({ next: nextPath, provider: "github" });
 
-  passport.authenticate("github", { session: true, state })(req, res, next);
+  passport.authenticate("github", { session: false, state })(req, res, next);
 });
 
 router.get(
   "/oauth/github/callback",
-  passport.authenticate("github", { session: true, failureRedirect: "/api/auth/oauth/fail?provider=github" }),
+  passport.authenticate("github", { session: false, failureRedirect: "/api/auth/oauth/fail?provider=github" }),
   async (req, res) => {
     const st = decodeState(req.query.state);
     const nextPath = safeNextPath(st.next);
