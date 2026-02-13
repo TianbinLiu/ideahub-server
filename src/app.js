@@ -23,6 +23,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/me", meRoutes);
 app.use("/api/company", companyRoutes);
 app.use("/api/notifications", notificationsRoutes);
+app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
 
 
 app.use(notFound);

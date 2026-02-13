@@ -1,13 +1,10 @@
 const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
-const { generateIdeaReview } = require("../services/aiReview.service");
+const AiJob = require("../models/AiJob");
+const { canReadIdea } = require("../utils/permissions");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
-}
-
-function isOwner(idea, user) {
-  return idea.author.toString() === user._id.toString();
 }
 
 async function requestAiReview(req, res, next) {
@@ -24,23 +21,26 @@ async function requestAiReview(req, res, next) {
       throw new Error("Idea not found");
     }
 
-    // ✅ 仅作者可调用（建议 Phase 7 这样做最安全）
-    if (!isOwner(idea, req.user)) {
+    // 权限：至少能 read（也可收紧成只有作者能请求）
+    if (!canReadIdea(idea, req.user)) {
       res.status(403);
       throw new Error("Forbidden");
     }
 
-    const review = await generateIdeaReview({
-      title: idea.title,
-      summary: idea.summary,
-      content: idea.content,
-      tags: idea.tags,
+    // 已有未完成 job → 复用
+    const existing = await AiJob.findOne({ ideaId: idea._id, status: { $in: ["pending", "running"] } }).lean();
+    if (existing) {
+      return res.status(202).json({ ok: true, jobId: existing._id, status: existing.status, reused: true });
+    }
+
+    const job = await AiJob.create({
+      ideaId: idea._id,
+      requesterId: req.user._id,
+      status: "pending",
+      attempts: 0,
     });
 
-    idea.aiReview = review;
-    await idea.save();
-
-    res.json({ ok: true, aiReview: idea.aiReview });
+    res.status(202).json({ ok: true, jobId: job._id, status: job.status });
   } catch (err) {
     next(err);
   }

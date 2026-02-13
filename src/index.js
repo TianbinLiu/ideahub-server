@@ -1,6 +1,7 @@
 require("dotenv").config();
 const app = require("./app");
 const { connectDB } = require("./config/db");
+const { startAiWorker } = require("./workers/aiReview.worker");
 
 const PORT = process.env.PORT || 4000;
 
@@ -17,3 +18,4 @@ async function start() {
 }
 
 start();
+startAiWorker();

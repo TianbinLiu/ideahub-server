@@ -1,7 +1,7 @@
+// src/services/aiReview.service.js
 const OpenAI = require("openai");
 
 function getClient() {
-  // SDK 会默认读 OPENAI_API_KEY；这里显式写更清晰
   return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
@@ -29,15 +29,12 @@ Tags: ${(tags || []).join(", ")}
 Content: ${content || ""}
 `;
 
-  // 使用官方 SDK 的 Responses API（文档示例）
   const resp = await client.responses.create({
     model,
     input: prompt,
   });
 
   const text = resp.output_text || "";
-
-  // 尝试从模型输出中解析 JSON（允许模型输出含多余文字时兜底）
   const jsonTextMatch = text.match(/\{[\s\S]*\}/);
   const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
 
@@ -45,7 +42,6 @@ Content: ${content || ""}
   try {
     data = JSON.parse(jsonText);
   } catch {
-    // 解析失败：做一个保底结构
     data = {
       feasibilityScore: 50,
       profitPotentialScore: 50,
@@ -53,7 +49,6 @@ Content: ${content || ""}
     };
   }
 
-  // 规范化（防止越界/类型错）
   const clamp = (n) => Math.max(0, Math.min(100, Number(n) || 0));
 
   return {
@@ -65,4 +60,14 @@ Content: ${content || ""}
   };
 }
 
-module.exports = { generateIdeaReview };
+// ✅ Worker 入口：接收 Idea 文档
+async function runAiReview(ideaDoc) {
+  return generateIdeaReview({
+    title: ideaDoc.title,
+    summary: ideaDoc.summary,
+    content: ideaDoc.content,
+    tags: ideaDoc.tags || [],
+  });
+}
+
+module.exports = { generateIdeaReview, runAiReview };
