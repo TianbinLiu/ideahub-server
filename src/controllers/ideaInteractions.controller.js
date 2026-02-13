@@ -4,24 +4,30 @@ const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
 const { createNotification } = require("../services/notification.service");
-
+const { canReadIdea, canInteractIdea } = require("../utils/permissions");
+const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
 }
 
-async function getIdeaOr404(id, res) {
+async function getIdeaOr404(id, req, res) {
   if (!isValidId(id)) {
-    res.status(400);
-    throw new Error("Invalid idea id");
+    invalidId("Invalid idea id");
   }
   const idea = await Idea.findById(id);
   if (!idea) {
-    res.status(404);
-    throw new Error("Idea not found");
+    notFound("Idea not found");
+  }
+  if (!canReadIdea(idea, req.user)) {
+    if (!req.user) {
+      unauthorized("Login required")
+    }
+    forbidden("Forbidden");
   }
   return idea;
 }
+
 
 /**
  * POST /api/ideas/:id/like
@@ -33,7 +39,7 @@ async function toggleLike(req, res, next) {
     const { id } = req.params;
     const userId = req.user._id;
 
-    const idea = await getIdeaOr404(id, res);
+    const idea = await getIdeaOr404(id, req, res);
 
     const existing = await Like.findOne({ user: userId, idea: idea._id });
     let liked;
@@ -76,7 +82,7 @@ async function toggleBookmark(req, res, next) {
     const { id } = req.params;
     const userId = req.user._id;
 
-    const idea = await getIdeaOr404(id, res);
+    const idea = await getIdeaOr404(id, req, res);
 
     const existing = await Bookmark.findOne({ user: userId, idea: idea._id });
     let bookmarked;
@@ -116,7 +122,7 @@ async function toggleBookmark(req, res, next) {
 async function listComments(req, res, next) {
   try {
     const { id } = req.params;
-    const idea = await getIdeaOr404(id, res);
+    const idea = await getIdeaOr404(id, req, res);
 
     const comments = await Comment.find({ idea: idea._id })
       .sort({ createdAt: -1 })
@@ -138,12 +144,7 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     const { content } = req.body;
 
-    if (!content || !String(content).trim()) {
-      res.status(400);
-      throw new Error("content is required");
-    }
-
-    const idea = await getIdeaOr404(id, res);
+    const idea = await getIdeaOr404(id, req, res);
 
     const comment = await Comment.create({
       idea: idea._id,

@@ -2,6 +2,9 @@ const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
+const { canReadIdea, canWriteIdea } = require("../utils/permissions");
+const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+
 
 require("../models/User"); // 确保 populate(User) 不报错
 
@@ -32,8 +35,7 @@ async function createIdea(req, res, next) {
     const { title, summary, content, visibility, isMonetizable, licenseType, tags } = req.body;
 
     if (!title || !title.trim()) {
-      res.status(400);
-      throw new Error("title is required");
+      invalidId("Invalid idea id")
     }
 
     const idea = await Idea.create({
@@ -127,28 +129,23 @@ async function getIdeaById(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid idea id");
+      invalidId("Invalid idea id")
     }
 
     const idea = await Idea.findById(id).populate("author", "username role");
     if (!idea) {
-      res.status(404);
-      throw new Error("Idea not found");
+      notFound("Idea not found")
     }
 
     // 权限判断
-    if (idea.visibility === "private") {
-      // 必须登录且是作者
+    if (!canReadIdea(idea, req.user)) {
+      // private 且未登录 → 401 更合理；private 且登录但不是作者 → 403
       if (!req.user) {
-        res.status(401);
-        throw new Error("Login required");
+        unauthorized("Login required")
       }
-      if (!isOwner(idea, req.user)) {
-        res.status(403);
-        throw new Error("Forbidden");
-      }
+      forbidden("Forbidden")
     }
+
 
     // viewCount + 1（不阻塞返回也行，但这里简单同步做）
     idea.stats = idea.stats || {};
@@ -182,20 +179,18 @@ async function updateIdea(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid idea id");
+      invalidId("Invalid idea id")
     }
 
     const idea = await Idea.findById(id);
     if (!idea) {
-      res.status(404);
-      throw new Error("Idea not found");
+      notFound("Idea not found")
     }
 
-    if (!isOwner(idea, req.user)) {
-      res.status(403);
-      throw new Error("Forbidden");
+    if (!canWriteIdea(idea, req.user)) {
+      forbidden("Forbidden")
     }
+
 
     const { title, summary, content, tags, visibility, isMonetizable, licenseType } = req.body;
 
@@ -230,20 +225,18 @@ async function deleteIdea(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid idea id");
+      invalidId("Invalid idea id")
     }
 
     const idea = await Idea.findById(id);
     if (!idea) {
-      res.status(404);
-      throw new Error("Idea not found");
+      notFound("Idea not found")
     }
 
-    if (!isOwner(idea, req.user)) {
-      res.status(403);
-      throw new Error("Forbidden");
+    if (!canWriteIdea(idea, req.user)) {
+      forbidden("Forbidden")
     }
+
 
     await Idea.deleteOne({ _id: id });
     res.json({ ok: true });

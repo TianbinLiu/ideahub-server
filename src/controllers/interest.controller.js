@@ -2,6 +2,9 @@ const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
 const Interest = require("../models/Interest");
 const { createNotification } = require("../services/notification.service");
+const { canCompanyInterest } = require("../utils/permissions");
+const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+
 
 
 function isValidId(id) {
@@ -15,15 +18,18 @@ async function toggleInterest(req, res, next) {
   try {
     const { id } = req.params; // idea id
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid idea id");
+      invalidId("Invalid idea id")
     }
 
     const idea = await Idea.findById(id);
     if (!idea) {
-      res.status(404);
-      throw new Error("Idea not found");
+      notFound("Idea not found");
     }
+
+    if (!canCompanyInterest(idea, req.user)) {
+      forbidden("Forbidden");
+    }
+
 
     // 只有企业用户能操作（也可以用 requireRole("company")）
     if (req.user.role !== "company") {
