@@ -221,12 +221,12 @@ async function deleteIdea(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      invalidId("Invalid idea id")
+      badRequest("title is required");
     }
 
     const idea = await Idea.findById(id);
     if (!idea) {
-      notFound("Idea not found")
+      notFound("Idea not found");
     }
 
     if (!canWriteIdea(idea, req.user)) {

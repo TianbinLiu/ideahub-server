@@ -1,3 +1,5 @@
+//admin.controller.js
+
 const mongoose = require("mongoose");
 const User = require("../models/User");
 const Idea = require("../models/Idea");
@@ -5,11 +7,12 @@ const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
 const Interest = require("../models/Interest");
+const { invalidId, notFound, badRequest } = require("../utils/http");
 
 // 可选模型：有就删，没有就跳过（避免 require 报错）
 let Notification, AiJob;
-try { Notification = require("../models/Notification"); } catch {}
-try { AiJob = require("../models/AiJob"); } catch {}
+try { Notification = require("../models/Notification"); } catch { }
+try { AiJob = require("../models/AiJob"); } catch { }
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -19,14 +22,12 @@ async function adminDeleteIdea(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid idea id");
+      invalidId("Invalid idea id");
     }
 
     const idea = await Idea.findById(id);
     if (!idea) {
-      res.status(404);
-      throw new Error("Idea not found");
+      notFound("Idea not found");
     }
 
     await Promise.all([
@@ -50,22 +51,19 @@ async function adminDeleteUser(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) {
-      res.status(400);
-      throw new Error("Invalid user id");
+      invalidId("Invalid idea id");
     }
 
     const user = await User.findById(id);
     if (!user) {
-      res.status(404);
-      throw new Error("User not found");
+      notFound("User not found");
     }
 
     // 防止误删最后一个 admin
     if (user.role === "admin") {
       const adminCount = await User.countDocuments({ role: "admin" });
       if (adminCount <= 1) {
-        res.status(400);
-        throw new Error("Cannot delete the last admin");
+        badRequest("Cannot delete the last admin");
       }
     }
 
@@ -87,17 +85,17 @@ async function adminDeleteUser(req, res, next) {
       // 通知 + AI Jobs（如果存在）
       Notification
         ? Notification.deleteMany({
-            $or: [
-              { userId: user._id },
-              { actorId: user._id },
-              { ideaId: { $in: ideaIds } },
-            ],
-          })
+          $or: [
+            { userId: user._id },
+            { actorId: user._id },
+            { ideaId: { $in: ideaIds } },
+          ],
+        })
         : Promise.resolve(),
       AiJob
         ? AiJob.deleteMany({
-            $or: [{ requesterId: user._id }, { ideaId: { $in: ideaIds } }],
-          })
+          $or: [{ requesterId: user._id }, { ideaId: { $in: ideaIds } }],
+        })
         : Promise.resolve(),
     ]);
 
@@ -113,4 +111,34 @@ async function adminDeleteUser(req, res, next) {
   }
 }
 
-module.exports = { adminDeleteIdea, adminDeleteUser };
+async function adminListUsers(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const q = String(req.query.q || "").trim();
+
+    const filter = {};
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ username: re }, { email: re }];
+    }
+
+    const [items, total] = await Promise.all([
+      User.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .select("_id username email role createdAt")
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({ ok: true, items, total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+module.exports = { adminListUsers, adminDeleteIdea, adminDeleteUser };
+
