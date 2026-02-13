@@ -1,3 +1,5 @@
+//jwt.js
+
 const jwt = require("jsonwebtoken");
 
 function signToken(user) {

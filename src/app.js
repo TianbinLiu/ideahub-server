@@ -10,6 +10,8 @@ const { notFound, errorHandler } = require("./middleware/error");
 const companyRoutes = require("./routes/company.routes");
 const notificationsRoutes = require("./routes/notifications.routes");
 const adminRoutes = require("./routes/admin.routes");
+const authOtpRoutes = require("./routes/authOtp.routes");
+
 
 
 const app = express();
@@ -21,6 +23,7 @@ app.use(helmet());
 app.use("/api", healthRoutes);
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/auth", authRoutes);
+app.use("/api/auth", authOtpRoutes);
 app.use("/api/me", meRoutes);
 app.use("/api/company", companyRoutes);
 app.use("/api/notifications", notificationsRoutes);

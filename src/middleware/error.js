@@ -1,3 +1,5 @@
+//error.js
+
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 
