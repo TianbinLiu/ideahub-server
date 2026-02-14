@@ -1,3 +1,5 @@
+//authOtp.routes.js
+
 const router = require("express").Router();
 const ctrl = require("../controllers/authOtp.controller");
 

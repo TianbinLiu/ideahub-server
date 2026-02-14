@@ -1,3 +1,5 @@
+//email.service.js
+
 const { badRequest } = require("../utils/http");
 
 async function sendEmailOtp({ to, code }) {
@@ -30,7 +32,8 @@ async function sendEmailOtp({ to, code }) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      badRequest("Failed to send email", { provider: "resend", text });
+      console.error("[RESEND] send failed", res.status, text);
+      badRequest("Failed to send email", { provider: "resend", status: res.status, text });
     }
     return { ok: true, provider: "resend" };
   }

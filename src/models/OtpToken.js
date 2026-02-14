@@ -1,3 +1,5 @@
+//OtpToken.js
+
 const mongoose = require("mongoose");
 
 const otpTokenSchema = new mongoose.Schema(
