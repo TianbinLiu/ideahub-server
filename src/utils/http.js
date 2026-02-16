@@ -4,6 +4,9 @@ const CODES = require("./errorCodes");
 function badRequest(message = "Bad request", details) {
   throw new AppError({ code: CODES.VALIDATION_ERROR, status: 400, message, details });
 }
+function otpCooldown(message = "Please wait before requesting another code", retryAfterSeconds = 60) {
+  throw new AppError({ code: CODES.OTP_RESEND_COOLDOWN, status: 429, message, details: { retryAfter: retryAfterSeconds } });
+}
 function unauthorized(message = "Unauthorized") {
   throw new AppError({ code: CODES.UNAUTHORIZED, status: 401, message });
 }

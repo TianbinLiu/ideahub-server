@@ -2,7 +2,7 @@
 
 const crypto = require("crypto");
 const OtpToken = require("../models/OtpToken");
-const { badRequest } = require("../utils/http");
+const { badRequest, otpCooldown } = require("../utils/http");
 
 function normEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -37,7 +37,14 @@ async function createOtp({ target, purpose }) {
     const ok = await canResend(latest);
     if (!ok) badRequest("Please wait before requesting another code");
   }
-
+  // If not ok, provide retryAfter seconds to client via otpCooldown
+  if (latest && latest.usedAt == null && latest.expiresAt && new Date(latest.expiresAt) > new Date()) {
+    const cd = parseInt(process.env.OTP_RESEND_COOLDOWN_SECONDS || "60", 10);
+    const since = Date.now() - new Date(latest.lastSentAt).getTime();
+    const retryAfter = Math.max(0, cd - Math.floor(since / 1000));
+    const ok = await canResend(latest);
+    if (!ok) otpCooldown("Please wait before requesting another code", retryAfter);
+  }
   const code = genCode6();
   const token = await OtpToken.create({
     target,
