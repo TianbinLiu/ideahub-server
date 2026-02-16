@@ -7,6 +7,8 @@ const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http"
 
 
 require("../models/User"); // 确保 populate(User) 不报错
+// IdeaView 用于记录用户对某个 idea 的最后浏览时间（用于每天只计一次 view）
+const IdeaView = require("../models/IdeaView");
 
 function toStringArray(tags) {
   if (!tags) return [];
@@ -143,10 +145,34 @@ async function getIdeaById(req, res, next) {
     }
 
 
-    // viewCount + 1（不阻塞返回也行，但这里简单同步做）
-    idea.stats = idea.stats || {};
-    idea.stats.viewCount = (idea.stats.viewCount || 0) + 1;
-    await idea.save();
+    // 只有已登录用户会计入 view；且同一用户在 24 小时内仅计一次
+    if (req.user) {
+      try {
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const now = new Date();
+
+        const existing = await IdeaView.findOne({ user: req.user._id, idea: idea._id });
+        if (!existing) {
+          // 首次浏览：创建记录并 +1
+          await IdeaView.create({ user: req.user._id, idea: idea._id, lastViewedAt: now });
+          idea.stats = idea.stats || {};
+          idea.stats.viewCount = (idea.stats.viewCount || 0) + 1;
+          await idea.save();
+        } else {
+          const last = existing.lastViewedAt || existing.createdAt || new Date(0);
+          if (now.getTime() - new Date(last).getTime() >= DAY_MS) {
+            existing.lastViewedAt = now;
+            await existing.save();
+            idea.stats = idea.stats || {};
+            idea.stats.viewCount = (idea.stats.viewCount || 0) + 1;
+            await idea.save();
+          }
+        }
+      } catch (e) {
+        // 任何计数错误不应阻塞返回（例如并发或索引冲突），只打印日志
+        console.error("view count update failed:", e?.message || e);
+      }
+    }
 
     let liked = false;
     let bookmarked = false;

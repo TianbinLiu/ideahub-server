@@ -13,6 +13,8 @@ const { invalidId, notFound, badRequest } = require("../utils/http");
 let Notification, AiJob;
 try { Notification = require("../models/Notification"); } catch { }
 try { AiJob = require("../models/AiJob"); } catch { }
+let IdeaView;
+try { IdeaView = require("../models/IdeaView"); } catch { }
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -37,6 +39,7 @@ async function adminDeleteIdea(req, res, next) {
       Interest.deleteMany({ idea: idea._id }),
       Notification ? Notification.deleteMany({ ideaId: idea._id }) : Promise.resolve(),
       AiJob ? AiJob.deleteMany({ ideaId: idea._id }) : Promise.resolve(),
+      IdeaView ? IdeaView.deleteMany({ idea: idea._id }) : Promise.resolve(),
     ]);
 
     await Idea.deleteOne({ _id: idea._id });
@@ -96,6 +99,9 @@ async function adminDeleteUser(req, res, next) {
         ? AiJob.deleteMany({
           $or: [{ requesterId: user._id }, { ideaId: { $in: ideaIds } }],
         })
+        : Promise.resolve(),
+      IdeaView
+        ? IdeaView.deleteMany({ $or: [{ user: user._id }, { idea: { $in: ideaIds } }] })
         : Promise.resolve(),
     ]);
 
