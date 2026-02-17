@@ -15,6 +15,7 @@ const notificationsRoutes = require("./routes/notifications.routes");
 const adminRoutes = require("./routes/admin.routes");
 const authOtpRoutes = require("./routes/authOtp.routes");
 const oauthRoutes = require("./routes/oauth.routes");
+const tagRankRoutes = require("./routes/tagRank.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
@@ -41,6 +42,7 @@ app.use("/api/company", companyRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
+app.use("/api/tag-rank", tagRankRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
