@@ -1,6 +1,9 @@
 // src/utils/permissions.js
 function isOwner(idea, user) {
-  return !!(idea?.author && user?._id) && String(idea.author) === String(user._id);
+  if (!idea || !user || !user._id) return false;
+  // idea.author may be an ObjectId or a populated user object; normalize to id string
+  const authorId = idea.author && (idea.author._id || idea.author);
+  return !!authorId && String(authorId) === String(user._id);
 }
 
 function canReadIdea(idea, user) {
