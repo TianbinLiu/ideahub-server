@@ -303,4 +303,23 @@ async function listMyIdeas(req, res, next) {
 }
 
 
-module.exports = { createIdea, listIdeas, getIdeaById, updateIdea, deleteIdea, listMyIdeas };
+
+
+// suggestion endpoint for idea titles (used by client autocomplete)
+async function suggestTitles(req, res, next) {
+  try {
+    const q = (req.query.q || "").toString().trim();
+    if (!q) return res.json({ ok: true, ideas: [] });
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
+    const items = await Idea.find({ visibility: "public", title: re })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .select("title")
+      .lean();
+    res.json({ ok: true, ideas: items.map(i => ({ id: i._id, title: i.title })) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { createIdea, listIdeas, getIdeaById, updateIdea, deleteIdea, listMyIdeas, suggestTitles };

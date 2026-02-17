@@ -1,5 +1,6 @@
 const Idea = require("../models/Idea");
 const TagVote = require("../models/TagVote");
+const TagLeaderboard = require("../models/TagLeaderboard");
 const mongoose = require("mongoose");
 const { invalidId, unauthorized, forbidden } = require("../utils/http");
 
@@ -17,11 +18,21 @@ async function getRank(req, res, next) {
   try {
     const tags = normalizeTags(req.query.tags || req.query.tag || []);
     const tagsKey = tags.join("|");
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 200);
 
-    // check cache
-    const cached = CACHE.get(tagsKey);
-    if (cached && cached.expires > Date.now()) {
-      return res.json({ ok: true, tags, tagKey: tagsKey, results: cached.value });
+    // prefer persisted leaderboard if exists
+    const board = await TagLeaderboard.findOne({ tagsKey }).lean();
+    if (board) {
+      const start = (page - 1) * limit;
+      const pageEntries = (board.entries || []).slice(start, start + limit);
+      // populate idea refs
+      const ideaIds = pageEntries.map(e => e.idea);
+      const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "username role").lean();
+      const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
+      const results = pageEntries.map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })).filter(r => r.idea);
+
+      return res.json({ ok: true, tags, tagsKey: tagsKey, page, limit, total: board.entries.length, results });
     }
 
     // aggregate TagVote to compute score per idea for this tag combo
@@ -48,7 +59,7 @@ async function getRank(req, res, next) {
     const ideaMap = Object.fromEntries(ideas.map((i) => [String(i._id), i]));
     const results = agg.map((a) => ({ idea: ideaMap[String(a._id)] || null, score: a.score, votes: a.votes })).filter(r=>r.idea);
 
-    // store cache
+    // store in short-lived memory cache as well
     CACHE.set(tagsKey, { expires: Date.now() + CACHE_TTL * 1000, value: results });
     res.json({ ok: true, tags, tagKey: tagsKey, results });
   } catch (err) {
@@ -99,6 +110,8 @@ async function vote(req, res, next) {
 
     // invalidate cache for this tagKey
     CACHE.delete(tagsKey);
+    // remove persisted leaderboard so it will be recomputed next time (or we could incrementally update)
+    try { await TagLeaderboard.deleteOne({ tagsKey }); } catch (e) {}
 
     res.json({ ok: true, ideaId, tags: normalized, tagsKey, score, votes: votesCount });
   } catch (err) {
@@ -106,7 +119,45 @@ async function vote(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote };
+// create or refresh a leaderboard for a tagsKey
+async function createLeaderboard(req, res, next) {
+  try {
+    const tags = normalizeTags(req.body.tags || req.query.tags || req.query.tag || []);
+    const tagsKey = tags.join("|");
+    const limit = Math.min(Math.max(parseInt(req.body.limit || req.query.limit || "100", 10), 1), 1000);
+
+    // compute aggregation similar to getRank
+    let agg;
+    if (!tagsKey) {
+      agg = await TagVote.aggregate([
+        { $group: { _id: "$idea", score: { $sum: "$vote" }, votes: { $sum: 1 } } },
+        { $sort: { score: -1 } },
+        { $limit: limit },
+      ]);
+    } else {
+      agg = await TagVote.aggregate([
+        { $match: { tagsKey } },
+        { $group: { _id: "$idea", score: { $sum: "$vote" }, votes: { $sum: 1 } } },
+        { $sort: { score: -1 } },
+        { $limit: limit },
+      ]);
+    }
+
+    const entries = agg.map(a => ({ idea: a._id, score: a.score, votes: a.votes }));
+    const now = new Date();
+    await TagLeaderboard.findOneAndUpdate(
+      { tagsKey },
+      { $set: { tags, entries, computedAt: now } },
+      { upsert: true }
+    );
+
+    res.json({ ok: true, tags, tagsKey, entriesCount: entries.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getRank, vote, suggestTags, createLeaderboard };
 // tag suggestions: find popular tags starting with q
 async function suggestTags(req, res, next) {
   try {

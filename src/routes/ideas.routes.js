@@ -27,6 +27,9 @@ const { addCommentBody } = require("../schemas/comment.schemas");
 // 列表：公开（+分页/排序）
 router.get("/", listIdeas);
 
+// title suggestions for autocomplete
+router.get("/suggest", require("../controllers/ideas.controller").suggestTitles || ((req,res)=>res.json({ok:true, ideas:[]})));
+
 router.get("/mine", requireAuth, listMyIdeas);
 
 // 详情：公开/未列出任何人可看；私密仅作者
