@@ -91,21 +91,25 @@ async function listIdeas(req, res, next) {
         ? { "stats.likeCount": -1, createdAt: -1 }
         : { createdAt: -1 };
 
-    const tag = (req.query.tag || "").toString().trim();
-    const keyword = (req.query.keyword || "").toString().trim();
+    const q = (req.query.q || req.query.keyword || req.query.tag || "").toString().trim();
 
     // 列表：只返回 public
     const filter = { visibility: "public" };
 
-    if (tag) {
-      // tags 是字符串数组，直接匹配
-      filter.tags = tag;
-    }
-
-    if (keyword) {
-      // 简单版：title/summary/content 模糊匹配（不做全文索引）
-      const re = new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [{ title: re }, { summary: re }, { content: re }];
+    if (q) {
+      // If q contains commas or spaces, treat as tag combination
+      if (q.includes(",") || q.includes(" ")) {
+        const tags = q.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+        if (tags.length === 1) {
+          filter.tags = tags[0];
+        } else if (tags.length > 1) {
+          filter.tags = { $all: tags };
+        }
+      } else {
+        // single token: match either tag or text
+        const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
+        filter.$or = [{ title: re }, { summary: re }, { content: re }, { tags: q }];
+      }
     }
 
     const [items, total] = await Promise.all([
