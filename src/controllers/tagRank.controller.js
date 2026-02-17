@@ -157,7 +157,6 @@ async function createLeaderboard(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote, suggestTags, createLeaderboard };
 // tag suggestions: find popular tags starting with q
 async function suggestTags(req, res, next) {
   try {
@@ -179,4 +178,4 @@ async function suggestTags(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote, suggestTags };
+module.exports = { getRank, vote, suggestTags, createLeaderboard };
