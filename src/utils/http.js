@@ -7,6 +7,9 @@ function badRequest(message = "Bad request", details) {
 function otpCooldown(message = "Please wait before requesting another code", retryAfterSeconds = 60) {
   throw new AppError({ code: CODES.OTP_RESEND_COOLDOWN, status: 429, message, details: { retryAfter: retryAfterSeconds } });
 }
+function publicLimitExceeded(message = "Public idea limit reached", limit = 5) {
+  throw new AppError({ code: CODES.PUBLIC_LIMIT_EXCEEDED, status: 403, message, details: { limit } });
+}
 function unauthorized(message = "Unauthorized") {
   throw new AppError({ code: CODES.UNAUTHORIZED, status: 401, message });
 }
@@ -20,4 +23,4 @@ function invalidId(message = "Invalid id") {
   throw new AppError({ code: CODES.INVALID_ID, status: 400, message });
 }
 
-module.exports = { badRequest, unauthorized, forbidden, notFound, invalidId };
+module.exports = { badRequest, otpCooldown, publicLimitExceeded, unauthorized, forbidden, notFound, invalidId };

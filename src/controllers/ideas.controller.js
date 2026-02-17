@@ -36,6 +36,25 @@ async function createIdea(req, res, next) {
       invalidId("Invalid idea id")
     }
 
+    // Enforce: clients should not create server-side private ideas — private ideas are stored locally in browser.
+    if (visibility === "private") {
+      // tell client to save locally instead of creating on server
+      return res.status(400).json({ ok: false, code: "PRIVATE_SAVE_LOCAL", message: "Private ideas should be saved locally in browser." });
+    }
+
+    // Enforce public idea limit for free users
+    const PUBLIC_LIMIT = Number(process.env.FREE_PUBLIC_IDEA_LIMIT || 5);
+    if ((visibility || "public") === "public" && req.user) {
+      const role = (req.user && req.user.role) || "user";
+      if (role !== "company" && role !== "admin") {
+        const count = await Idea.countDocuments({ author: req.user._id, visibility: "public" });
+        if (count >= PUBLIC_LIMIT) {
+          const { publicLimitExceeded } = require("../utils/http");
+          return next(new (require("../utils/AppError"))({ code: require("../utils/errorCodes").PUBLIC_LIMIT_EXCEEDED, status: 403, message: `Free accounts can publish up to ${PUBLIC_LIMIT} public ideas.`, details: { limit: PUBLIC_LIMIT } }));
+        }
+      }
+    }
+
     const idea = await Idea.create({
       title: title.trim(),
       summary: summary || "",
