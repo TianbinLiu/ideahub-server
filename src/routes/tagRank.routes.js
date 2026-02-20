@@ -1,6 +1,7 @@
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { getRank, vote, createLeaderboard, listLeaderboards } = require("../controllers/tagRank.controller");
+const { createPost, listPosts, likePost } = require("../controllers/leaderboard.controller");
 
 // GET /api/tag-rank?tags=tag1,tag2
 router.get("/", optionalAuth, getRank);
@@ -14,5 +15,10 @@ router.get("/suggest", optionalAuth, require("../controllers/tagRank.controller"
 
 // POST /api/tag-rank/vote { ideaId, tags, vote }
 router.post("/vote", requireAuth, vote);
+
+// leaderboard posts
+router.get("/posts", optionalAuth, listPosts); // ?tagsKey=...&sort=popular
+router.post("/posts", requireAuth, createPost);
+router.post("/posts/:id/like", requireAuth, likePost);
 
 module.exports = router;
