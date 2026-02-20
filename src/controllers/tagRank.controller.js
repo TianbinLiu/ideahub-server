@@ -61,7 +61,7 @@ async function getRank(req, res, next) {
 
     // store in short-lived memory cache as well
     CACHE.set(tagsKey, { expires: Date.now() + CACHE_TTL * 1000, value: results });
-    res.json({ ok: true, tags, tagKey: tagsKey, results });
+    res.json({ ok: true, tags, tagKey: tagsKey, results, total: results.length, page, limit });
   } catch (err) {
     next(err);
   }
@@ -143,7 +143,19 @@ async function createLeaderboard(req, res, next) {
       ]);
     }
 
-    const entries = agg.map(a => ({ idea: a._id, score: a.score, votes: a.votes }));
+    let entries = agg.map(a => ({ idea: a._id, score: a.score, votes: a.votes }));
+
+    // if no TagVote entries found, fallback to selecting popular ideas by view/like counts
+    if ((!entries || entries.length === 0)) {
+      // build a query for ideas matching tags (all tags if provided)
+      let ideaQuery = {};
+      if (tags.length) {
+        ideaQuery = { tags: { $all: tags } };
+      }
+      // prefer viewCount, then likeCount, then createdAt
+      const popular = await Idea.find(ideaQuery).sort({ "stats.viewCount": -1, "stats.likeCount": -1, createdAt: -1 }).limit(limit).lean();
+      entries = popular.map(p => ({ idea: p._id, score: (p.stats?.viewCount ?? 0), votes: (p.stats?.likeCount ?? 0) }));
+    }
     const now = new Date();
     await TagLeaderboard.findOneAndUpdate(
       { tagsKey },
@@ -178,4 +190,20 @@ async function suggestTags(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote, suggestTags, createLeaderboard };
+module.exports = { getRank, vote, suggestTags, createLeaderboard, listLeaderboards };
+
+// list recent persisted leaderboards
+async function listLeaderboards(req, res, next) {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
+    const boards = await TagLeaderboard.find({}).sort({ computedAt: -1 }).limit(limit).lean();
+    // populate idea titles for convenience
+    const ideaIds = Array.from(new Set(boards.flatMap(b => (b.entries || []).map(e => String(e.idea)))));
+    const ideas = await Idea.find({ _id: { $in: ideaIds } }).lean();
+    const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
+    const payload = boards.map(b => ({ tags: b.tags, tagsKey: b.tagsKey, computedAt: b.computedAt, entries: (b.entries || []).slice(0,5).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })) }));
+    res.json({ ok: true, boards: payload });
+  } catch (err) {
+    next(err);
+  }
+}
