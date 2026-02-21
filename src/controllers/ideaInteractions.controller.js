@@ -189,4 +189,55 @@ async function addComment(req, res, next) {
   }
 }
 
-module.exports = { toggleLike, toggleBookmark, listComments, addComment };
+/**
+ * POST /api/ideas/:id/comments/:commentId/like
+ * Toggle like on a comment
+ */
+async function likeComment(req, res, next) {
+  try {
+    const { id, commentId } = req.params;
+    const userId = req.user._id;
+
+    const idea = await getIdeaOr404(id, req, res);
+    
+    const comment = await Comment.findOne({ _id: commentId, idea: idea._id });
+    if (!comment) {
+      return res.status(404).json({ ok: false, message: "Comment not found" });
+    }
+
+    const uid = String(userId);
+    const idx = comment.likes.findIndex(u => String(u) === uid);
+    let liked = false;
+
+    if (idx >= 0) {
+      // unlike
+      comment.likes.splice(idx, 1);
+      comment.likesCount = Math.max(0, comment.likesCount - 1);
+      liked = false;
+    } else {
+      // like
+      comment.likes.push(userId);
+      comment.likesCount = (comment.likesCount || 0) + 1;
+      liked = true;
+    }
+
+    await comment.save();
+
+    // Create LIKE notification for comment author if not self
+    if (liked && String(comment.author) !== uid) {
+      await createNotification({
+        userId: comment.author,
+        actorId: userId,
+        ideaId: idea._id,
+        type: "LIKE_COMMENT",
+        payload: { commentId: comment._id },
+      });
+    }
+
+    res.json({ ok: true, liked, likesCount: comment.likesCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment };

@@ -1,6 +1,7 @@
 const LeaderboardPost = require("../models/LeaderboardPost");
 const Idea = require("../models/Idea");
 const { invalidId, unauthorized } = require("../utils/http");
+const { createNotification } = require("../services/notification.service");
 const mongoose = require("mongoose");
 
 async function createPost(req, res, next) {
@@ -54,6 +55,14 @@ async function likePost(req, res, next) {
       post.likes.push(req.user._id);
       post.likesCount = (post.likesCount || 0) + 1;
       liked = true;
+      // Create notification when liking
+      await createNotification({
+        userId: post.author,
+        actorId: req.user._id,
+        ideaId: null,
+        type: "LIKE_POST",
+        payload: { postId: post._id, postTitle: post.title },
+      });
     }
     await post.save();
     res.json({ ok: true, liked, likesCount: post.likesCount });
