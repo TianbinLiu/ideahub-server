@@ -31,6 +31,8 @@ const ideaSchema = new mongoose.Schema(
 
     visibility: { type: String, enum: ["public", "private", "unlisted"], default: "public" },
 
+    invitedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", index: true }],
+
     isMonetizable: { type: Boolean, default: false },
     licenseType: { type: String, default: "default" },
 

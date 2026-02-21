@@ -13,7 +13,14 @@ function canReadIdea(idea, user) {
 
   // private
   if (!user) return false;
-  return isOwner(idea, user) || user.role === "admin";
+  if (isOwner(idea, user) || user.role === "admin") return true;
+  
+  // Check if user is in invitedUsers
+  if (idea.invitedUsers && Array.isArray(idea.invitedUsers)) {
+    return idea.invitedUsers.some(uid => String(uid) === String(user._id));
+  }
+  
+  return false;
 }
 
 function canWriteIdea(idea, user) {

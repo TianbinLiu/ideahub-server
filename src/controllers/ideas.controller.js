@@ -2,8 +2,10 @@ const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
+const Notification = require("../models/Notification");
 const { canReadIdea, canWriteIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+const { parseMentions } = require("../utils/mentionParser");
 
 
 require("../models/User"); // 确保 populate(User) 不报错
@@ -55,6 +57,9 @@ async function createIdea(req, res, next) {
       }
     }
 
+    // Parse mentions from content to build invited users list
+    const { userIds: mentionedUserIds } = await parseMentions(content);
+
     const idea = await Idea.create({
       title: title.trim(),
       summary: summary || "",
@@ -64,7 +69,20 @@ async function createIdea(req, res, next) {
       visibility: visibility || "public",
       isMonetizable: Boolean(isMonetizable),
       licenseType: licenseType || "default",
+      invitedUsers: mentionedUserIds,
     });
+
+    // Create INVITE notifications for mentioned users
+    if (mentionedUserIds.length > 0) {
+      const notifs = mentionedUserIds.map(userId => ({
+        userId,
+        actorId: req.user._id,
+        ideaId: idea._id,
+        type: "INVITE",
+        payload: { title: idea.title },
+      }));
+      await Notification.insertMany(notifs);
+    }
 
     const populated = await Idea.findById(idea._id).populate("author", "username role");
     res.status(201).json({ ok: true, idea: populated });
@@ -247,7 +265,30 @@ async function updateIdea(req, res, next) {
       idea.title = String(title).trim();
     }
     if (summary !== undefined) idea.summary = String(summary);
-    if (content !== undefined) idea.content = String(content);
+    
+    if (content !== undefined) {
+      idea.content = String(content);
+      // Re-parse mentions when content changes
+      const { userIds: mentionedUserIds } = await parseMentions(content);
+      // Find new mentions (not already in invitedUsers)
+      const currentInvited = idea.invitedUsers.map(u => String(u));
+      const newMentions = mentionedUserIds.filter(uid => !currentInvited.includes(String(uid)));
+      
+      // Add new mentioned users
+      if (newMentions.length > 0) {
+        idea.invitedUsers = [...new Set([...currentInvited.map(u => new mongoose.Types.ObjectId(u)), ...newMentions])];
+        // Create INVITE notifications for newly mentioned users
+        const notifs = newMentions.map(userId => ({
+          userId,
+          actorId: req.user._id,
+          ideaId: idea._id,
+          type: "INVITE",
+          payload: { title: idea.title },
+        }));
+        await Notification.insertMany(notifs);
+      }
+    }
+    
     if (tags !== undefined) idea.tags = toStringArray(tags);
     if (visibility !== undefined) idea.visibility = visibility;
     if (isMonetizable !== undefined) idea.isMonetizable = Boolean(isMonetizable);

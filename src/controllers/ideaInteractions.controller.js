@@ -3,9 +3,11 @@ const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
+const Notification = require("../models/Notification");
 const { createNotification } = require("../services/notification.service");
 const { canReadIdea, canInteractIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+const { parseMentions } = require("../utils/mentionParser");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -146,10 +148,14 @@ async function addComment(req, res, next) {
 
     const idea = await getIdeaOr404(id, req, res);
 
+    // Parse mentions in comment content
+    const { userIds: mentionedUserIds } = await parseMentions(content);
+
     const comment = await Comment.create({
       idea: idea._id,
       author: req.user._id,
       content: String(content).trim(),
+      mentions: mentionedUserIds,
     });
 
     idea.stats.commentCount = (idea.stats.commentCount || 0) + 1;
@@ -165,6 +171,17 @@ async function addComment(req, res, next) {
       payload: { commentId: comment._id },
     });
 
+    // Create MENTION notifications for mentioned users (excluding the idea author if already notified)
+    if (mentionedUserIds.length > 0) {
+      const notifs = mentionedUserIds.map(userId => ({
+        userId,
+        actorId: req.user._id,
+        ideaId: idea._id,
+        type: "MENTION",
+        payload: { commentId: comment._id, content: comment.content },
+      }));
+      await Notification.insertMany(notifs);
+    }
 
     res.status(201).json({ ok: true, comment: populated, commentCount: idea.stats.commentCount });
   } catch (err) {
