@@ -40,9 +40,14 @@ async function likePost(req, res, next) {
   try {
     if (!req.user) return unauthorized("Login required");
     const id = req.params.id;
+    console.log(`[likePost] userId=${req.user._id}, postId=${id}`);
+
     if (!id || !mongoose.isValidObjectId(id)) return invalidId("Invalid post id");
     const post = await LeaderboardPost.findById(id);
     if (!post) return invalidId("Post not found");
+
+    console.log(`[likePost] Found post:`, { _id: post._id, author: post.author, title: post.title });
+
     const uid = String(req.user._id);
     const idx = post.likes.findIndex(u => String(u) === uid);
     let liked = false;
@@ -55,7 +60,13 @@ async function likePost(req, res, next) {
       post.likes.push(req.user._id);
       post.likesCount = (post.likesCount || 0) + 1;
       liked = true;
-      // Create notification when liking
+    }
+    await post.save();
+    console.log(`[likePost] Saved post, liked=${liked}, likesCount=${post.likesCount}`);
+
+    // Create notification when liking
+    if (liked) {
+      console.log(`[likePost] Creating LIKE_POST notification for author=${post.author}`);
       await createNotification({
         userId: post.author,
         actorId: req.user._id,
@@ -64,7 +75,7 @@ async function likePost(req, res, next) {
         payload: { postId: post._id, postTitle: post.title },
       });
     }
-    await post.save();
+
     res.json({ ok: true, liked, likesCount: post.likesCount });
   } catch (err) {
     next(err);

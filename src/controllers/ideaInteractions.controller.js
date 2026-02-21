@@ -198,9 +198,13 @@ async function likeComment(req, res, next) {
     const { id, commentId } = req.params;
     const userId = req.user._id;
 
+    console.log(`[likeComment] userId=${userId}, commentId=${commentId}, ideaId=${id}`);
+
     const idea = await getIdeaOr404(id, req, res);
     
     const comment = await Comment.findOne({ _id: commentId, idea: idea._id });
+    console.log(`[likeComment] Found comment:`, { _id: comment?._id, author: comment?.author, content: comment?.content?.substring(0, 20) });
+
     if (!comment) {
       return res.status(404).json({ ok: false, message: "Comment not found" });
     }
@@ -222,9 +226,11 @@ async function likeComment(req, res, next) {
     }
 
     await comment.save();
+    console.log(`[likeComment] Saved comment, liked=${liked}, likesCount=${comment.likesCount}`);
 
     // Create LIKE notification for comment author if not self
     if (liked && String(comment.author) !== uid) {
+      console.log(`[likeComment] Creating notification for author=${comment.author}`);
       await createNotification({
         userId: comment.author,
         actorId: userId,
@@ -232,6 +238,8 @@ async function likeComment(req, res, next) {
         type: "LIKE_COMMENT",
         payload: { commentId: comment._id },
       });
+    } else {
+      console.log(`[likeComment] Skipped notification: liked=${liked}, authorEqualsUser=${String(comment.author) === uid}`);
     }
 
     res.json({ ok: true, liked, likesCount: comment.likesCount });

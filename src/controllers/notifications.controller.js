@@ -10,9 +10,10 @@ async function listMyNotifications(req, res, next) {
     const filter = { userId };
     if (req.query.unread === "1") filter.readAt = null;
 
+    console.log(`[Notifications] Fetching for userId=${userId}, filter=${JSON.stringify(filter)}`);
+
     const [items, total] = await Promise.all([
       Notification.find(filter)
-        .select("_id type readAt createdAt actorId ideaId payload")
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
@@ -21,6 +22,8 @@ async function listMyNotifications(req, res, next) {
         .lean(),
       Notification.countDocuments(filter),
     ]);
+
+    console.log(`[Notifications] Found ${items.length} items, total=${total}`);
 
     res.json({ ok: true, items, total, page, limit });
   } catch (err) {
@@ -31,7 +34,9 @@ async function listMyNotifications(req, res, next) {
 async function getUnreadCount(req, res, next) {
   try {
     const userId = req.user._id;
+    console.log(`[getUnreadCount] Checking unread for userId=${userId}`);
     const count = await Notification.countDocuments({ userId, readAt: null });
+    console.log(`[getUnreadCount] Found ${count} unread notifications`);
     res.json({ ok: true, count });
   } catch (err) {
     next(err);
