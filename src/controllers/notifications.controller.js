@@ -12,6 +12,7 @@ async function listMyNotifications(req, res, next) {
 
     const [items, total] = await Promise.all([
       Notification.find(filter)
+        .select("_id type readAt createdAt actorId ideaId payload")
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
