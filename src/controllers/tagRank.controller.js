@@ -1,6 +1,7 @@
 const Idea = require("../models/Idea");
 const TagVote = require("../models/TagVote");
 const TagLeaderboard = require("../models/TagLeaderboard");
+const LeaderboardPost = require("../models/LeaderboardPost");
 const mongoose = require("mongoose");
 const { invalidId, unauthorized, forbidden } = require("../utils/http");
 
@@ -200,7 +201,23 @@ async function listLeaderboards(req, res, next) {
     const ideaIds = Array.from(new Set(boards.flatMap(b => (b.entries || []).map(e => String(e.idea)))));
     const ideas = await Idea.find({ _id: { $in: ideaIds } }).lean();
     const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
-    const payload = boards.map(b => ({ _id: b._id, tags: b.tags, tagsKey: b.tagsKey, computedAt: b.computedAt, entries: (b.entries || []).slice(0,5).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })) }));
+    
+    // get posts count for each board
+    const tagsKeys = boards.map(b => b.tagsKey);
+    const postsCounts = await LeaderboardPost.aggregate([
+      { $match: { tagsKey: { $in: tagsKeys } } },
+      { $group: { _id: "$tagsKey", count: { $sum: 1 } } }
+    ]);
+    const postsCountMap = Object.fromEntries(postsCounts.map(p => [p._id, p.count]));
+    
+    const payload = boards.map(b => ({ 
+      _id: b._id, 
+      tags: b.tags, 
+      tagsKey: b.tagsKey, 
+      computedAt: b.computedAt, 
+      postsCount: postsCountMap[b.tagsKey] || 0,
+      entries: (b.entries || []).slice(0,5).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })) 
+    }));
     res.json({ ok: true, boards: payload });
   } catch (err) {
     next(err);
@@ -253,8 +270,29 @@ async function searchLeaderboards(req, res, next) {
     .slice(0, 5)
     .map(s => s.board);
 
-    const exactPayload = exact ? { _id: exact._id, tags: exact.tags, tagsKey: exact.tagsKey, entriesCount: exact.entries?.length || 0 } : null;
-    const relatedPayload = scored.map(b => ({ _id: b._id, tags: b.tags, tagsKey: b.tagsKey, entriesCount: b.entries?.length || 0 }));
+    // get posts count for exact and related boards
+    const allBoards = [exact, ...scored].filter(Boolean);
+    const tagsKeys = allBoards.map(b => b.tagsKey);
+    const postsCounts = await LeaderboardPost.aggregate([
+      { $match: { tagsKey: { $in: tagsKeys } } },
+      { $group: { _id: "$tagsKey", count: { $sum: 1 } } }
+    ]);
+    const postsCountMap = Object.fromEntries(postsCounts.map(p => [p._id, p.count]));
+
+    const exactPayload = exact ? { 
+      _id: exact._id, 
+      tags: exact.tags, 
+      tagsKey: exact.tagsKey, 
+      entriesCount: exact.entries?.length || 0,
+      postsCount: postsCountMap[exact.tagsKey] || 0 
+    } : null;
+    const relatedPayload = scored.map(b => ({ 
+      _id: b._id, 
+      tags: b.tags, 
+      tagsKey: b.tagsKey, 
+      entriesCount: b.entries?.length || 0,
+      postsCount: postsCountMap[b.tagsKey] || 0 
+    }));
 
     res.json({ ok: true, searchTags: tags, exact: exactPayload, related: relatedPayload });
   } catch (err) {
