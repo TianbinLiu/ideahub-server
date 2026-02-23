@@ -10,6 +10,7 @@ const TagLeaderboardSchema = new mongoose.Schema({
   tagsKey: { type: String, required: true, unique: true },
   tags: [{ type: String }],
   entries: [EntrySchema],
+  author: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   computedAt: { type: Date, default: Date.now },
 });
 

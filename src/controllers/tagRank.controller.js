@@ -2,6 +2,7 @@ const Idea = require("../models/Idea");
 const TagVote = require("../models/TagVote");
 const TagLeaderboard = require("../models/TagLeaderboard");
 const LeaderboardPost = require("../models/LeaderboardPost");
+const Bookmark = require("../models/Bookmark");
 const mongoose = require("mongoose");
 const { invalidId, unauthorized, forbidden } = require("../utils/http");
 
@@ -126,6 +127,7 @@ async function createLeaderboard(req, res, next) {
     const tags = normalizeTags(req.body.tags || req.query.tags || req.query.tag || []);
     const tagsKey = tags.join("|");
     const limit = Math.min(Math.max(parseInt(req.body.limit || req.query.limit || "100", 10), 1), 1000);
+    const userId = req.user?._id || req.user?.id;
 
     // compute aggregation similar to getRank
     let agg;
@@ -158,9 +160,19 @@ async function createLeaderboard(req, res, next) {
       entries = popular.map(p => ({ idea: p._id, score: (p.stats?.viewCount ?? 0), votes: (p.stats?.likeCount ?? 0) }));
     }
     const now = new Date();
+    
+    // Check if board exists
+    const existing = await TagLeaderboard.findOne({ tagsKey });
+    let updateData = { tags, entries, computedAt: now };
+    
+    // Only set author if creating new and user is logged in
+    if (!existing && userId) {
+      updateData.author = userId;
+    }
+    
     const board = await TagLeaderboard.findOneAndUpdate(
       { tagsKey },
-      { $set: { tags, entries, computedAt: now } },
+      { $set: updateData },
       { upsert: true, new: true }
     );
 
@@ -228,10 +240,19 @@ async function listLeaderboards(req, res, next) {
 async function getLeaderboardById(req, res, next) {
   try {
     const { id } = req.params;
+    const userId = req.user?._id || req.user?.id;
+    
     if (!mongoose.isValidObjectId(id)) return invalidId("Invalid leaderboard id");
 
-    const board = await TagLeaderboard.findById(id).lean();
+    const board = await TagLeaderboard.findById(id).populate("author", "username role").lean();
     if (!board) return invalidId("Leaderboard not found");
+
+    // Check if user has bookmarked this leaderboard
+    let bookmarked = false;
+    if (userId) {
+      const bookmark = await Bookmark.findOne({ user: userId, leaderboard: id, type: "leaderboard" });
+      bookmarked = !!bookmark;
+    }
 
     // get all entries with idea details
     const ideaIds = (board.entries || []).map(e => e.idea);
@@ -239,7 +260,17 @@ async function getLeaderboardById(req, res, next) {
     const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
     const entries = (board.entries || []).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })).filter(e => e.idea);
 
-    res.json({ ok: true, _id: board._id, tags: board.tags, tagsKey: board.tagsKey, computedAt: board.computedAt, entries, entriesCount: entries.length });
+    res.json({ 
+      ok: true, 
+      _id: board._id, 
+      tags: board.tags, 
+      tagsKey: board.tagsKey, 
+      author: board.author,
+      computedAt: board.computedAt, 
+      bookmarked,
+      entries, 
+      entriesCount: entries.length 
+    });
   } catch (err) {
     next(err);
   }
@@ -300,4 +331,62 @@ async function searchLeaderboards(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote, suggestTags, createLeaderboard, listLeaderboards, getLeaderboardById, searchLeaderboards };
+// toggle bookmark for a leaderboard
+async function bookmarkLeaderboard(req, res, next) {
+  try {
+    const { id } = req.params;
+    const userId = req.user?._id || req.user?.id;
+    
+    if (!userId) return unauthorized("Login required");
+    if (!mongoose.isValidObjectId(id)) return invalidId("Invalid leaderboard id");
+
+    const board = await TagLeaderboard.findById(id);
+    if (!board) return invalidId("Leaderboard not found");
+
+    const existing = await Bookmark.findOne({ user: userId, leaderboard: id, type: "leaderboard" });
+
+    if (existing) {
+      // Remove bookmark
+      await Bookmark.deleteOne({ _id: existing._id });
+      return res.json({ ok: true, bookmarked: false });
+    } else {
+      // Add bookmark
+      await Bookmark.create({ user: userId, leaderboard: id, type: "leaderboard" });
+      return res.json({ ok: true, bookmarked: true });
+    }
+  } catch (err) {
+    next(err);
+  }
+}
+
+// delete a leaderboard (author only)
+async function deleteLeaderboard(req, res, next) {
+  try {
+    const { id } = req.params;
+    const userId = req.user?._id || req.user?.id;
+    
+    if (!userId) return unauthorized("Login required");
+    if (!mongoose.isValidObjectId(id)) return invalidId("Invalid leaderboard id");
+
+    const board = await TagLeaderboard.findById(id);
+    if (!board) return invalidId("Leaderboard not found");
+
+    // Check if user is author
+    if (!board.author || String(board.author) !== String(userId)) {
+      return forbidden("Only the author can delete this leaderboard");
+    }
+
+    // Delete the leaderboard
+    await TagLeaderboard.deleteOne({ _id: id });
+    
+    // Also delete related bookmarks and posts
+    await Bookmark.deleteMany({ leaderboard: id, type: "leaderboard" });
+    await LeaderboardPost.deleteMany({ tagsKey: board.tagsKey });
+
+    res.json({ ok: true, message: "Leaderboard deleted" });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getRank, vote, suggestTags, createLeaderboard, listLeaderboards, getLeaderboardById, searchLeaderboards, bookmarkLeaderboard, deleteLeaderboard };

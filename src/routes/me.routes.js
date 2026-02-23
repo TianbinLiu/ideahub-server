@@ -31,10 +31,16 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
         path: "idea",
         populate: { path: "author", select: "username role" },
       })
+      .populate({
+        path: "leaderboard",
+        populate: { path: "author", select: "username role" },
+      })
       .lean();
 
-    const ideas = rows.map(r => r.idea).filter(Boolean);
-    res.json({ ok: true, ideas });
+    const ideas = rows.filter(r => r.type === "idea" && r.idea).map(r => r.idea);
+    const leaderboards = rows.filter(r => r.type === "leaderboard" && r.leaderboard).map(r => r.leaderboard);
+    
+    res.json({ ok: true, ideas, leaderboards });
   } catch (err) {
     next(err);
   }

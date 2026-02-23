@@ -1,6 +1,6 @@
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
-const { getRank, vote, createLeaderboard, listLeaderboards, getLeaderboardById, searchLeaderboards } = require("../controllers/tagRank.controller");
+const { getRank, vote, createLeaderboard, listLeaderboards, getLeaderboardById, searchLeaderboards, bookmarkLeaderboard, deleteLeaderboard } = require("../controllers/tagRank.controller");
 const { createPost, listPosts, likePost } = require("../controllers/leaderboard.controller");
 
 // GET /api/tag-rank?tags=tag1,tag2
@@ -13,13 +13,19 @@ router.get("/search", optionalAuth, searchLeaderboards);
 router.get("/suggest", optionalAuth, require("../controllers/tagRank.controller").suggestTags || ((req,res)=>res.json({ok:true, tags:[] }))); 
 
 // POST /api/tag-rank/leaderboard { tags }
-router.post("/leaderboard", createLeaderboard);
+router.post("/leaderboard", optionalAuth, createLeaderboard);
 
 // GET /api/tag-rank/leaderboards?sort=recent|hottest
 router.get("/leaderboards", optionalAuth, listLeaderboards);
 
 // GET /api/tag-rank/leaderboards/:id
 router.get("/leaderboards/:id", optionalAuth, getLeaderboardById);
+
+// POST /api/tag-rank/leaderboards/:id/bookmark
+router.post("/leaderboards/:id/bookmark", requireAuth, bookmarkLeaderboard);
+
+// DELETE /api/tag-rank/leaderboards/:id
+router.delete("/leaderboards/:id", requireAuth, deleteLeaderboard);
 
 // POST /api/tag-rank/vote { ideaId, tags, vote }
 router.post("/vote", requireAuth, vote);
