@@ -158,13 +158,13 @@ async function createLeaderboard(req, res, next) {
       entries = popular.map(p => ({ idea: p._id, score: (p.stats?.viewCount ?? 0), votes: (p.stats?.likeCount ?? 0) }));
     }
     const now = new Date();
-    await TagLeaderboard.findOneAndUpdate(
+    const board = await TagLeaderboard.findOneAndUpdate(
       { tagsKey },
       { $set: { tags, entries, computedAt: now } },
-      { upsert: true }
+      { upsert: true, new: true }
     );
 
-    res.json({ ok: true, tags, tagsKey, entriesCount: entries.length });
+    res.json({ ok: true, _id: board._id, tags, tagsKey, entriesCount: entries.length });
   } catch (err) {
     next(err);
   }
