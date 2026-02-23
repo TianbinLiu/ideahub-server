@@ -86,7 +86,7 @@ async function toggleBookmark(req, res, next) {
 
     const idea = await getIdeaOr404(id, req, res);
 
-    const existing = await Bookmark.findOne({ user: userId, idea: idea._id });
+    const existing = await Bookmark.findOne({ user: userId, idea: idea._id, type: "idea" });
     let bookmarked;
 
     if (existing) {
@@ -94,7 +94,7 @@ async function toggleBookmark(req, res, next) {
       bookmarked = false;
       idea.stats.bookmarkCount = Math.max((idea.stats.bookmarkCount || 0) - 1, 0);
     } else {
-      await Bookmark.create({ user: userId, idea: idea._id });
+      await Bookmark.create({ user: userId, idea: idea._id, type: "idea" });
       bookmarked = true;
       idea.stats.bookmarkCount = (idea.stats.bookmarkCount || 0) + 1;
     }

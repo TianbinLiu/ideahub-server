@@ -221,7 +221,7 @@ async function getIdeaById(req, res, next) {
     if (req.user) {
       const [l, b] = await Promise.all([
         Like.findOne({ user: req.user._id, idea: idea._id }).lean(),
-        Bookmark.findOne({ user: req.user._id, idea: idea._id }).lean(),
+        Bookmark.findOne({ user: req.user._id, idea: idea._id, type: "idea" }).lean(),
       ]);
       liked = !!l;
       bookmarked = !!b;
