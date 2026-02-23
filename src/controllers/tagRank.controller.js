@@ -190,20 +190,76 @@ async function suggestTags(req, res, next) {
   }
 }
 
-module.exports = { getRank, vote, suggestTags, createLeaderboard, listLeaderboards };
-
-// list recent persisted leaderboards
+// list recent or hottest persisted leaderboards
 async function listLeaderboards(req, res, next) {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
-    const boards = await TagLeaderboard.find({}).sort({ computedAt: -1 }).limit(limit).lean();
+    const sort = req.query.sort === "hottest" ? { "entries.score": -1 } : { computedAt: -1 };
+    const boards = await TagLeaderboard.find({}).sort(sort).limit(limit).lean();
     // populate idea titles for convenience
     const ideaIds = Array.from(new Set(boards.flatMap(b => (b.entries || []).map(e => String(e.idea)))));
     const ideas = await Idea.find({ _id: { $in: ideaIds } }).lean();
     const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
-    const payload = boards.map(b => ({ tags: b.tags, tagsKey: b.tagsKey, computedAt: b.computedAt, entries: (b.entries || []).slice(0,5).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })) }));
+    const payload = boards.map(b => ({ _id: b._id, tags: b.tags, tagsKey: b.tagsKey, computedAt: b.computedAt, entries: (b.entries || []).slice(0,5).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })) }));
     res.json({ ok: true, boards: payload });
   } catch (err) {
     next(err);
   }
 }
+
+// get single leaderboard by ID with all entries and posts
+async function getLeaderboardById(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) return invalidId("Invalid leaderboard id");
+
+    const board = await TagLeaderboard.findById(id).lean();
+    if (!board) return invalidId("Leaderboard not found");
+
+    // get all entries with idea details
+    const ideaIds = (board.entries || []).map(e => e.idea);
+    const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "username role").lean();
+    const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
+    const entries = (board.entries || []).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })).filter(e => e.idea);
+
+    res.json({ ok: true, _id: board._id, tags: board.tags, tagsKey: board.tagsKey, computedAt: board.computedAt, entries, entriesCount: entries.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// search leaderboards by tags - returns exact match and related ones
+async function searchLeaderboards(req, res, next) {
+  try {
+    const tags = normalizeTags(req.query.q || req.query.tags || []);
+    if (tags.length === 0) return res.json({ ok: true, exact: null, related: [] });
+
+    const tagsKey = tags.join("|");
+    
+    // try exact match first
+    const exact = await TagLeaderboard.findOne({ tagsKey }).lean();
+
+    // find related boards (partial tag matches)
+    const related = await TagLeaderboard.find({ tagsKey: { $ne: tagsKey } }).lean();
+    
+    // score related boards by tag overlap
+    const scored = related.map(b => {
+      const boardTags = b.tags || [];
+      const overlap = tags.filter(t => boardTags.includes(t)).length;
+      return { board: b, overlap };
+    })
+    .filter(s => s.overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap)
+    .slice(0, 5)
+    .map(s => s.board);
+
+    const exactPayload = exact ? { _id: exact._id, tags: exact.tags, tagsKey: exact.tagsKey, entriesCount: exact.entries?.length || 0 } : null;
+    const relatedPayload = scored.map(b => ({ _id: b._id, tags: b.tags, tagsKey: b.tagsKey, entriesCount: b.entries?.length || 0 }));
+
+    res.json({ ok: true, searchTags: tags, exact: exactPayload, related: relatedPayload });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getRank, vote, suggestTags, createLeaderboard, listLeaderboards, getLeaderboardById, searchLeaderboards };
