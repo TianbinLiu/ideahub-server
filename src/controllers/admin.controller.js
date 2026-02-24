@@ -3,6 +3,9 @@
 const mongoose = require("mongoose");
 const User = require("../models/User");
 const Idea = require("../models/Idea");
+const TagLeaderboard = require("../models/TagLeaderboard");
+const LeaderboardPost = require("../models/LeaderboardPost");
+const TagVote = require("../models/TagVote");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
@@ -43,6 +46,34 @@ async function adminDeleteIdea(req, res, next) {
     ]);
 
     await Idea.deleteOne({ _id: idea._id });
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function adminDeleteLeaderboard(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      invalidId("Invalid leaderboard id");
+    }
+
+    const board = await TagLeaderboard.findById(id);
+    if (!board) {
+      notFound("Leaderboard not found");
+    }
+
+    const tagsKey = board.tagsKey || "";
+
+    await Promise.all([
+      Bookmark.deleteMany({ leaderboard: board._id, type: "leaderboard" }),
+      LeaderboardPost.deleteMany({ tagsKey }),
+      TagVote.deleteMany({ tagsKey }),
+    ]);
+
+    await TagLeaderboard.deleteOne({ _id: board._id });
 
     res.json({ ok: true });
   } catch (err) {
@@ -145,6 +176,91 @@ async function adminListUsers(req, res, next) {
   }
 }
 
+async function adminListIdeas(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const q = String(req.query.q || "").trim();
 
-module.exports = { adminListUsers, adminDeleteIdea, adminDeleteUser };
+    const filter = {};
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { title: re },
+        { summary: re },
+        { content: re },
+        { tags: re },
+      ];
+    }
+
+    const [items, total] = await Promise.all([
+      Idea.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate("author", "_id username role")
+        .select("_id title summary tags visibility createdAt author")
+        .lean(),
+      Idea.countDocuments(filter),
+    ]);
+
+    res.json({ ok: true, items, total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function adminListLeaderboards(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const q = String(req.query.q || "").trim();
+
+    const filter = {};
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ tagsKey: re }, { tags: re }];
+    }
+
+    const [items, total] = await Promise.all([
+      TagLeaderboard.find(filter)
+        .sort({ computedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .select("_id tags tagsKey computedAt entries")
+        .lean(),
+      TagLeaderboard.countDocuments(filter),
+    ]);
+
+    const tagsKeys = items.map((b) => b.tagsKey).filter(Boolean);
+    const postsCounts = await LeaderboardPost.aggregate([
+      { $match: { tagsKey: { $in: tagsKeys } } },
+      { $group: { _id: "$tagsKey", count: { $sum: 1 } } },
+    ]);
+    const postsCountMap = Object.fromEntries(postsCounts.map((p) => [p._id, p.count]));
+
+    const payload = items.map((b) => ({
+      _id: b._id,
+      tags: b.tags,
+      tagsKey: b.tagsKey,
+      computedAt: b.computedAt,
+      entriesCount: (b.entries || []).length,
+      postsCount: postsCountMap[b.tagsKey] || 0,
+    }));
+
+    res.json({ ok: true, items: payload, total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+module.exports = {
+  adminListUsers,
+  adminListIdeas,
+  adminListLeaderboards,
+  adminDeleteIdea,
+  adminDeleteLeaderboard,
+  adminDeleteUser,
+};
 
