@@ -1,6 +1,8 @@
 const User = require("../models/User");
 const Follow = require("../models/Follow");
 const Bookmark = require("../models/Bookmark");
+const TagLeaderboard = require("../models/TagLeaderboard");
+const LeaderboardPost = require("../models/LeaderboardPost");
 const AppError = require("../utils/AppError");
 
 /**
@@ -204,6 +206,48 @@ async function getUserBookmarks(req, res, next) {
   }
 }
 
+/**
+ * GET /api/users/:id/leaderboards
+ * Get leaderboards created by user
+ */
+async function getUserLeaderboards(req, res, next) {
+  try {
+    const { id } = req.params;
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+
+    const [items, total] = await Promise.all([
+      TagLeaderboard.find({ author: id })
+        .sort({ computedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .select("_id tags tagsKey computedAt entries")
+        .lean(),
+      TagLeaderboard.countDocuments({ author: id }),
+    ]);
+
+    const tagsKeys = items.map((b) => b.tagsKey).filter(Boolean);
+    const postsCounts = await LeaderboardPost.aggregate([
+      { $match: { tagsKey: { $in: tagsKeys } } },
+      { $group: { _id: "$tagsKey", count: { $sum: 1 } } },
+    ]);
+    const postsCountMap = Object.fromEntries(postsCounts.map((p) => [p._id, p.count]));
+
+    const payload = items.map((b) => ({
+      _id: b._id,
+      tags: b.tags,
+      tagsKey: b.tagsKey,
+      computedAt: b.computedAt,
+      entriesCount: (b.entries || []).length,
+      postsCount: postsCountMap[b.tagsKey] || 0,
+    }));
+
+    res.json({ ok: true, items: payload, total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = { 
   searchUsers,
   getUserProfile,
@@ -211,5 +255,6 @@ module.exports = {
   getFollowers,
   getFollowing,
   getUserBookmarks,
+  getUserLeaderboards,
 };
 

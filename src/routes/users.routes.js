@@ -6,6 +6,7 @@ const {
   getFollowers, 
   getFollowing,
   getUserBookmarks,
+  getUserLeaderboards,
 } = require("../controllers/users.controller");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 
@@ -26,5 +27,8 @@ router.get("/:id/following", getFollowing);
 
 // GET /api/users/:id/bookmarks - Get user's bookmarks
 router.get("/:id/bookmarks", optionalAuth, getUserBookmarks);
+
+// GET /api/users/:id/leaderboards - Get user's leaderboards
+router.get("/:id/leaderboards", optionalAuth, getUserLeaderboards);
 
 module.exports = router;
