@@ -207,8 +207,12 @@ async function suggestTags(req, res, next) {
 async function listLeaderboards(req, res, next) {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
-    const sort = req.query.sort === "hottest" ? { "entries.score": -1 } : { computedAt: -1 };
-    const boards = await TagLeaderboard.find({}).sort(sort).limit(limit).lean();
+    const isHottest = req.query.sort === "hottest";
+    const sort = isHottest
+      ? { "entries.0.score": -1, computedAt: -1 }
+      : { computedAt: -1 };
+    const filter = { "entries.0": { $exists: true } };
+    const boards = await TagLeaderboard.find(filter).sort(sort).limit(limit).lean();
     // populate idea titles for convenience
     const ideaIds = Array.from(new Set(boards.flatMap(b => (b.entries || []).map(e => String(e.idea)))));
     const ideas = await Idea.find({ _id: { $in: ideaIds } }).lean();
