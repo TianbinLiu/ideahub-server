@@ -4,7 +4,7 @@ const TagLeaderboard = require("../models/TagLeaderboard");
 const LeaderboardPost = require("../models/LeaderboardPost");
 const Bookmark = require("../models/Bookmark");
 const mongoose = require("mongoose");
-const { invalidId, unauthorized, forbidden } = require("../utils/http");
+const { invalidId, unauthorized, forbidden, badRequest } = require("../utils/http");
 
 // simple in-memory cache for leaderboards
 const CACHE = new Map(); // key -> { expires: Date, value }
@@ -80,6 +80,9 @@ async function vote(req, res, next) {
     const v = Number(vote) === 1 ? 1 : -1;
 
     const normalized = normalizeTags(tags);
+    if (normalized.length === 0) {
+      return badRequest("At least one tag is required");
+    }
     const tagsKey = normalized.join("|");
       // ensure idea exists and is public
       const idea = await Idea.findById(ideaId).lean();
@@ -126,6 +129,9 @@ async function createLeaderboard(req, res, next) {
   try {
     const tags = normalizeTags(req.body.tags || req.query.tags || req.query.tag || []);
     const tagsKey = tags.join("|");
+    if (tags.length === 0 || !tagsKey) {
+      return badRequest("At least one tag is required");
+    }
     const limit = Math.min(Math.max(parseInt(req.body.limit || req.query.limit || "100", 10), 1), 1000);
     const userId = req.user?._id || req.user?.id;
 
@@ -209,10 +215,20 @@ async function listLeaderboards(req, res, next) {
     const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
     const isHottest = req.query.sort === "hottest";
     const sort = isHottest
-      ? { "entries.0.score": -1, computedAt: -1 }
+      ? { topScore: -1, computedAt: -1 }
       : { computedAt: -1 };
-    const filter = { "entries.0": { $exists: true } };
-    const boards = await TagLeaderboard.find(filter).sort(sort).limit(limit).lean();
+
+    const pipeline = [];
+    if (isHottest) {
+      pipeline.push({
+        $addFields: {
+          topScore: { $ifNull: [{ $arrayElemAt: ["$entries.score", 0] }, -1] },
+        },
+      });
+    }
+    pipeline.push({ $sort: sort }, { $limit: limit });
+
+    const boards = await TagLeaderboard.aggregate(pipeline);
     // populate idea titles for convenience
     const ideaIds = Array.from(new Set(boards.flatMap(b => (b.entries || []).map(e => String(e.idea)))));
     const ideas = await Idea.find({ _id: { $in: ideaIds } }).lean();

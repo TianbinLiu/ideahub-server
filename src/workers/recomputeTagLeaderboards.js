@@ -7,20 +7,6 @@ async function recompute() {
   await connectDB();
   console.log("Recomputing tag leaderboards...");
 
-  // compute global leaderboard (no tags)
-  try {
-    const globalAgg = await TagVote.aggregate([
-      { $group: { _id: "$idea", score: { $sum: "$vote" }, votes: { $sum: 1 } } },
-      { $sort: { score: -1 } },
-      { $limit: 500 },
-    ]);
-    const globalEntries = globalAgg.map(a => ({ idea: a._id, score: a.score, votes: a.votes }));
-    await TagLeaderboard.findOneAndUpdate({ tagsKey: "" }, { $set: { tagsKey: "", tags: [], entries: globalEntries, computedAt: new Date() } }, { upsert: true });
-    console.log("Global leaderboard computed", globalEntries.length);
-  } catch (e) {
-    console.error("global leaderboard failed", e.message || e);
-  }
-
   // compute per-tagsKey (from TagVote distinct)
   try {
     const keys = await TagVote.distinct("tagsKey");

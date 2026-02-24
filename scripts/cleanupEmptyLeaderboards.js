@@ -1,6 +1,8 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
 const TagLeaderboard = require("../src/models/TagLeaderboard");
+const LeaderboardPost = require("../src/models/LeaderboardPost");
+const TagVote = require("../src/models/TagVote");
 
 async function main() {
   const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
@@ -8,15 +10,13 @@ async function main() {
 
   await mongoose.connect(uri);
 
-  const filter = {
-    $or: [
-      { entries: { $exists: false } },
-      { entries: { $size: 0 } },
-    ],
-  };
-
-  const result = await TagLeaderboard.deleteMany(filter);
-  console.log("Deleted empty leaderboards:", result.deletedCount || 0);
+  await Promise.all([
+    LeaderboardPost.deleteMany({ tagsKey: "" }),
+    TagVote.deleteMany({ tagsKey: "" }),
+  ]);
+  const activeTagsKeys = (await LeaderboardPost.distinct("tagsKey")).filter(Boolean);
+  const result = await TagLeaderboard.deleteMany({ tagsKey: { $nin: activeTagsKeys } });
+  console.log("Deleted leaderboards with no nominations:", result.deletedCount || 0);
 
   await mongoose.disconnect();
 }
