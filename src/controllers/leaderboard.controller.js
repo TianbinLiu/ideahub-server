@@ -11,7 +11,7 @@ async function createPost(req, res, next) {
     if (!tagsKey) return invalidId("tagsKey required");
     if (!title || !body) return invalidId("title and body required");
     const post = await LeaderboardPost.create({ title, body, tagsKey, author: req.user._id });
-    const populated = await LeaderboardPost.findById(post._id).populate("author", "username role").lean();
+    const populated = await LeaderboardPost.findById(post._id).populate("author", "_id username role").lean();
     res.json({ ok: true, post: populated });
   } catch (err) {
     next(err);
@@ -28,7 +28,7 @@ async function listPosts(req, res, next) {
     const skip = (page - 1) * limit;
     let sortObj = { likesCount: -1, createdAt: -1 };
     if (sort === "recent") sortObj = { createdAt: -1 };
-    const posts = await LeaderboardPost.find(q).sort(sortObj).skip(skip).limit(limit).populate("author", "username role").lean();
+    const posts = await LeaderboardPost.find(q).sort(sortObj).skip(skip).limit(limit).populate("author", "_id username role").lean();
     const total = await LeaderboardPost.countDocuments(q);
     res.json({ ok: true, posts, total, page, limit });
   } catch (err) {

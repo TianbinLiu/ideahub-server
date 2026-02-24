@@ -7,7 +7,7 @@ const {
   getFollowing,
   getUserBookmarks,
 } = require("../controllers/users.controller");
-const { authenticate, optionalAuth } = require("../middleware/auth");
+const { requireAuth, optionalAuth } = require("../middleware/auth");
 
 // GET /api/users/search?q=username&limit=8
 router.get("/search", searchUsers);
@@ -16,7 +16,7 @@ router.get("/search", searchUsers);
 router.get("/:id", optionalAuth, getUserProfile);
 
 // POST /api/users/:id/follow - Follow/unfollow user
-router.post("/:id/follow", authenticate, toggleFollow);
+router.post("/:id/follow", requireAuth, toggleFollow);
 
 // GET /api/users/:id/followers - Get user's followers
 router.get("/:id/followers", getFollowers);

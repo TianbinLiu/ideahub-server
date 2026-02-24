@@ -116,7 +116,7 @@ async function listCompanyInterests(req, res, next) {
       .limit(200)
       .populate({
         path: "idea",
-        populate: { path: "author", select: "username role" },
+        populate: { path: "author", select: "_id username role" },
       })
       .lean();
 

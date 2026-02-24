@@ -30,7 +30,7 @@ async function getRank(req, res, next) {
       const pageEntries = (board.entries || []).slice(start, start + limit);
       // populate idea refs
       const ideaIds = pageEntries.map(e => e.idea);
-      const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "username role").lean();
+      const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "_id username role").lean();
       const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
       const results = pageEntries.map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })).filter(r => r.idea);
 
@@ -55,7 +55,7 @@ async function getRank(req, res, next) {
     }
 
     const ideaIds = agg.map((a) => a._id);
-    const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "username role").lean();
+    const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "_id username role").lean();
 
     // map ideas with scores preserving order
     const ideaMap = Object.fromEntries(ideas.map((i) => [String(i._id), i]));
@@ -244,7 +244,7 @@ async function getLeaderboardById(req, res, next) {
     
     if (!mongoose.isValidObjectId(id)) return invalidId("Invalid leaderboard id");
 
-    const board = await TagLeaderboard.findById(id).populate("author", "username role").lean();
+    const board = await TagLeaderboard.findById(id).populate("author", "_id username role").lean();
     if (!board) return invalidId("Leaderboard not found");
 
     // Check if user has bookmarked this leaderboard
@@ -256,7 +256,7 @@ async function getLeaderboardById(req, res, next) {
 
     // get all entries with idea details
     const ideaIds = (board.entries || []).map(e => e.idea);
-    const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "username role").lean();
+    const ideas = await Idea.find({ _id: { $in: ideaIds } }).populate("author", "_id username role").lean();
     const ideaMap = Object.fromEntries(ideas.map(i => [String(i._id), i]));
     const entries = (board.entries || []).map(e => ({ idea: ideaMap[String(e.idea)] || null, score: e.score, votes: e.votes })).filter(e => e.idea);
 

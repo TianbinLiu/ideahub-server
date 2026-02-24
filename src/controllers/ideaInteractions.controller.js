@@ -129,7 +129,7 @@ async function listComments(req, res, next) {
     const comments = await Comment.find({ idea: idea._id })
       .sort({ createdAt: -1 })
       .limit(100)
-      .populate("author", "username role")
+      .populate("author", "_id username role")
       .lean();
 
     res.json({ ok: true, comments });
@@ -161,7 +161,7 @@ async function addComment(req, res, next) {
     idea.stats.commentCount = (idea.stats.commentCount || 0) + 1;
     await idea.save();
 
-    const populated = await Comment.findById(comment._id).populate("author", "username role");
+    const populated = await Comment.findById(comment._id).populate("author", "_id username role");
 
     await createNotification({
       userId: idea.author,

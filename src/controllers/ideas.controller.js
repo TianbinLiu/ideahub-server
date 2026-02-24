@@ -84,7 +84,7 @@ async function createIdea(req, res, next) {
       await Notification.insertMany(notifs);
     }
 
-    const populated = await Idea.findById(idea._id).populate("author", "username role");
+    const populated = await Idea.findById(idea._id).populate("author", "_id username role");
     res.status(201).json({ ok: true, idea: populated });
   } catch (err) {
     next(err);
@@ -135,7 +135,7 @@ async function listIdeas(req, res, next) {
         .sort(sortSpec)
         .skip((page - 1) * limit)
         .limit(limit)
-        .populate("author", "username role")
+        .populate("author", "_id username role")
         .lean(),
       Idea.countDocuments(filter),
     ]);
@@ -171,7 +171,7 @@ async function getIdeaById(req, res, next) {
       invalidId("Invalid idea id")
     }
 
-    const idea = await Idea.findById(id).populate("author", "username role");
+    const idea = await Idea.findById(id).populate("author", "_id username role");
     if (!idea) {
       notFound("Idea not found")
     }
@@ -296,7 +296,7 @@ async function updateIdea(req, res, next) {
 
     await idea.save();
 
-    const populated = await Idea.findById(id).populate("author", "username role");
+    const populated = await Idea.findById(id).populate("author", "_id username role");
     res.json({ ok: true, idea: populated });
   } catch (err) {
     next(err);
@@ -336,7 +336,7 @@ async function listMyIdeas(req, res, next) {
     const items = await Idea.find({ author: req.user._id })
       .sort({ createdAt: -1 })
       .limit(50)
-      .populate("author", "username role");
+      .populate("author", "_id username role");
     res.json({ ok: true, ideas: items });
   } catch (err) {
     next(err);
