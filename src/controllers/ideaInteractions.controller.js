@@ -3,10 +3,11 @@ const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
+const CommentBlock = require("../models/CommentBlock");
 const Notification = require("../models/Notification");
 const { createNotification } = require("../services/notification.service");
 const { canReadIdea, canInteractIdea } = require("../utils/permissions");
-const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+const { invalidId, notFound, unauthorized, forbidden, commentCooldown } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
 
 function isValidId(id) {
@@ -147,6 +148,56 @@ async function addComment(req, res, next) {
     const { content } = req.body;
 
     const idea = await getIdeaOr404(id, req, res);
+
+    // Block users who have been flagged for rapid comment spam on this idea
+    const now = new Date();
+    const activeBlock = await CommentBlock.findOne({
+      user: req.user._id,
+      idea: idea._id,
+      blockedUntil: { $gt: now },
+    })
+      .select("blockedUntil")
+      .lean();
+    if (activeBlock) {
+      const retryAfter = Math.max(1, Math.ceil((new Date(activeBlock.blockedUntil).getTime() - now.getTime()) / 1000));
+      commentCooldown("You are temporarily blocked from commenting on this idea due to abnormal activity.", retryAfter);
+    }
+
+    // Prevent rapid comment spam from the same user on the same idea
+    const COOLDOWN_SECONDS = 15;
+    const lastComment = await Comment.findOne({ idea: idea._id, author: req.user._id })
+      .sort({ createdAt: -1 })
+      .select("createdAt")
+      .lean();
+    if (lastComment) {
+      const elapsedMs = Date.now() - new Date(lastComment.createdAt).getTime();
+      if (elapsedMs < COOLDOWN_SECONDS * 1000) {
+        const retryAfter = Math.max(1, Math.ceil((COOLDOWN_SECONDS * 1000 - elapsedMs) / 1000));
+        commentCooldown("You are commenting too fast. Please wait a moment.", retryAfter);
+      }
+    }
+
+    // Escalate to a 24h block if too many comments in a short window
+    const ABUSE_WINDOW_SECONDS = 60;
+    const ABUSE_LIMIT = 6;
+    const abuseSince = new Date(now.getTime() - ABUSE_WINDOW_SECONDS * 1000);
+    const recentCount = await Comment.countDocuments({
+      idea: idea._id,
+      author: req.user._id,
+      createdAt: { $gte: abuseSince },
+    });
+    if (recentCount >= ABUSE_LIMIT) {
+      const blockedUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      await CommentBlock.findOneAndUpdate(
+        { user: req.user._id, idea: idea._id },
+        { $set: { blockedUntil, reason: "rate_limit" } },
+        { upsert: true }
+      );
+      commentCooldown(
+        "Abnormal comment activity detected. You are blocked from commenting on this idea for 24 hours.",
+        24 * 60 * 60
+      );
+    }
 
     // Parse mentions in comment content
     const { userIds: mentionedUserIds } = await parseMentions(content);

@@ -96,7 +96,7 @@ async function createIdea(req, res, next) {
  * Phase 3：列表只返回 public（unlisted/private 不出现在列表）
  * sort:
  *  - new: createdAt desc
- *  - hot: stats.likeCount desc, then createdAt desc（先简化）
+ *  - hot: stats.likeCount desc, then comment/view counts, then createdAt desc
  */
 async function listIdeas(req, res, next) {
   try {
@@ -106,7 +106,7 @@ async function listIdeas(req, res, next) {
     const sort = String(req.query.sort || "new");
     const sortSpec =
       sort === "hot"
-        ? { "stats.likeCount": -1, createdAt: -1 }
+        ? { "stats.likeCount": -1, "stats.commentCount": -1, "stats.viewCount": -1, createdAt: -1 }
         : { createdAt: -1 };
 
     const q = (req.query.q || req.query.keyword || req.query.tag || "").toString().trim();
