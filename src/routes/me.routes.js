@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
+const { upload } = require("../middleware/upload");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const User = require("../models/User");
@@ -48,6 +49,30 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
 });
 
 router.get("/received-interests", requireAuth, listReceivedInterests);
+
+// POST /api/me/avatar - Upload avatar image
+router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    // 构建文件URL
+    const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
+    const avatarUrl = `${baseUrl}/uploads/avatars/${req.file.filename}`;
+
+    // 更新用户头像
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: { avatarUrl } },
+      { new: true, runValidators: true }
+    ).select('username displayName bio avatarUrl role createdAt');
+
+    res.json({ ok: true, user, avatarUrl });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // PUT /api/me/profile - Update user profile
 router.put("/profile", requireAuth, async (req, res, next) => {

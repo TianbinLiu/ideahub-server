@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const passport = require("passport");
+const path = require("path");
 
 const healthRoutes = require("./routes/health.routes");
 const ideaRoutes = require("./routes/ideas.routes");
@@ -24,6 +25,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(helmet());
+
+// 提供静态文件服务 - 上传的文件
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 
 // ✅ passport
