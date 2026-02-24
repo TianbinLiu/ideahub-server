@@ -1,4 +1,7 @@
 const User = require("../models/User");
+const Follow = require("../models/Follow");
+const Bookmark = require("../models/Bookmark");
+const AppError = require("../utils/AppError");
 
 /**
  * GET /api/users/search?q=username&limit=8
@@ -26,4 +29,187 @@ async function searchUsers(req, res, next) {
   }
 }
 
-module.exports = { searchUsers };
+/**
+ * GET /api/users/:id
+ * Get public user profile
+ */
+async function getUserProfile(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user?._id?.toString();
+
+    const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt');
+    if (!user) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+
+    // Count followers and following
+    const followerCount = await Follow.countDocuments({ following: id });
+    const followingCount = await Follow.countDocuments({ follower: id });
+
+    // Check if current user follows this user
+    let isFollowing = false;
+    if (currentUserId && currentUserId !== id) {
+      const follow = await Follow.findOne({ follower: currentUserId, following: id });
+      isFollowing = !!follow;
+    }
+
+    res.json({
+      ok: true,
+      user: {
+        _id: user._id,
+        username: user.username,
+        displayName: user.displayName,
+        bio: user.bio,
+        avatarUrl: user.avatarUrl,
+        role: user.role,
+        createdAt: user.createdAt,
+        followerCount,
+        followingCount,
+        isFollowing,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/users/:id/follow
+ * Toggle follow/unfollow
+ */
+async function toggleFollow(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user._id.toString();
+
+    if (currentUserId === id) {
+      throw new AppError('Cannot follow yourself', 400, 'CANNOT_FOLLOW_SELF');
+    }
+
+    const targetUser = await User.findById(id);
+    if (!targetUser) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+
+    const existing = await Follow.findOne({ follower: currentUserId, following: id });
+
+    if (existing) {
+      // Unfollow
+      await Follow.deleteOne({ _id: existing._id });
+      return res.json({ ok: true, following: false });
+    } else {
+      // Follow
+      await Follow.create({ follower: currentUserId, following: id });
+      return res.json({ ok: true, following: true });
+    }
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/users/:id/followers
+ * Get user's followers
+ */
+async function getFollowers(req, res, next) {
+  try {
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+
+    const followers = await Follow.find({ following: id })
+      .populate('follower', 'username displayName avatarUrl')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const total = await Follow.countDocuments({ following: id });
+
+    res.json({
+      ok: true,
+      followers: followers.map(f => f.follower),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/users/:id/following
+ * Get users that this user follows
+ */
+async function getFollowing(req, res, next) {
+  try {
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+
+    const following = await Follow.find({ follower: id })
+      .populate('following', 'username displayName avatarUrl')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const total = await Follow.countDocuments({ follower: id });
+
+    res.json({
+      ok: true,
+      following: following.map(f => f.following),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/users/:id/bookmarks
+ * Get user's public bookmarks (ideas and leaderboards)
+ */
+async function getUserBookmarks(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user?._id?.toString();
+
+    // Only show bookmarks if viewing own profile or if user is admin
+    const isOwnProfile = currentUserId === id;
+    const isAdmin = req.user?.role === 'admin';
+
+    if (!isOwnProfile && !isAdmin) {
+      return res.json({
+        ok: true,
+        ideas: [],
+        leaderboards: [],
+      });
+    }
+
+    const bookmarks = await Bookmark.find({ user: id })
+      .populate('idea', 'title summary tags createdAt author')
+      .populate('leaderboard', 'tags computedAt')
+      .sort({ createdAt: -1 });
+
+    const ideas = bookmarks
+      .filter(b => b.type === 'idea' && b.idea)
+      .map(b => b.idea);
+
+    const leaderboards = bookmarks
+      .filter(b => b.type === 'leaderboard' && b.leaderboard)
+      .map(b => b.leaderboard);
+
+    res.json({ ok: true, ideas, leaderboards });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { 
+  searchUsers,
+  getUserProfile,
+  toggleFollow,
+  getFollowers,
+  getFollowing,
+  getUserBookmarks,
+};
+

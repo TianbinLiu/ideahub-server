@@ -2,6 +2,7 @@ const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
+const User = require("../models/User");
 const { listReceivedInterests } = require("../controllers/interest.controller");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
@@ -48,5 +49,27 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
 
 router.get("/received-interests", requireAuth, listReceivedInterests);
 
+// PUT /api/me/profile - Update user profile
+router.put("/profile", requireAuth, async (req, res, next) => {
+  try {
+    const { displayName, bio, avatarUrl } = req.body;
+    const userId = req.user._id;
+
+    const updates = {};
+    if (displayName !== undefined) updates.displayName = displayName.trim();
+    if (bio !== undefined) updates.bio = bio.trim();
+    if (avatarUrl !== undefined) updates.avatarUrl = avatarUrl.trim();
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: updates },
+      { new: true, runValidators: true }
+    ).select('username displayName bio avatarUrl role createdAt');
+
+    res.json({ ok: true, user });
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = router;

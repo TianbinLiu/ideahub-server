@@ -10,6 +10,7 @@ const userSchema = new mongoose.Schema(
     passwordHash: { type: String, default: "" },
 
     role: { type: String, enum: ["user", "company", "admin"], default: "user" },
+    displayName: { type: String, default: "" },
     bio: { type: String, default: "" },
 
     // ✅ OAuth providers
