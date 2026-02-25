@@ -6,6 +6,9 @@ const Notification = require("../models/Notification");
 const { canReadIdea, canWriteIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
+const { validateFeedback } = require("../services/aiReview.service");
+const AppError = require("../utils/AppError");
+const errorCodes = require("../utils/errorCodes");
 
 
 require("../models/User"); // 确保 populate(User) 不报错
@@ -32,7 +35,7 @@ function isValidId(id) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { title, summary, content, visibility, isMonetizable, licenseType, tags } = req.body;
+    const { title, summary, content, visibility, isMonetizable, licenseType, tags, isFeedback } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -57,6 +60,34 @@ async function createIdea(req, res, next) {
       }
     }
 
+    // Validate feedback if isFeedback is true
+    let feedbackType = null;
+    let feedbackStatus = null;
+    let aiSummary = "";
+    let feedbackTags = toStringArray(tags);
+
+    if (isFeedback) {
+      const validation = await validateFeedback({ title, summary, content });
+      
+      if (!validation.isValid) {
+        throw new AppError({
+          code: errorCodes.FEEDBACK_VALIDATION_FAILED,
+          status: 400,
+          message: validation.reason || "反馈内容无效，请提供有意义的bug报告或功能建议。",
+        });
+      }
+
+      feedbackType = validation.feedbackType;
+      feedbackStatus = "pending";
+      aiSummary = validation.summary;
+
+      // Add appropriate feedback tag
+      const feedbackTag = feedbackType === "bug" ? "bug" : "网站建议";
+      if (!feedbackTags.includes(feedbackTag)) {
+        feedbackTags.push(feedbackTag);
+      }
+    }
+
     // Parse mentions from content to build invited users list
     const { userIds: mentionedUserIds } = await parseMentions(content);
 
@@ -65,11 +96,15 @@ async function createIdea(req, res, next) {
       summary: summary || "",
       content: content || "",
       author: req.user._id,
-      tags: toStringArray(tags),
+      tags: feedbackTags,
       visibility: visibility || "public",
       isMonetizable: Boolean(isMonetizable),
       licenseType: licenseType || "default",
       invitedUsers: mentionedUserIds,
+      isFeedback: Boolean(isFeedback),
+      feedbackType,
+      feedbackStatus,
+      aiSummary,
     });
 
     // Create INVITE notifications for mentioned users

@@ -16,6 +16,12 @@ router.get("/ideas", ctrl.adminListIdeas);
 // 列出 leaderboards（支持搜索）
 router.get("/leaderboards", ctrl.adminListLeaderboards);
 
+// 列出 feedback ideas（支持 type 和 status 过滤）
+router.get("/feedback", ctrl.adminListFeedback);
+
+// 更新 feedback status
+router.patch("/ideas/:id/feedback-status", ctrl.adminUpdateFeedbackStatus);
+
 // 强制删除任意 Idea（含清理互动数据）
 router.delete("/ideas/:id", ctrl.adminDeleteIdea);
 

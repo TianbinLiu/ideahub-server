@@ -44,6 +44,16 @@ const ideaSchema = new mongoose.Schema(
       createdAt: { type: Date },
     },
 
+    // Feedback system fields
+    isFeedback: { type: Boolean, default: false },
+    feedbackType: { type: String, enum: ["bug", "suggestion", null], default: null },
+    feedbackStatus: { 
+      type: String, 
+      enum: ["pending", "under_review", "adopted", "resolved", "rejected", null], 
+      default: null 
+    },
+    aiSummary: { type: String, default: "" },
+
     stats: { type: statsSchema, default: () => ({}) },
   },
   { timestamps: true }

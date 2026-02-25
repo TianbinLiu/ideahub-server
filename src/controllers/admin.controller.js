@@ -254,11 +254,77 @@ async function adminListLeaderboards(req, res, next) {
   }
 }
 
+async function adminUpdateFeedbackStatus(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!isValidId(id)) {
+      invalidId("Invalid idea id");
+    }
+
+    const validStatuses = ["pending", "under_review", "adopted", "resolved", "rejected"];
+    if (!validStatuses.includes(status)) {
+      badRequest("Invalid feedback status");
+    }
+
+    const idea = await Idea.findById(id);
+    if (!idea) {
+      notFound("Idea not found");
+    }
+
+    if (!idea.isFeedback) {
+      badRequest("This idea is not a feedback submission");
+    }
+
+    idea.feedbackStatus = status;
+    await idea.save();
+
+    res.json({ ok: true, idea });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function adminListFeedback(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const type = req.query.type; // "bug" | "suggestion" | undefined (all)
+    const status = req.query.status; // "pending" | "under_review" | etc. | undefined (all)
+
+    const filter = { isFeedback: true };
+    if (type && (type === "bug" || type === "suggestion")) {
+      filter.feedbackType = type;
+    }
+    if (status && ["pending", "under_review", "adopted", "resolved", "rejected"].includes(status)) {
+      filter.feedbackStatus = status;
+    }
+
+    const [items, total] = await Promise.all([
+      Idea.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate("author", "_id username role")
+        .select("_id title summary aiSummary feedbackType feedbackStatus createdAt author stats")
+        .lean(),
+      Idea.countDocuments(filter),
+    ]);
+
+    res.json({ ok: true, items, total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
 
 module.exports = {
   adminListUsers,
   adminListIdeas,
   adminListLeaderboards,
+  adminListFeedback,
+  adminUpdateFeedbackStatus,
   adminDeleteIdea,
   adminDeleteLeaderboard,
   adminDeleteUser,

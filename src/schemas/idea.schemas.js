@@ -13,6 +13,7 @@ const createIdeaBody = z.object({
   visibility: z.enum(["public", "private", "unlisted"]).optional().default("public"),
   isMonetizable: z.coerce.boolean().optional().default(false),
   licenseType: z.string().optional().default("default"),
+  isFeedback: z.coerce.boolean().optional().default(false),
 });
 
 const updateIdeaBody = z.object({
