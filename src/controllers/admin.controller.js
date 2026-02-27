@@ -1,6 +1,8 @@
 //admin.controller.js
 
 const mongoose = require("mongoose");
+const fs = require("fs").promises;
+const path = require("path");
 const User = require("../models/User");
 const Idea = require("../models/Idea");
 const TagLeaderboard = require("../models/TagLeaderboard");
@@ -318,6 +320,27 @@ async function adminListFeedback(req, res, next) {
   }
 }
 
+/**
+ * 获取项目架构文档 - 读取 PROJECT_STRUCTURE.md
+ */
+async function adminGetProjectDocs(req, res, next) {
+  try {
+    // 读取项目根目录的 PROJECT_STRUCTURE.md
+    const docsPath = path.join(__dirname, "..", "..", "..", "PROJECT_STRUCTURE.md");
+    const content = await fs.readFile(docsPath, "utf-8");
+    
+    res.json({ ok: true, content });
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return res.status(404).json({ 
+        ok: false, 
+        error: "PROJECT_STRUCTURE.md not found. Please create this file in the project root." 
+      });
+    }
+    next(err);
+  }
+}
+
 
 module.exports = {
   adminListUsers,
@@ -328,5 +351,6 @@ module.exports = {
   adminDeleteIdea,
   adminDeleteLeaderboard,
   adminDeleteUser,
+  adminGetProjectDocs,
 };
 

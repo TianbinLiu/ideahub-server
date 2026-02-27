@@ -7,6 +7,9 @@ const ctrl = require("../controllers/admin.controller");
 // 全部 admin API 都需要：登录 + admin
 router.use(requireAuth, requireRole("admin"));
 
+// 获取项目架构文档
+router.get("/docs", ctrl.adminGetProjectDocs);
+
 // 列出用户（支持搜索）
 router.get("/users", ctrl.adminListUsers);
 
