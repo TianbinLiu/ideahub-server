@@ -325,10 +325,34 @@ async function adminListFeedback(req, res, next) {
  */
 async function adminGetProjectDocs(req, res, next) {
   try {
-    // 读取项目根目录的 PROJECT_STRUCTURE.md
-    const docsPath = path.join(__dirname, "..", "..", "..", "PROJECT_STRUCTURE.md");
-    const content = await fs.readFile(docsPath, "utf-8");
-    
+    // 尝试从多个可能路径读取文档，兼容不同部署结构
+    const candidates = [
+      path.join(process.cwd(), "PROJECT_STRUCTURE.md"),
+      path.join(process.cwd(), "..", "PROJECT_STRUCTURE.md"),
+      path.join(__dirname, "..", "..", "..", "PROJECT_STRUCTURE.md"),
+      path.join(__dirname, "..", "..", "PROJECT_STRUCTURE.md"),
+      path.join(__dirname, "..", "..", "..", "..", "PROJECT_STRUCTURE.md"),
+    ];
+
+    let content = null;
+    for (const candidate of candidates) {
+      try {
+        content = await fs.readFile(candidate, "utf-8");
+        break;
+      } catch (err) {
+        if (err && err.code !== "ENOENT") {
+          throw err;
+        }
+      }
+    }
+
+    if (!content) {
+      return res.status(404).json({
+        ok: false,
+        error: "PROJECT_STRUCTURE.md not found. Please ensure it exists in the project root or server root.",
+      });
+    }
+
     res.json({ ok: true, content });
   } catch (err) {
     if (err.code === "ENOENT") {

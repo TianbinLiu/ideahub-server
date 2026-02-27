@@ -11,6 +11,8 @@
  */
 
 require("dotenv").config();
+const fs = require("fs").promises;
+const path = require("path");
 const app = require("./app");
 const { connectDB } = require("./config/db");
 const TagLeaderboard = require("./models/TagLeaderboard");
@@ -20,8 +22,43 @@ const { startAiWorker } = require("./workers/aiReview.worker");
 
 const PORT = process.env.PORT || 4000;
 
+async function syncProjectDocs() {
+  const destPath = path.join(process.cwd(), "PROJECT_STRUCTURE.md");
+  const candidates = [
+    path.join(process.cwd(), "..", "PROJECT_STRUCTURE.md"),
+    path.join(process.cwd(), "..", "..", "PROJECT_STRUCTURE.md"),
+    path.join(__dirname, "..", "..", "PROJECT_STRUCTURE.md"),
+    path.join(__dirname, "..", "..", "..", "PROJECT_STRUCTURE.md"),
+  ];
+
+  let sourcePath = null;
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      sourcePath = candidate;
+      break;
+    } catch (err) {
+      if (err && err.code !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+
+  if (!sourcePath || sourcePath === destPath) {
+    return;
+  }
+
+  try {
+    await fs.copyFile(sourcePath, destPath);
+    console.log(`Synced PROJECT_STRUCTURE.md to server root: ${destPath}`);
+  } catch (err) {
+    console.warn("Project docs sync failed:", err.message || err);
+  }
+}
+
 async function start() {
   try {
+    await syncProjectDocs();
     await connectDB();
     // Cleanup leaderboards with no nominations on startup
     try {
