@@ -1,4 +1,15 @@
-//app.js
+/**
+ * app.js - Express应用配置中心
+ * 
+ * 📖 AI开发规范：修改前必读 /.ai-instructions.md 和 PROJECT_STRUCTURE.md
+ * 🔄 修改后同步更新：PROJECT_STRUCTURE.md 相关章节
+ * 
+ * 职责：
+ * - 配置Express中间件链
+ * - 注册所有路由模块
+ * - 错误处理中间件
+ * - CORS和安全配置
+ */
 
 const express = require("express");
 const cors = require("cors");

@@ -1,3 +1,15 @@
+/**
+ * index.js - 服务器启动入口
+ * 
+ * 📖 AI开发规范：修改前必读 /.ai-instructions.md 和 PROJECT_STRUCTURE.md
+ * 🔄 修改后同步更新：PROJECT_STRUCTURE.md 相关章节
+ * 
+ * 职责：
+ * - 启动Express服务器
+ * - 连接MongoDB数据库
+ * - 启动后台任务（AI Worker等）
+ */
+
 require("dotenv").config();
 const app = require("./app");
 const { connectDB } = require("./config/db");
