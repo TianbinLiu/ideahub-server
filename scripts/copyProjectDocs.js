@@ -14,6 +14,7 @@ async function main() {
   const serverRoot = process.cwd();
   const destPath = path.join(serverRoot, "PROJECT_STRUCTURE.md");
   const candidates = [
+    path.join(serverRoot, "PROJECT_STRUCTURE.md"),
     path.join(serverRoot, "..", "PROJECT_STRUCTURE.md"),
     path.join(serverRoot, "..", "..", "PROJECT_STRUCTURE.md"),
     path.join(__dirname, "..", "..", "PROJECT_STRUCTURE.md"),

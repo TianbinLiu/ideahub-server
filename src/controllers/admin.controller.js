@@ -3,6 +3,8 @@
 const mongoose = require("mongoose");
 const fs = require("fs").promises;
 const path = require("path");
+const http = require("http");
+const https = require("https");
 const User = require("../models/User");
 const Idea = require("../models/Idea");
 const TagLeaderboard = require("../models/TagLeaderboard");
@@ -347,6 +349,16 @@ async function adminGetProjectDocs(req, res, next) {
     }
 
     if (!content) {
+      const remoteUrl =
+        process.env.PROJECT_DOCS_URL ||
+        "https://raw.githubusercontent.com/TianbinLiu/ideahub-server/main/PROJECT_STRUCTURE.md";
+      if (remoteUrl) {
+        const remoteContent = await fetchRemoteText(remoteUrl);
+        if (remoteContent) {
+          return res.json({ ok: true, content: remoteContent });
+        }
+      }
+
       return res.status(404).json({
         ok: false,
         error: "PROJECT_STRUCTURE.md not found. Please ensure it exists in the project root or server root.",
@@ -363,6 +375,34 @@ async function adminGetProjectDocs(req, res, next) {
     }
     next(err);
   }
+}
+
+function fetchRemoteText(urlString) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try {
+      url = new URL(urlString);
+    } catch (err) {
+      return reject(err);
+    }
+
+    const client = url.protocol === "https:" ? https : http;
+    const req = client.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return resolve(null);
+      }
+
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => resolve(data));
+    });
+
+    req.on("error", reject);
+  });
 }
 
 

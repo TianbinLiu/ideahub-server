@@ -1,0 +1,61 @@
+# 请按照以下格式编写提交信息
+
+# 类型(范围): 简短描述 (不超过50字符)
+# |<----  最多50字符  ---->|
+
+
+# 详细描述 (可选，72字符换行)
+# |<----  每行最多72字符   ---->|
+
+
+# 🔄 文档同步检查清单 (如修改了代码，必须勾选)
+# [ ] 已更新 PROJECT_STRUCTURE.md 相关章节
+# [ ] 已更新文件头注释（如果修改了文件职责或关联关系）
+# [ ] 已在 PROJECT_STRUCTURE.md 更新记录表添加条目
+# [ ] 已确认所有新增文本都有中英文翻译
+
+
+# 💡 提交类型说明:
+# feat:     新功能
+# fix:      Bug修复
+# docs:     仅文档修改
+# style:    代码格式修改（不影响代码逻辑）
+# refactor: 重构（既不是新功能也不是Bug修复）
+# perf:     性能优化
+# test:     测试相关
+# chore:    构建/工具/依赖相关
+# i18n:     国际化相关
+#
+# 范围示例: 
+# feat(auth): 添加OAuth登录
+# fix(idea): 修复创意列表加载问题
+# docs(structure): 更新架构文档
+# i18n(admin): 添加管理页面翻译
+#
+# 📖 详细格式说明: https://www.conventionalcommits.org/
+
+
+# ⚠️  重要提醒:
+# 1. 如果修改了任何 .ts/.tsx/.js 文件，必须检查是否需要更新文档
+# 2. 新增页面/组件必须更新 PROJECT_STRUCTURE.md
+# 3. 修改API端点必须更新路由文档
+# 4. 添加新翻译必须同时更新 en.json 和 zh.json
+# 5. AI系统会依赖准确的文档，请务必保持同步！
+
+
+# --- 提交示例 ---
+#
+# feat(idea): Add AI review feature
+#
+# - Add AI review service with OpenAI integration
+# - Add AI review queue using Bull
+# - Add review results display in idea detail page
+# - Add i18n for AI review related strings
+#
+# 🔄 文档同步:
+# [x] 已更新 PROJECT_STRUCTURE.md 添加 aiReview.service.js 说明
+# [x] 已更新 IdeaDetailPage.tsx 文件头
+# [x] 已添加 aiReview 模块翻译（en.json + zh.json）
+# [x] 已在更新记录表添加: v2.2 - 添加AI评审功能
+#
+# ----------------
