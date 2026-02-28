@@ -24,6 +24,11 @@ const {
   listConversations,
   getConversationMessages,
   sendDirectMessage,
+  deleteConversation,
+  blockDmUser,
+  unblockDmUser,
+  listDmBlacklist,
+  getDmBlockStatus,
 } = require("../controllers/messages.controller");
 const { requireAuth } = require("../middleware/auth");
 
@@ -40,6 +45,13 @@ router.patch("/request/:requestId/reject", rejectMessageRequest);
 // 对话和消息相关
 router.get("/conversations", listConversations);
 router.get("/conversations/:conversationId", getConversationMessages);
+router.delete("/conversations/:conversationId", deleteConversation);
 router.post("/send", sendDirectMessage);
+
+// 私信黑名单
+router.get("/blacklist", listDmBlacklist);
+router.get("/blacklist/:userId/status", getDmBlockStatus);
+router.post("/blacklist/:userId", blockDmUser);
+router.delete("/blacklist/:userId", unblockDmUser);
 
 module.exports = router;
