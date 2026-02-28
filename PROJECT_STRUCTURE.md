@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-02-27  
-> 版本: 2.7
+> 最后更新: 2026-02-28  
+> 版本: 2.8
 > 
 > ---
 > 
@@ -119,7 +119,7 @@ ideahub/
     │   │   ├── db.js                 # MongoDB连接
     │   │   └── passport.js           # 认证策略
     │   │
-    │   ├── models/                   # 数据模型（9个）
+    │   ├── models/                   # 数据模型（12个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── Comment.js
@@ -128,10 +128,13 @@ ideahub/
     │   │   ├── Notification.js
     │   │   ├── Interest.js
     │   │   ├── OtpToken.js
-    │   │   └── AiJob.js
+    │   │   ├── AiJob.js
+    │   │   ├── UserReputation.js
+    │   │   ├── MessageRequest.js
+    │   │   └── DirectMessage.js
     │   │
-    │   ├── controllers/              # 控制器（9个）
-    │   ├── routes/                   # 路由（10个）
+    │   ├── controllers/              # 控制器（11个）
+    │   ├── routes/                   # 路由（11个）
     │   ├── middleware/               # 中间件（3个）
     │   ├── schemas/                  # 验证模式（2个）
     │   ├── services/                 # 业务服务（4个）
@@ -709,7 +712,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/models/`
-**9个数据模型**:
+**12个数据模型**:
 - `User.js` - 用户（邮箱、用户名、角色、密码哈希）
 - `Idea.js` - 创意（标题、内容、可见性、标签、AI评审）
 - `Comment.js` - 评论
@@ -719,11 +722,14 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `Interest.js` - 公司兴趣表达
 - `OtpToken.js` - 邮箱验证码
 - `AiJob.js` - AI评审任务队列
+- `UserReputation.js` - 用户声誉（点赞/倒踩）
+- `MessageRequest.js` - 私信请求（7天TTL自动过期）
+- `DirectMessage.js` - 私信对话消息
 
 ---
 
 #### `server/src/controllers/`
-**9个控制器**:
+**11个控制器**:
 - `auth.controller.js` - 登录、注册
 - `authOtp.controller.js` - 邮箱验证码
 - `ideas.controller.js` - 创意CRUD
@@ -733,11 +739,13 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `aiReview.controller.js` - AI评审
 - `aiJobs.controller.js` - AI任务查询
 - `admin.controller.js` - 管理后台
+- `reputation.controller.js` - 用户声誉(点赞/倒踩)
+- `messages.controller.js` - 私信系统(请求/对话/消息)
 
 ---
 
 #### `server/src/routes/`
-**10个路由模块**:
+**11个路由模块**:
 - `health.routes.js` - 健康检查
 - `auth.routes.js` - 认证
 - `authOtp.routes.js` - OTP验证
@@ -748,6 +756,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `notifications.routes.js` - 通知
 - `aiJobs.routes.js` - AI任务
 - `admin.routes.js` - 管理
+- `messages.routes.js` - 私信系统(请求/对话/消息)
 
 ---
 
@@ -786,6 +795,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-02-27 | 2.5 | 文档读取支持远程URL，Docs页面支持配置GitHub链接 |
 | 2026-02-27 | 2.6 | 设置默认GitHub仓库与文档URL（server仓库） |
 | 2026-02-27 | 2.7 | AI工作流与文档文件迁移到 server 仓库，移除根目录副本 |
+| 2026-02-28 | 2.8 | **私信系统&声誉系统**：新增3个后端模型(UserReputation/MessageRequest/DirectMessage)，2个控制器(messages/reputation)，1个路由(messages)，2个前端页面(MessagesPage/MessageRequestsPage) |
 
 ---
 
@@ -1189,7 +1199,90 @@ ideahub/
 
 ---
 
-### 7. 用户资料系统 (User Profile)
+### 7. 用户声誉系统 (User Reputation)
+
+#### 功能列表
+- ✅ 用户点赞(👍)
+- ✅ 用户倒踩(👎)
+- ✅ 声誉统计(点赞/倒踩数量)
+- ✅ 用户徽章(热门用户/恶意用户)
+- ✅ 徽章显示条件(双向>=10)
+- ✅ 重复投票切换/取消
+
+#### 徽章判定规则
+- **热门用户**: 点赞数/倒踩数 >= 3.0 且双方>=10
+- **恶意用户**: 点赞数/倒踩数 <= 0.33 且双方>=10
+
+#### 相关文件
+**前端:**
+- `client/src/pages/UserProfilePage.tsx` - 个人主页显示声誉【✅ i18n】
+- `client/src/components/UserHoverCard.tsx` - 悬浮卡片显示徽章和投票按钮【✅ i18n】
+
+**后端:**
+- `server/src/models/UserReputation.js` - 声誉模型(vote字段: 1/-1)
+- `server/src/controllers/reputation.controller.js` - 投票和统计API
+- `server/src/routes/users.routes.js` - 声誉相关路由
+
+**API端点:**
+- `POST /api/users/:userId/reputation` - 投票(点赞/倒踩/切换/取消)
+- `GET /api/users/:userId/reputation` - 获取声誉统计和徽章
+
+**国际化资源:**
+- `client/src/locales/en.json` - profile模块(votedLike/votedDislike/popularUser/maliciousUser等)
+- `client/src/locales/zh.json` - profile模块(中文翻译)
+
+---
+
+### 8. 私信系统 (Direct Messages)
+
+#### 功能列表
+- ✅ 发送私信请求(带初始消息)
+- ✅ 查看/接受/拒绝私信请求
+- ✅ 初始消息隐藏(接受前不可见)
+- ✅ 私信请求7天TTL自动过期
+- ✅ 对话列表
+- ✅ 一对一聊天
+- ✅ 消息发送
+- ✅ 消息已读标记
+- ✅ 自动刷新(轮询)
+
+#### 相关文件
+**前端:**
+- `client/src/pages/MessagesPage.tsx` - 对话列表和聊天【✅ i18n】
+- `client/src/pages/MessageRequestsPage.tsx` - 请求管理【✅ i18n】
+- `client/src/components/UserHoverCard.tsx` - DM按钮和发送模态框【✅ i18n】
+- `client/src/components/NotificationsDropdown.tsx` - "我的消息"菜单项
+
+**后端:**
+- `server/src/models/MessageRequest.js` - 请求模型(status: pending/accepted/rejected, TTL: 7天)
+- `server/src/models/DirectMessage.js` - 消息模型(conversationId, participants)
+- `server/src/controllers/messages.controller.js` - 8个API函数
+- `server/src/routes/messages.routes.js` - 7个端点
+
+**API端点:**
+- `POST /api/messages/request` - 发送私信请求
+- `GET /api/messages/request` - 获取请求列表
+- `PATCH /api/messages/request/:id/view` - 标记请求已查看
+- `PATCH /api/messages/request/:id/accept` - 接受请求
+- `PATCH /api/messages/request/:id/reject` - 拒绝请求
+- `GET /api/messages/conversations` - 获取对话列表
+- `GET /api/messages/conversations/:id` - 获取对话消息
+- `POST /api/messages/send` - 发送消息
+
+**conversationId生成规则:**
+```javascript
+function generateConversationId(userId1, userId2) {
+  return [userId1, userId2].sort().join('_');
+}
+```
+
+**国际化资源:**
+- `client/src/locales/en.json` - messages模块(40个键)
+- `client/src/locales/zh.json` - messages模块(40个键)
+
+---
+
+### 9. 用户资料系统 (User Profile)
 
 #### 功能列表
 - ✅ 用户主页

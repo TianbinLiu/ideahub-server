@@ -29,6 +29,7 @@ const authOtpRoutes = require("./routes/authOtp.routes");
 const oauthRoutes = require("./routes/oauth.routes");
 const tagRankRoutes = require("./routes/tagRank.routes");
 const usersRoutes = require("./routes/users.routes");
+const messagesRoutes = require("./routes/messages.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
@@ -60,6 +61,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
 app.use("/api/tag-rank", tagRankRoutes);
 app.use("/api/users", usersRoutes);
+app.use("/api/messages", messagesRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
