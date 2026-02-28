@@ -8,6 +8,7 @@ const {
   getUserBookmarks,
   getUserLeaderboards,
 } = require("../controllers/users.controller");
+const { voteUser, getUserReputation } = require("../controllers/reputation.controller");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 
 // GET /api/users/search?q=username&limit=8
@@ -30,5 +31,11 @@ router.get("/:id/bookmarks", optionalAuth, getUserBookmarks);
 
 // GET /api/users/:id/leaderboards - Get user's leaderboards
 router.get("/:id/leaderboards", optionalAuth, getUserLeaderboards);
+
+// POST /api/users/:id/reputation - Vote for user (like/dislike)
+router.post("/:userId/reputation", requireAuth, voteUser);
+
+// GET /api/users/:id/reputation - Get user's reputation stats
+router.get("/:userId/reputation", optionalAuth, getUserReputation);
 
 module.exports = router;

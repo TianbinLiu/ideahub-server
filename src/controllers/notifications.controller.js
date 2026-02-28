@@ -10,6 +10,12 @@ async function listMyNotifications(req, res, next) {
     const filter = { userId };
     if (req.query.unread === "1") filter.readAt = null;
 
+    // Support type filtering
+    if (req.query.type) {
+      const types = req.query.type.split(",");
+      filter.type = { $in: types };
+    }
+
     console.log(`[Notifications] Fetching for userId=${userId}, filter=${JSON.stringify(filter)}`);
 
     const [items, total] = await Promise.all([
