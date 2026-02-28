@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-02-28  
-> 版本: 2.8
+> 版本: 2.9
 > 
 > ---
 > 
@@ -78,7 +78,7 @@ ideahub/
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
 │   │   │   └── UserHoverCard.tsx     # 用户卡片
 │   │   │
-│   │   ├── pages/                    # 页面组件（17个）
+│   │   ├── pages/                    # 页面组件（20个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -94,12 +94,15 @@ ideahub/
 │   │   │   ├── LeaderboardDetailPage.tsx
 │   │   │   ├── TagRankPage.tsx
 │   │   │   ├── NotificationsPage.tsx
+│   │   │   ├── MessagesPage.tsx
+│   │   │   ├── MessageRequestsPage.tsx
+│   │   │   ├── BlacklistPage.tsx
 │   │   │   ├── AdminUsersPage.tsx
 │   │   │   └── FeedbackAdminPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
-│   │   │   ├── en.json               # 英文翻译（355键）
-│   │   │   └── zh.json               # 中文翻译（353键）
+│   │   │   ├── en.json               # 英文翻译（370键）
+│   │   │   └── zh.json               # 中文翻译（368键）
 │   │   │
 │   │   └── utils/                    # 工具函数
 │   │       ├── humanizeError.ts      # 错误国际化
@@ -119,7 +122,7 @@ ideahub/
     │   │   ├── db.js                 # MongoDB连接
     │   │   └── passport.js           # 认证策略
     │   │
-    │   ├── models/                   # 数据模型（12个）
+    │   ├── models/                   # 数据模型（13个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── Comment.js
@@ -131,7 +134,8 @@ ideahub/
     │   │   ├── AiJob.js
     │   │   ├── UserReputation.js
     │   │   ├── MessageRequest.js
-    │   │   └── DirectMessage.js
+    │   │   ├── DirectMessage.js
+    │   │   └── DmRequestBlock.js
     │   │
     │   ├── controllers/              # 控制器（11个）
     │   ├── routes/                   # 路由（11个）
@@ -177,7 +181,7 @@ i18n.use(initReactI18next).init({
 - `pages/*.tsx` - 所有页面组件
 - `components/ProtectedRoute.tsx` - 路由守卫
 
-**路由表** (17个路由):
+**路由表** (20个路由):
 ```
 / → HomePage
 /login → LoginPage
@@ -194,6 +198,9 @@ i18n.use(initReactI18next).init({
 /leaderboard/:id → LeaderboardDetailPage
 /tag-rank → TagRankPage
 /notifications → NotificationsPage
+/messages → MessagesPage
+/message-requests → MessageRequestsPage
+/blacklist → BlacklistPage
 /admin/users → AdminUsersPage
 /admin/feedback → FeedbackAdminPage
 ```
@@ -725,6 +732,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `UserReputation.js` - 用户声誉（点赞/倒踩）
 - `MessageRequest.js` - 私信请求（7天TTL自动过期）
 - `DirectMessage.js` - 私信对话消息
+- `DmRequestBlock.js` - 私信黑名单（用户互相阻止）
 
 ---
 
@@ -796,6 +804,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-02-27 | 2.6 | 设置默认GitHub仓库与文档URL（server仓库） |
 | 2026-02-27 | 2.7 | AI工作流与文档文件迁移到 server 仓库，移除根目录副本 |
 | 2026-02-28 | 2.8 | **私信系统&声誉系统**：新增3个后端模型(UserReputation/MessageRequest/DirectMessage)，2个控制器(messages/reputation)，1个路由(messages)，2个前端页面(MessagesPage/MessageRequestsPage) |
+| 2026-02-28 | 2.9 | **黑名单管理系统**：新增DmRequestBlock后端模型，新增/修改4个后端API (blockDmUser/unblockDmUser/listDmBlacklist/getDmBlockStatus)，新增BlacklistPage前端页面，修改NotificationsPage支持私信对话删除+可选黑名单操作，修改UserHoverCard支持黑名单切换，前端新增15个i18n键（messages模块），更新翻译资源从355/353键→370/368键 |
 
 ---
 
