@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-02-28  
-> 版本: 2.9
+> 最后更新: 2026-03-01  
+> 版本: 3.0
 > 
 > ---
 > 
@@ -101,8 +101,8 @@ ideahub/
 │   │   │   └── FeedbackAdminPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
-│   │   │   ├── en.json               # 英文翻译（370键）
-│   │   │   └── zh.json               # 中文翻译（368键）
+│   │   │   ├── en.json               # 英文翻译（375键）
+│   │   │   └── zh.json               # 中文翻译（373键）
 │   │   │
 │   │   └── utils/                    # 工具函数
 │   │       ├── humanizeError.ts      # 错误国际化
@@ -805,6 +805,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-02-27 | 2.7 | AI工作流与文档文件迁移到 server 仓库，移除根目录副本 |
 | 2026-02-28 | 2.8 | **私信系统&声誉系统**：新增3个后端模型(UserReputation/MessageRequest/DirectMessage)，2个控制器(messages/reputation)，1个路由(messages)，2个前端页面(MessagesPage/MessageRequestsPage) |
 | 2026-02-28 | 2.9 | **黑名单管理系统**：新增DmRequestBlock后端模型，新增/修改4个后端API (blockDmUser/unblockDmUser/listDmBlacklist/getDmBlockStatus)，新增BlacklistPage前端页面，修改NotificationsPage支持私信对话删除+可选黑名单操作，修改UserHoverCard支持黑名单切换，前端新增15个i18n键（messages模块），更新翻译资源从355/353键→370/368键 |
+| 2026-03-01 | 3.0 | **关注列表搜索和共同关注功能**：修改UserProfilePage，在关注/粉丝列表添加搜索栏支持按用户名搜索；查看他人关注/粉丝时标注"共同关注"并显示在列表前列；新增5个i18n键，更新翻译资源从370/368键→375/373键 |
 
 ---
 
