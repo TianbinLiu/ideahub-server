@@ -182,6 +182,7 @@ async function acceptMessageRequest(req, res, next) {
 async function rejectMessageRequest(req, res, next) {
   try {
     const { requestId } = req.params;
+    const { responseMessage } = req.body;
     const toUserId = req.user._id;
 
     const request = await MessageRequest.findOne({ _id: requestId, toUserId });
@@ -191,6 +192,9 @@ async function rejectMessageRequest(req, res, next) {
 
     request.status = "rejected";
     request.respondedAt = new Date();
+    if (responseMessage && responseMessage.trim()) {
+      request.responseMessage = responseMessage.trim();
+    }
     await request.save();
 
     res.json({ ok: true });

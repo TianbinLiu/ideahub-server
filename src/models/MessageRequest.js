@@ -60,6 +60,12 @@ const MessageRequestSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    
+    // 拒绝时附带的回复消息（可选）
+    responseMessage: {
+      type: String,
+      default: null,
+    },
   },
   { timestamps: true }
 );
