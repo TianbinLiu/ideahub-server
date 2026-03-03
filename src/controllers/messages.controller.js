@@ -420,27 +420,34 @@ async function sendDirectMessage(req, res, next) {
     }
 
     // 检查私信申请状态
-    // 查找双方的任何私信请求记录
-    const request = await MessageRequest.findOne({
+    // 查找双方的任何私信请求记录（可能有多条：A->B 和 B->A）
+    const requests = await MessageRequest.find({
       $or: [
         { fromUserId, toUserId },
         { fromUserId: toUserId, toUserId: fromUserId },
       ],
     }).lean();
 
-    if (request) {
-      // 如果请求被拒绝，禁止发送消息
-      if (request.status === "rejected") {
-        throw new AppError("Message request was rejected. Cannot send messages.", 403);
+    if (requests.length === 0) {
+      throw new AppError("No message request found. Please send a message request first.", 403);
+    }
+
+    // 找到最新的申请（按创建时间排序）
+    const latestRequest = requests.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+
+    // 根据最新申请的状态决定是否允许发送消息
+    if (latestRequest.status === "accepted") {
+      // 最新申请已被接受，双方都可以发送消息
+    } else if (latestRequest.status === "pending") {
+      // 如果当前用户是最新申请的发起人，不能发送（等待对方接受）
+      if (latestRequest.fromUserId.toString() === fromUserId.toString()) {
+        throw new AppError("Message request is still pending. Wait for acceptance.", 403);
       }
-      // 如果请求还在等待中，只有接受者可以发送消息（接受后）
-      if (request.status === "pending") {
-        // 如果当前用户是发起者，不能发送消息
-        if (request.fromUserId.toString() === fromUserId.toString()) {
-          throw new AppError("Message request is still pending. Wait for acceptance.", 403);
-        }
-      }
-      // 如果状态是 accepted，则允许双方发送消息
+      // 如果当前用户是最新申请的接收人，可以发送（回复即接受）
+    } else if (latestRequest.status === "rejected") {
+      // 最新申请被拒绝，任何人都不能发送消息
+      // 需要发起新的申请来更新状态
+      throw new AppError("Message request was rejected. Cannot send messages.", 403);
     }
 
     // 创建消息
