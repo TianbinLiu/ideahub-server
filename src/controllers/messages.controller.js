@@ -68,25 +68,42 @@ async function sendMessageRequest(req, res, next) {
     }
 
     // 检查是否已有 pending 状态的申请
-    const existingPendingRequest = await MessageRequest.findOne({
+    const existingRequest = await MessageRequest.findOne({
       fromUserId,
       toUserId,
-      status: "pending",
     }).lean();
-    if (existingPendingRequest) {
+
+    if (existingRequest && existingRequest.status === "pending") {
       throw new AppError("You already have a pending message request to this user. Please wait for their response.", 400);
     }
 
-    // 创建新请求（不再使用 upsert，防止频繁更新）
-    let request = await MessageRequest.create({
-      fromUserId,
-      toUserId,
-      initialMessage,
-      status: "pending",
-    });
-
-    request = await request.populate("fromUserId", "username displayName avatarUrl");
-    request = await request.populate("toUserId", "username displayName avatarUrl");
+    // 如果存在已拒绝或已接受的申请，更新而不是创建新记录（避免唯一索引冲突）
+    let request;
+    if (existingRequest) {
+      request = await MessageRequest.findOneAndUpdate(
+        { fromUserId, toUserId },
+        {
+          initialMessage,
+          status: "pending",
+          viewedAt: null,
+          respondedAt: null,
+          responseMessage: null,
+        },
+        { new: true }
+      );
+      request = await request.populate("fromUserId", "username displayName avatarUrl");
+      request = await request.populate("toUserId", "username displayName avatarUrl");
+    } else {
+      // 创建新请求
+      request = await MessageRequest.create({
+        fromUserId,
+        toUserId,
+        initialMessage,
+        status: "pending",
+      });
+      request = await request.populate("fromUserId", "username displayName avatarUrl");
+      request = await request.populate("toUserId", "username displayName avatarUrl");
+    }
 
     res.json({ ok: true, request });
   } catch (err) {
