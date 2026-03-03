@@ -9,6 +9,7 @@ const DirectMessage = require("../models/DirectMessage");
 const DmRequestBlock = require("../models/DmRequestBlock");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
+const { createNotification } = require("../services/notification.service");
 
 /**
  * 生成对话ID（两个userId排序后的组合）
@@ -66,19 +67,26 @@ async function sendMessageRequest(req, res, next) {
       throw new AppError("Please remove this user from blacklist before sending message request", 400);
     }
 
-    // 如果已有请求，则替换（upsert）
-    let request = await MessageRequest.findOneAndUpdate(
-      { fromUserId, toUserId },
-      {
-        initialMessage,
-        status: "pending",
-        viewedAt: null,
-        respondedAt: null,
-      },
-      { upsert: true, new: true }
-    )
-      .populate("fromUserId", "username displayName avatarUrl")
-      .populate("toUserId", "username displayName");
+    // 检查是否已有 pending 状态的申请
+    const existingPendingRequest = await MessageRequest.findOne({
+      fromUserId,
+      toUserId,
+      status: "pending",
+    }).lean();
+    if (existingPendingRequest) {
+      throw new AppError("You already have a pending message request to this user. Please wait for their response.", 400);
+    }
+
+    // 创建新请求（不再使用 upsert，防止频繁更新）
+    let request = await MessageRequest.create({
+      fromUserId,
+      toUserId,
+      initialMessage,
+      status: "pending",
+    });
+
+    request = await request.populate("fromUserId", "username displayName avatarUrl");
+    request = await request.populate("toUserId", "username displayName avatarUrl");
 
     res.json({ ok: true, request });
   } catch (err) {
@@ -94,17 +102,34 @@ async function sendMessageRequest(req, res, next) {
  */
 async function listMessageRequests(req, res, next) {
   try {
-    const toUserId = req.user._id;
+    const userId = req.user._id;
     const { status } = req.query;
 
-    const filter = { toUserId };
-    if (status) filter.status = status;
+    // 构建过滤条件
+    let statusFilter = {};
+    if (status) statusFilter.status = status;
 
-    const requests = await MessageRequest.find(filter)
+    // 获取收到的申请
+    const receivedRequests = await MessageRequest.find({
+      toUserId: userId,
+      ...statusFilter,
+    })
       .populate("fromUserId", "username displayName avatarUrl role")
       .sort({ createdAt: -1 });
 
-    res.json({ ok: true, requests });
+    // 获取发出的申请
+    const sentRequests = await MessageRequest.find({
+      fromUserId: userId,
+      ...statusFilter,
+    })
+      .populate("toUserId", "username displayName avatarUrl role")
+      .sort({ createdAt: -1 });
+
+    res.json({
+      ok: true,
+      receivedRequests,
+      sentRequests,
+    });
   } catch (err) {
     next(err);
   }
@@ -168,6 +193,23 @@ async function acceptMessageRequest(req, res, next) {
       content: request.initialMessage,
     });
 
+    // 向发起人发送通知
+    try {
+      await createNotification({
+        userId: request.fromUserId,
+        actorId: toUserId,
+        type: "MESSAGE_REQUEST_ACCEPTED",
+        payload: {
+          requestId,
+          conversationId,
+          responderUsername: (await User.findById(toUserId).select("username")).username,
+        },
+      });
+    } catch (notifErr) {
+      console.error("[acceptMessageRequest] Failed to create notification:", notifErr);
+      // 不因为通知失败而中断主逻辑
+    }
+
     res.json({ ok: true, conversationId });
   } catch (err) {
     next(err);
@@ -196,6 +238,23 @@ async function rejectMessageRequest(req, res, next) {
       request.responseMessage = responseMessage.trim();
     }
     await request.save();
+
+    // 向发起人发送通知
+    try {
+      await createNotification({
+        userId: request.fromUserId,
+        actorId: toUserId,
+        type: "MESSAGE_REQUEST_REJECTED",
+        payload: {
+          requestId,
+          responseMessage: request.responseMessage || null,
+          responderUsername: (await User.findById(toUserId).select("username")).username,
+        },
+      });
+    } catch (notifErr) {
+      console.error("[rejectMessageRequest] Failed to create notification:", notifErr);
+      // 不因为通知失败而中断主逻辑
+    }
 
     res.json({ ok: true });
   } catch (err) {
