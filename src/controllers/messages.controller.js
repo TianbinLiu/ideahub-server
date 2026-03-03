@@ -228,7 +228,7 @@ async function listConversations(req, res, next) {
       { $sort: { "lastMessage.createdAt": -1 } },
     ]);
 
-    // 填充用户信息
+    // 填充用户信息和申请状态
     const result = [];
     for (const conv of conversations) {
       const msg = conv.lastMessage;
@@ -236,6 +236,14 @@ async function listConversations(req, res, next) {
       
       const otherUser = await User.findById(otherUserId).select("username displayName avatarUrl role");
       
+      // 查找双方的私信申请记录
+      const request = await MessageRequest.findOne({
+        $or: [
+          { fromUserId: userId, toUserId: otherUserId },
+          { fromUserId: otherUserId, toUserId: userId },
+        ],
+      }).select("status fromUserId").lean();
+
       result.push({
         conversationId: conv._id,
         otherUser,
@@ -245,6 +253,8 @@ async function listConversations(req, res, next) {
           createdAt: msg.createdAt,
         },
         unreadCount: conv.unreadCount,
+        requestStatus: request?.status || null,
+        isRequestInitiator: request ? request.fromUserId.toString() === userId.toString() : false,
       });
     }
 
@@ -331,6 +341,30 @@ async function sendDirectMessage(req, res, next) {
     const targetUser = await User.findById(toUserId);
     if (!targetUser) {
       throw new AppError("User not found", 404);
+    }
+
+    // 检查私信申请状态
+    // 查找双方的任何私信请求记录
+    const request = await MessageRequest.findOne({
+      $or: [
+        { fromUserId, toUserId },
+        { fromUserId: toUserId, toUserId: fromUserId },
+      ],
+    }).lean();
+
+    if (request) {
+      // 如果请求被拒绝，禁止发送消息
+      if (request.status === "rejected") {
+        throw new AppError("Message request was rejected. Cannot send messages.", 403);
+      }
+      // 如果请求还在等待中，只有接受者可以发送消息（接受后）
+      if (request.status === "pending") {
+        // 如果当前用户是发起者，不能发送消息
+        if (request.fromUserId.toString() === fromUserId.toString()) {
+          throw new AppError("Message request is still pending. Wait for acceptance.", 403);
+        }
+      }
+      // 如果状态是 accepted，则允许双方发送消息
     }
 
     // 创建消息
