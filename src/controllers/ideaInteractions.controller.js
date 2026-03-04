@@ -127,14 +127,11 @@ async function listComments(req, res, next) {
     const { id } = req.params;
     const idea = await getIdeaOr404(id, req, res);
 
-    // 只返回顶级评论（没有父评论的评论）
-    // 使用 $or 同时匹配 null 和不存在的情况（兼容旧数据）
+    // 只返回顶级评论（排除所有有 parentCommentId 的评论）
+    // 这样既兼容新数据（parentCommentId: null）也兼容旧数据（字段不存在）
     const comments = await Comment.find({
       idea: idea._id,
-      $or: [
-        { parentCommentId: null },
-        { parentCommentId: { $exists: false } }
-      ]
+      parentCommentId: { $eq: null }
     })
       .sort({ createdAt: -1 })
       .limit(100)
