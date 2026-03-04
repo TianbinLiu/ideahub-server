@@ -63,6 +63,7 @@ const {
   listComments,
   addComment,
   likeComment,
+  listCommentReplies,
 } = require("../controllers/ideaInteractions.controller");
 
 const { createIdeaBody, updateIdeaBody } = require("../schemas/idea.schemas");
@@ -92,6 +93,7 @@ router.post("/:id/bookmark", requireAuth, toggleBookmark);
 
 router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), addComment);
+router.get("/:id/comments/:commentId/replies", optionalAuth, listCommentReplies);
 router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
 
 router.post("/:id/ai-review", requireAuth, requestAiReview);

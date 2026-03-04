@@ -8,10 +8,13 @@ const commentSchema = new mongoose.Schema(
     mentions: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", index: true }],
     likes: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     likesCount: { type: Number, default: 0 },
+    parentCommentId: { type: mongoose.Schema.Types.ObjectId, ref: "Comment", default: null, index: true },
+    replyCount: { type: Number, default: 0 },
   },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );
 
 commentSchema.index({ idea: 1, createdAt: -1 });
+commentSchema.index({ parentCommentId: 1, createdAt: 1 });
 
 module.exports = mongoose.model("Comment", commentSchema);

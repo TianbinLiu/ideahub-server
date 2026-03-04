@@ -127,7 +127,8 @@ async function listComments(req, res, next) {
     const { id } = req.params;
     const idea = await getIdeaOr404(id, req, res);
 
-    const comments = await Comment.find({ idea: idea._id })
+    // 只返回顶级评论（没有父评论的评论）
+    const comments = await Comment.find({ idea: idea._id, parentCommentId: null })
       .sort({ createdAt: -1 })
       .limit(100)
       .populate("author", "_id username role")
@@ -145,9 +146,18 @@ async function listComments(req, res, next) {
 async function addComment(req, res, next) {
   try {
     const { id } = req.params;
-    const { content } = req.body;
+    const { content, parentCommentId } = req.body;
 
     const idea = await getIdeaOr404(id, req, res);
+
+    // 如果是回复评论，验证父评论存在
+    let parentComment = null;
+    if (parentCommentId) {
+      parentComment = await Comment.findOne({ _id: parentCommentId, idea: idea._id }).lean();
+      if (!parentComment) {
+        throw new AppError("Parent comment not found", 404);
+      }
+    }
 
     // Block users who have been flagged for rapid comment spam on this idea
     const now = new Date();
@@ -207,20 +217,42 @@ async function addComment(req, res, next) {
       author: req.user._id,
       content: String(content).trim(),
       mentions: mentionedUserIds,
+      parentCommentId: parentCommentId || null,
     });
 
-    idea.stats.commentCount = (idea.stats.commentCount || 0) + 1;
-    await idea.save();
+    // 如果是回复，更新父评论的回复数
+    if (parentCommentId) {
+      await Comment.findByIdAndUpdate(parentCommentId, { $inc: { replyCount: 1 } });
+    } else {
+      // 只有顶级评论才增加 idea 的评论计数
+      idea.stats.commentCount = (idea.stats.commentCount || 0) + 1;
+      await idea.save();
+    }
 
     const populated = await Comment.findById(comment._id).populate("author", "_id username role");
 
-    await createNotification({
-      userId: idea.author,
-      actorId: req.user._id,
-      ideaId: idea._id,
-      type: "COMMENT",
-      payload: { commentId: comment._id },
-    });
+    // 发送通知
+    if (parentCommentId && parentComment) {
+      // 回复评论：通知被回复的评论作者
+      if (parentComment.author.toString() !== req.user._id.toString()) {
+        await createNotification({
+          userId: parentComment.author,
+          actorId: req.user._id,
+          ideaId: idea._id,
+          type: "COMMENT",
+          payload: { commentId: comment._id, parentCommentId },
+        });
+      }
+    } else {
+      // 顶级评论：通知 idea 作者
+      await createNotification({
+        userId: idea.author,
+        actorId: req.user._id,
+        ideaId: idea._id,
+        type: "COMMENT",
+        payload: { commentId: comment._id },
+      });
+    }
 
     // Create MENTION notifications for mentioned users (excluding the idea author if already notified)
     if (mentionedUserIds.length > 0) {
@@ -299,4 +331,32 @@ async function likeComment(req, res, next) {
   }
 }
 
-module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment };
+/**
+ * GET /api/ideas/:id/comments/:commentId/replies
+ * 获取某个评论的回复
+ */
+async function listCommentReplies(req, res, next) {
+  try {
+    const { id, commentId } = req.params;
+    const idea = await getIdeaOr404(id, req, res);
+
+    // 验证父评论存在
+    const parentComment = await Comment.findOne({ _id: commentId, idea: idea._id }).lean();
+    if (!parentComment) {
+      throw new AppError("Parent comment not found", 404);
+    }
+
+    // 获取所有回复，按时间正序排列
+    const replies = await Comment.find({ parentCommentId: commentId })
+      .sort({ createdAt: 1 })
+      .limit(100)
+      .populate("author", "_id username role")
+      .lean();
+
+    res.json({ ok: true, replies });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment, listCommentReplies };
