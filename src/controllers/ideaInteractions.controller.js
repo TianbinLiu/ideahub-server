@@ -245,38 +245,64 @@ async function addComment(req, res, next) {
     const populated = await Comment.findById(comment._id).populate("author", "_id username role");
 
     // 发送通知
+    console.log('[addComment] Sending notifications...');
+    console.log('[addComment] parentCommentId:', parentCommentId);
+    console.log('[addComment] parentComment:', parentComment ? { _id: parentComment._id, author: parentComment.author } : null);
+    
     if (parentCommentId && parentComment) {
       // 回复评论：通知被回复的评论作者
+      console.log('[addComment] This is a reply. Parent author:', parentComment.author, 'Current user:', req.user._id);
+      
       if (parentComment.author.toString() !== req.user._id.toString()) {
-        await createNotification({
-          userId: parentComment.author,
-          actorId: req.user._id,
-          ideaId: idea._id,
-          type: "COMMENT",
-          payload: { commentId: comment._id, parentCommentId },
-        });
+        console.log('[addComment] Creating reply notification for:', parentComment.author);
+        try {
+          await createNotification({
+            userId: parentComment.author,
+            actorId: req.user._id,
+            ideaId: idea._id,
+            type: "COMMENT",
+            payload: { commentId: comment._id, parentCommentId },
+          });
+          console.log('[addComment] Reply notification created successfully');
+        } catch (notifErr) {
+          console.error('[addComment] Error creating reply notification:', notifErr);
+        }
+      } else {
+        console.log('[addComment] Skipped notification (user replied to their own comment)');
       }
     } else {
       // 顶级评论：通知 idea 作者
-      await createNotification({
-        userId: idea.author,
-        actorId: req.user._id,
-        ideaId: idea._id,
-        type: "COMMENT",
-        payload: { commentId: comment._id },
-      });
+      console.log('[addComment] This is a top-level comment. Idea author:', idea.author);
+      try {
+        await createNotification({
+          userId: idea.author,
+          actorId: req.user._id,
+          ideaId: idea._id,
+          type: "COMMENT",
+          payload: { commentId: comment._id },
+        });
+        console.log('[addComment] Top-level comment notification created successfully');
+      } catch (notifErr) {
+        console.error('[addComment] Error creating top-level comment notification:', notifErr);
+      }
     }
 
     // Create MENTION notifications for mentioned users (excluding the idea author if already notified)
     if (mentionedUserIds.length > 0) {
-      const notifs = mentionedUserIds.map(userId => ({
-        userId,
-        actorId: req.user._id,
-        ideaId: idea._id,
-        type: "MENTION",
-        payload: { commentId: comment._id, content: comment.content },
-      }));
-      await Notification.insertMany(notifs);
+      console.log('[addComment] Creating MENTION notifications for:', mentionedUserIds);
+      try {
+        const notifs = mentionedUserIds.map(userId => ({
+          userId,
+          actorId: req.user._id,
+          ideaId: idea._id,
+          type: "MENTION",
+          payload: { commentId: comment._id, content: comment.content },
+        }));
+        await Notification.insertMany(notifs);
+        console.log('[addComment] MENTION notifications created successfully');
+      } catch (mentionErr) {
+        console.error('[addComment] Error creating MENTION notifications:', mentionErr);
+      }
     }
 
     res.status(201).json({ ok: true, comment: populated, commentCount: idea.stats.commentCount });
