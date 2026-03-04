@@ -155,15 +155,21 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     const { content, parentCommentId } = req.body;
 
+    console.log('[addComment] Full req.body:', JSON.stringify(req.body));
+    console.log('[addComment] parentCommentId:', parentCommentId, 'Type:', typeof parentCommentId);
+
     const idea = await getIdeaOr404(id, req, res);
 
     // 如果是回复评论，验证父评论存在
     let parentComment = null;
     if (parentCommentId) {
+      console.log('[addComment] Looking for parent comment with ID:', parentCommentId);
       parentComment = await Comment.findOne({ _id: parentCommentId, idea: idea._id }).lean();
       if (!parentComment) {
+        console.log('[addComment] Parent comment NOT found!');
         throw new AppError("Parent comment not found", 404);
       }
+      console.log('[addComment] Found parent comment');
     }
 
     // Block users who have been flagged for rapid comment spam on this idea

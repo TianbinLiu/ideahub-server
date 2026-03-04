@@ -1,67 +1,49 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const mongoose = require('mongoose');
 const Comment = require('./src/models/Comment');
 
-async function checkReplies() {
+async function checkLatestReply() {
   try {
-    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/ideahub');
-    console.log('Connected to DB');
+    const uri = process.env.MONGO_URI;
+    await mongoose.connect(uri || 'mongodb://localhost:27017/ideahub');
+    console.log('✅ Connected to MongoDB');
     
-    // Check all comments with parentCommentId
-    const repliesCount = await Comment.countDocuments({
-      parentCommentId: { $exists: true, $ne: null }
+    // Get all comments sorted by creation time (newest first)
+    const allComments = await Comment.find().sort({ createdAt: -1 }).limit(10);
+    console.log('\n📋 最近10条评论（包括回复）:');
+    
+    allComments.forEach((c, i) => {
+      console.log(`\n${i+1}. Content: "${c.content.substring(0, 30)}..."`);
+      console.log(`   _id: ${c._id}`);
+      console.log(`   parentCommentId: ${c.parentCommentId}`);
+      console.log(`   parentCommentId type: ${typeof c.parentCommentId}`);
+      console.log(`   parentCommentId exists: ${c.parentCommentId !== undefined}`);
+      console.log(`   replyCount: ${c.replyCount}`);
+      console.log(`   createdAt: ${c.createdAt}`);
     });
-    console.log('\n回复总数:', repliesCount);
     
-    if (repliesCount > 0) {
-      const latestReply = await Comment.findOne({
-        parentCommentId: { $exists: true, $ne: null }
-      }).sort({ createdAt: -1 }).populate('author', '_id username');
-      console.log('\n最新回复:', JSON.stringify(latestReply, null, 2));
-    }
+    // Check specifically for replies
+    console.log('\n\n🔍 检查回复数据:');
+    const replies = await Comment.find({ parentCommentId: { $exists: true, $ne: null } });
+    console.log(`回复总数: ${replies.length}`);
     
-    // Check top-level comments
-    const topLevelCount = await Comment.countDocuments({
-      $or: [
-        { parentCommentId: null },
-        { parentCommentId: { $exists: false } }
-      ]
-    });
-    console.log('\n顶级评论总数:', topLevelCount);
-    
-    // Check a sample top-level comment
-    const sample = await Comment.findOne({
-      $or: [
-        { parentCommentId: null },
-        { parentCommentId: { $exists: false } }
-      ]
-    }).sort({ createdAt: -1 }).populate('author', '_id username');
-    
-    if (sample) {
-      console.log('\n最新顶级评论:', {
-        _id: sample._id,
-        content: sample.content,
-        replyCount: sample.replyCount,
-        parentCommentId: sample.parentCommentId,
-        createdAt: sample.createdAt
+    if (replies.length > 0) {
+      console.log('\n最新的回复:');
+      replies.sort((a, b) => b.createdAt - a.createdAt);
+      replies.slice(0, 3).forEach(r => {
+        console.log(`- Content: "${r.content.substring(0, 30)}..."`);
+        console.log(`  parentCommentId: ${r.parentCommentId}`);
+        console.log(`  createdAt: ${r.createdAt}`);
       });
-      
-      // Check replies for this comment
-      const replies = await Comment.find({
-        parentCommentId: sample._id
-      }).populate('author', '_id username');
-      console.log(`\n此评论的回复数: ${replies.length}`, replies.map(r => ({
-        _id: r._id,
-        content: r.content,
-        parentCommentId: r.parentCommentId
-      })));
     }
     
     process.exit(0);
   } catch (err) {
-    console.error('Error:', err);
+    console.error('❌ Error:', err.message);
+    console.error(err);
     process.exit(1);
   }
 }
 
-checkReplies();
+checkLatestReply();
