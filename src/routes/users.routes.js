@@ -7,6 +7,7 @@ const {
   getFollowing,
   getUserBookmarks,
   getUserLeaderboards,
+  deleteAccount,
 } = require("../controllers/users.controller");
 const { voteUser, getUserReputation } = require("../controllers/reputation.controller");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
@@ -37,5 +38,8 @@ router.post("/:userId/reputation", requireAuth, voteUser);
 
 // GET /api/users/:id/reputation - Get user's reputation stats
 router.get("/:userId/reputation", optionalAuth, getUserReputation);
+
+// DELETE /api/users/:id - Delete own account (irreversible)
+router.delete("/:id", requireAuth, deleteAccount);
 
 module.exports = router;

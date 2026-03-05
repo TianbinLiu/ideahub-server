@@ -248,6 +248,33 @@ async function getUserLeaderboards(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/users/:id
+ * Delete user account (irreversible)
+ * Requires authentication and user must be deleting their own account
+ */
+async function deleteAccount(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user._id.toString();
+
+    // User can only delete their own account
+    if (currentUserId !== id) {
+      throw new AppError('Cannot delete another user account', 403, 'FORBIDDEN');
+    }
+
+    // Delete the user account
+    const result = await User.findByIdAndDelete(id);
+    if (!result) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+
+    res.json({ ok: true, message: 'Account deleted successfully' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = { 
   searchUsers,
   getUserProfile,
@@ -256,5 +283,6 @@ module.exports = {
   getFollowing,
   getUserBookmarks,
   getUserLeaderboards,
+  deleteAccount,
 };
 
