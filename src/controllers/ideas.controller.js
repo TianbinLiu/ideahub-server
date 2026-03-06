@@ -28,6 +28,53 @@ function isValidId(id) {
   return mongoose.isValidObjectId(id);
 }
 
+function isValidUrl(url) {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateExternalSource(externalSource) {
+  if (!externalSource) return null;
+  
+  const { platform, url, originalAuthor, sourceCreatedAt } = externalSource;
+  
+  // If platform is provided, url is required
+  if (platform && !platform.trim()) {
+    throw new AppError({
+      code: "INVALID_EXTERNAL_SOURCE",
+      status: 400,
+      message: "Platform name is required for external source."
+    });
+  }
+  
+  if (platform && !url) {
+    throw new AppError({
+      code: "INVALID_EXTERNAL_SOURCE",
+      status: 400,
+      message: "URL is required for external source."
+    });
+  }
+  
+  if (platform && !isValidUrl(url)) {
+    throw new AppError({
+      code: "INVALID_EXTERNAL_SOURCE",
+      status: 400,
+      message: "Invalid URL format."
+    });
+  }
+  
+  return {
+    platform: platform ? String(platform).trim() : undefined,
+    url: url ? String(url).trim() : undefined,
+    originalAuthor: originalAuthor ? String(originalAuthor).trim() : undefined,
+    sourceCreatedAt: sourceCreatedAt ? new Date(sourceCreatedAt) : undefined,
+  };
+}
+
 /**
  * POST /api/ideas
  * 需要登录：req.user
@@ -35,7 +82,7 @@ function isValidId(id) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { title, summary, content, visibility, isMonetizable, licenseType, tags, isFeedback } = req.body;
+    const { title, summary, content, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -91,6 +138,9 @@ async function createIdea(req, res, next) {
     // Parse mentions from content to build invited users list
     const { userIds: mentionedUserIds } = await parseMentions(content);
 
+    // Validate external source if provided
+    const validatedExternalSource = validateExternalSource(externalSource);
+
     const idea = await Idea.create({
       title: title.trim(),
       summary: summary || "",
@@ -105,6 +155,7 @@ async function createIdea(req, res, next) {
       feedbackType,
       feedbackStatus,
       aiSummary,
+      externalSource: validatedExternalSource,
     });
 
     // Create INVITE notifications for mentioned users
@@ -328,6 +379,9 @@ async function updateIdea(req, res, next) {
     if (visibility !== undefined) idea.visibility = visibility;
     if (isMonetizable !== undefined) idea.isMonetizable = Boolean(isMonetizable);
     if (licenseType !== undefined) idea.licenseType = String(licenseType);
+    if (req.body.externalSource !== undefined) {
+      idea.externalSource = validateExternalSource(req.body.externalSource);
+    }
 
     await idea.save();
 

@@ -54,6 +54,15 @@ const ideaSchema = new mongoose.Schema(
     },
     aiSummary: { type: String, default: "" },
 
+    // External source - for repurposed ideas from other platforms
+    externalSource: {
+      platform: { type: String },  // e.g., "贴吧", "Facebook", "Twitter"
+      url: { type: String },        // link to original post
+      originalAuthor: { type: String },  // author name from original platform
+      sourceCreatedAt: { type: Date },   // when original post was created
+      _id: false
+    },
+
     stats: { type: statsSchema, default: () => ({}) },
   },
   { timestamps: true }
