@@ -73,18 +73,25 @@
 ### 安装
 
 ```bash
-# 克隆后端仓库
-git clone https://github.com/TianbinLiu/ideahub-server.git
-cd ideahub-server
+# 克隆仓库
+git clone https://github.com/yourusername/ideahub.git
+cd ideahub
+
+# 安装前端依赖
+cd client
 npm install
 
-# 克隆前端仓库（另一个仓库）
-git clone https://github.com/TianbinLiu/ideahub-client.git
+# 安装后端依赖
+cd ../server
+npm install
+
+# 返回根目录
+cd ..
 ```
 
 ### 配置环境变量
 
-**后端 `.env`（在 ideahub-server 仓库根目录）**:
+**后端 `server/.env`**:
 ```env
 # 数据库
 MONGODB_URI=mongodb://localhost:27017/ideahub
@@ -116,7 +123,7 @@ NODE_ENV=development
 PROJECT_DOCS_URL=https://raw.githubusercontent.com/TianbinLiu/ideahub-server/main/PROJECT_STRUCTURE.md
 ```
 
-**前端 `.env`（在 ideahub-client 仓库根目录）**:
+**前端 `client/.env`** (如需要):
 ```env
 VITE_API_BASE_URL=http://localhost:4000
 VITE_GITHUB_REPO_URL=https://github.com/TianbinLiu/ideahub-server
@@ -126,10 +133,10 @@ VITE_GITHUB_DOCS_URL=https://github.com/TianbinLiu/ideahub-server/blob/main/PROJ
 ### 启动项目
 
 ```bash
-# 启动后端（在 ideahub-server 目录）
+# 启动后端（在 server/ 目录）
 npm run dev
 
-# 启动前端（在 ideahub-client 目录，新终端）
+# 启动前端（在 client/ 目录，新终端）
 npm run dev
 ```
 
@@ -138,6 +145,7 @@ npm run dev
 ### 初始管理员账户
 
 ```bash
+cd server
 node scripts/seedAdmin.js
 ```
 
@@ -207,37 +215,41 @@ npm run validate
 
 ## 📁 项目结构
 
-**后端仓库（ideahub-server）**
-
 ```
-ideahub-server/
+ideahub/
 │
 ├── .ai-instructions.md          # 🤖 AI开发工作流程指南
 ├── .ai-file-header-templates.md # 📋 标准文件头模板
 ├── PROJECT_STRUCTURE.md         # 📚 项目架构文档（核心）
 ├── .gitmessage                  # 📝 Git提交模板
+│
 ├── scripts/
-│   ├── validate-project.js      # 🔍 自动化验证脚本
-│   ├── add-file-headers.js      # 🧩 批量文件头生成
-│   └── copyProjectDocs.js       # 📄 文档同步脚本
+│   └── validate-project.js      # 🔍 自动化验证脚本
 │
-├── src/
-│   ├── routes/                  # 10个路由模块
-│   ├── controllers/             # 9个控制器
-│   ├── models/                  # 12个数据模型
-│   ├── middleware/              # 5个中间件
-│   ├── services/                # 4个服务
-│   ├── workers/                 # 后台任务
-│   ├── config/                  # 配置
-│   ├── utils/                   # 工具函数
-│   ├── app.js                   # Express配置
-│   └── index.js                 # 服务器入口
+├── client/                      # 前端应用
+│   ├── src/
+│   │   ├── pages/              # 18个页面组件
+│   │   ├── components/         # 8个通用组件
+│   │   ├── utils/              # 工具函数
+│   │   ├── locales/            # 国际化资源
+│   │   ├── main.tsx            # 应用入口
+│   │   └── App.tsx             # 路由配置
+│   └── package.json
 │
-└── package.json
+└── server/                      # 后端应用
+    ├── src/
+    │   ├── routes/             # 10个路由模块
+    │   ├── controllers/        # 9个控制器
+    │   ├── models/             # 12个数据模型
+    │   ├── middleware/         # 5个中间件
+    │   ├── services/           # 4个服务
+    │   ├── workers/            # 后台任务
+    │   ├── config/             # 配置
+    │   ├── utils/              # 工具函数
+    │   ├── app.js              # Express配置
+    │   └── index.js            # 服务器入口
+    └── package.json
 ```
-
-**前端仓库（ideahub-client）**
-- GitHub: https://github.com/TianbinLiu/ideahub-client
 
 详细结构见 [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md)
 
@@ -245,13 +257,13 @@ ideahub-server/
 
 ## 🔧 可用脚本
 
-### 后端仓库根目录
+### 根目录
 ```bash
 npm run validate         # 运行项目完整性验证
 git commit               # 使用标准化提交模板
 ```
 
-### 前端 (ideahub-client)
+### 前端 (client/)
 ```bash
 npm run dev              # 启动开发服务器
 npm run build            # 构建生产版本
@@ -259,7 +271,7 @@ npm run preview          # 预览构建结果
 npm run lint             # 运行 ESLint
 ```
 
-### 后端 (ideahub-server)
+### 后端 (server/)
 ```bash
 npm run dev              # 启动开发服务器（nodemon）
 npm start                # 启动生产服务器
@@ -437,7 +449,7 @@ const { t } = useTranslation();
 
 如果你发现了 Bug 或有功能建议：
 
-1. 检查 [Issues](https://github.com/TianbinLiu/ideahub-server/issues) 是否已存在
+1. 检查 [Issues](https://github.com/yourusername/ideahub/issues) 是否已存在
 2. 如果没有，创建新的 Issue
 3. 提供详细的描述和复现步骤
 

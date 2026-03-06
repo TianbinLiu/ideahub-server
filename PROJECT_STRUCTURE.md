@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-01  
-> 版本: 3.0
+> 最后更新: 2026-03-06  
+> 版本: 3.3
 > 
 > ---
 > 
@@ -15,8 +15,6 @@
 > 4. **🔄 修改后同步更新本文档** - 更新对应章节和更新记录表
 > 
 > > 💡 **快速链接**: [查看AI工作流程图](.ai-instructions.md#⚙️-ai工作流程) | [新页面必备清单](.ai-instructions.md#✅-新建页面必备功能清单)
-> 
-> > 📌 **仓库说明**: 本文档与AI规范文件位于 `ideahub-server` 仓库根目录；前端代码位于 `ideahub-client` 仓库。
 > 
 > ---
 
@@ -40,6 +38,7 @@
 - **后端**: Node.js + Express + MongoDB + Mongoose
 - **认证**: Passport.js (Local + OAuth)
 - **任务队列**: Bull + Redis
+- **网页抓取**: axios + cheerio
 
 ### 核心特性
 ✅ 完整认证系统（邮箱/OAuth）  
@@ -49,7 +48,8 @@
 ✅ 通知系统  
 ✅ 管理后台  
 ✅ **完整国际化（17页面+4组件）**  
-✅ 公司兴趣表达功能
+✅ 公司兴趣表达功能  
+✅ **外部来源导入功能（12个预设平台）**
 
 ---
 
@@ -101,13 +101,14 @@ ideahub/
 │   │   │   └── FeedbackAdminPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
-│   │   │   ├── en.json               # 英文翻译（375键）
-│   │   │   └── zh.json               # 中文翻译（373键）
+│   │   │   ├── en.json               # 英文翻译（391键）
+│   │   │   └── zh.json               # 中文翻译（389键）
 │   │   │
 │   │   └── utils/                    # 工具函数
 │   │       ├── humanizeError.ts      # 错误国际化
 │   │       ├── safeNext.ts           # URL安全处理
-│   │       └── localIdeas.ts         # 本地存储
+│   │       ├── localIdeas.ts         # 本地存储
+│   │       └── platformConfig.ts     # 外部平台配置
 │   │
 │   ├── package.json                  # 依赖管理
 │   ├── vite.config.ts               # Vite配置
@@ -122,7 +123,7 @@ ideahub/
     │   │   ├── db.js                 # MongoDB连接
     │   │   └── passport.js           # 认证策略
     │   │
-    │   ├── models/                   # 数据模型（13个）
+    │   ├── models/                   # 数据模型（9个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── Comment.js
@@ -131,13 +132,9 @@ ideahub/
     │   │   ├── Notification.js
     │   │   ├── Interest.js
     │   │   ├── OtpToken.js
-    │   │   ├── AiJob.js
-    │   │   ├── UserReputation.js
-    │   │   ├── MessageRequest.js
-    │   │   ├── DirectMessage.js
-    │   │   └── DmRequestBlock.js
+    │   │   └── AiJob.js
     │   │
-    │   ├── controllers/              # 控制器（11个）
+    │   ├── controllers/              # 控制器（10个）
     │   ├── routes/                   # 路由（11个）
     │   ├── middleware/               # 中间件（3个）
     │   ├── schemas/                  # 验证模式（2个）
@@ -329,6 +326,39 @@ return <>{children}</>;
 
 ---
 
+#### `client/src/components/NotificationsDropdown.tsx`
+**功能**: 通知下拉菜单，显示各类通知的计数和菜单项  
+**使用页面**: `Navbar.tsx`（导航栏中集成）  
+**关联文件**:
+- `api.ts` - 获取未读通知按类型统计
+- `authContext.tsx` - 用户认证状态
+- `React Router` - 菜单项导航
+
+**菜单项** (5个):
+1. My Messages → /message-requests
+2. System Messages → /notifications?tab=system
+3. @Mentions → /notifications?tab=mentions
+4. **⭐ Replies → /notifications?tab=replies** [新增]
+5. Likes Received → /notifications?tab=likes
+
+**功能**:
+- **动态计数显示**
+  - 按类型统计未读通知数
+  - System：顶级评论 + 收藏 + 公司兴趣（不包含回复）
+  - Replies：只统计回复评论通知（parentCommentId存在）
+  - @Mentions、Likes：按通知类型统计
+- **点击导航** - 点击菜单项跳转到对应类别的通知页面
+- **加载态提示** - 获取计数时显示加载状态
+
+**关键逻辑** [新增]:
+- 通过 `payload?.parentCommentId` 字段区分System和Replies
+- System过滤条件：`(n.type === "COMMENT" && !n.payload?.parentCommentId)`
+- Replies过滤条件：`(n.type === "COMMENT" && n.payload?.parentCommentId)`
+
+**国际化**: ✅ 完整支持（nav和notifications模块）
+
+---
+
 ### 📄 4. 页面组件（按功能分组）
 
 #### 认证页面组（5个）
@@ -407,10 +437,14 @@ return <>{children}</>;
 **关联文件**:
 - `api.ts` - 获取创意列表
 - `authContext.tsx` - 获取用户状态
+- `utils/platformConfig.ts` - 平台图标获取
 
 **显示内容**:
 - 创意卡片列表
 - 标题、摘要、作者
+- **⭐ 外部来源标签** [v3.3新增]: 
+  - 紫色标签显示平台图标 + 平台名
+  - 替代普通作者显示（如有externalSource）
 - 点赞、评论、收藏数
 - 标签、可见性
 - AI摘要（如有）
@@ -429,17 +463,26 @@ return <>{children}</>;
 **关联文件**:
 - `api.ts` - 提交创意
 - `utils/localIdeas.ts` - 本地私密创意存储
+- `utils/platformConfig.ts` - 外部平台配置
 
 **表单字段**:
 - 标题、摘要、内容、标签
 - 可见性（公开/私密/未列出）
 - 可盈利性、许可类型
 - 反馈类型（Bug/功能建议）
+- **⭐ 外部来源** [v3.3新增]
+  - 启用开关（"From External Source"复选框）
+  - 平台选择器（12个预设平台下拉框）
+  - 外部URL输入框（自动检测平台）
+  - 原作者输入框（可选）
+  - 自动抓取按钮（调用后端API填充标题和内容）
 
 **功能**:
 - 创建服务器创意（公开/未列出）
 - 创建本地创意（私密）
 - 请求AI评审（可选）
+- **⭐ URL自动检测平台** [v3.3新增]: 输入URL时自动检测并更新平台选择
+- **⭐ 智能内容抓取** [v3.3新增]: 点击"Auto Fetch"调用后端API抓取页面标题、内容和作者
 
 **国际化**: ✅ 完整支持
 
@@ -450,10 +493,12 @@ return <>{children}</>;
 **关联文件**:
 - `api.ts` - 获取和更新创意
 - `authContext.tsx` - 权限验证（作者或管理员）
+- `utils/platformConfig.ts` - 外部平台配置
 
 **功能**:
-- 加载现有创意数据
+- 加载现有创意数据（包括externalSource）
 - 更新创意信息
+- **⭐ 编辑外部来源信息** [v3.3新增]: 保留外部来源表单（与NewIdeaPage相同）
 - 权限检查
 - 请求AI重新评审
 
@@ -462,25 +507,40 @@ return <>{children}</>;
 ---
 
 ##### `IdeaDetailPage.tsx`
-**功能**: 创意详情页，最复杂的页面  
+**功能**: 创意详情页，最复杂的页面，包含完整评论嵌套回复系统  
 **关联文件**:
-- `api.ts` - 获取创意、点赞、收藏、评论、兴趣表达
+- `api.ts` - 获取创意、点赞、收藏、评论、回复、兴趣表达
 - `authContext.tsx` - 用户状态
 - `UserHoverCard.tsx` - 作者信息卡片
 - `utils/localIdeas.ts` - 本地创意操作
+- `utils/platformConfig.ts` - 平台图标获取
 
 **显示内容**:
 - 创意完整信息
+- **⭐ 外部来源信息** [v3.3新增]:
+  - 如果有externalSource: {平台图标} {平台名} · [查看原帖](链接) · 原作者: {名称}
+  - 如果没有: by {用户名} · 时间
 - AI评审结果（可行性、盈利潜力）
 - 互动统计（浏览、点赞、评论、收藏）
-- 评论列表
+- **⭐ 评论列表（包含嵌套回复）** [新增]
+  - 顶级评论显示
+  - 回复计数和展开按钮
+  - 展开的回复列表（按创建时间排序）
+  - 缩进样式及视觉区分
 - 作者信息
 
 **功能**:
 - 点赞/取消点赞
 - 收藏/取消收藏
-- 发表评论
-- 删除评论（作者或管理员）
+- 发表评论（成为回复时自动展开回复列表）
+- **⭐ 评论回复系统** [新增]
+  - 在任何评论上点击"💬 回复"
+  - 输入回复内容（缩进显示，视觉区分）
+  - 提交回复后自动加载并展开回复列表
+  - 支持展开/收起回复（显示回复计数）
+  - 刷新后回复保持正确的嵌套结构
+  - 系统自动发送"被回复者"通知
+- 删除评论/回复（作者或管理员）
 - 公司表达兴趣
 - 编辑/删除创意（作者或管理员）
 - 本地创意操作（移动到服务器、删除）
@@ -514,23 +574,45 @@ return <>{children}</>;
 ---
 
 ##### `UserProfilePage.tsx`
-**功能**: 用户公开主页  
+**功能**: 用户公开主页（含搜索和共同关注功能）  
 **关联文件**:
-- `api.ts` - 获取用户信息、创意、关注/粉丝
+- `api.ts` - 获取用户信息、创意、关注/粉丝、搜索用户
 - `authContext.tsx` - 判断是否自己
 
 **显示内容**:
+- **⭐ 全局用户搜索栏** [新增]
+  - 页面顶部搜索栏
+  - 支持按用户名搜索所有用户
+  - 下拉显示搜索结果（头像、昵称、用户名）
+  - 点击结果跳转到用户主页
+  - 实时搜索，加载状态提示
 - 用户头像、用户名、简介
 - 关注/粉丝数
 - 用户的公开创意列表
-- 关注/粉丝列表（标签页）
+- 关注/粉丝列表（标签页，含搜索栏）
 
 **功能**:
 - 关注/取消关注
+- **⭐ 全局用户搜索** [新增]
+  - 在页面顶部提供全局搜索功能
+  - 搜索全平台用户（非限于当前关注列表）
+  - 支持快速访问任意用户主页
+- **⭐ 关注列表搜索** [已有]
+  - 在自己和他人的关注/粉丝列表中添加搜索栏
+  - 支持按用户名和昵称搜索
+  - 搜索时快速过滤结果
+- **⭐ 共同关注标注** [已有]
+  - 查看他人关注/粉丝时，标注"共同关注"
+  - 共同关注显示在列表前列
+  - 仅在查看他人列表时显示
 - 编辑个人资料（自己）
-- 查看用户创意
+- **⭐ 账号注销** [新增]
+  - 仅在自己的资料页面显示"Delete Account"按钮
+  - 点击后显示确认对话框，警示操作不可撤销
+  - 确认删除后：清除token并重定向到登录页
+  - 账号和所有相关数据被永久删除
 
-**国际化**: ✅ 完整支持（profile模块 32个键）
+**国际化**: ✅ 完整支持（profile模块 43个键 - v3.0: 39键 → v3.2: 43键）
 
 ---
 
@@ -581,24 +663,119 @@ return <>{children}</>;
 ---
 
 ##### `NotificationsPage.tsx`
-**功能**: 通知列表  
+**功能**: 统一通知中心（包含系统/回复/提及/点赞/私信/请求各类通知）  
 **关联文件**:
-- `api.ts` - 获取通知、标记已读
+- `api.ts` - 获取通知、标记已读、私信对话、请求、删除对话
 - `UserHoverCard.tsx` - 显示相关用户
+- `BlacklistPage.tsx` - 黑名单管理链接
 
-**通知类型**:
+**通知类型** (共6类):
+- 系统通知（收藏、公司兴趣、顶级评论）
+- **⭐ 回复通知** [新增] - 有人回复你的评论
+- @提及通知
 - 点赞通知
-- 评论通知
-- 收藏通知
-- 公司兴趣通知
+- 私信
+- 私信请求
 
 **功能**:
-- 显示所有通知
-- 标记单个已读
-- 标记全部已读
-- 跳转到相关创意
+- **All选项卡**: 显示所有通知
+  - 标记单个/全部已读
+  - 跳转到相关创意或对话
+- **System选项卡**: 系统事件通知
+  - 收藏、公司兴趣、顶级评论
+  - 排除回复评论（单独在Replies选项卡）
+- **@Mentions选项卡**: @提及通知
+- **⭐ Replies选项卡** [新增]: 评论回复通知
+  - 显示有人回复你的评论的通知
+  - 标记已读后语气提示消失
+  - 点击跳转到对应创意的回复位置
+- **Likes选项卡**: 点赞通知
+- **Messages选项卡**: 私信对话列表
+  - 显示对话列表（最新消息优先）
+  - 删除对话（带可选黑名单操作）
+  - 模态框确认：删除&黑名单、删除&取消黑名单、打开对话、取消
+  - 成功toast通知
+- **Requests选项卡**: 待处理私信请求
+  - 待处理/已处理分类
+  - 初始消息隐藏直到接受
 
-**国际化**: ✅ 完整支持（notifications模块 17个键）
+**国际化**: ✅ 完整支持（notifications + messages模块）
+
+---
+
+#### 私信系统页面组（2个）
+
+##### `MessagesPage.tsx`
+**功能**: 私信对话列表和聊天界面  
+**关联文件**:
+- `api.ts` - 获取对话、消息、发送消息
+- `UserHoverCard.tsx` - 用户信息卡片
+
+**功能**:
+- 左侧栏显示对话列表（最新消息优先）
+- 主区域显示选中对话的消息
+- 实时消息加载（5秒刷新）
+- 发送消息功能
+- 用户头像、昵称显示
+- 消息时间戳
+- 自动滚动到最新消息
+
+**国际化**: ✅ 完整支持（messages模块 34个键）
+
+**实现**:
+- 双面板布局（Sidebar + Chat）
+- 消息按发送者颜色区分
+- 支持未读消息计数
+
+---
+
+##### `MessageRequestsPage.tsx`
+**功能**: 私信请求管理页面（已关联到 NotificationsPage 的 Requests 选项卡）  
+**关联文件**:
+- `api.ts` - 获取/查看/接受/拒绝请求
+- `UserHoverCard.tsx` - 用户信息卡片
+
+**功能**:
+- 分类显示（待处理/已处理）
+- 查看按钮（显示隐藏的初始消息）
+- 接受/拒绝按钮
+- 请求时间显示
+- 用户信息显示（头像、昵称、@用户名）
+- 消息内容预览
+- 自动刷新（5秒）
+
+**国际化**: ✅ 完整支持（messages模块）
+
+**实现**:
+- 初始消息在接受前为隐藏状态
+- 状态徽章（待处理/已接受/已拒绝）
+- 已处理请求折叠显示
+
+---
+
+##### `BlacklistPage.tsx` ⭐ **新增**
+**功能**: 黑名单管理专用页面  
+**关联文件**:
+- `api.ts` - 获取/解除黑名单
+- `UserHoverCard.tsx` - 用户卡片
+
+**功能**:
+- 列表显示所有被黑名单的用户
+- 每个用户卡片包含：头像、昵称、@用户名、黑名单时间
+- 解除黑名单按钮（带加载状态）
+- 空状态提示（无黑名单用户）
+- 自动刷新功能
+- 操作后实时更新列表
+
+**国际化**: ✅ 完整支持（messages模块 3个新键）
+  - `blacklistManage` - 黑名单管理
+  - `blacklistEmpty` - 您的黑名单为空
+  - `unblockedUser` - 已将用户从黑名单移除
+
+**入口点**:
+- Navbar 用户悬浮卡片菜单（自己资料时显示）
+- UserProfilePage 自己资料的黑名单管理链接
+- NotificationsPage 模态框中的黑名单入口
 
 ---
 
@@ -644,7 +821,7 @@ return <>{children}</>;
 **功能**: 英文翻译资源  
 **使用**: 所有页面和组件  
 **模块数**: 13个  
-**翻译键**: 355个
+**翻译键**: 377个 (v3.0) → 381个 (v3.2) → 391个 (v3.3) [v3.3新增10个]
 
 **模块结构**:
 ```json
@@ -652,25 +829,51 @@ return <>{children}</>;
   "common": {...},        // 16键 - 通用词汇
   "nav": {...},           // 9键 - 导航
   "auth": {...},          // 76键 - 认证
-  "idea": {...},          // 57键 - 创意
-  "comment": {...},       // 5键 - 评论
+  "idea": {...},          // 67键 - 创意 [v3.3新增10个: 外部来源相关]
+  "comment": {...},       // 7键 - 评论 [新增2个: reply, replyPlaceholder]
   "aiReview": {...},      // 5键 - AI评审
   "admin": {...},         // 50键 - 管理
   "leaderboard": {...},   // 21键 - 排行榜
   "tagRank": {...},       // 15键 - 标签排行
-  "notifications": {...}, // 17键 - 通知
-  "profile": {...},       // 32键 - 用户资料
+  "notifications": {...}, // 19键 - 通知 [新增2个: tabReplies, reply]
+  "profile": {...},       // 43键 - 用户资料 [v3.2新增4个账号注销相关键]
   "me": {...},            // 24键 - 个人中心
+  "messages": {...},      // 34键 - 私信系统
   "company": {...}        // 4键 - 公司
 }
 ```
+
+**v3.1新增键** (2个):
+- `comment.reply` - 回复按钮文本
+- `comment.replyPlaceholder` - 回复输入框占位符
+- `notifications.tabReplies` - "Replies"标签页
+- `notifications.reply` - 回复通知文本
+
+**v3.2新增键** (4个):
+- `profile.deleteAccount` - 删除账号按钮文本
+- `profile.deleteAccountConfirm` - 确认删除对话框标题
+- `profile.deleteAccountWarning` - 删除警示文本
+- `profile.deleteAccountButton` - 删除确认按钮文本
+- `profile.accountDeleted` - 删除成功提示
+
+**v3.3新增键** (10个):
+- `idea.fromExternalSource` - "From External Source"复选框
+- `idea.selectPlatform` - "Select Platform"下拉框
+- `idea.platformUrl` - "External URL"输入框
+- `idea.platformDetected` - "Detected: {name}"检测提示
+- `idea.autoFetch` - "Auto Fetch"按钮
+- `idea.autoFetchSuccess` - "Content fetched"成功提示
+- `idea.autoFetchFailed` - "Failed to fetch"失败提示
+- `idea.originalAuthor` - "Original Author"输入框
+- `idea.viewOriginal` - "View Original"链接
+- `idea.externalAuthor` - "Author:"标签
 
 ---
 
 #### `client/src/locales/zh.json`
 **功能**: 中文翻译资源  
 **结构**: 与en.json完全对应  
-**翻译键**: 353个
+**翻译键**: 375个 (v3.0) → 379个 (v3.2) → 389个 (v3.3) [v3.3新增10个]
 
 ---
 
@@ -707,6 +910,41 @@ return <>{children}</>;
 
 ---
 
+#### `client/src/utils/platformConfig.ts`
+**功能**: 外部平台配置和图标管理  
+**使用**: `NewIdeaPage.tsx`, `EditIdeaPage.tsx`, `IdeaDetailPage.tsx`, `HomePage.tsx`  
+**平台数**: 12个预设平台
+
+**预设平台**:
+```typescript
+[
+  { name: "Tieba", icon: "🏮", urlPattern: "tieba.baidu.com" },
+  { name: "Zhihu", icon: "📘", urlPattern: "zhihu.com" },
+  { name: "Xiaohongshu", icon: "📕", urlPattern: "xiaohongshu.com" },
+  { name: "Weibo", icon: "🐦", urlPattern: "weibo.com" },
+  { name: "Facebook", icon: "👥", urlPattern: "facebook.com" },
+  { name: "Twitter", icon: "🐤", urlPattern: "twitter.com|x.com" },
+  { name: "Reddit", icon: "🤖", urlPattern: "reddit.com" },
+  { name: "Instagram", icon: "📷", urlPattern: "instagram.com" },
+  { name: "YouTube", icon: "📹", urlPattern: "youtube.com" },
+  { name: "TikTok", icon: "🎵", urlPattern: "tiktok.com|douyin.com" },
+  { name: "LinkedIn", icon: "💼", urlPattern: "linkedin.com" },
+  { name: "Other", icon: "🌐", urlPattern: "" }
+]
+```
+
+**API**:
+- `detectPlatformFromUrl(url)` - URL自动检测平台（正则匹配）
+- `getPlatformIcon(platformName)` - 获取平台emoji图标
+- `getPlatformByName(name)` - 按名称获取平台配置
+
+**应用场景**:
+1. NewIdeaPage/EditIdeaPage: 平台下拉选择器数据源
+2. URL输入时自动检测平台并更新选择器
+3. 详情页/列表页显示平台图标
+
+---
+
 ### 🔧 7. 后端核心文件
 
 #### `server/src/app.js`
@@ -719,9 +957,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/models/`
-**12个数据模型**:
+**9个数据模型**:
 - `User.js` - 用户（邮箱、用户名、角色、密码哈希）
-- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审）
+- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审、外部来源）
 - `Comment.js` - 评论
 - `Like.js` - 点赞
 - `Bookmark.js` - 收藏
@@ -729,15 +967,11 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `Interest.js` - 公司兴趣表达
 - `OtpToken.js` - 邮箱验证码
 - `AiJob.js` - AI评审任务队列
-- `UserReputation.js` - 用户声誉（点赞/倒踩）
-- `MessageRequest.js` - 私信请求（7天TTL自动过期）
-- `DirectMessage.js` - 私信对话消息
-- `DmRequestBlock.js` - 私信黑名单（用户互相阻止）
 
 ---
 
 #### `server/src/controllers/`
-**11个控制器**:
+**10个控制器**:
 - `auth.controller.js` - 登录、注册
 - `authOtp.controller.js` - 邮箱验证码
 - `ideas.controller.js` - 创意CRUD
@@ -747,8 +981,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `aiReview.controller.js` - AI评审
 - `aiJobs.controller.js` - AI任务查询
 - `admin.controller.js` - 管理后台
-- `reputation.controller.js` - 用户声誉(点赞/倒踩)
-- `messages.controller.js` - 私信系统(请求/对话/消息)
+- `scraper.controller.js` - 外部内容抓取
 
 ---
 
@@ -764,7 +997,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `notifications.routes.js` - 通知
 - `aiJobs.routes.js` - AI任务
 - `admin.routes.js` - 管理
-- `messages.routes.js` - 私信系统(请求/对话/消息)
+- `scraper.routes.js` - 外部内容抓取
 
 ---
 
@@ -780,6 +1013,62 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `otp.service.js` - OTP生成/验证
 - `notification.service.js` - 通知创建
 - `aiReview.service.js` - AI评审队列
+
+---
+
+#### `server/src/controllers/scraper.controller.js`
+**功能**: 外部网页内容抓取控制器  
+**路由**: POST `/api/scraper/fetch`（需认证）  
+**依赖**: axios, cheerio, AppError
+
+**核心函数**: `fetchExternalContent(req, res, next)`  
+**请求参数**:
+```json
+{ "url": "https://example.com/post/12345" }
+```
+
+**响应格式**:
+```json
+{
+  "title": "帖子标题",
+  "content": "帖子内容（前1000字符）",
+  "author": "原作者名"
+}
+```
+
+**智能提取策略**:
+1. **标题提取**（优先级）:
+   - `<meta property="og:title">` (OpenGraph)
+   - `<meta name="twitter:title">` (Twitter Cards)
+   - `<title>` (HTML标题)
+   - `<h1>` (页面主标题)
+
+2. **内容提取**（优先级）:
+   - `<article>` (语义化文章标签)
+   - `<meta property="og:description">` (OpenGraph描述)
+   - `.content, .post-content, .article-content` (常见内容类)
+   - `<main>` (主内容区域)
+   - `<body>` (兜底提取前1000字符)
+
+3. **作者提取**（优先级）:
+   - `<meta name="author">`
+   - `<meta property="article:author">`
+   - `.author, .post-author, .username` (常见作者类)
+
+**错误处理**:
+- 无效URL → 400错误
+- 网络请求失败 → 500错误 + 原始错误信息
+- HTML解析失败 → 返回空字符串
+
+**CORS解决方案**: 后端代理抓取，绕过浏览器同源策略
+
+---
+
+#### `server/src/routes/scraper.routes.js`
+**功能**: 外部内容抓取路由配置  
+**端点**: POST `/api/scraper/fetch`  
+**中间件**: requireAuth（需登录）  
+**关联文件**: `scraper.controller.js`
 
 ---
 
@@ -802,10 +1091,14 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-02-27 | 2.4 | 构建时自动复制文档到 server 根目录，修复登录表单提示 |
 | 2026-02-27 | 2.5 | 文档读取支持远程URL，Docs页面支持配置GitHub链接 |
 | 2026-02-27 | 2.6 | 设置默认GitHub仓库与文档URL（server仓库） |
-| 2026-02-27 | 2.7 | AI工作流与文档文件迁移到 server 仓库，移除根目录副本 |
-| 2026-02-28 | 2.8 | **私信系统&声誉系统**：新增3个后端模型(UserReputation/MessageRequest/DirectMessage)，2个控制器(messages/reputation)，1个路由(messages)，2个前端页面(MessagesPage/MessageRequestsPage) |
-| 2026-02-28 | 2.9 | **黑名单管理系统**：新增DmRequestBlock后端模型，新增/修改4个后端API (blockDmUser/unblockDmUser/listDmBlacklist/getDmBlockStatus)，新增BlacklistPage前端页面，修改NotificationsPage支持私信对话删除+可选黑名单操作，修改UserHoverCard支持黑名单切换，前端新增15个i18n键（messages模块），更新翻译资源从355/353键→370/368键 |
-| 2026-03-01 | 3.0 | **关注列表搜索和共同关注功能**：修改UserProfilePage，在关注/粉丝列表添加搜索栏支持按用户名搜索；查看他人关注/粉丝时标注"共同关注"并显示在列表前列；新增5个i18n键，更新翻译资源从370/368键→375/373键 |
+| 2026-02-28 | 2.7 | **私信系统**：新增MessagesPage、MessageRequestsPage，3个后端模型(UserReputation/MessageRequest/DirectMessage)，2个控制器(messages/reputation)，1个路由(messages) |
+| 2026-02-28 | 2.8 | **黑名单管理系统**：新增BlacklistPage，新增DmRequestBlock后端模型，新增/修改4个后端API (blockDmUser/unblockDmUser/listDmBlacklist/getDmBlockStatus)，修改NotificationsPage支持私信对话删除+可选黑名单，修改UserHoverCard支持黑名单切换，前端新增15个i18n键（messages模块），更新翻译资源从355/353键→370/368键 |
+| 2026-03-01 | 2.9 | **关注列表搜索和共同关注功能**：修改UserProfilePage，在关注/粉丝列表添加搜索栏，支持按用户名搜索；查看他人关注/粉丝时标注"共同关注"并显示在列表前列；新增5个i18n键，更新翻译资源从370/368键→375/373键 |
+| 2026-03-01 | 3.0 | **全局用户搜索功能**：在UserProfilePage顶部添加全局用户搜索栏，支持按用户名搜索全平台用户；实时显示搜索结果（头像、昵称、用户名），点击跳转到用户主页；新增2个i18n键，更新翻译资源从375/373键→377/375键 |
+| 2026-03-05 | 3.1 | **评论回复嵌套系统和通知优化**：修改Comment模型添加parentCommentId和replyCount字段；IdeaDetailPage支持评论回复（展开/收起、自动展开、嵌套显示）；NotificationsPage添加Replies tab分离回复通知；NotificationsDropdown菜单项添加Replies选项，修正System/Replies的计数逻辑；后端API新增POST /ideas/:id/comments支持parentCommentId、GET /ideas/:id/comments/:commentId/replies；验证模式添加parentCommentId字段；新增i18n键（tabReplies、reply），翻译资源保持377/375键 |
+| 2026-03-05 | 3.2 | **账号注销功能**：在UserProfilePage添加"Delete Account"按钮（仅自己的资料页显示）；确认对话框警示操作不可撤销；后端新增DELETE /api/users/:id接口，删除用户及关联数据；删除成功后清除token并重定向登录页；新增4个i18n键（deleteAccount、deleteAccountConfirm、deleteAccountWarning、deleteAccountButton、accountDeleted），更新翻译资源从377/375键→381/379键 |
+| 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增10个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
+| 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增14个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 
 ---
 
@@ -1209,90 +1502,7 @@ ideahub/
 
 ---
 
-### 7. 用户声誉系统 (User Reputation)
-
-#### 功能列表
-- ✅ 用户点赞(👍)
-- ✅ 用户倒踩(👎)
-- ✅ 声誉统计(点赞/倒踩数量)
-- ✅ 用户徽章(热门用户/恶意用户)
-- ✅ 徽章显示条件(双向>=10)
-- ✅ 重复投票切换/取消
-
-#### 徽章判定规则
-- **热门用户**: 点赞数/倒踩数 >= 3.0 且双方>=10
-- **恶意用户**: 点赞数/倒踩数 <= 0.33 且双方>=10
-
-#### 相关文件
-**前端:**
-- `client/src/pages/UserProfilePage.tsx` - 个人主页显示声誉【✅ i18n】
-- `client/src/components/UserHoverCard.tsx` - 悬浮卡片显示徽章和投票按钮【✅ i18n】
-
-**后端:**
-- `server/src/models/UserReputation.js` - 声誉模型(vote字段: 1/-1)
-- `server/src/controllers/reputation.controller.js` - 投票和统计API
-- `server/src/routes/users.routes.js` - 声誉相关路由
-
-**API端点:**
-- `POST /api/users/:userId/reputation` - 投票(点赞/倒踩/切换/取消)
-- `GET /api/users/:userId/reputation` - 获取声誉统计和徽章
-
-**国际化资源:**
-- `client/src/locales/en.json` - profile模块(votedLike/votedDislike/popularUser/maliciousUser等)
-- `client/src/locales/zh.json` - profile模块(中文翻译)
-
----
-
-### 8. 私信系统 (Direct Messages)
-
-#### 功能列表
-- ✅ 发送私信请求(带初始消息)
-- ✅ 查看/接受/拒绝私信请求
-- ✅ 初始消息隐藏(接受前不可见)
-- ✅ 私信请求7天TTL自动过期
-- ✅ 对话列表
-- ✅ 一对一聊天
-- ✅ 消息发送
-- ✅ 消息已读标记
-- ✅ 自动刷新(轮询)
-
-#### 相关文件
-**前端:**
-- `client/src/pages/MessagesPage.tsx` - 对话列表和聊天【✅ i18n】
-- `client/src/pages/MessageRequestsPage.tsx` - 请求管理【✅ i18n】
-- `client/src/components/UserHoverCard.tsx` - DM按钮和发送模态框【✅ i18n】
-- `client/src/components/NotificationsDropdown.tsx` - "我的消息"菜单项
-
-**后端:**
-- `server/src/models/MessageRequest.js` - 请求模型(status: pending/accepted/rejected, TTL: 7天)
-- `server/src/models/DirectMessage.js` - 消息模型(conversationId, participants)
-- `server/src/controllers/messages.controller.js` - 8个API函数
-- `server/src/routes/messages.routes.js` - 7个端点
-
-**API端点:**
-- `POST /api/messages/request` - 发送私信请求
-- `GET /api/messages/request` - 获取请求列表
-- `PATCH /api/messages/request/:id/view` - 标记请求已查看
-- `PATCH /api/messages/request/:id/accept` - 接受请求
-- `PATCH /api/messages/request/:id/reject` - 拒绝请求
-- `GET /api/messages/conversations` - 获取对话列表
-- `GET /api/messages/conversations/:id` - 获取对话消息
-- `POST /api/messages/send` - 发送消息
-
-**conversationId生成规则:**
-```javascript
-function generateConversationId(userId1, userId2) {
-  return [userId1, userId2].sort().join('_');
-}
-```
-
-**国际化资源:**
-- `client/src/locales/en.json` - messages模块(40个键)
-- `client/src/locales/zh.json` - messages模块(40个键)
-
----
-
-### 9. 用户资料系统 (User Profile)
+### 7. 用户资料系统 (User Profile)
 
 #### 功能列表
 - ✅ 用户主页
