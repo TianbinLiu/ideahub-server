@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-06  
-> 版本: 3.3
+> 最后更新: 2026-03-07  
+> 版本: 3.4
 > 
 > ---
 > 
@@ -507,9 +507,9 @@ return <>{children}</>;
 ---
 
 ##### `IdeaDetailPage.tsx`
-**功能**: 创意详情页，最复杂的页面，包含完整评论嵌套回复系统  
+**功能**: 创意详情页，最复杂的页面，包含完整评论嵌套回复系统和外部链接备注窗口  
 **关联文件**:
-- `api.ts` - 获取创意、点赞、收藏、评论、回复、兴趣表达
+- `api.ts` - 获取创意、点赞、收藏、评论、回复、兴趣表达、外部链接备注
 - `authContext.tsx` - 用户状态
 - `UserHoverCard.tsx` - 作者信息卡片
 - `utils/localIdeas.ts` - 本地创意操作
@@ -520,20 +520,39 @@ return <>{children}</>;
 - **⭐ 外部来源信息** [v3.3新增]:
   - 如果有externalSource: {平台图标} {平台名} · [查看原帖](链接) · 原作者: {名称}
   - 如果没有: by {用户名} · 时间
+- **⭐ 外部链接备注窗口（Linked Content Window）** [v3.4新增]:
+  - 仅当创意包含外部链接（externalSource.url）时显示
+  - iframe嵌入外部网站预览（360px高度）
+  - 全屏模式按钮、直接访问网站按钮
+  - 全屏模式下的备注功能（非全屏时显示提示："进入全屏模式以查看和添加位置备注"）
+  - 位置备注标记（紫色编号圆圈，显示在iframe覆盖层）
+  - 备注列表（显示坐标、内容、作者、时间）
+  - 点击备注标记高亮显示对应项
+  - 从评论区跳转时自动进入全屏并闪烁高亮标记（1.6秒黄色ring+pulse动画）
 - AI评审结果（可行性、盈利潜力）
 - 互动统计（浏览、点赞、评论、收藏）
-- **⭐ 评论列表（包含嵌套回复）** [新增]
+- **⭐ 评论列表（包含嵌套回复和链接备注跳转）** [v3.1/v3.4增强]:
   - 顶级评论显示
   - 回复计数和展开按钮
   - 展开的回复列表（按创建时间排序）
   - 缩进样式及视觉区分
+  - **如果评论关联外部链接备注**：显示"跳转到备注"链接
 - 作者信息
 
 **功能**:
 - 点赞/取消点赞
 - 收藏/取消收藏
 - 发表评论（成为回复时自动展开回复列表）
-- **⭐ 评论回复系统** [新增]
+- **⭐ 外部链接备注系统** [v3.4新增]:
+  - 全屏模式下点击"Annotation Mode"按钮开启备注模式
+  - 在iframe预览上点击放置黄色临时标记
+  - 输入备注内容（最多500字符）
+  - 保存后生成紫色编号标记（使用百分比坐标x/y: 0-100%）
+  - 备注自动同步为评论（含externalLinkNote元数据）
+  - 评论中的"跳转到备注"链接可回到窗口并闪烁高亮
+  - 退出全屏自动清除备注模式和待添加标记
+  - 坐标定位在全屏模式下稳定（最小化响应式影响）
+- **⭐ 评论回复系统** [v3.1新增]:
   - 在任何评论上点击"💬 回复"
   - 输入回复内容（缩进显示，视觉区分）
   - 提交回复后自动加载并展开回复列表
@@ -821,7 +840,7 @@ return <>{children}</>;
 **功能**: 英文翻译资源  
 **使用**: 所有页面和组件  
 **模块数**: 13个  
-**翻译键**: 377个 (v3.0) → 381个 (v3.2) → 391个 (v3.3) [v3.3新增10个]
+**翻译键**: 377个 (v3.0) → 381个 (v3.2) → 391个 (v3.3) → 410个 (v3.4) 
 
 **模块结构**:
 ```json
@@ -829,14 +848,14 @@ return <>{children}</>;
   "common": {...},        // 16键 - 通用词汇
   "nav": {...},           // 9键 - 导航
   "auth": {...},          // 76键 - 认证
-  "idea": {...},          // 67键 - 创意 [v3.3新增10个: 外部来源相关]
-  "comment": {...},       // 7键 - 评论 [新增2个: reply, replyPlaceholder]
+  "idea": {...},          // 76键 - 创意 [v3.4新增19个: linkWidget相关]
+  "comment": {...},       // 10键 - 评论 [v3.4新增1个: jumpToLinkNote]
   "aiReview": {...},      // 5键 - AI评审
   "admin": {...},         // 50键 - 管理
   "leaderboard": {...},   // 21键 - 排行榜
   "tagRank": {...},       // 15键 - 标签排行
-  "notifications": {...}, // 19键 - 通知 [新增2个: tabReplies, reply]
-  "profile": {...},       // 43键 - 用户资料 [v3.2新增4个账号注销相关键]
+  "notifications": {...}, // 19键 - 通知
+  "profile": {...},       // 43键 - 用户资料
   "me": {...},            // 24键 - 个人中心
   "messages": {...},      // 34键 - 私信系统
   "company": {...}        // 4键 - 公司
@@ -873,7 +892,7 @@ return <>{children}</>;
 #### `client/src/locales/zh.json`
 **功能**: 中文翻译资源  
 **结构**: 与en.json完全对应  
-**翻译键**: 375个 (v3.0) → 379个 (v3.2) → 389个 (v3.3) [v3.3新增10个]
+**翻译键**: 375个 (v3.0) → 379个 (v3.2) → 389个 (v3.3) → 408个 (v3.4)
 
 ---
 
@@ -959,8 +978,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 #### `server/src/models/`
 **9个数据模型**:
 - `User.js` - 用户（邮箱、用户名、角色、密码哈希）
-- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审、外部来源）
-- `Comment.js` - 评论
+- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审、外部来源、链接备注）
+- `Comment.js` - 评论（支持回复、外部链接备注关联）
 - `Like.js` - 点赞
 - `Bookmark.js` - 收藏
 - `Notification.js` - 通知
@@ -974,7 +993,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 **10个控制器**:
 - `auth.controller.js` - 登录、注册
 - `authOtp.controller.js` - 邮箱验证码
-- `ideas.controller.js` - 创意CRUD
+- `ideas.controller.js` - 创意CRUD、外部链接备注
 - `ideaInteractions.controller.js` - 点赞、评论、收藏
 - `interest.controller.js` - 公司兴趣
 - `notifications.controller.js` - 通知
@@ -1099,6 +1118,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-05 | 3.2 | **账号注销功能**：在UserProfilePage添加"Delete Account"按钮（仅自己的资料页显示）；确认对话框警示操作不可撤销；后端新增DELETE /api/users/:id接口，删除用户及关联数据；删除成功后清除token并重定向登录页；新增4个i18n键（deleteAccount、deleteAccountConfirm、deleteAccountWarning、deleteAccountButton、accountDeleted），更新翻译资源从377/375键→381/379键 |
 | 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增10个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 | 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增14个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
+| 2026-03-07 | 3.4 | **外部链接备注窗口（Linked Content Window）**：支持在创意的外部链接中添加位置备注和评价；在IdeaDetailPage添加链接小窗口（iframe嵌入预览+全屏模式）；仅在全屏模式下允许查看和添加位置备注（最小化响应式布局影响）；位置备注使用百分比坐标（x/y 0-100%）；备注自动同步到评论区并附带跳转链接；评论中点击"跳转到备注"自动进入全屏并闪烁高亮标记（1.6秒动画）；后端新增Idea.externalSource.linkNotes数组（externalLinkNoteSchema含x/y/content/user/timestamps）；Comment模型添加externalLinkNote元数据（noteId/x/y）实现双向关联；新增GET/POST /api/ideas/:id/link-notes API（optionalAuth/requireAuth）；ideas.controller.js新增listExternalLinkNotes和addExternalLinkNote函数（自动创建关联评论+通知）；client/src/api.ts添加ExternalLinkNote类型；client/src/pages/IdeaDetailPage.tsx新增完整链接小窗口UI（iframe、标记覆盖层、备注表单、备注列表、全屏状态管理、闪烁动画逻辑）；新增19个i18n键（linkWidgetTitle/linkWidgetSubtitle/linkWidgetFullscreenRequired等），更新翻译资源从391/389键→410/408键 |
 
 ---
 
@@ -1245,8 +1265,8 @@ ideahub/
 │   │   │
 │   │   ├── models/                  # Mongoose数据模型
 │   │   │   ├── User.js              # 用户模型（邮箱、用户名、角色）
-│   │   │   ├── Idea.js              # 创意模型（标题、内容、可见性、标签）
-│   │   │   ├── Comment.js           # 评论模型
+│   │   │   ├── Idea.js              # 创意模型（标题、内容、可见性、标签、外部来源+链接备注）
+│   │   │   ├── Comment.js           # 评论模型（支持回复、外部链接备注关联）
 │   │   │   ├── Like.js              # 点赞模型
 │   │   │   ├── Bookmark.js          # 收藏模型
 │   │   │   ├── Notification.js      # 通知模型
@@ -1257,7 +1277,7 @@ ideahub/
 │   │   ├── controllers/             # 业务逻辑控制器
 │   │   │   ├── auth.controller.js           # 认证控制器（登录、注册）
 │   │   │   ├── authOtp.controller.js        # OTP邮箱验证控制器
-│   │   │   ├── ideas.controller.js          # 创意CRUD控制器
+│   │   │   ├── ideas.controller.js          # 创意CRUD控制器（含外部链接备注）
 │   │   │   ├── ideaInteractions.controller.js # 创意互动（点赞、评论、收藏）
 │   │   │   ├── interest.controller.js       # 公司兴趣控制器
 │   │   │   ├── notifications.controller.js  # 通知控制器
@@ -1383,11 +1403,12 @@ ideahub/
 - `server/src/controllers/ideas.controller.js`
 - `server/src/controllers/ideaInteractions.controller.js`
 - `server/src/models/Idea.js`
+- `server/src/models/Comment.js` - 评论模型（v3.4新增externalLinkNote字段）
 - `server/src/schemas/idea.schemas.js`
 
 **国际化资源:**
-- `client/src/locales/en.json` - idea模块（57个键）
-- `client/src/locales/zh.json` - idea模块（57个键）
+- `client/src/locales/en.json` - idea模块（76个键，v3.4新增19个linkWidget相关键）
+- `client/src/locales/zh.json` - idea模块（76个键，v3.4新增19个linkWidget相关键）
 
 ---
 
@@ -1414,8 +1435,8 @@ ideahub/
 - `server/src/models/Bookmark.js`
 
 **国际化资源:**
-- `client/src/locales/en.json` - comment模块（5个键）
-- `client/src/locales/zh.json` - comment模块（5个键）
+- `client/src/locales/en.json` - comment模块（10个键，v3.4新增jumpToLinkNote）
+- `client/src/locales/zh.json` - comment模块（10个键，v3.4新增jumpToLinkNote）
 
 ---
 
