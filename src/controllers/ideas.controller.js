@@ -3,9 +3,11 @@ const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Notification = require("../models/Notification");
+const Comment = require("../models/Comment");
 const { canReadIdea, canWriteIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
+const { createNotification } = require("../services/notification.service");
 const { validateFeedback } = require("../services/aiReview.service");
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
@@ -72,6 +74,33 @@ function validateExternalSource(externalSource) {
     url: url ? String(url).trim() : undefined,
     originalAuthor: originalAuthor ? String(originalAuthor).trim() : undefined,
     sourceCreatedAt: sourceCreatedAt ? new Date(sourceCreatedAt) : undefined,
+  };
+}
+
+function normalizeLinkNoteInput(payload = {}) {
+  const { x, y, content } = payload;
+  const noteX = Number(x);
+  const noteY = Number(y);
+
+  if (!Number.isFinite(noteX) || noteX < 0 || noteX > 100) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "x must be a number between 0 and 100." });
+  }
+  if (!Number.isFinite(noteY) || noteY < 0 || noteY > 100) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "y must be a number between 0 and 100." });
+  }
+
+  const text = String(content || "").trim();
+  if (!text) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "content is required." });
+  }
+  if (text.length > 500) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "content is too long (max 500 chars)." });
+  }
+
+  return {
+    x: noteX,
+    y: noteY,
+    content: text,
   };
 }
 
@@ -432,6 +461,131 @@ async function listMyIdeas(req, res, next) {
   }
 }
 
+/**
+ * GET /api/ideas/:id/link-notes
+ * 返回外部链接窗口的定位备注
+ */
+async function listExternalLinkNotes(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      invalidId("Invalid idea id");
+    }
+
+    const idea = await Idea.findById(id)
+      .populate("author", "_id username role")
+      .populate("externalSource.linkNotes.user", "_id username role");
+
+    if (!idea) {
+      notFound("Idea not found");
+    }
+
+    if (!canReadIdea(idea, req.user)) {
+      if (!req.user) unauthorized("Login required");
+      forbidden("Forbidden");
+    }
+
+    const notes = (idea.externalSource?.linkNotes || []).map((note) => ({
+      _id: note._id,
+      x: note.x,
+      y: note.y,
+      content: note.content,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+      user: note.user,
+    }));
+
+    res.json({ ok: true, notes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/ideas/:id/link-notes
+ * 在外部链接窗口的坐标位置添加备注/评价
+ */
+async function addExternalLinkNote(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      invalidId("Invalid idea id");
+    }
+
+    const idea = await Idea.findById(id);
+    if (!idea) {
+      notFound("Idea not found");
+    }
+
+    if (!canReadIdea(idea, req.user)) {
+      forbidden("Forbidden");
+    }
+
+    if (!idea.externalSource?.url) {
+      throw new AppError({
+        code: "LINK_WIDGET_NOT_AVAILABLE",
+        status: 400,
+        message: "This idea does not have an external source URL.",
+      });
+    }
+
+    const noteData = normalizeLinkNoteInput(req.body);
+    idea.externalSource.linkNotes = idea.externalSource.linkNotes || [];
+    idea.externalSource.linkNotes.push({
+      ...noteData,
+      user: req.user._id,
+    });
+
+    await idea.save();
+
+    const populated = await Idea.findById(id).populate("externalSource.linkNotes.user", "_id username role");
+    const notes = populated?.externalSource?.linkNotes || [];
+    const latest = notes[notes.length - 1];
+
+    // Sync link-note to top-level comments so it appears in comment feed.
+    const syncedComment = await Comment.create({
+      idea: idea._id,
+      author: req.user._id,
+      content: noteData.content,
+      parentCommentId: null,
+      externalLinkNote: {
+        noteId: latest?._id,
+        x: noteData.x,
+        y: noteData.y,
+      },
+    });
+
+    idea.stats.commentCount = (idea.stats.commentCount || 0) + 1;
+    await idea.save();
+
+    const populatedComment = await Comment.findById(syncedComment._id).populate("author", "_id username role");
+
+    if (String(idea.author) !== String(req.user._id)) {
+      try {
+        await createNotification({
+          userId: idea.author,
+          actorId: req.user._id,
+          ideaId: idea._id,
+          type: "COMMENT",
+          payload: { commentId: syncedComment._id },
+        });
+      } catch (notifErr) {
+        console.error("[addExternalLinkNote] Error creating comment notification:", notifErr?.message || notifErr);
+      }
+    }
+
+    res.status(201).json({
+      ok: true,
+      note: latest,
+      count: notes.length,
+      comment: populatedComment,
+      commentCount: idea.stats.commentCount,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 
 
 
@@ -452,4 +606,14 @@ async function suggestTitles(req, res, next) {
   }
 }
 
-module.exports = { createIdea, listIdeas, getIdeaById, updateIdea, deleteIdea, listMyIdeas, suggestTitles };
+module.exports = {
+  createIdea,
+  listIdeas,
+  getIdeaById,
+  updateIdea,
+  deleteIdea,
+  listMyIdeas,
+  suggestTitles,
+  listExternalLinkNotes,
+  addExternalLinkNote,
+};

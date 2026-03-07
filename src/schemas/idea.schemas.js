@@ -5,6 +5,15 @@ const tagsSchema = z
   .optional()
   .transform((val) => val ?? []);
 
+const externalSourceSchema = z
+  .object({
+    platform: z.string().trim().min(1).max(100).optional(),
+    url: z.string().url().optional(),
+    originalAuthor: z.string().trim().max(120).optional(),
+    sourceCreatedAt: z.string().datetime().optional(),
+  })
+  .partial();
+
 const createIdeaBody = z.object({
   title: z.string().trim().min(1).max(120),
   summary: z.string().max(300).optional().default(""),
@@ -14,6 +23,7 @@ const createIdeaBody = z.object({
   isMonetizable: z.coerce.boolean().optional().default(false),
   licenseType: z.string().optional().default("default"),
   isFeedback: z.coerce.boolean().optional().default(false),
+  externalSource: externalSourceSchema.optional(),
 });
 
 const updateIdeaBody = z.object({
@@ -24,6 +34,7 @@ const updateIdeaBody = z.object({
   visibility: z.enum(["public", "private", "unlisted"]).optional(),
   isMonetizable: z.coerce.boolean().optional(),
   licenseType: z.string().optional(),
+  externalSource: externalSourceSchema.optional(),
 });
 
 module.exports = { createIdeaBody, updateIdeaBody };

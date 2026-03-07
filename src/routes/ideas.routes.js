@@ -55,6 +55,8 @@ const {
   updateIdea,
   deleteIdea,
   listMyIdeas,
+  listExternalLinkNotes,
+  addExternalLinkNote,
 } = require("../controllers/ideas.controller");
 
 const {
@@ -95,6 +97,9 @@ router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), addComment);
 router.get("/:id/comments/:commentId/replies", optionalAuth, listCommentReplies);
 router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
+
+router.get("/:id/link-notes", optionalAuth, listExternalLinkNotes);
+router.post("/:id/link-notes", requireAuth, addExternalLinkNote);
 
 router.post("/:id/ai-review", requireAuth, requestAiReview);
 
