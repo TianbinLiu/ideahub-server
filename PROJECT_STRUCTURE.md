@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-07  
-> 版本: 3.4
+> 版本: 3.5
 > 
 > ---
 > 
@@ -78,13 +78,14 @@ ideahub/
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
 │   │   │   └── UserHoverCard.tsx     # 用户卡片
 │   │   │
-│   │   ├── pages/                    # 页面组件（20个）
+│   │   ├── pages/                    # 页面组件（21个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
 │   │   │   ├── ResetPasswordPage.tsx
 │   │   │   ├── OAuthCallbackPage.tsx
 │   │   │   ├── PhoneLoginPage.tsx
+│   │   │   ├── NewIdeaTypePage.tsx
 │   │   │   ├── NewIdeaPage.tsx
 │   │   │   ├── EditIdeaPage.tsx
 │   │   │   ├── IdeaDetailPage.tsx
@@ -101,8 +102,8 @@ ideahub/
 │   │   │   └── FeedbackAdminPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
-│   │   │   ├── en.json               # 英文翻译（391键）
-│   │   │   └── zh.json               # 中文翻译（389键）
+│   │   │   ├── en.json               # 英文翻译（持续更新）
+│   │   │   └── zh.json               # 中文翻译（持续更新）
 │   │   │
 │   │   └── utils/                    # 工具函数
 │   │       ├── humanizeError.ts      # 错误国际化
@@ -178,19 +179,20 @@ i18n.use(initReactI18next).init({
 - `pages/*.tsx` - 所有页面组件
 - `components/ProtectedRoute.tsx` - 路由守卫
 
-**路由表** (20个路由):
+**路由表** (关键路由):
 ```
 / → HomePage
 /login → LoginPage
 /register → RegisterPage
-/reset-password → ResetPasswordPage
+/reset → ResetPasswordPage
 /oauth/callback → OAuthCallbackPage
-/phone-login → PhoneLoginPage
-/ideas/new → NewIdeaPage
+/login/phone → PhoneLoginPage
+/ideas/new → NewIdeaTypePage
+/ideas/new/:mode → NewIdeaPage (business/feedback/external/daily)
 /ideas/:id → IdeaDetailPage
 /ideas/:id/edit → EditIdeaPage
-/me → MePage
-/users/:username → UserProfilePage
+/me → MeRedirect
+/users/:id → UserProfilePage
 /company → CompanyPage
 /leaderboard/:id → LeaderboardDetailPage
 /tag-rank → TagRankPage
@@ -199,7 +201,8 @@ i18n.use(initReactI18next).init({
 /message-requests → MessageRequestsPage
 /blacklist → BlacklistPage
 /admin/users → AdminUsersPage
-/admin/feedback → FeedbackAdminPage
+/feedback → FeedbackAdminPage
+/admin/docs → DocsAdminPage
 ```
 
 ---
@@ -458,31 +461,58 @@ return <>{children}</>;
 
 ---
 
+##### `NewIdeaTypePage.tsx`
+**功能**: 新建创意类型选择页（分流入口）  
+**关联文件**:
+- `App.tsx` - 路由入口（`/ideas/new`）
+- `NewIdeaPage.tsx` - 按模式跳转到具体表单
+
+**显示内容**:
+- 4个创建类型卡片：
+  - 商业想法（business）
+  - 反馈bug/网站建议（feedback）
+  - 引用其它网站（external）
+  - 日常想法（daily）
+
+**功能**:
+- 用户先选模式再进入创建表单
+- 降低单页复杂度，避免冲突勾选
+
+**国际化**: ✅ 完整支持（idea模块）
+
+---
+
 ##### `NewIdeaPage.tsx`
-**功能**: 创建新创意  
+**功能**: 按模式创建新创意（v3.5重构）  
 **关联文件**:
 - `api.ts` - 提交创意
 - `utils/localIdeas.ts` - 本地私密创意存储
 - `utils/platformConfig.ts` - 外部平台配置
+- `App.tsx` - 模式路由（`/ideas/new/:mode`）
+- `NewIdeaTypePage.tsx` - 模式入口页
 
-**表单字段**:
-- 标题、摘要、内容、标签
-- 可见性（公开/私密/未列出）
-- 可盈利性、许可类型
-- 反馈类型（Bug/功能建议）
-- **⭐ 外部来源** [v3.3新增]
-  - 启用开关（"From External Source"复选框）
-  - 平台选择器（12个预设平台下拉框）
-  - 外部URL输入框（自动检测平台）
-  - 原作者输入框（可选）
-  - 自动抓取按钮（调用后端API填充标题和内容）
+**模式与字段控制**:
+- business（商业想法）:
+  - 保留Request AI review
+  - 不显示Monetizable / Submit As Feedback / 外链来源开关
+- feedback（反馈bug/网站建议）:
+  - 隐藏勾选项
+  - 隐藏tags输入框
+  - 自动固定标签：`反馈bug/网站建议`
+- external（引用其它网站）:
+  - 显示外链来源信息表单（平台、链接、原作者、自动抓取）
+  - 选择“其他/Other”时显示“具体平台名称”输入框（必填）
+  - 提交时具体平台名称会写入`externalSource.platform`并自动加入tags（不会使用“其他”标签）
+- daily（日常想法）:
+  - 轻量普通表单，无额外模式勾选
 
 **功能**:
 - 创建服务器创意（公开/未列出）
 - 创建本地创意（私密）
-- 请求AI评审（可选）
-- **⭐ URL自动检测平台** [v3.3新增]: 输入URL时自动检测并更新平台选择
-- **⭐ 智能内容抓取** [v3.3新增]: 点击"Auto Fetch"调用后端API抓取页面标题、内容和作者
+- business模式可请求AI评审
+- external模式支持URL自动检测和内容自动抓取
+- 顶部新增“当前模式徽章 + 一键切换模式”条
+- 平台“其他/Other”选项支持中英文显示切换
 
 **国际化**: ✅ 完整支持
 
@@ -1119,6 +1149,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增10个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 | 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增14个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 | 2026-03-07 | 3.4 | **外部链接备注窗口（Linked Content Window）**：支持在创意的外部链接中添加位置备注和评价；在IdeaDetailPage添加链接小窗口（iframe嵌入预览+全屏模式）；仅在全屏模式下允许查看和添加位置备注（最小化响应式布局影响）；位置备注使用百分比坐标（x/y 0-100%）；备注自动同步到评论区并附带跳转链接；评论中点击"跳转到备注"自动进入全屏并闪烁高亮标记（1.6秒动画）；后端新增Idea.externalSource.linkNotes数组（externalLinkNoteSchema含x/y/content/user/timestamps）；Comment模型添加externalLinkNote元数据（noteId/x/y）实现双向关联；新增GET/POST /api/ideas/:id/link-notes API（optionalAuth/requireAuth）；ideas.controller.js新增listExternalLinkNotes和addExternalLinkNote函数（自动创建关联评论+通知）；client/src/api.ts添加ExternalLinkNote类型；client/src/pages/IdeaDetailPage.tsx新增完整链接小窗口UI（iframe、标记覆盖层、备注表单、备注列表、全屏状态管理、闪烁动画逻辑）；新增19个i18n键（linkWidgetTitle/linkWidgetSubtitle/linkWidgetFullscreenRequired等），更新翻译资源从391/389键→410/408键 |
+| 2026-03-07 | 3.5 | **新建创意流程拆分与模式化表单**：新增`NewIdeaTypePage`作为`/ideas/new`入口，先选择创建类型（business/feedback/external/daily）再进入`/ideas/new/:mode`；`NewIdeaPage`改为按模式控制字段显示与提交逻辑，避免互斥功能冲突（如Request AI review与Submit As Feedback）；feedback模式隐藏tags输入并固定标签为“反馈bug/网站建议”；external模式支持“Other/其他”双语选项，选择后可填写具体平台名，提交时具体平台名写入`externalSource.platform`并自动加入tags（不使用“其他”tag）；新增顶部“当前模式徽章 + 一键切换模式”条；同步更新中英翻译键。 |
 
 ---
 
