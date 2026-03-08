@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-07  
-> 版本: 3.5
+> 版本: 3.6
 > 
 > ---
 > 
@@ -78,7 +78,7 @@ ideahub/
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
 │   │   │   └── UserHoverCard.tsx     # 用户卡片
 │   │   │
-│   │   ├── pages/                    # 页面组件（21个）
+│   │   ├── pages/                    # 页面组件（22个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -124,7 +124,7 @@ ideahub/
     │   │   ├── db.js                 # MongoDB连接
     │   │   └── passport.js           # 认证策略
     │   │
-    │   ├── models/                   # 数据模型（9个）
+    │   ├── models/                   # 数据模型（19个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── Comment.js
@@ -135,13 +135,13 @@ ideahub/
     │   │   ├── OtpToken.js
     │   │   └── AiJob.js
     │   │
-    │   ├── controllers/              # 控制器（10个）
-    │   ├── routes/                   # 路由（11个）
-    │   ├── middleware/               # 中间件（3个）
+    │   ├── controllers/              # 控制器（15个）
+    │   ├── routes/                   # 路由（15个）
+    │   ├── middleware/               # 中间件（5个）
     │   ├── schemas/                  # 验证模式（2个）
     │   ├── services/                 # 业务服务（4个）
-    │   ├── workers/                  # 后台任务（1个）
-    │   └── utils/                    # 工具（5个）
+    │   ├── workers/                  # 后台任务（2个）
+    │   └── utils/                    # 工具（6个）
     │
     └── package.json                  # 依赖管理
 ```
@@ -244,6 +244,10 @@ i18n.use(initReactI18next).init({
 apiFetch<T>(url: string, options?: RequestInit): Promise<T>
 // 自动添加Authorization header
 // 统一错误处理
+
+apiUploadImage(file: File, scope?: "idea" | "comment" | "leaderboard" | "annotation")
+// multipart/form-data 上传内容图片
+// 服务端统一大小与格式校验
 ```
 
 ---
@@ -485,7 +489,7 @@ return <>{children}</>;
 ##### `NewIdeaPage.tsx`
 **功能**: 按模式创建新创意（v3.5重构）  
 **关联文件**:
-- `api.ts` - 提交创意
+- `api.ts` - 提交创意与图片上传（`apiUploadImage`）
 - `utils/localIdeas.ts` - 本地私密创意存储
 - `utils/platformConfig.ts` - 外部平台配置
 - `App.tsx` - 模式路由（`/ideas/new/:mode`）
@@ -509,6 +513,8 @@ return <>{children}</>;
 **功能**:
 - 创建服务器创意（公开/未列出）
 - 创建本地创意（私密）
+- 支持本地图片上传（idea场景），单图大小限制5MB，最多8张
+- 上传后支持预览和单张移除，提交时写入`imageUrls`
 - business模式可请求AI评审
 - external模式支持URL自动检测和内容自动抓取
 - 顶部新增“当前模式徽章 + 一键切换模式”条
@@ -537,9 +543,9 @@ return <>{children}</>;
 ---
 
 ##### `IdeaDetailPage.tsx`
-**功能**: 创意详情页，最复杂的页面，包含完整评论嵌套回复系统和外部链接备注窗口  
+**功能**: 创意详情页，最复杂的页面，包含完整评论嵌套回复系统、截图标注窗口和多处图片上传  
 **关联文件**:
-- `api.ts` - 获取创意、点赞、收藏、评论、回复、兴趣表达、外部链接备注
+- `api.ts` - 获取创意、点赞、收藏、评论、回复、兴趣表达、外部链接备注、图片上传
 - `authContext.tsx` - 用户状态
 - `UserHoverCard.tsx` - 作者信息卡片
 - `utils/localIdeas.ts` - 本地创意操作
@@ -550,17 +556,18 @@ return <>{children}</>;
 - **⭐ 外部来源信息** [v3.3新增]:
   - 如果有externalSource: {平台图标} {平台名} · [查看原帖](链接) · 原作者: {名称}
   - 如果没有: by {用户名} · 时间
-- **⭐ 外部链接备注窗口（Linked Content Window）** [v3.4新增]:
+- **⭐ 外部链接备注窗口（Linked Content Window）** [v3.6增强]:
   - 仅当创意包含外部链接（externalSource.url）时显示
   - iframe嵌入外部网站预览（360px高度）
   - 全屏模式按钮、直接访问网站按钮
-  - 全屏模式下的备注功能（非全屏时显示提示："进入全屏模式以查看和添加位置备注"）
-  - 位置备注标记（紫色编号圆圈，显示在iframe覆盖层）
-  - 备注列表（显示坐标、内容、作者、时间）
-  - 点击备注标记高亮显示对应项
+  - 全屏模式下的截图标注工作流：先截取屏幕，再填写备注并保存
+  - 右侧半透明标注面板（仅此处展示列表），按从上到下排序
+  - 标注面板支持拖拽位置，并通过API持久化`panelY`
+  - 点击标注项可高亮对应标注
   - 从评论区跳转时自动进入全屏并闪烁高亮标记（1.6秒黄色ring+pulse动画）
 - AI评审结果（可行性、盈利潜力）
 - 互动统计（浏览、点赞、评论、收藏）
+- 创意图片展示（`idea.imageUrls`）
 - **⭐ 评论列表（包含嵌套回复和链接备注跳转）** [v3.1/v3.4增强]:
   - 顶级评论显示
   - 回复计数和展开按钮
@@ -573,15 +580,18 @@ return <>{children}</>;
 - 点赞/取消点赞
 - 收藏/取消收藏
 - 发表评论（成为回复时自动展开回复列表）
-- **⭐ 外部链接备注系统** [v3.4新增]:
-  - 全屏模式下点击"Annotation Mode"按钮开启备注模式
-  - 在iframe预览上点击放置黄色临时标记
-  - 输入备注内容（最多500字符）
-  - 保存后生成紫色编号标记（使用百分比坐标x/y: 0-100%）
+- **⭐ 外部链接备注系统（截图版）** [v3.6增强]:
+  - 全屏模式下点击"Annotation Mode"开启标注
+  - 先截图（浏览器屏幕捕获），再填写备注内容（最多500字符）
+  - 保存后生成标注项，并同步图片+备注到评论区
+  - 右侧标注面板支持拖拽排序和位置持久化
   - 备注自动同步为评论（含externalLinkNote元数据）
   - 评论中的"跳转到备注"链接可回到窗口并闪烁高亮
   - 退出全屏自动清除备注模式和待添加标记
-  - 坐标定位在全屏模式下稳定（最小化响应式影响）
+  - 通过`screenshotUrl`保存截图，通过`panelY`保存面板位置
+- **⭐ 评论/回复图片上传** [v3.6新增]:
+  - 评论和回复支持本地图片上传，单图大小限制5MB，最多8张
+  - 上传后可预览和移除，提交后在评论区渲染图片
 - **⭐ 评论回复系统** [v3.1新增]:
   - 在任何评论上点击"💬 回复"
   - 输入回复内容（缩进显示，视觉区分）
@@ -697,12 +707,14 @@ return <>{children}</>;
 ##### `LeaderboardDetailPage.tsx`
 **功能**: 排行榜详情页  
 **关联文件**:
-- `api.ts` - 获取排行榜、提名创意、投票、删除提名
+- `api.ts` - 获取排行榜、提名创意、投票、删除提名、图片上传
 - `authContext.tsx` - 用户状态
 
 **功能**:
 - 显示排行榜信息
 - 提名新创意
+- 提名时支持本地图片上传（leaderboard场景），单图大小限制5MB，最多8张
+- 提名列表渲染图片（`imageUrls`）
 - 创意排序（最新/多数投票/点赞/收藏）
 - 删除提名（自己的或管理员）
 - 收藏排行榜
@@ -870,7 +882,7 @@ return <>{children}</>;
 **功能**: 英文翻译资源  
 **使用**: 所有页面和组件  
 **模块数**: 13个  
-**翻译键**: 377个 (v3.0) → 381个 (v3.2) → 391个 (v3.3) → 410个 (v3.4) 
+**翻译键**: 540个（v3.6）
 
 **模块结构**:
 ```json
@@ -878,7 +890,7 @@ return <>{children}</>;
   "common": {...},        // 16键 - 通用词汇
   "nav": {...},           // 9键 - 导航
   "auth": {...},          // 76键 - 认证
-  "idea": {...},          // 76键 - 创意 [v3.4新增19个: linkWidget相关]
+  "idea": {...},          // 创意（含外链窗口、截图标注、图片上传相关文案）
   "comment": {...},       // 10键 - 评论 [v3.4新增1个: jumpToLinkNote]
   "aiReview": {...},      // 5键 - AI评审
   "admin": {...},         // 50键 - 管理
@@ -922,7 +934,7 @@ return <>{children}</>;
 #### `client/src/locales/zh.json`
 **功能**: 中文翻译资源  
 **结构**: 与en.json完全对应  
-**翻译键**: 375个 (v3.0) → 379个 (v3.2) → 389个 (v3.3) → 408个 (v3.4)
+**翻译键**: 540个（v3.6）
 
 ---
 
@@ -1006,10 +1018,10 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/models/`
-**9个数据模型**:
+**19个数据模型**（核心如下）:
 - `User.js` - 用户（邮箱、用户名、角色、密码哈希）
-- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审、外部来源、链接备注）
-- `Comment.js` - 评论（支持回复、外部链接备注关联）
+- `Idea.js` - 创意（标题、内容、可见性、标签、AI评审、外部来源、链接备注、imageUrls）
+- `Comment.js` - 评论（支持回复、外部链接备注关联、imageUrls）
 - `Like.js` - 点赞
 - `Bookmark.js` - 收藏
 - `Notification.js` - 通知
@@ -1020,11 +1032,11 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/controllers/`
-**10个控制器**:
+**15个控制器**（核心如下）:
 - `auth.controller.js` - 登录、注册
 - `authOtp.controller.js` - 邮箱验证码
-- `ideas.controller.js` - 创意CRUD、外部链接备注
-- `ideaInteractions.controller.js` - 点赞、评论、收藏
+- `ideas.controller.js` - 创意CRUD、外部链接备注、标注面板位置更新
+- `ideaInteractions.controller.js` - 点赞、评论、收藏（含评论图片）
 - `interest.controller.js` - 公司兴趣
 - `notifications.controller.js` - 通知
 - `aiReview.controller.js` - AI评审
@@ -1035,7 +1047,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/routes/`
-**11个路由模块**:
+**15个路由模块**:
 - `health.routes.js` - 健康检查
 - `auth.routes.js` - 认证
 - `authOtp.routes.js` - OTP验证
@@ -1047,6 +1059,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `aiJobs.routes.js` - AI任务
 - `admin.routes.js` - 管理
 - `scraper.routes.js` - 外部内容抓取
+- `uploads.routes.js` - 内容图片上传
 
 ---
 
@@ -1054,6 +1067,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `auth.js` - 认证中间件（requireAuth, requireRole）
 - `error.js` - 错误处理中间件
 - `validate.js` - 请求验证中间件
+- `upload.js` - 图片上传中间件（头像/内容图片、格式与大小限制）
 
 ---
 
@@ -1146,10 +1160,10 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-01 | 3.0 | **全局用户搜索功能**：在UserProfilePage顶部添加全局用户搜索栏，支持按用户名搜索全平台用户；实时显示搜索结果（头像、昵称、用户名），点击跳转到用户主页；新增2个i18n键，更新翻译资源从375/373键→377/375键 |
 | 2026-03-05 | 3.1 | **评论回复嵌套系统和通知优化**：修改Comment模型添加parentCommentId和replyCount字段；IdeaDetailPage支持评论回复（展开/收起、自动展开、嵌套显示）；NotificationsPage添加Replies tab分离回复通知；NotificationsDropdown菜单项添加Replies选项，修正System/Replies的计数逻辑；后端API新增POST /ideas/:id/comments支持parentCommentId、GET /ideas/:id/comments/:commentId/replies；验证模式添加parentCommentId字段；新增i18n键（tabReplies、reply），翻译资源保持377/375键 |
 | 2026-03-05 | 3.2 | **账号注销功能**：在UserProfilePage添加"Delete Account"按钮（仅自己的资料页显示）；确认对话框警示操作不可撤销；后端新增DELETE /api/users/:id接口，删除用户及关联数据；删除成功后清除token并重定向登录页；新增4个i18n键（deleteAccount、deleteAccountConfirm、deleteAccountWarning、deleteAccountButton、accountDeleted），更新翻译资源从377/375键→381/379键 |
-| 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增10个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 | 2026-03-06 | 3.3 | **外部来源导入功能**：支持从其他平台（贴吧、知乎、Twitter等）导入创意；新增Idea.externalSource字段（platform/url/originalAuthor/sourceCreatedAt）；新增platformConfig.ts工具（12个预设平台+图标+URL自动检测）；NewIdeaPage/EditIdeaPage添加外部来源表单（平台下拉选择、URL自动检测、平台图标）；IdeaDetailPage/HomePage显示外部来源标签并支持跳转原帖；后端新增scraper.controller.js+scraper.routes.js，使用axios+cheerio实现智能内容抓取（OpenGraph/Twitter Cards/多重选择器）；新增POST /api/scraper/fetch API（需登录）；安装axios+cheerio依赖；新增14个i18n键（selectPlatform/platformDetected/autoFetch/autoFetchSuccess等），更新翻译资源从381/379键→391/389键 |
 | 2026-03-07 | 3.4 | **外部链接备注窗口（Linked Content Window）**：支持在创意的外部链接中添加位置备注和评价；在IdeaDetailPage添加链接小窗口（iframe嵌入预览+全屏模式）；仅在全屏模式下允许查看和添加位置备注（最小化响应式布局影响）；位置备注使用百分比坐标（x/y 0-100%）；备注自动同步到评论区并附带跳转链接；评论中点击"跳转到备注"自动进入全屏并闪烁高亮标记（1.6秒动画）；后端新增Idea.externalSource.linkNotes数组（externalLinkNoteSchema含x/y/content/user/timestamps）；Comment模型添加externalLinkNote元数据（noteId/x/y）实现双向关联；新增GET/POST /api/ideas/:id/link-notes API（optionalAuth/requireAuth）；ideas.controller.js新增listExternalLinkNotes和addExternalLinkNote函数（自动创建关联评论+通知）；client/src/api.ts添加ExternalLinkNote类型；client/src/pages/IdeaDetailPage.tsx新增完整链接小窗口UI（iframe、标记覆盖层、备注表单、备注列表、全屏状态管理、闪烁动画逻辑）；新增19个i18n键（linkWidgetTitle/linkWidgetSubtitle/linkWidgetFullscreenRequired等），更新翻译资源从391/389键→410/408键 |
 | 2026-03-07 | 3.5 | **新建创意流程拆分与模式化表单**：新增`NewIdeaTypePage`作为`/ideas/new`入口，先选择创建类型（business/feedback/external/daily）再进入`/ideas/new/:mode`；`NewIdeaPage`改为按模式控制字段显示与提交逻辑，避免互斥功能冲突（如Request AI review与Submit As Feedback）；feedback模式隐藏tags输入并固定标签为“反馈bug/网站建议”；external模式支持“Other/其他”双语选项，选择后可填写具体平台名，提交时具体平台名写入`externalSource.platform`并自动加入tags（不使用“其他”tag）；新增顶部“当前模式徽章 + 一键切换模式”条；同步更新中英翻译键。 |
+| 2026-03-07 | 3.6 | **截图标注与统一图片上传系统**：外链标注升级为“截图+备注”流程（全屏下先捕获屏幕再保存标注），标注数据新增`screenshotUrl`和`panelY`；全屏标注列表精简为“仅右侧半透明面板展示”，支持拖拽并通过`PATCH /api/ideas/:id/link-notes/:noteId/position`持久化位置；标注保存后继续同步到评论区，评论可展示截图。新增统一内容图片上传接口`POST /api/uploads/image`（`uploads.routes.js`），上传中间件重构为头像/内容双通道并统一5MB限制（`middleware/upload.js`）。`Idea/Comment/LeaderboardPost`新增`imageUrls`字段，创意创建/编辑、评论/回复、排行榜提名均支持图片上传与渲染；`api.ts`新增`apiUploadImage`封装；`IdeaDetailPage/NewIdeaPage/LeaderboardDetailPage`补齐前端上传交互与预览；中英文翻译资源新增截图标注文案，键总数更新到540/540。 |
 
 ---
 
