@@ -14,6 +14,14 @@ function isValidId(id) {
   return mongoose.isValidObjectId(id);
 }
 
+function normalizeImageUrls(input, limit = 8) {
+  if (!input || !Array.isArray(input)) return [];
+  return input
+    .map((item) => String(item || "").trim())
+    .filter((item) => item && /^https?:\/\//i.test(item))
+    .slice(0, limit);
+}
+
 async function getIdeaOr404(id, req, res) {
   if (!isValidId(id)) {
     invalidId("Invalid idea id");
@@ -153,7 +161,7 @@ async function listComments(req, res, next) {
 async function addComment(req, res, next) {
   try {
     const { id } = req.params;
-    const { content, parentCommentId } = req.body;
+    const { content, imageUrls, parentCommentId } = req.body;
 
     const idea = await getIdeaOr404(id, req, res);
 
@@ -223,6 +231,7 @@ async function addComment(req, res, next) {
       idea: idea._id,
       author: req.user._id,
       content: String(content).trim(),
+      imageUrls: normalizeImageUrls(imageUrls),
       mentions: mentionedUserIds,
       parentCommentId: parentCommentId || null,
     });

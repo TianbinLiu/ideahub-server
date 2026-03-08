@@ -4,13 +4,27 @@ const { invalidId, unauthorized } = require("../utils/http");
 const { createNotification } = require("../services/notification.service");
 const mongoose = require("mongoose");
 
+function normalizeImageUrls(input, limit = 8) {
+  if (!input || !Array.isArray(input)) return [];
+  return input
+    .map((item) => String(item || "").trim())
+    .filter((item) => item && /^https?:\/\//i.test(item))
+    .slice(0, limit);
+}
+
 async function createPost(req, res, next) {
   try {
     if (!req.user) return unauthorized("Login required");
-    const { title, body, tagsKey } = req.body;
+    const { title, body, tagsKey, imageUrls } = req.body;
     if (!tagsKey) return invalidId("tagsKey required");
     if (!title || !body) return invalidId("title and body required");
-    const post = await LeaderboardPost.create({ title, body, tagsKey, author: req.user._id });
+    const post = await LeaderboardPost.create({
+      title,
+      body,
+      imageUrls: normalizeImageUrls(imageUrls),
+      tagsKey,
+      author: req.user._id,
+    });
     const populated = await LeaderboardPost.findById(post._id).populate("author", "_id username role").lean();
     res.json({ ok: true, post: populated });
   } catch (err) {

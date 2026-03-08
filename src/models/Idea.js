@@ -25,6 +25,8 @@ const externalLinkNoteSchema = new mongoose.Schema(
     x: { type: Number, min: 0, max: 100, required: true },
     y: { type: Number, min: 0, max: 100, required: true },
     content: { type: String, required: true, trim: true, maxlength: 500 },
+    screenshotUrl: { type: String, default: "" },
+    panelY: { type: Number, min: 0, default: 0 },
   },
   { timestamps: true }
 );
@@ -34,6 +36,7 @@ const ideaSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true, maxlength: 120 },
     summary: { type: String, default: "", trim: true, maxlength: 300 },
     content: { type: String, default: "" },
+    imageUrls: { type: [String], default: [] },
 
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
 

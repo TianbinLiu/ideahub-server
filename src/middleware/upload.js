@@ -1,46 +1,66 @@
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
-// 确保uploads目录存在
-const uploadDir = path.join(__dirname, '../../uploads/avatars');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+const ALLOWED_MIMES = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"];
+const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
-// 配置存储
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    // 生成唯一文件名：userId-timestamp-随机数.扩展名
-    const userId = req.user._id || req.user.id;
-    const timestamp = Date.now();
-    const random = Math.floor(Math.random() * 10000);
-    const ext = path.extname(file.originalname);
-    cb(null, `${userId}-${timestamp}-${random}${ext}`);
-  }
-});
+function createStorage(subDir, namePrefixResolver) {
+  const uploadDir = path.join(__dirname, `../../uploads/${subDir}`);
+  ensureDir(uploadDir);
 
-// 文件过滤器：只允许图片
+  return multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+      const prefix = namePrefixResolver(req);
+      const timestamp = Date.now();
+      const random = Math.floor(Math.random() * 10000);
+      const ext = path.extname(file.originalname);
+      cb(null, `${prefix}-${timestamp}-${random}${ext}`);
+    },
+  });
+}
+
 const fileFilter = (req, file, cb) => {
-  const allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
-  
-  if (allowedMimes.includes(file.mimetype)) {
+  if (ALLOWED_MIMES.includes(file.mimetype)) {
     cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'), false);
+    return;
   }
+  cb(new Error("Only image files are allowed (jpeg, jpg, png, gif, webp)"), false);
 };
 
-// 创建multer实例
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
-  }
+function createImageUpload(storage) {
+  return multer({
+    storage,
+    fileFilter,
+    limits: {
+      fileSize: MAX_IMAGE_SIZE_BYTES,
+    },
+  });
+}
+
+const avatarStorage = createStorage("avatars", (req) => {
+  return (req.user?._id || req.user?.id || "user").toString();
 });
 
-module.exports = { upload };
+const contentImageStorage = createStorage("content-images", (req) => {
+  return (req.user?._id || req.user?.id || "user").toString();
+});
+
+const upload = createImageUpload(avatarStorage);
+const contentImageUpload = createImageUpload(contentImageStorage);
+
+module.exports = {
+  upload,
+  contentImageUpload,
+  ALLOWED_MIMES,
+  MAX_IMAGE_SIZE_BYTES,
+};

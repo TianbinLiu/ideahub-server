@@ -57,6 +57,7 @@ const {
   listMyIdeas,
   listExternalLinkNotes,
   addExternalLinkNote,
+  updateExternalLinkNotePosition,
 } = require("../controllers/ideas.controller");
 
 const {
@@ -100,6 +101,7 @@ router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
 
 router.get("/:id/link-notes", optionalAuth, listExternalLinkNotes);
 router.post("/:id/link-notes", requireAuth, addExternalLinkNote);
+router.patch("/:id/link-notes/:noteId/position", requireAuth, updateExternalLinkNotePosition);
 
 router.post("/:id/ai-review", requireAuth, requestAiReview);
 

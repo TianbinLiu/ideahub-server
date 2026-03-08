@@ -31,6 +31,7 @@ const tagRankRoutes = require("./routes/tagRank.routes");
 const usersRoutes = require("./routes/users.routes");
 const messagesRoutes = require("./routes/messages.routes");
 const scraperRoutes = require("./routes/scraper.routes");
+const uploadsRoutes = require("./routes/uploads.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
@@ -64,6 +65,7 @@ app.use("/api/tag-rank", tagRankRoutes);
 app.use("/api/users", usersRoutes);
 app.use("/api/messages", messagesRoutes);
 app.use("/api/scraper", scraperRoutes);
+app.use("/api/uploads", uploadsRoutes);
 
 app.use(notFound);
 app.use(errorHandler);

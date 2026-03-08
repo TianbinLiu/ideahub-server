@@ -39,6 +39,14 @@ function isValidUrl(url) {
   }
 }
 
+function normalizeImageUrls(input, limit = 8) {
+  if (!input || !Array.isArray(input)) return [];
+  return input
+    .map((item) => String(item || "").trim())
+    .filter((item) => item && /^https?:\/\//i.test(item))
+    .slice(0, limit);
+}
+
 function validateExternalSource(externalSource) {
   if (!externalSource) return null;
   
@@ -78,9 +86,9 @@ function validateExternalSource(externalSource) {
 }
 
 function normalizeLinkNoteInput(payload = {}) {
-  const { x, y, content } = payload;
-  const noteX = Number(x);
-  const noteY = Number(y);
+  const { x, y, content, screenshotUrl, panelY } = payload;
+  const noteX = x === undefined || x === null ? 0 : Number(x);
+  const noteY = y === undefined || y === null ? 0 : Number(y);
 
   if (!Number.isFinite(noteX) || noteX < 0 || noteX > 100) {
     throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "x must be a number between 0 and 100." });
@@ -97,10 +105,22 @@ function normalizeLinkNoteInput(payload = {}) {
     throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "content is too long (max 500 chars)." });
   }
 
+  const screenshot = String(screenshotUrl || "").trim();
+  if (screenshot && !/^https?:\/\//i.test(screenshot)) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "screenshotUrl must be a valid URL." });
+  }
+
+  const notePanelY = panelY === undefined || panelY === null ? 0 : Number(panelY);
+  if (!Number.isFinite(notePanelY) || notePanelY < 0) {
+    throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "panelY must be a non-negative number." });
+  }
+
   return {
     x: noteX,
     y: noteY,
     content: text,
+    screenshotUrl: screenshot,
+    panelY: notePanelY,
   };
 }
 
@@ -111,7 +131,7 @@ function normalizeLinkNoteInput(payload = {}) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { title, summary, content, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
+    const { title, summary, content, imageUrls, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -174,6 +194,7 @@ async function createIdea(req, res, next) {
       title: title.trim(),
       summary: summary || "",
       content: content || "",
+      imageUrls: normalizeImageUrls(imageUrls),
       author: req.user._id,
       tags: feedbackTags,
       visibility: visibility || "public",
@@ -370,7 +391,7 @@ async function updateIdea(req, res, next) {
     }
 
 
-    const { title, summary, content, tags, visibility, isMonetizable, licenseType } = req.body;
+    const { title, summary, content, imageUrls, tags, visibility, isMonetizable, licenseType } = req.body;
 
     if (title !== undefined) {
       if (!String(title).trim()) {
@@ -405,6 +426,7 @@ async function updateIdea(req, res, next) {
     }
     
     if (tags !== undefined) idea.tags = toStringArray(tags);
+    if (imageUrls !== undefined) idea.imageUrls = normalizeImageUrls(imageUrls);
     if (visibility !== undefined) idea.visibility = visibility;
     if (isMonetizable !== undefined) idea.isMonetizable = Boolean(isMonetizable);
     if (licenseType !== undefined) idea.licenseType = String(licenseType);
@@ -489,6 +511,8 @@ async function listExternalLinkNotes(req, res, next) {
       _id: note._id,
       x: note.x,
       y: note.y,
+      screenshotUrl: note.screenshotUrl || "",
+      panelY: Number(note.panelY || 0),
       content: note.content,
       createdAt: note.createdAt,
       updatedAt: note.updatedAt,
@@ -547,6 +571,7 @@ async function addExternalLinkNote(req, res, next) {
       idea: idea._id,
       author: req.user._id,
       content: noteData.content,
+      imageUrls: noteData.screenshotUrl ? [noteData.screenshotUrl] : [],
       parentCommentId: null,
       externalLinkNote: {
         noteId: latest?._id,
@@ -586,6 +611,45 @@ async function addExternalLinkNote(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/ideas/:id/link-notes/:noteId/position
+ * Update right-side panel Y position for one annotation
+ */
+async function updateExternalLinkNotePosition(req, res, next) {
+  try {
+    const { id, noteId } = req.params;
+    if (!isValidId(id) || !isValidId(noteId)) {
+      invalidId("Invalid id");
+    }
+
+    const panelY = Number(req.body?.panelY);
+    if (!Number.isFinite(panelY) || panelY < 0) {
+      throw new AppError({ code: "INVALID_LINK_NOTE", status: 400, message: "panelY must be a non-negative number." });
+    }
+
+    const idea = await Idea.findById(id);
+    if (!idea) {
+      notFound("Idea not found");
+    }
+    if (!canReadIdea(idea, req.user)) {
+      forbidden("Forbidden");
+    }
+
+    const notes = idea.externalSource?.linkNotes || [];
+    const note = notes.find((item) => String(item._id) === String(noteId));
+    if (!note) {
+      notFound("Annotation not found");
+    }
+
+    note.panelY = panelY;
+    await idea.save();
+
+    res.json({ ok: true, noteId, panelY });
+  } catch (err) {
+    next(err);
+  }
+}
+
 
 
 
@@ -616,4 +680,5 @@ module.exports = {
   suggestTitles,
   listExternalLinkNotes,
   addExternalLinkNote,
+  updateExternalLinkNotePosition,
 };
