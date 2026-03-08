@@ -8,7 +8,11 @@ router.post("/image", requireAuth, contentImageUpload.single("image"), async (re
       return res.status(400).json({ ok: false, message: "No file uploaded" });
     }
 
-    const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
+    const forwardedProto = req.headers["x-forwarded-proto"];
+    const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
+    const host = req.get("host");
+    const requestBaseUrl = `${protocol}://${host}`;
+    const baseUrl = process.env.API_URL || requestBaseUrl;
     const imageUrl = `${baseUrl}/uploads/content-images/${req.file.filename}`;
 
     res.json({

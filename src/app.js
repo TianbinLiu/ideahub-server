@@ -35,6 +35,7 @@ const uploadsRoutes = require("./routes/uploads.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
+app.set("trust proxy", 1);
 
 app.use(cors());
 app.use(express.json());
