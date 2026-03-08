@@ -19,18 +19,6 @@ const statsSchema = new mongoose.Schema(
   { _id: false }
 );
 
-const externalLinkNoteSchema = new mongoose.Schema(
-  {
-    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-    x: { type: Number, min: 0, max: 100, required: true },
-    y: { type: Number, min: 0, max: 100, required: true },
-    content: { type: String, required: true, trim: true, maxlength: 500 },
-    screenshotUrl: { type: String, default: "" },
-    panelY: { type: Number, min: 0, default: 0 },
-  },
-  { timestamps: true }
-);
-
 const ideaSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -73,7 +61,6 @@ const ideaSchema = new mongoose.Schema(
       url: { type: String },        // link to original post
       originalAuthor: { type: String },  // author name from original platform
       sourceCreatedAt: { type: Date },   // when original post was created
-      linkNotes: { type: [externalLinkNoteSchema], default: [] },
       _id: false
     },
 

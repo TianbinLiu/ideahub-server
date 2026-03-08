@@ -55,9 +55,6 @@ const {
   updateIdea,
   deleteIdea,
   listMyIdeas,
-  listExternalLinkNotes,
-  addExternalLinkNote,
-  updateExternalLinkNotePosition,
 } = require("../controllers/ideas.controller");
 
 const {
@@ -100,10 +97,6 @@ router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), ad
 router.get("/:id/comments/:commentId/replies", optionalAuth, listCommentReplies);
 router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
 router.delete("/:id/comments/:commentId", requireAuth, deleteComment);
-
-router.get("/:id/link-notes", optionalAuth, listExternalLinkNotes);
-router.post("/:id/link-notes", requireAuth, addExternalLinkNote);
-router.patch("/:id/link-notes/:noteId/position", requireAuth, updateExternalLinkNotePosition);
 
 router.post("/:id/ai-review", requireAuth, requestAiReview);
 

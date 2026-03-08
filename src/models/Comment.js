@@ -11,12 +11,6 @@ const commentSchema = new mongoose.Schema(
     likesCount: { type: Number, default: 0 },
     parentCommentId: { type: mongoose.Schema.Types.ObjectId, ref: "Comment", default: null, index: true },
     replyCount: { type: Number, default: 0 },
-    externalLinkNote: {
-      noteId: { type: mongoose.Schema.Types.ObjectId },
-      x: { type: Number, min: 0, max: 100 },
-      y: { type: Number, min: 0, max: 100 },
-      _id: false,
-    },
   },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );
