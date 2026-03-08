@@ -360,6 +360,51 @@ async function likeComment(req, res, next) {
 }
 
 /**
+ * DELETE /api/ideas/:id/comments/:commentId
+ * Delete own comment (or admin). If top-level comment, remove its direct replies too.
+ */
+async function deleteComment(req, res, next) {
+  try {
+    const { id, commentId } = req.params;
+    const idea = await getIdeaOr404(id, req, res);
+
+    const comment = await Comment.findOne({ _id: commentId, idea: idea._id });
+    if (!comment) {
+      notFound("Comment not found");
+    }
+
+    const isAuthor = String(comment.author) === String(req.user._id);
+    const isAdmin = req.user?.role === "admin";
+    if (!isAuthor && !isAdmin) {
+      forbidden("Only the comment author or admin can delete this comment");
+    }
+
+    const parentCommentId = comment.parentCommentId ? String(comment.parentCommentId) : null;
+
+    if (parentCommentId) {
+      await Comment.deleteOne({ _id: comment._id });
+      await Comment.findByIdAndUpdate(parentCommentId, { $inc: { replyCount: -1 } });
+    } else {
+      const directReplies = await Comment.find({ parentCommentId: comment._id }).select("_id").lean();
+      const idsToDelete = [comment._id, ...directReplies.map((r) => r._id)];
+      await Comment.deleteMany({ _id: { $in: idsToDelete } });
+
+      idea.stats.commentCount = Math.max((idea.stats.commentCount || 0) - 1, 0);
+      await idea.save();
+    }
+
+    res.json({
+      ok: true,
+      deletedId: String(comment._id),
+      parentCommentId,
+      commentCount: idea.stats.commentCount || 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
  * GET /api/ideas/:id/comments/:commentId/replies
  * 获取某个评论的回复
  */
@@ -387,4 +432,4 @@ async function listCommentReplies(req, res, next) {
   }
 }
 
-module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment, listCommentReplies };
+module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment, deleteComment, listCommentReplies };

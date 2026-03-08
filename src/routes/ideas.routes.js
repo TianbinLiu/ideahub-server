@@ -66,6 +66,7 @@ const {
   listComments,
   addComment,
   likeComment,
+  deleteComment,
   listCommentReplies,
 } = require("../controllers/ideaInteractions.controller");
 
@@ -98,6 +99,7 @@ router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), addComment);
 router.get("/:id/comments/:commentId/replies", optionalAuth, listCommentReplies);
 router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
+router.delete("/:id/comments/:commentId", requireAuth, deleteComment);
 
 router.get("/:id/link-notes", optionalAuth, listExternalLinkNotes);
 router.post("/:id/link-notes", requireAuth, addExternalLinkNote);
