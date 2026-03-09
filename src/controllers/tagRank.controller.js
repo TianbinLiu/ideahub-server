@@ -13,7 +13,7 @@ const CACHE_TTL = Number(process.env.TAG_RANK_CACHE_TTL_SECONDS) || 30;
 function normalizeTags(tags) {
   if (!tags) return [];
   if (Array.isArray(tags)) return tags.map(String).map(s => s.trim()).filter(Boolean).map(s=>s.toLowerCase()).sort();
-  return String(tags).split(",").map(s => s.trim()).filter(Boolean).map(s=>s.toLowerCase()).sort();
+  return String(tags).split(/[,，]/).map(s => s.trim()).filter(Boolean).map(s=>s.toLowerCase()).sort();
 }
 
 async function getRank(req, res, next) {

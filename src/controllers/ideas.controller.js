@@ -215,16 +215,13 @@ async function listIdeas(req, res, next) {
 
     if (q) {
       // If q contains commas or spaces, treat as tag combination
-      if (q.includes(",") || q.includes(" ")) {
-        const tags = q.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+      if (q.includes(",") || q.includes("，") || q.includes(" ")) {
+        const tags = q.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
         if (tags.length === 1) {
-          filter.tags = { $regex: `^${escapeRegex(tags[0])}$`, $options: "i" };
+          filter.tags = new RegExp(`^${escapeRegex(tags[0])}$`, "i");
         } else if (tags.length > 1) {
           filter.tags = {
-            $all: tags.map((tag) => ({
-              $regex: `^${escapeRegex(tag)}$`,
-              $options: "i",
-            })),
+            $all: tags.map((tag) => new RegExp(`^${escapeRegex(tag)}$`, "i")),
           };
         }
       } else {
