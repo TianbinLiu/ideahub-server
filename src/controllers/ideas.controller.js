@@ -45,6 +45,10 @@ function normalizeImageUrls(input, limit = 8) {
     .slice(0, limit);
 }
 
+function escapeRegex(input) {
+  return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function validateExternalSource(externalSource) {
   if (!externalSource) return null;
   
@@ -214,14 +218,20 @@ async function listIdeas(req, res, next) {
       if (q.includes(",") || q.includes(" ")) {
         const tags = q.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
         if (tags.length === 1) {
-          filter.tags = tags[0];
+          filter.tags = { $regex: `^${escapeRegex(tags[0])}$`, $options: "i" };
         } else if (tags.length > 1) {
-          filter.tags = { $all: tags };
+          filter.tags = {
+            $all: tags.map((tag) => ({
+              $regex: `^${escapeRegex(tag)}$`,
+              $options: "i",
+            })),
+          };
         }
       } else {
         // single token: match either tag or text
-        const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
-        filter.$or = [{ title: re }, { summary: re }, { content: re }, { tags: q }];
+        const re = new RegExp(escapeRegex(q), "i");
+        const exactTagRe = new RegExp(`^${escapeRegex(q)}$`, "i");
+        filter.$or = [{ title: re }, { summary: re }, { content: re }, { tags: exactTagRe }];
       }
     }
 
