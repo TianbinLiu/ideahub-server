@@ -489,6 +489,7 @@ async function fetchExternalContent(req, res, next) {
     const bilibiliId = extractBilibiliVideoId(parsedUrl);
     if (bilibiliId) {
       try {
+        // Fetch video info
         const apiRes = await axios.get("https://api.bilibili.com/x/web-interface/view", {
           params: bilibiliId,
           timeout: 15000,
@@ -503,16 +504,28 @@ async function fetchExternalContent(req, res, next) {
         if (data?.title) {
           coverImageUrl = normalizeHttpUrl(data?.pic);
           
-          // Extract tags from data.tags array (contains actual video tags)
-          console.log('[BiliBili API Debug] data.tags:', JSON.stringify(data.tags));
-          console.log('[BiliBili API Debug] data.tname:', data.tname);
-          
-          const videoTags = Array.isArray(data.tags) 
-            ? data.tags.map(t => t.tag_name || t.name).filter(Boolean)
-            : [];
+          // Fetch tags from separate API
+          let videoTags = [];
+          try {
+            const tagRes = await axios.get("https://api.bilibili.com/x/tag/archive/tags", {
+              params: bilibiliId,
+              timeout: 10000,
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                Referer: "https://www.bilibili.com/",
+              },
+            });
+            
+            if (tagRes?.data?.code === 0 && Array.isArray(tagRes.data.data)) {
+              videoTags = tagRes.data.data.map(t => t.tag_name).filter(Boolean);
+              console.log('[BiliBili Tags API] Successfully fetched tags:', videoTags);
+            }
+          } catch (tagErr) {
+            console.log('[BiliBili Tags API] Failed to fetch tags:', tagErr.message);
+          }
           
           const tags = toTagArray([data.tname, ...videoTags, "bilibili"]);
-          console.log('[BiliBili API Debug] Final tags sent to frontend:', tags);
           
           return res.json({
             ok: true,
