@@ -56,7 +56,8 @@ function detectPlatformName(hostname) {
 function normalizeHttpUrl(raw) {
   const val = String(raw || "").trim();
   if (!val) return "";
-  if (/^https?:\/\//i.test(val)) return val;
+  if (/^http:\/\//i.test(val)) return val.replace(/^http:\/\//i, "https://");
+  if (/^https:\/\//i.test(val)) return val;
   if (val.startsWith("//")) return `https:${val}`;
   return "";
 }
