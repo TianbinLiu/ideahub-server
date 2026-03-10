@@ -1,4 +1,7 @@
 const mongoose = require("mongoose");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const Idea = require("../models/Idea");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
@@ -93,6 +96,69 @@ async function resolveBilibiliCover(rawUrl) {
   });
 
   return normalizeHttpUrl(apiRes?.data?.data?.pic);
+}
+
+function isHotlinkProneCoverUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const host = String(parsed.hostname || "").toLowerCase();
+    return host.includes("hdslb.com") || host.includes("bilibili.com");
+  } catch {
+    return false;
+  }
+}
+
+function buildRequestBaseUrl(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
+  const host = req.get("host");
+  return `${protocol}://${host}`;
+}
+
+async function saveRemoteImageToLocal(sourceUrl, publicBaseUrl) {
+  const normalizedSourceUrl = normalizeHttpUrl(sourceUrl);
+  if (!normalizedSourceUrl) return "";
+
+  const parsed = new URL(normalizedSourceUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) return "";
+
+  const axios = (await import("axios")).default;
+  const response = await axios.get(normalizedSourceUrl, {
+    responseType: "arraybuffer",
+    timeout: 20000,
+    maxRedirects: 5,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Referer: `${parsed.protocol}//${parsed.host}/`,
+    },
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
+  const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("image/")) return "";
+
+  const extMap = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+  };
+  const ext = extMap[contentType] || ".jpg";
+
+  const bytes = Buffer.from(response.data);
+  const MAX_BYTES = 5 * 1024 * 1024;
+  if (bytes.length > MAX_BYTES) return "";
+
+  const uploadDir = path.join(__dirname, "../../uploads/content-images");
+  fs.mkdirSync(uploadDir, { recursive: true });
+
+  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+  const fullPath = path.join(uploadDir, filename);
+  fs.writeFileSync(fullPath, bytes);
+
+  return `${publicBaseUrl}/uploads/content-images/${filename}`;
 }
 
 function validateExternalSource(externalSource) {
@@ -289,22 +355,33 @@ async function listIdeas(req, res, next) {
       Idea.countDocuments(filter),
     ]);
 
-    // Best-effort backfill for older BiliBili items without coverImageUrl.
-    const missingCoverItems = items.filter(
-      (item) => !String(item.coverImageUrl || "").trim() && item?.externalSource?.url
-    );
+    // Best-effort backfill/localization for old BiliBili items.
+    const backfillCoverItems = items.filter((item) => {
+      const currentCover = String(item.coverImageUrl || "").trim();
+      const hasExternalSourceUrl = Boolean(item?.externalSource?.url);
+      return (hasExternalSourceUrl && !currentCover) || isHotlinkProneCoverUrl(currentCover);
+    });
 
-    if (missingCoverItems.length > 0) {
+    if (backfillCoverItems.length > 0) {
+      const requestBaseUrl = buildRequestBaseUrl(req);
+      const publicBaseUrl = process.env.API_URL || requestBaseUrl;
+
       await Promise.all(
-        missingCoverItems.slice(0, 6).map(async (item) => {
+        backfillCoverItems.slice(0, 6).map(async (item) => {
           try {
-            const cover = await resolveBilibiliCover(item.externalSource.url);
-            if (!cover) return;
+            const existingCover = normalizeHttpUrl(item.coverImageUrl);
+            const resolvedCover = existingCover || await resolveBilibiliCover(item.externalSource?.url);
+            if (!resolvedCover) return;
 
-            item.coverImageUrl = cover;
+            const localizedCover = await saveRemoteImageToLocal(resolvedCover, publicBaseUrl).catch(() => "");
+            const finalCover = localizedCover || resolvedCover;
+
+            if (!finalCover || finalCover === item.coverImageUrl) return;
+            item.coverImageUrl = finalCover;
+
             await Idea.updateOne(
-              { _id: item._id, $or: [{ coverImageUrl: { $exists: false } }, { coverImageUrl: "" }] },
-              { $set: { coverImageUrl: cover } }
+              { _id: item._id },
+              { $set: { coverImageUrl: finalCover } }
             );
           } catch {
             // Ignore backfill failures to avoid impacting list API stability.
