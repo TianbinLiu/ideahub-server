@@ -41,8 +41,13 @@ app.use(cors());
 app.use(express.json());
 app.use(helmet());
 
-// 提供静态文件服务 - 上传的文件
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+// 提供静态文件服务 - 上传的文件（配置CORS）
+app.use('/uploads', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+}, express.static(path.join(__dirname, '../uploads')));
 
 
 // ✅ passport
