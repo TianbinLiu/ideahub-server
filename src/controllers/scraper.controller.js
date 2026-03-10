@@ -502,7 +502,18 @@ async function fetchExternalContent(req, res, next) {
         const data = apiRes?.data?.data;
         if (data?.title) {
           coverImageUrl = normalizeHttpUrl(data?.pic);
-          const tags = toTagArray([data.tname, data.tag, "bilibili"]);
+          
+          // Extract tags from data.tags array (contains actual video tags)
+          console.log('[BiliBili API Debug] data.tags:', JSON.stringify(data.tags));
+          console.log('[BiliBili API Debug] data.tname:', data.tname);
+          
+          const videoTags = Array.isArray(data.tags) 
+            ? data.tags.map(t => t.tag_name || t.name).filter(Boolean)
+            : [];
+          
+          const tags = toTagArray([data.tname, ...videoTags, "bilibili"]);
+          console.log('[BiliBili API Debug] Final tags sent to frontend:', tags);
+          
           return res.json({
             ok: true,
             success: true,
