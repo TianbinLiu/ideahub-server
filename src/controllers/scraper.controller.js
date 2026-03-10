@@ -349,12 +349,17 @@ async function listAdminCrawlHistory(req, res, next) {
 async function startAdminCrawl(req, res, next) {
   let job = null;
   try {
+    console.log('[Admin Crawl] Request received from user:', req.user?._id, 'role:', req.user?.role);
+    console.log('[Admin Crawl] Request body:', JSON.stringify(req.body, null, 2));
+    
     const platform = String(req.body.platform || "").trim().toLowerCase();
     const minViews = Math.max(parseInt(req.body.minViews || "0", 10) || 0, 0);
     const keywords = normalizeKeywordList(req.body.keywords || req.body.keyword || "热门");
     const limit = Math.min(Math.max(parseInt(req.body.limit || "20", 10), 1), 100);
     const maxPages = Math.min(Math.max(parseInt(req.body.maxPages || "5", 10), 1), 20);
     const maxCreate = Math.min(Math.max(parseInt(req.body.maxCreate || String(limit), 10), 1), 100);
+
+    console.log('[Admin Crawl] Parsed params:', { platform, minViews, keywords, limit, maxPages, maxCreate });
 
     if (!platform) {
       throw new AppError({ code: "INVALID_PLATFORM", status: 400, message: "platform is required" });
@@ -364,6 +369,7 @@ async function startAdminCrawl(req, res, next) {
       throw new AppError({ code: "INVALID_PLATFORM", status: 400, message: `Unsupported platform: ${platform}` });
     }
 
+    console.log('[Admin Crawl] Creating scraper job...');
     job = await ScraperJob.create({
       platform,
       triggeredBy: req.user._id,
@@ -377,10 +383,16 @@ async function startAdminCrawl(req, res, next) {
       },
       startedAt: new Date(),
     });
+    console.log('[Admin Crawl] Job created:', job._id);
 
+    console.log('[Admin Crawl] Fetching BiliBili candidates...');
     const candidates = await fetchBilibiliCandidates({ keywords, limit, maxPages });
+    console.log('[Admin Crawl] Found', candidates.length, 'candidates');
+    
     const requestBaseUrl = buildRequestBaseUrl(req);
     const publicBaseUrl = process.env.API_URL || requestBaseUrl;
+    
+    console.log('[Admin Crawl] Creating ideas from candidates...');
     const { created, skipped } = await createIdeasFromCandidates({
       candidates,
       minViews,
@@ -388,6 +400,7 @@ async function startAdminCrawl(req, res, next) {
       maxCreate,
       publicBaseUrl,
     });
+    console.log('[Admin Crawl] Created', created.length, 'ideas');
 
     const createdIdeaIds = created.map((x) => x._id).filter(Boolean);
     await ScraperJob.findByIdAndUpdate(job._id, {
@@ -407,6 +420,7 @@ async function startAdminCrawl(req, res, next) {
       },
     });
 
+    console.log('[Admin Crawl] Job completed successfully');
     res.json({
       ok: true,
       jobId: job._id,
@@ -421,6 +435,9 @@ async function startAdminCrawl(req, res, next) {
       created,
     });
   } catch (err) {
+    console.error('[Admin Crawl] Error:', err.message);
+    console.error('[Admin Crawl] Stack:', err.stack);
+    
     if (job?._id) {
       await ScraperJob.findByIdAndUpdate(job._id, {
         $set: {
