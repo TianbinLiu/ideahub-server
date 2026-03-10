@@ -502,6 +502,7 @@ async function fetchExternalContent(req, res, next) {
         const data = apiRes?.data?.data;
         if (data?.title) {
           coverImageUrl = normalizeHttpUrl(data?.pic);
+          const tags = toTagArray([data.tname, data.tag, "bilibili"]);
           return res.json({
             ok: true,
             success: true,
@@ -510,6 +511,7 @@ async function fetchExternalContent(req, res, next) {
             author: String(data?.owner?.name || "").trim().slice(0, 100),
             platform: "BiliBili",
             coverImageUrl: shouldSuggestCover ? coverImageUrl : "",
+            tags: tags,
             message: "Content fetched successfully",
           });
         }
