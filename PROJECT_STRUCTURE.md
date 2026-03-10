@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-08  
-> 版本: 3.7
+> 最后更新: 2026-03-10  
+> 版本: 3.8
 > 
 > ---
 > 
@@ -78,7 +78,7 @@ ideahub/
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
 │   │   │   └── UserHoverCard.tsx     # 用户卡片
 │   │   │
-│   │   ├── pages/                    # 页面组件（22个）
+│   │   ├── pages/                    # 页面组件（24个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -94,12 +94,15 @@ ideahub/
 │   │   │   ├── CompanyPage.tsx
 │   │   │   ├── LeaderboardDetailPage.tsx
 │   │   │   ├── TagRankPage.tsx
+│   │   │   ├── TagMapPage.tsx
 │   │   │   ├── NotificationsPage.tsx
 │   │   │   ├── MessagesPage.tsx
 │   │   │   ├── MessageRequestsPage.tsx
 │   │   │   ├── BlacklistPage.tsx
 │   │   │   ├── AdminUsersPage.tsx
-│   │   │   └── FeedbackAdminPage.tsx
+│   │   │   ├── FeedbackAdminPage.tsx
+│   │   │   ├── DocsAdminPage.tsx
+│   │   │   └── AdminScraperPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
 │   │   │   ├── en.json               # 英文翻译（持续更新）
@@ -124,7 +127,7 @@ ideahub/
     │   │   ├── db.js                 # MongoDB连接
     │   │   └── passport.js           # 认证策略
     │   │
-    │   ├── models/                   # 数据模型（19个）
+    │   ├── models/                   # 数据模型（20个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── Comment.js
@@ -133,10 +136,11 @@ ideahub/
     │   │   ├── Notification.js
     │   │   ├── Interest.js
     │   │   ├── OtpToken.js
-    │   │   └── AiJob.js
+    │   │   ├── AiJob.js
+    │   │   └── ScraperJob.js
     │   │
     │   ├── controllers/              # 控制器（15个）
-    │   ├── routes/                   # 路由（15个）
+    │   ├── routes/                   # 路由（16个）
     │   ├── middleware/               # 中间件（5个）
     │   ├── schemas/                  # 验证模式（2个）
     │   ├── services/                 # 业务服务（4个）
@@ -196,6 +200,7 @@ i18n.use(initReactI18next).init({
 /company → CompanyPage
 /leaderboard/:id → LeaderboardDetailPage
 /tag-rank → TagRankPage
+/tag-map → TagMapPage
 /notifications → NotificationsPage
 /messages → MessagesPage
 /message-requests → MessageRequestsPage
@@ -203,6 +208,7 @@ i18n.use(initReactI18next).init({
 /admin/users → AdminUsersPage
 /feedback → FeedbackAdminPage
 /admin/docs → DocsAdminPage
+/admin/scraper → AdminScraperPage
 ```
 
 ---
@@ -1065,57 +1071,45 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/controllers/scraper.controller.js`
-**功能**: 外部网页内容抓取控制器  
-**路由**: POST `/api/scraper/fetch`（需认证）  
-**依赖**: axios, cheerio, AppError
+**功能**: 外部内容抓取与批量导入控制器  
+**路由**: `POST /api/scraper/fetch`、`POST /api/scraper/import-cover`、`GET /api/scraper/admin/platforms`、`GET /api/scraper/admin/history`、`POST /api/scraper/admin/crawl`  
+**依赖**: axios, cheerio, AppError, Idea, ScraperJob
 
-**核心函数**: `fetchExternalContent(req, res, next)`  
-**请求参数**:
-```json
-{ "url": "https://example.com/post/12345" }
-```
+**核心能力**:
+1. **Auto Fetch** (`/api/scraper/fetch`)
+   - 支持通用网页 OpenGraph/Twitter/JSON-LD 提取（title/content/author/platform）
+   - BiliBili 视频优先走官方接口 `x/web-interface/view`（更稳定）
+   - 返回 `coverImageUrl`（视频平台场景）用于新建页自动预填封面
 
-**响应格式**:
-```json
-{
-  "title": "帖子标题",
-  "content": "帖子内容（前1000字符）",
-  "author": "原作者名"
-}
-```
+2. **封面转存** (`/api/scraper/import-cover`)
+   - 下载远程封面图片并保存到本地 `/uploads/content-images`
+   - 解决外链图片（如 B站）防盗链导致的新建页预览失败
 
-**智能提取策略**:
-1. **标题提取**（优先级）:
-   - `<meta property="og:title">` (OpenGraph)
-   - `<meta name="twitter:title">` (Twitter Cards)
-   - `<title>` (HTML标题)
-   - `<h1>` (页面主标题)
+3. **管理员批量导入** (`/api/scraper/admin/crawl`)
+   - 平台：当前支持 BiliBili
+   - 条件：关键词、最小播放量、抓取页数、扫描上限、创建上限
+   - 自动创建 Quote External Website 的 Idea（填充 externalSource）
 
-2. **内容提取**（优先级）:
-   - `<article>` (语义化文章标签)
-   - `<meta property="og:description">` (OpenGraph描述)
-   - `.content, .post-content, .article-content` (常见内容类)
-   - `<main>` (主内容区域)
-   - `<body>` (兜底提取前1000字符)
-
-3. **作者提取**（优先级）:
-   - `<meta name="author">`
-   - `<meta property="article:author">`
-   - `.author, .post-author, .username` (常见作者类)
+4. **任务历史** (`/api/scraper/admin/history`)
+   - 按时间倒序返回批量导入任务
+   - 包含参数快照、执行状态、统计结果、错误信息
 
 **错误处理**:
-- 无效URL → 400错误
-- 网络请求失败 → 500错误 + 原始错误信息
-- HTML解析失败 → 返回空字符串
-
-**CORS解决方案**: 后端代理抓取，绕过浏览器同源策略
+- URL/平台/参数非法 → 400
+- 第三方请求失败 → 回退策略 + 错误信息
+- 批量导入异常 → 任务状态写入 `failed` 并记录 errorMessage
 
 ---
 
 #### `server/src/routes/scraper.routes.js`
-**功能**: 外部内容抓取路由配置  
-**端点**: POST `/api/scraper/fetch`  
-**中间件**: requireAuth（需登录）  
+**功能**: 外部内容抓取与批量导入路由配置  
+**端点**:
+- `POST /api/scraper/fetch`（需登录）
+- `POST /api/scraper/import-cover`（需登录）
+- `GET /api/scraper/admin/platforms`（管理员）
+- `GET /api/scraper/admin/history`（管理员）
+- `POST /api/scraper/admin/crawl`（管理员）
+**中间件**: `requireAuth`、`requireRole("admin")`  
 **关联文件**: `scraper.controller.js`
 
 ---
@@ -1150,6 +1144,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-07 | 3.5 | **新建创意流程拆分与模式化表单**：新增`NewIdeaTypePage`作为`/ideas/new`入口，先选择创建类型（business/feedback/external/daily）再进入`/ideas/new/:mode`；`NewIdeaPage`改为按模式控制字段显示与提交逻辑，避免互斥功能冲突（如Request AI review与Submit As Feedback）；feedback模式隐藏tags输入并固定标签为“反馈bug/网站建议”；external模式支持“Other/其他”双语选项，选择后可填写具体平台名，提交时具体平台名写入`externalSource.platform`并自动加入tags（不使用“其他”tag）；新增顶部“当前模式徽章 + 一键切换模式”条；同步更新中英翻译键。 |
 | 2026-03-07 | 3.6 | **截图标注与统一图片上传系统**：外链标注升级为“截图+备注”流程（全屏下先捕获屏幕再保存标注），标注数据新增`screenshotUrl`和`panelY`；全屏标注列表精简为“仅右侧半透明面板展示”，支持拖拽并通过`PATCH /api/ideas/:id/link-notes/:noteId/position`持久化位置；标注保存后继续同步到评论区，评论可展示截图。新增统一内容图片上传接口`POST /api/uploads/image`（`uploads.routes.js`），上传中间件重构为头像/内容双通道并统一5MB限制（`middleware/upload.js`）。`Idea/Comment/LeaderboardPost`新增`imageUrls`字段，创意创建/编辑、评论/回复、排行榜提名均支持图片上传与渲染；`api.ts`新增`apiUploadImage`封装；`IdeaDetailPage/NewIdeaPage/LeaderboardDetailPage`补齐前端上传交互与预览；中英文翻译资源新增截图标注文案，键总数更新到540/540。 |
 | 2026-03-08 | 3.7 | **下线 annotation 功能并清理后端**：`IdeaDetailPage`移除截图标注/跳转备注 UI，外链区域简化为来源卡片 + Open Website。后端删除 `GET/POST /api/ideas/:id/link-notes` 与 `PATCH /api/ideas/:id/link-notes/:noteId/position` 路由；`ideas.controller.js` 移除 link-note 相关控制器与输入校验；`Idea.externalSource` 删除 `linkNotes` 子结构；`Comment` 删除 `externalLinkNote` 字段；`client/src/api.ts` 删除 `ExternalLinkNote` 类型并移除 `apiUploadImage` 的 `annotation` scope。同步更新文档章节描述。 |
+| 2026-03-10 | 3.8 | **外部导入与封面能力增强**：新增 `TagMapPage` 与 `AdminScraperPage` 路由（`/tag-map`, `/admin/scraper`）；`scraper.controller.js` 扩展 BiliBili 批量导入、任务历史、封面转存与 Auto Fetch 平台/作者/封面返回；新增 `ScraperJob` 模型记录导入历史；`scraper.routes.js` 新增 `import-cover` 与 admin crawler/history API；`Idea` 新增 `coverImageUrl` 字段并在 `NewIdeaPage` 支持封面上传、Auto Fetch 预填与平台不在列表时自动切换 Other；`HomePage` 卡片支持半透明封面背景显示。 |
 
 ---
 
