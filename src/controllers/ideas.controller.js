@@ -49,6 +49,52 @@ function escapeRegex(input) {
   return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function normalizeHttpUrl(raw) {
+  const val = String(raw || "").trim();
+  if (!val) return "";
+  if (/^http:\/\//i.test(val)) return val.replace(/^http:\/\//i, "https://");
+  if (/^https:\/\//i.test(val)) return val;
+  if (val.startsWith("//")) return `https:${val}`;
+  return "";
+}
+
+function extractBilibiliVideoIdFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const host = String(parsed.hostname || "").toLowerCase();
+    if (!host.includes("bilibili.com") && !host.includes("b23.tv")) return null;
+
+    const path = String(parsed.pathname || "");
+    const bvidMatch = path.match(/\/video\/(BV[0-9A-Za-z]+)/i);
+    if (bvidMatch?.[1]) return { bvid: bvidMatch[1] };
+
+    const aidMatch = path.match(/\/video\/av(\d+)/i);
+    if (aidMatch?.[1]) return { aid: aidMatch[1] };
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveBilibiliCover(rawUrl) {
+  const id = extractBilibiliVideoIdFromUrl(rawUrl);
+  if (!id) return "";
+
+  const axios = (await import("axios")).default;
+  const apiRes = await axios.get("https://api.bilibili.com/x/web-interface/view", {
+    params: id,
+    timeout: 12000,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Referer: "https://www.bilibili.com/",
+    },
+  });
+
+  return normalizeHttpUrl(apiRes?.data?.data?.pic);
+}
+
 function validateExternalSource(externalSource) {
   if (!externalSource) return null;
   
@@ -242,6 +288,30 @@ async function listIdeas(req, res, next) {
         .lean(),
       Idea.countDocuments(filter),
     ]);
+
+    // Best-effort backfill for older BiliBili items without coverImageUrl.
+    const missingCoverItems = items.filter(
+      (item) => !String(item.coverImageUrl || "").trim() && item?.externalSource?.url
+    );
+
+    if (missingCoverItems.length > 0) {
+      await Promise.all(
+        missingCoverItems.slice(0, 6).map(async (item) => {
+          try {
+            const cover = await resolveBilibiliCover(item.externalSource.url);
+            if (!cover) return;
+
+            item.coverImageUrl = cover;
+            await Idea.updateOne(
+              { _id: item._id, $or: [{ coverImageUrl: { $exists: false } }, { coverImageUrl: "" }] },
+              { $set: { coverImageUrl: cover } }
+            );
+          } catch {
+            // Ignore backfill failures to avoid impacting list API stability.
+          }
+        })
+      );
+    }
 
     const totalPages = Math.max(Math.ceil(total / limit), 1);
 

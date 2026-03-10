@@ -65,6 +65,59 @@ function normalizeHttpUrl(raw) {
   return "";
 }
 
+function buildRequestBaseUrl(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
+  const host = req.get("host");
+  return `${protocol}://${host}`;
+}
+
+async function saveRemoteImageToLocal(sourceUrl, publicBaseUrl) {
+  const normalizedSourceUrl = normalizeHttpUrl(sourceUrl);
+  if (!normalizedSourceUrl) return "";
+
+  const parsed = new URL(normalizedSourceUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) return "";
+
+  const axios = (await import("axios")).default;
+  const response = await axios.get(normalizedSourceUrl, {
+    responseType: "arraybuffer",
+    timeout: 20000,
+    maxRedirects: 5,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Referer: `${parsed.protocol}//${parsed.host}/`,
+    },
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
+  const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("image/")) return "";
+
+  const extMap = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+  };
+  const ext = extMap[contentType] || ".jpg";
+
+  const bytes = Buffer.from(response.data);
+  const MAX_BYTES = 5 * 1024 * 1024;
+  if (bytes.length > MAX_BYTES) return "";
+
+  const uploadDir = path.join(__dirname, "../../uploads/content-images");
+  fs.mkdirSync(uploadDir, { recursive: true });
+
+  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+  const fullPath = path.join(uploadDir, filename);
+  fs.writeFileSync(fullPath, bytes);
+
+  return `${publicBaseUrl}/uploads/content-images/${filename}`;
+}
+
 async function importCoverImage(req, res, next) {
   try {
     const sourceUrl = normalizeHttpUrl(req.body?.url);
@@ -72,59 +125,14 @@ async function importCoverImage(req, res, next) {
       throw new AppError({ code: "INVALID_URL", status: 400, message: "Valid HTTP/HTTPS image URL is required" });
     }
 
-    const parsed = new URL(sourceUrl);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      throw new AppError({ code: "INVALID_URL", status: 400, message: "Only HTTP/HTTPS URLs are allowed" });
-    }
-
-    const axios = (await import("axios")).default;
-    const response = await axios.get(sourceUrl, {
-      responseType: "arraybuffer",
-      timeout: 20000,
-      maxRedirects: 5,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        Referer: `${parsed.protocol}//${parsed.host}/`,
-      },
-      validateStatus: (status) => status >= 200 && status < 400,
-    });
-
-    const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
-    if (!contentType.startsWith("image/")) {
-      throw new AppError({ code: "INVALID_IMAGE", status: 400, message: "Source URL is not an image" });
-    }
-
-    const extMap = {
-      "image/jpeg": ".jpg",
-      "image/jpg": ".jpg",
-      "image/png": ".png",
-      "image/gif": ".gif",
-      "image/webp": ".webp",
-    };
-    const ext = extMap[contentType] || ".jpg";
-
-    const bytes = Buffer.from(response.data);
-    const MAX_BYTES = 5 * 1024 * 1024;
-    if (bytes.length > MAX_BYTES) {
-      throw new AppError({ code: "FILE_TOO_LARGE", status: 400, message: "Image size must be <= 5MB" });
-    }
-
-    const uploadDir = path.join(__dirname, "../../uploads/content-images");
-    fs.mkdirSync(uploadDir, { recursive: true });
-
-    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
-    const fullPath = path.join(uploadDir, filename);
-    fs.writeFileSync(fullPath, bytes);
-
-    const forwardedProto = req.headers["x-forwarded-proto"];
-    const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
-    const host = req.get("host");
-    const requestBaseUrl = `${protocol}://${host}`;
+    const requestBaseUrl = buildRequestBaseUrl(req);
     const baseUrl = process.env.API_URL || requestBaseUrl;
-    const imageUrl = `${baseUrl}/uploads/content-images/${filename}`;
+    const imageUrl = await saveRemoteImageToLocal(sourceUrl, baseUrl);
+    if (!imageUrl) {
+      throw new AppError({ code: "INVALID_IMAGE", status: 400, message: "Source URL is not a supported image or exceeds limit" });
+    }
 
-    res.json({ ok: true, imageUrl, size: bytes.length, mimeType: contentType });
+    res.json({ ok: true, imageUrl });
   } catch (err) {
     next(err);
   }
@@ -226,6 +234,7 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
           tags: toTagArray([item.tag, item.typename, keyword, "bilibili"]),
           views: parseViewCount(item.play),
           author: stripHtml(item.author || ""),
+          coverImageUrl: normalizeHttpUrl(item.pic),
           sourceCreatedAt: item.pubdate ? new Date(item.pubdate * 1000) : undefined,
           summary: stripHtml(item.description || ""),
           keyword,
@@ -239,7 +248,7 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
   return candidates;
 }
 
-async function createIdeasFromCandidates({ candidates, minViews, adminUserId, maxCreate }) {
+async function createIdeasFromCandidates({ candidates, minViews, adminUserId, maxCreate, publicBaseUrl }) {
   const created = [];
   const safeMaxCreate = Math.min(Math.max(parseInt(maxCreate || "20", 10), 1), 100);
   const skipped = {
@@ -274,10 +283,21 @@ async function createIdeasFromCandidates({ candidates, minViews, adminUserId, ma
     const summary =
       item.summary || `Auto imported from BiliBili. Views: ${item.views || 0}. Source author: ${item.author || "unknown"}.`;
 
+    let resolvedCoverImageUrl = normalizeHttpUrl(item.coverImageUrl);
+    if (resolvedCoverImageUrl && publicBaseUrl) {
+      try {
+        const localCover = await saveRemoteImageToLocal(resolvedCoverImageUrl, publicBaseUrl);
+        if (localCover) resolvedCoverImageUrl = localCover;
+      } catch {
+        // keep original normalized URL as fallback
+      }
+    }
+
     const idea = await Idea.create({
       title: item.title.slice(0, 120),
       summary: summary.slice(0, 300),
       content: "",
+      coverImageUrl: resolvedCoverImageUrl || "",
       author: adminUserId,
       tags: item.tags,
       visibility: "public",
@@ -359,11 +379,14 @@ async function startAdminCrawl(req, res, next) {
     });
 
     const candidates = await fetchBilibiliCandidates({ keywords, limit, maxPages });
+    const requestBaseUrl = buildRequestBaseUrl(req);
+    const publicBaseUrl = process.env.API_URL || requestBaseUrl;
     const { created, skipped } = await createIdeasFromCandidates({
       candidates,
       minViews,
       adminUserId: req.user._id,
       maxCreate,
+      publicBaseUrl,
     });
 
     const createdIdeaIds = created.map((x) => x._id).filter(Boolean);
