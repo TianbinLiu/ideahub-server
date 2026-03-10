@@ -39,7 +39,9 @@ app.set("trust proxy", 1);
 
 app.use(cors());
 app.use(express.json());
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 
 // 提供静态文件服务 - 上传的文件（配置CORS）
 app.use('/uploads', (req, res, next) => {
