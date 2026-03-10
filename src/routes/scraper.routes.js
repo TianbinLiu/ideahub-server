@@ -18,7 +18,7 @@ router.post("/fetch", requireAuth, fetchExternalContent);
 
 /**
  * POST /api/scraper/import-cover
- * Download remote cover image and rehost under local uploads to avoid hotlink blocks
+ * Download remote cover image and rehost to Cloudinary to avoid hotlink blocks
  */
 router.post("/import-cover", requireAuth, importCoverImage);
 

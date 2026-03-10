@@ -6,9 +6,7 @@
 const AppError = require("../utils/AppError");
 const Idea = require("../models/Idea");
 const ScraperJob = require("../models/ScraperJob");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const { uploadToCloudinary } = require("../middleware/upload");
 
 const PLATFORM_CATALOG = [
   {
@@ -72,7 +70,7 @@ function buildRequestBaseUrl(req) {
   return `${protocol}://${host}`;
 }
 
-async function saveRemoteImageToLocal(sourceUrl, publicBaseUrl) {
+async function saveRemoteImageToCloudinary(sourceUrl) {
   const normalizedSourceUrl = normalizeHttpUrl(sourceUrl);
   if (!normalizedSourceUrl) return "";
 
@@ -99,11 +97,9 @@ async function saveRemoteImageToLocal(sourceUrl, publicBaseUrl) {
   const MAX_BYTES = 5 * 1024 * 1024;
   if (bytes.length > MAX_BYTES) return "";
 
-  // 上传到 Cloudinary
-  const { uploadToCloudinary } = require('../middleware/upload');
   const cloudinaryUrl = await uploadToCloudinary(
     bytes,
-    'cover-images',
+    "cover-images",
     `scraped-${Date.now()}`
   );
 
@@ -117,9 +113,7 @@ async function importCoverImage(req, res, next) {
       throw new AppError({ code: "INVALID_URL", status: 400, message: "Valid HTTP/HTTPS image URL is required" });
     }
 
-    const requestBaseUrl = buildRequestBaseUrl(req);
-    const baseUrl = process.env.API_URL || requestBaseUrl;
-    const imageUrl = await saveRemoteImageToLocal(sourceUrl, baseUrl);
+    const imageUrl = await saveRemoteImageToCloudinary(sourceUrl);
     if (!imageUrl) {
       throw new AppError({ code: "INVALID_IMAGE", status: 400, message: "Source URL is not a supported image or exceeds limit" });
     }
@@ -240,7 +234,7 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
   return candidates;
 }
 
-async function createIdeasFromCandidates({ candidates, minViews, adminUserId, maxCreate, publicBaseUrl }) {
+async function createIdeasFromCandidates({ candidates, minViews, adminUserId, maxCreate }) {
   const created = [];
   const safeMaxCreate = Math.min(Math.max(parseInt(maxCreate || "20", 10), 1), 100);
   const skipped = {
@@ -276,9 +270,9 @@ async function createIdeasFromCandidates({ candidates, minViews, adminUserId, ma
       item.summary || `Auto imported from BiliBili. Views: ${item.views || 0}. Source author: ${item.author || "unknown"}.`;
 
     let resolvedCoverImageUrl = normalizeHttpUrl(item.coverImageUrl);
-    if (resolvedCoverImageUrl && publicBaseUrl) {
+    if (resolvedCoverImageUrl) {
       try {
-        const localCover = await saveRemoteImageToLocal(resolvedCoverImageUrl, publicBaseUrl);
+        const localCover = await saveRemoteImageToCloudinary(resolvedCoverImageUrl);
         if (localCover) resolvedCoverImageUrl = localCover;
       } catch {
         // keep original normalized URL as fallback
@@ -381,16 +375,12 @@ async function startAdminCrawl(req, res, next) {
     const candidates = await fetchBilibiliCandidates({ keywords, limit, maxPages });
     console.log('[Admin Crawl] Found', candidates.length, 'candidates');
     
-    const requestBaseUrl = buildRequestBaseUrl(req);
-    const publicBaseUrl = process.env.API_URL || requestBaseUrl;
-    
     console.log('[Admin Crawl] Creating ideas from candidates...');
     const { created, skipped } = await createIdeasFromCandidates({
       candidates,
       minViews,
       adminUserId: req.user._id,
       maxCreate,
-      publicBaseUrl,
     });
     console.log('[Admin Crawl] Created', created.length, 'ideas');
 
