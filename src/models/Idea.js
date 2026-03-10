@@ -25,6 +25,7 @@ const ideaSchema = new mongoose.Schema(
     summary: { type: String, default: "", trim: true, maxlength: 300 },
     content: { type: String, default: "" },
     imageUrls: { type: [String], default: [] },
+    coverImageUrl: { type: String, default: "" },
 
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
 

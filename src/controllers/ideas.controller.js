@@ -94,7 +94,7 @@ function validateExternalSource(externalSource) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { title, summary, content, imageUrls, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
+    const { title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -158,6 +158,7 @@ async function createIdea(req, res, next) {
       summary: summary || "",
       content: content || "",
       imageUrls: normalizeImageUrls(imageUrls),
+      coverImageUrl: /^https?:\/\//i.test(String(coverImageUrl || "").trim()) ? String(coverImageUrl).trim() : "",
       author: req.user._id,
       tags: feedbackTags,
       visibility: visibility || "public",

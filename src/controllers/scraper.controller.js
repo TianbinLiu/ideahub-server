@@ -4,6 +4,309 @@
  */
 
 const AppError = require("../utils/AppError");
+const Idea = require("../models/Idea");
+const ScraperJob = require("../models/ScraperJob");
+
+const PLATFORM_CATALOG = [
+  {
+    id: "bilibili",
+    name: "BiliBili",
+    type: "video",
+    supportsViewThreshold: true,
+    status: "ready",
+  },
+];
+
+function normalizeKeywordList(raw) {
+  if (Array.isArray(raw)) {
+    return [...new Set(raw.map((x) => String(x || "").trim()).filter(Boolean))].slice(0, 20);
+  }
+
+  return [...new Set(
+    String(raw || "")
+      .split(/[\n,，|]+/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+  )].slice(0, 20);
+}
+
+function stripHtml(input) {
+  return String(input || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectPlatformName(hostname) {
+  const host = String(hostname || "").toLowerCase();
+  if (host.includes("bilibili.com") || host.includes("b23.tv")) return "BiliBili";
+  if (host.includes("youtube.com") || host.includes("youtu.be")) return "YouTube";
+  if (host.includes("facebook.com")) return "Facebook";
+  if (host.includes("twitter.com") || host.includes("x.com")) return "Twitter";
+  if (host.includes("instagram.com")) return "Instagram";
+  if (host.includes("tiktok.com")) return "TikTok";
+  if (host.includes("weibo.com")) return "微博";
+  return "";
+}
+
+function parseViewCount(raw) {
+  if (typeof raw === "number") return raw;
+  const text = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/,/g, "");
+  if (!text) return 0;
+
+  const value = parseFloat(text.replace(/[^\d.]/g, ""));
+  if (Number.isNaN(value)) return 0;
+
+  if (text.includes("亿")) return Math.round(value * 100000000);
+  if (text.includes("万")) return Math.round(value * 10000);
+  if (text.endsWith("k")) return Math.round(value * 1000);
+  if (text.endsWith("m")) return Math.round(value * 1000000);
+  if (text.endsWith("b")) return Math.round(value * 1000000000);
+  return Math.round(value);
+}
+
+function toTagArray(rawPieces) {
+  const all = rawPieces
+    .filter(Boolean)
+    .flatMap((piece) => String(piece).split(/[,，|/、\s]+/))
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+
+  return [...new Set(all)].slice(0, 8);
+}
+
+async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
+  const axios = (await import("axios")).default;
+  const safeLimit = Math.min(Math.max(parseInt(limit || "20", 10), 1), 100);
+  const safePages = Math.min(Math.max(parseInt(maxPages || "5", 10), 1), 20);
+  const candidates = [];
+  const seenUrls = new Set();
+  const terms = normalizeKeywordList(keywords);
+  const effectiveTerms = terms.length > 0 ? terms : ["热门"];
+
+  for (const keyword of effectiveTerms) {
+    for (let page = 1; page <= safePages && candidates.length < safeLimit; page += 1) {
+      const url = "https://api.bilibili.com/x/web-interface/search/type";
+      const res = await axios.get(url, {
+        params: {
+          search_type: "video",
+          keyword,
+          page,
+          order: "pubdate",
+        },
+        timeout: 15000,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          Referer: "https://www.bilibili.com/",
+        },
+      });
+
+      const items = res?.data?.data?.result || [];
+      if (!Array.isArray(items) || items.length === 0) break;
+
+      for (const item of items) {
+        const arcUrl = item.arcurl || (item.bvid ? `https://www.bilibili.com/video/${item.bvid}` : "");
+        if (!arcUrl || seenUrls.has(arcUrl)) continue;
+
+        seenUrls.add(arcUrl);
+        candidates.push({
+          url: arcUrl,
+          title: stripHtml(item.title || "Untitled video"),
+          tags: toTagArray([item.tag, item.typename, keyword, "bilibili"]),
+          views: parseViewCount(item.play),
+          author: stripHtml(item.author || ""),
+          sourceCreatedAt: item.pubdate ? new Date(item.pubdate * 1000) : undefined,
+          summary: stripHtml(item.description || ""),
+          keyword,
+        });
+
+        if (candidates.length >= safeLimit) break;
+      }
+    }
+  }
+
+  return candidates;
+}
+
+async function createIdeasFromCandidates({ candidates, minViews, adminUserId, maxCreate }) {
+  const created = [];
+  const safeMaxCreate = Math.min(Math.max(parseInt(maxCreate || "20", 10), 1), 100);
+  const skipped = {
+    belowThreshold: 0,
+    existing: 0,
+    invalid: 0,
+    overCreateLimit: 0,
+  };
+
+  for (const item of candidates) {
+    if (created.length >= safeMaxCreate) {
+      skipped.overCreateLimit += 1;
+      continue;
+    }
+
+    if (!item.url || !item.title) {
+      skipped.invalid += 1;
+      continue;
+    }
+
+    if ((item.views || 0) < minViews) {
+      skipped.belowThreshold += 1;
+      continue;
+    }
+
+    const exists = await Idea.exists({ "externalSource.url": item.url });
+    if (exists) {
+      skipped.existing += 1;
+      continue;
+    }
+
+    const summary =
+      item.summary || `Auto imported from BiliBili. Views: ${item.views || 0}. Source author: ${item.author || "unknown"}.`;
+
+    const idea = await Idea.create({
+      title: item.title.slice(0, 120),
+      summary: summary.slice(0, 300),
+      content: "",
+      author: adminUserId,
+      tags: item.tags,
+      visibility: "public",
+      isMonetizable: false,
+      licenseType: "default",
+      externalSource: {
+        platform: "BiliBili",
+        url: item.url,
+        originalAuthor: item.author || "",
+        sourceCreatedAt: item.sourceCreatedAt,
+      },
+    });
+
+    created.push({
+      _id: idea._id,
+      title: idea.title,
+      url: item.url,
+      views: item.views || 0,
+      tags: item.tags,
+    });
+  }
+
+  return { created, skipped };
+}
+
+async function listCrawlerPlatforms(req, res, next) {
+  try {
+    res.json({ ok: true, platforms: PLATFORM_CATALOG });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listAdminCrawlHistory(req, res, next) {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 100);
+    const jobs = await ScraperJob.find({})
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate("triggeredBy", "_id username role")
+      .lean();
+
+    res.json({ ok: true, jobs });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function startAdminCrawl(req, res, next) {
+  let job = null;
+  try {
+    const platform = String(req.body.platform || "").trim().toLowerCase();
+    const minViews = Math.max(parseInt(req.body.minViews || "0", 10) || 0, 0);
+    const keywords = normalizeKeywordList(req.body.keywords || req.body.keyword || "热门");
+    const limit = Math.min(Math.max(parseInt(req.body.limit || "20", 10), 1), 100);
+    const maxPages = Math.min(Math.max(parseInt(req.body.maxPages || "5", 10), 1), 20);
+    const maxCreate = Math.min(Math.max(parseInt(req.body.maxCreate || String(limit), 10), 1), 100);
+
+    if (!platform) {
+      throw new AppError({ code: "INVALID_PLATFORM", status: 400, message: "platform is required" });
+    }
+
+    if (platform !== "bilibili") {
+      throw new AppError({ code: "INVALID_PLATFORM", status: 400, message: `Unsupported platform: ${platform}` });
+    }
+
+    job = await ScraperJob.create({
+      platform,
+      triggeredBy: req.user._id,
+      status: "running",
+      params: {
+        keywords,
+        minViews,
+        limit,
+        maxPages,
+        maxCreate,
+      },
+      startedAt: new Date(),
+    });
+
+    const candidates = await fetchBilibiliCandidates({ keywords, limit, maxPages });
+    const { created, skipped } = await createIdeasFromCandidates({
+      candidates,
+      minViews,
+      adminUserId: req.user._id,
+      maxCreate,
+    });
+
+    const createdIdeaIds = created.map((x) => x._id).filter(Boolean);
+    await ScraperJob.findByIdAndUpdate(job._id, {
+      $set: {
+        status: "success",
+        finishedAt: new Date(),
+        createdIdeas: createdIdeaIds,
+        createdPreview: created.slice(0, 50),
+        stats: {
+          scanned: candidates.length,
+          createdCount: created.length,
+          skippedBelowThreshold: skipped.belowThreshold || 0,
+          skippedExisting: skipped.existing || 0,
+          skippedInvalid: skipped.invalid || 0,
+          skippedOverCreateLimit: skipped.overCreateLimit || 0,
+        },
+      },
+    });
+
+    res.json({
+      ok: true,
+      jobId: job._id,
+      platform,
+      keywords,
+      minViews,
+      maxPages,
+      maxCreate,
+      scanned: candidates.length,
+      createdCount: created.length,
+      skipped,
+      created,
+    });
+  } catch (err) {
+    if (job?._id) {
+      await ScraperJob.findByIdAndUpdate(job._id, {
+        $set: {
+          status: "failed",
+          finishedAt: new Date(),
+          errorMessage: String(err?.message || "Unknown crawler error").slice(0, 500),
+        },
+      }).catch(() => {});
+    }
+    next(err);
+  }
+}
 
 /**
  * POST /api/scraper/fetch
@@ -48,6 +351,7 @@ async function fetchExternalContent(req, res, next) {
     let title = "";
     let content = "";
     let author = "";
+    let platform = detectPlatformName(parsedUrl.hostname);
 
     // Dynamic import for ESM modules
     const axios = (await import("axios")).default;
@@ -55,6 +359,36 @@ async function fetchExternalContent(req, res, next) {
 
     function parseHtml(html) {
       const $ = cheerio.load(html);
+
+      // Try extracting author from JSON-LD first, then fallback to metas/selectors.
+      let jsonLdAuthor = "";
+      $("script[type='application/ld+json']").each((_, el) => {
+        if (jsonLdAuthor) return;
+        try {
+          const raw = $(el).text();
+          if (!raw) return;
+          const data = JSON.parse(raw);
+          const arr = Array.isArray(data) ? data : [data];
+          for (const item of arr) {
+            const a = item?.author;
+            if (!a) continue;
+            if (typeof a === "string") {
+              jsonLdAuthor = a;
+              break;
+            }
+            if (Array.isArray(a) && a[0]?.name) {
+              jsonLdAuthor = String(a[0].name);
+              break;
+            }
+            if (a?.name) {
+              jsonLdAuthor = String(a.name);
+              break;
+            }
+          }
+        } catch {
+          // ignore malformed json-ld
+        }
+      });
 
       const parsedTitle =
         $("meta[property='og:title']").attr("content") ||
@@ -77,16 +411,25 @@ async function fetchExternalContent(req, res, next) {
         "";
 
       const parsedAuthor =
+        jsonLdAuthor ||
         $("meta[name='author']").attr("content") ||
         $("meta[property='article:author']").attr("content") ||
+        $("meta[name='twitter:creator']").attr("content") ||
         $(".author").first().text() ||
         $(".post-author").first().text() ||
+        "";
+
+      const parsedPlatform =
+        $("meta[property='og:site_name']").attr("content") ||
+        $("meta[name='application-name']").attr("content") ||
+        detectPlatformName(parsedUrl.hostname) ||
         "";
 
       return {
         title: parsedTitle.trim().substring(0, 200),
         content: parsedContent.replace(/\s+/g, " ").trim().substring(0, 5000),
         author: parsedAuthor.trim().substring(0, 100),
+        platform: parsedPlatform.trim().substring(0, 100),
       };
     }
 
@@ -131,6 +474,7 @@ async function fetchExternalContent(req, res, next) {
           title = parsed.title;
           content = parsed.content;
           author = parsed.author;
+          platform = parsed.platform || platform;
 
           return res.json({
             ok: true,
@@ -138,6 +482,7 @@ async function fetchExternalContent(req, res, next) {
             title,
             content,
             author,
+            platform,
             message: "Content fetched successfully",
           });
         }
@@ -158,6 +503,7 @@ async function fetchExternalContent(req, res, next) {
       title: fallbackTitle,
       content: "",
       author: "",
+      platform,
       error: "Failed to fetch content. The site may block automated requests or require JavaScript.",
       message: "Please manually copy the content from the source.",
     });
@@ -169,4 +515,7 @@ async function fetchExternalContent(req, res, next) {
 
 module.exports = {
   fetchExternalContent,
+  listCrawlerPlatforms,
+  listAdminCrawlHistory,
+  startAdminCrawl,
 };
