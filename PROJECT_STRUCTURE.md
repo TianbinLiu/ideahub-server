@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-10  
-> 版本: 3.9
+> 版本: 4.0
 > 
 > ---
 > 
@@ -35,7 +35,7 @@
 - **前端**: React 18 + TypeScript + Vite + Tailwind CSS
 - **路由**: React Router v6
 - **国际化**: i18next + react-i18next（中英双语）
-- **后端**: Node.js + Express + MongoDB + Mongoose
+- **后端**: Node.js + Express + MongoDB + Mongoose + Cloudinary
 - **认证**: Passport.js (Local + OAuth)
 - **任务队列**: Bull + Redis
 - **网页抓取**: axios + cheerio
@@ -125,7 +125,8 @@ ideahub/
     │   │
     │   ├── config/                   # 配置
     │   │   ├── db.js                 # MongoDB连接
-    │   │   └── passport.js           # 认证策略
+    │   │   ├── passport.js           # 认证策略
+    │   │   └── cloudinary.js         # Cloudinary配置与启动校验
     │   │
     │   ├── models/                   # 数据模型（20个）
     │   │   ├── User.js
@@ -687,7 +688,7 @@ return <>{children}</>;
 
 ---
 
-#### 排行榜和通知页面组（3个）
+#### 排行榜和通知页面组（4个）
 
 ##### `TagRankPage.tsx`
 **功能**: 标签排行榜发现页  
@@ -701,6 +702,24 @@ return <>{children}</>;
 - 浏览现有排行榜（热门/最新）
 
 **国际化**: ✅ 完整支持（tagRank模块 15个键）
+
+---
+
+##### `TagMapPage.tsx`
+**功能**: 标签地图可视化页面（聚类 + 散点 + 下钻）  
+**关联文件**:
+- `api.ts` - 获取 ideas 数据并驱动地图渲染
+- `App.tsx` - 路由入口（`/tag-map`）
+
+**功能**:
+- 按时间窗口（7/30/90/180/365 天）过滤创意
+- 顶层按标签聚类展示，支持点击 cluster 下钻
+- 面包屑回退查看上层聚类
+- 点击 idea 小点跳转详情页
+- 桌面端：鼠标 hover 小点弹出 tooltip（显示标题 + tags）
+- 移动端：长按小点弹出 tooltip，抑制长按后的误触跳转
+
+**国际化**: ✅ 完整支持（tagMap模块）
 
 ---
 
@@ -1067,7 +1086,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `auth.js` - 认证中间件（requireAuth, requireRole）
 - `error.js` - 错误处理中间件
 - `validate.js` - 请求验证中间件
-- `upload.js` - 图片上传中间件（头像/内容图片、格式与大小限制）
+- `upload.js` - 图片上传中间件（内存上传 + Cloudinary转存、格式与大小限制）
 
 ---
 
@@ -1095,8 +1114,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
    - 返回 `tags` 数组（包含视频标签 + 分区名 + 平台名）
 
 2. **封面转存** (`/api/scraper/import-cover`)
-   - 下载远程封面图片并保存到本地 `/uploads/content-images`
-   - 解决外链图片（如 B站）防盗链导致的新建页预览失败
+  - 下载远程封面图片并转存到 Cloudinary（`ideahub/cover-images`）
+  - 解决外链图片（如 B站）防盗链与临时文件系统图片丢失问题
 
 3. **管理员批量导入** (`/api/scraper/admin/crawl`)
    - 平台：当前支持 BiliBili
@@ -1161,6 +1180,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-08 | 3.7 | **下线 annotation 功能并清理后端**：`IdeaDetailPage`移除截图标注/跳转备注 UI，外链区域简化为来源卡片 + Open Website。后端删除 `GET/POST /api/ideas/:id/link-notes` 与 `PATCH /api/ideas/:id/link-notes/:noteId/position` 路由；`ideas.controller.js` 移除 link-note 相关控制器与输入校验；`Idea.externalSource` 删除 `linkNotes` 子结构；`Comment` 删除 `externalLinkNote` 字段；`client/src/api.ts` 删除 `ExternalLinkNote` 类型并移除 `apiUploadImage` 的 `annotation` scope。同步更新文档章节描述。 |
 | 2026-03-10 | 3.8 | **外部导入与封面能力增强**：新增 `TagMapPage` 与 `AdminScraperPage` 路由（`/tag-map`, `/admin/scraper`）；`scraper.controller.js` 扩展 BiliBili 批量导入、任务历史、封面转存与 Auto Fetch 平台/作者/封面返回；新增 `ScraperJob` 模型记录导入历史；`scraper.routes.js` 新增 `import-cover` 与 admin crawler/history API；`Idea` 新增 `coverImageUrl` 字段并在 `NewIdeaPage` 支持封面上传、Auto Fetch 预填与平台不在列表时自动切换 Other；`HomePage` 卡片支持半透明封面背景显示。 |
 | 2026-03-10 | 3.9 | **BiliBili 标签抓取修复与 UI 层级优化**：修复 BiliBili 标签抓取功能，使用独立标签 API (`/x/tag/archive/tags`) 替代不返回标签的视频信息 API，解决标签自动填充失败问题；创建 `test-tags-api.js` 测试脚本验证 API 可用性；UserHoverCard 组件重构为 React Portal 渲染模式（`createPortal`），添加智能边界检测（防止超出视口），提升 z-index 至 99999，彻底解决被其他元素遮挡问题；IdeaDetailPage iframe 安全权限优化，移除 `allow-top-navigation` 防止自动劫持父窗口导航，保留 `allow-top-navigation-by-user-activation` 支持用户点击跳转；为 scraper 和 auth 中间件添加详细调试日志便于排查 412 错误；前端 AdminScraperPage 添加针对性错误提示（412/401/403）。 |
+| 2026-03-10 | 4.0 | **Cloudinary 持久化与 TagMap 交互升级**：后端图片链路统一迁移到 Cloudinary（`config/cloudinary.js` + `middleware/upload.js`），`me.routes.js`、`uploads.routes.js`、`ideas.controller.js`、`scraper.controller.js` 的头像/内容图/封面转存改为云端持久化；`index.js` 启动新增 Cloudinary 配置校验；补充 `server/.env.example` 云存储环境变量。`TagMapPage.tsx` 新增 idea 小点 tooltip，支持桌面端 hover 显示 tags、移动端长按显示并防止误触跳转。 |
 
 ---
 
