@@ -15,6 +15,7 @@ const fs = require("fs").promises;
 const path = require("path");
 const app = require("./app");
 const { connectDB } = require("./config/db");
+const { validateCloudinaryConfig } = require("./config/cloudinary");
 const TagLeaderboard = require("./models/TagLeaderboard");
 const LeaderboardPost = require("./models/LeaderboardPost");
 const TagVote = require("./models/TagVote");
@@ -59,6 +60,10 @@ async function syncProjectDocs() {
 async function start() {
   try {
     await syncProjectDocs();
+    
+    // 验证 Cloudinary 配置
+    validateCloudinaryConfig();
+    
     await connectDB();
     // Cleanup leaderboards with no nominations on startup
     try {

@@ -95,27 +95,19 @@ async function saveRemoteImageToLocal(sourceUrl, publicBaseUrl) {
   const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
   if (!contentType.startsWith("image/")) return "";
 
-  const extMap = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-  };
-  const ext = extMap[contentType] || ".jpg";
-
   const bytes = Buffer.from(response.data);
   const MAX_BYTES = 5 * 1024 * 1024;
   if (bytes.length > MAX_BYTES) return "";
 
-  const uploadDir = path.join(__dirname, "../../uploads/content-images");
-  fs.mkdirSync(uploadDir, { recursive: true });
+  // 上传到 Cloudinary
+  const { uploadToCloudinary } = require('../middleware/upload');
+  const cloudinaryUrl = await uploadToCloudinary(
+    bytes,
+    'cover-images',
+    `scraped-${Date.now()}`
+  );
 
-  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
-  const fullPath = path.join(uploadDir, filename);
-  fs.writeFileSync(fullPath, bytes);
-
-  return `${publicBaseUrl}/uploads/content-images/${filename}`;
+  return cloudinaryUrl;
 }
 
 async function importCoverImage(req, res, next) {

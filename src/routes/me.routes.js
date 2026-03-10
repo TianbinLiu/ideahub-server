@@ -57,9 +57,13 @@ router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, ne
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // 构建文件URL
-    const baseUrl = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
-    const avatarUrl = `${baseUrl}/uploads/avatars/${req.file.filename}`;
+    // 上传到 Cloudinary
+    const { uploadToCloudinary } = require('../middleware/upload');
+    const avatarUrl = await uploadToCloudinary(
+      req.file.buffer,
+      'avatars',
+      req.user._id.toString()
+    );
 
     // 更新用户头像
     const user = await User.findByIdAndUpdate(

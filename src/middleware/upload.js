@@ -1,33 +1,11 @@
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const { cloudinary } = require("../config/cloudinary");
 
 const ALLOWED_MIMES = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"];
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-function createStorage(subDir, namePrefixResolver) {
-  const uploadDir = path.join(__dirname, `../../uploads/${subDir}`);
-  ensureDir(uploadDir);
-
-  return multer.diskStorage({
-    destination: (req, file, cb) => {
-      cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-      const prefix = namePrefixResolver(req);
-      const timestamp = Date.now();
-      const random = Math.floor(Math.random() * 10000);
-      const ext = path.extname(file.originalname);
-      cb(null, `${prefix}-${timestamp}-${random}${ext}`);
-    },
-  });
-}
+// 使用内存存储，上传到 Cloudinary
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   if (ALLOWED_MIMES.includes(file.mimetype)) {
@@ -37,30 +15,51 @@ const fileFilter = (req, file, cb) => {
   cb(new Error("Only image files are allowed (jpeg, jpg, png, gif, webp)"), false);
 };
 
-function createImageUpload(storage) {
-  return multer({
-    storage,
-    fileFilter,
-    limits: {
-      fileSize: MAX_IMAGE_SIZE_BYTES,
-    },
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    fileSize: MAX_IMAGE_SIZE_BYTES,
+  },
+});
+
+/**
+ * 上传图片到 Cloudinary
+ * @param {Buffer} buffer - 图片 buffer
+ * @param {string} folder - Cloudinary 文件夹名称（avatars 或 content-images）
+ * @param {string} userId - 用户 ID（用于生成唯一文件名）
+ * @returns {Promise<string>} Cloudinary URL
+ */
+async function uploadToCloudinary(buffer, folder, userId) {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: `ideahub/${folder}`, // Cloudinary 文件夹路径
+        public_id: `${userId}-${Date.now()}`, // 唯一文件名
+        resource_type: 'image',
+        transformation: [
+          { quality: 'auto', fetch_format: 'auto' }, // 自动优化
+        ],
+      },
+      (error, result) => {
+        if (error) {
+          console.error('[Cloudinary] Upload error:', error);
+          reject(error);
+        } else {
+          console.log('[Cloudinary] Upload success:', result.secure_url);
+          resolve(result.secure_url);
+        }
+      }
+    );
+    
+    // 将 buffer 写入上传流
+    uploadStream.end(buffer);
   });
 }
 
-const avatarStorage = createStorage("avatars", (req) => {
-  return (req.user?._id || req.user?.id || "user").toString();
-});
-
-const contentImageStorage = createStorage("content-images", (req) => {
-  return (req.user?._id || req.user?.id || "user").toString();
-});
-
-const upload = createImageUpload(avatarStorage);
-const contentImageUpload = createImageUpload(contentImageStorage);
-
 module.exports = {
   upload,
-  contentImageUpload,
+  uploadToCloudinary,
   ALLOWED_MIMES,
   MAX_IMAGE_SIZE_BYTES,
 };

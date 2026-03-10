@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-10  
-> 版本: 3.8
+> 版本: 3.9
 > 
 > ---
 > 
@@ -323,17 +323,26 @@ return <>{children}</>;
 
 #### `client/src/components/UserHoverCard.tsx`
 **功能**: 用户悬浮卡片，显示用户预览信息  
-**使用页面**: `IdeaDetailPage.tsx`, `NotificationsPage.tsx`  
+**使用页面**: `IdeaDetailPage.tsx`, `NotificationsPage.tsx`, `HomePage.tsx`  
 **关联文件**:
-- `api.ts` - 获取用户信息
+- `api.ts` - 获取用户信息、关注操作、点赞点踩、黑名单操作
 - `locales/*.json` - profile模块翻译
 
 **显示内容**:
-- 用户头像
-- 用户名
-- 简介
+- 用户头像和基本信息（用户名、简介）
 - 粉丝/关注数
-- 创意数
+- 信誉徽章（热门用户/恶意用户）
+- 点赞/点踩数量
+- 关注/取消关注按钮
+- 私信按钮（支持黑名单状态检测）
+- 黑名单切换按钮
+- 点赞/点踩按钮
+
+**技术实现**:
+- **React Portal 渲染**: 使用 `createPortal` 将悬浮卡片渲染到 `document.body`，避免被父容器遮挡
+- **智能定位**: 基于触发元素位置动态计算坐标，支持边界检测防止超出视口
+- **高 z-index**: z-[99999] 确保始终在最上层显示
+- **延迟加载**: 鼠标悬停 500ms 后才加载用户数据，减少不必要的请求
 
 **国际化**: ✅ 完整支持（profile模块）
 
@@ -1078,8 +1087,12 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 **核心能力**:
 1. **Auto Fetch** (`/api/scraper/fetch`)
    - 支持通用网页 OpenGraph/Twitter/JSON-LD 提取（title/content/author/platform）
-   - BiliBili 视频优先走官方接口 `x/web-interface/view`（更稳定）
+   - **BiliBili 视频特殊处理**:
+     - 视频信息走官方接口 `/x/web-interface/view`（获取标题、描述、作者、封面等）
+     - **标签信息走独立 API** `/x/tag/archive/tags`（因视频接口不返回 tags 字段）
+     - 合并视频信息 + 标签信息返回完整数据
    - 返回 `coverImageUrl`（视频平台场景）用于新建页自动预填封面
+   - 返回 `tags` 数组（包含视频标签 + 分区名 + 平台名）
 
 2. **封面转存** (`/api/scraper/import-cover`)
    - 下载远程封面图片并保存到本地 `/uploads/content-images`
@@ -1089,6 +1102,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
    - 平台：当前支持 BiliBili
    - 条件：关键词、最小播放量、抓取页数、扫描上限、创建上限
    - 自动创建 Quote External Website 的 Idea（填充 externalSource）
+   - **详细日志**: 记录每个步骤的执行状态（用户角色、参数解析、候选获取、创意创建等）
 
 4. **任务历史** (`/api/scraper/admin/history`)
    - 按时间倒序返回批量导入任务
@@ -1098,6 +1112,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - URL/平台/参数非法 → 400
 - 第三方请求失败 → 回退策略 + 错误信息
 - 批量导入异常 → 任务状态写入 `failed` 并记录 errorMessage
+- **调试支持**: 所有关键步骤输出 `[Admin Crawl]` 前缀日志便于排查
 
 ---
 
@@ -1145,6 +1160,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-07 | 3.6 | **截图标注与统一图片上传系统**：外链标注升级为“截图+备注”流程（全屏下先捕获屏幕再保存标注），标注数据新增`screenshotUrl`和`panelY`；全屏标注列表精简为“仅右侧半透明面板展示”，支持拖拽并通过`PATCH /api/ideas/:id/link-notes/:noteId/position`持久化位置；标注保存后继续同步到评论区，评论可展示截图。新增统一内容图片上传接口`POST /api/uploads/image`（`uploads.routes.js`），上传中间件重构为头像/内容双通道并统一5MB限制（`middleware/upload.js`）。`Idea/Comment/LeaderboardPost`新增`imageUrls`字段，创意创建/编辑、评论/回复、排行榜提名均支持图片上传与渲染；`api.ts`新增`apiUploadImage`封装；`IdeaDetailPage/NewIdeaPage/LeaderboardDetailPage`补齐前端上传交互与预览；中英文翻译资源新增截图标注文案，键总数更新到540/540。 |
 | 2026-03-08 | 3.7 | **下线 annotation 功能并清理后端**：`IdeaDetailPage`移除截图标注/跳转备注 UI，外链区域简化为来源卡片 + Open Website。后端删除 `GET/POST /api/ideas/:id/link-notes` 与 `PATCH /api/ideas/:id/link-notes/:noteId/position` 路由；`ideas.controller.js` 移除 link-note 相关控制器与输入校验；`Idea.externalSource` 删除 `linkNotes` 子结构；`Comment` 删除 `externalLinkNote` 字段；`client/src/api.ts` 删除 `ExternalLinkNote` 类型并移除 `apiUploadImage` 的 `annotation` scope。同步更新文档章节描述。 |
 | 2026-03-10 | 3.8 | **外部导入与封面能力增强**：新增 `TagMapPage` 与 `AdminScraperPage` 路由（`/tag-map`, `/admin/scraper`）；`scraper.controller.js` 扩展 BiliBili 批量导入、任务历史、封面转存与 Auto Fetch 平台/作者/封面返回；新增 `ScraperJob` 模型记录导入历史；`scraper.routes.js` 新增 `import-cover` 与 admin crawler/history API；`Idea` 新增 `coverImageUrl` 字段并在 `NewIdeaPage` 支持封面上传、Auto Fetch 预填与平台不在列表时自动切换 Other；`HomePage` 卡片支持半透明封面背景显示。 |
+| 2026-03-10 | 3.9 | **BiliBili 标签抓取修复与 UI 层级优化**：修复 BiliBili 标签抓取功能，使用独立标签 API (`/x/tag/archive/tags`) 替代不返回标签的视频信息 API，解决标签自动填充失败问题；创建 `test-tags-api.js` 测试脚本验证 API 可用性；UserHoverCard 组件重构为 React Portal 渲染模式（`createPortal`），添加智能边界检测（防止超出视口），提升 z-index 至 99999，彻底解决被其他元素遮挡问题；IdeaDetailPage iframe 安全权限优化，移除 `allow-top-navigation` 防止自动劫持父窗口导航，保留 `allow-top-navigation-by-user-activation` 支持用户点击跳转；为 scraper 和 auth 中间件添加详细调试日志便于排查 412 错误；前端 AdminScraperPage 添加针对性错误提示（412/401/403）。 |
 
 ---
 

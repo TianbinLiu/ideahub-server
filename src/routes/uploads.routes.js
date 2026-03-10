@@ -1,19 +1,19 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
-const { contentImageUpload, MAX_IMAGE_SIZE_BYTES } = require("../middleware/upload");
+const { upload, uploadToCloudinary, MAX_IMAGE_SIZE_BYTES } = require("../middleware/upload");
 
-router.post("/image", requireAuth, contentImageUpload.single("image"), async (req, res, next) => {
+router.post("/image", requireAuth, upload.single("image"), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ ok: false, message: "No file uploaded" });
     }
 
-    const forwardedProto = req.headers["x-forwarded-proto"];
-    const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
-    const host = req.get("host");
-    const requestBaseUrl = `${protocol}://${host}`;
-    const baseUrl = process.env.API_URL || requestBaseUrl;
-    const imageUrl = `${baseUrl}/uploads/content-images/${req.file.filename}`;
+    // 上传到 Cloudinary
+    const imageUrl = await uploadToCloudinary(
+      req.file.buffer,
+      'content-images',
+      req.user._id.toString()
+    );
 
     res.json({
       ok: true,
