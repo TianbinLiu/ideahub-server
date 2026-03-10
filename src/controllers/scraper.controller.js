@@ -53,6 +53,20 @@ function detectPlatformName(hostname) {
   return "";
 }
 
+function extractBilibiliVideoId(parsedUrl) {
+  const host = String(parsedUrl?.hostname || "").toLowerCase();
+  if (!host.includes("bilibili.com") && !host.includes("b23.tv")) return null;
+
+  const path = String(parsedUrl?.pathname || "");
+  const bvidMatch = path.match(/\/video\/(BV[0-9A-Za-z]+)/i);
+  if (bvidMatch?.[1]) return { bvid: bvidMatch[1] };
+
+  const aidMatch = path.match(/\/video\/av(\d+)/i);
+  if (aidMatch?.[1]) return { aid: aidMatch[1] };
+
+  return null;
+}
+
 function parseViewCount(raw) {
   if (typeof raw === "number") return raw;
   const text = String(raw || "")
@@ -356,6 +370,37 @@ async function fetchExternalContent(req, res, next) {
     // Dynamic import for ESM modules
     const axios = (await import("axios")).default;
     const cheerio = (await import("cheerio")).default;
+
+    // Prefer BiliBili official API for video pages, because HTML may be JS/anti-bot protected.
+    const bilibiliId = extractBilibiliVideoId(parsedUrl);
+    if (bilibiliId) {
+      try {
+        const apiRes = await axios.get("https://api.bilibili.com/x/web-interface/view", {
+          params: bilibiliId,
+          timeout: 15000,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            Referer: "https://www.bilibili.com/",
+          },
+        });
+
+        const data = apiRes?.data?.data;
+        if (data?.title) {
+          return res.json({
+            ok: true,
+            success: true,
+            title: String(data.title || "").trim().slice(0, 200),
+            content: String(data.desc || "").trim().replace(/\s+/g, " ").slice(0, 5000),
+            author: String(data?.owner?.name || "").trim().slice(0, 100),
+            platform: "BiliBili",
+            message: "Content fetched successfully",
+          });
+        }
+      } catch {
+        // Fallback to generic HTML parser below.
+      }
+    }
 
     function parseHtml(html) {
       const $ = cheerio.load(html);
