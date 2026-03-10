@@ -6,6 +6,9 @@
 const AppError = require("../utils/AppError");
 const Idea = require("../models/Idea");
 const ScraperJob = require("../models/ScraperJob");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const PLATFORM_CATALOG = [
   {
@@ -60,6 +63,71 @@ function normalizeHttpUrl(raw) {
   if (/^https:\/\//i.test(val)) return val;
   if (val.startsWith("//")) return `https:${val}`;
   return "";
+}
+
+async function importCoverImage(req, res, next) {
+  try {
+    const sourceUrl = normalizeHttpUrl(req.body?.url);
+    if (!sourceUrl) {
+      throw new AppError({ code: "INVALID_URL", status: 400, message: "Valid HTTP/HTTPS image URL is required" });
+    }
+
+    const parsed = new URL(sourceUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new AppError({ code: "INVALID_URL", status: 400, message: "Only HTTP/HTTPS URLs are allowed" });
+    }
+
+    const axios = (await import("axios")).default;
+    const response = await axios.get(sourceUrl, {
+      responseType: "arraybuffer",
+      timeout: 20000,
+      maxRedirects: 5,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Referer: `${parsed.protocol}//${parsed.host}/`,
+      },
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+
+    const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
+    if (!contentType.startsWith("image/")) {
+      throw new AppError({ code: "INVALID_IMAGE", status: 400, message: "Source URL is not an image" });
+    }
+
+    const extMap = {
+      "image/jpeg": ".jpg",
+      "image/jpg": ".jpg",
+      "image/png": ".png",
+      "image/gif": ".gif",
+      "image/webp": ".webp",
+    };
+    const ext = extMap[contentType] || ".jpg";
+
+    const bytes = Buffer.from(response.data);
+    const MAX_BYTES = 5 * 1024 * 1024;
+    if (bytes.length > MAX_BYTES) {
+      throw new AppError({ code: "FILE_TOO_LARGE", status: 400, message: "Image size must be <= 5MB" });
+    }
+
+    const uploadDir = path.join(__dirname, "../../uploads/content-images");
+    fs.mkdirSync(uploadDir, { recursive: true });
+
+    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+    const fullPath = path.join(uploadDir, filename);
+    fs.writeFileSync(fullPath, bytes);
+
+    const forwardedProto = req.headers["x-forwarded-proto"];
+    const protocol = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || req.protocol;
+    const host = req.get("host");
+    const requestBaseUrl = `${protocol}://${host}`;
+    const baseUrl = process.env.API_URL || requestBaseUrl;
+    const imageUrl = `${baseUrl}/uploads/content-images/${filename}`;
+
+    res.json({ ok: true, imageUrl, size: bytes.length, mimeType: contentType });
+  } catch (err) {
+    next(err);
+  }
 }
 
 function isVideoPlatformVideoUrl(parsedUrl) {
@@ -594,6 +662,7 @@ async function fetchExternalContent(req, res, next) {
 
 module.exports = {
   fetchExternalContent,
+  importCoverImage,
   listCrawlerPlatforms,
   listAdminCrawlHistory,
   startAdminCrawl,

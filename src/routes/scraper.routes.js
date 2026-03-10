@@ -3,6 +3,7 @@ const router = express.Router();
 const { requireAuth, requireRole } = require("../middleware/auth");
 const {
 	fetchExternalContent,
+	importCoverImage,
 	listCrawlerPlatforms,
 	listAdminCrawlHistory,
 	startAdminCrawl,
@@ -14,6 +15,12 @@ const {
  * Requires authentication to prevent abuse
  */
 router.post("/fetch", requireAuth, fetchExternalContent);
+
+/**
+ * POST /api/scraper/import-cover
+ * Download remote cover image and rehost under local uploads to avoid hotlink blocks
+ */
+router.post("/import-cover", requireAuth, importCoverImage);
 
 /**
  * GET /api/scraper/admin/platforms
