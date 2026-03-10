@@ -53,6 +53,26 @@ function detectPlatformName(hostname) {
   return "";
 }
 
+function normalizeHttpUrl(raw) {
+  const val = String(raw || "").trim();
+  if (!val) return "";
+  if (/^https?:\/\//i.test(val)) return val;
+  if (val.startsWith("//")) return `https:${val}`;
+  return "";
+}
+
+function isVideoPlatformVideoUrl(parsedUrl) {
+  const host = String(parsedUrl?.hostname || "").toLowerCase();
+  const path = String(parsedUrl?.pathname || "").toLowerCase();
+  if (!host) return false;
+
+  if ((host.includes("bilibili.com") || host.includes("b23.tv")) && path.includes("/video/")) return true;
+  if ((host.includes("youtube.com") && (path === "/watch" || path.startsWith("/shorts/") || path.startsWith("/live/"))) || host.includes("youtu.be")) return true;
+  if (host.includes("tiktok.com") && path.includes("/video/")) return true;
+  if (host.includes("vimeo.com")) return true;
+  return false;
+}
+
 function extractBilibiliVideoId(parsedUrl) {
   const host = String(parsedUrl?.hostname || "").toLowerCase();
   if (!host.includes("bilibili.com") && !host.includes("b23.tv")) return null;
@@ -366,6 +386,8 @@ async function fetchExternalContent(req, res, next) {
     let content = "";
     let author = "";
     let platform = detectPlatformName(parsedUrl.hostname);
+    let coverImageUrl = "";
+    const shouldSuggestCover = isVideoPlatformVideoUrl(parsedUrl);
 
     // Dynamic import for ESM modules
     const axios = (await import("axios")).default;
@@ -387,6 +409,7 @@ async function fetchExternalContent(req, res, next) {
 
         const data = apiRes?.data?.data;
         if (data?.title) {
+          coverImageUrl = normalizeHttpUrl(data?.pic);
           return res.json({
             ok: true,
             success: true,
@@ -394,6 +417,7 @@ async function fetchExternalContent(req, res, next) {
             content: String(data.desc || "").trim().replace(/\s+/g, " ").slice(0, 5000),
             author: String(data?.owner?.name || "").trim().slice(0, 100),
             platform: "BiliBili",
+            coverImageUrl: shouldSuggestCover ? coverImageUrl : "",
             message: "Content fetched successfully",
           });
         }
@@ -470,11 +494,17 @@ async function fetchExternalContent(req, res, next) {
         detectPlatformName(parsedUrl.hostname) ||
         "";
 
+      const parsedCoverImageUrl =
+        normalizeHttpUrl($("meta[property='og:image']").attr("content")) ||
+        normalizeHttpUrl($("meta[name='twitter:image']").attr("content")) ||
+        "";
+
       return {
         title: parsedTitle.trim().substring(0, 200),
         content: parsedContent.replace(/\s+/g, " ").trim().substring(0, 5000),
         author: parsedAuthor.trim().substring(0, 100),
         platform: parsedPlatform.trim().substring(0, 100),
+        coverImageUrl: parsedCoverImageUrl,
       };
     }
 
@@ -520,6 +550,7 @@ async function fetchExternalContent(req, res, next) {
           content = parsed.content;
           author = parsed.author;
           platform = parsed.platform || platform;
+          coverImageUrl = parsed.coverImageUrl || "";
 
           return res.json({
             ok: true,
@@ -528,6 +559,7 @@ async function fetchExternalContent(req, res, next) {
             content,
             author,
             platform,
+            coverImageUrl: shouldSuggestCover ? coverImageUrl : "",
             message: "Content fetched successfully",
           });
         }
@@ -549,6 +581,7 @@ async function fetchExternalContent(req, res, next) {
       content: "",
       author: "",
       platform,
+      coverImageUrl: "",
       error: "Failed to fetch content. The site may block automated requests or require JavaScript.",
       message: "Please manually copy the content from the source.",
     });
