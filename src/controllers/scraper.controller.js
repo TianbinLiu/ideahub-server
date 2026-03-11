@@ -196,7 +196,7 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
           search_type: "video",
           keyword,
           page,
-          order: "pubdate",
+          order: "click",  // 按播放量降序，确保候选视频本身是高播放量的
         },
         timeout: 15000,
         headers: {
