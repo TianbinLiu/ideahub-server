@@ -42,15 +42,21 @@ function stripHtml(input) {
     .trim();
 }
 
+// 返回的平台名与前端 platformConfig.ts 的 PLATFORMS[].name 保持一致
 function detectPlatformName(hostname) {
   const host = String(hostname || "").toLowerCase();
   if (host.includes("bilibili.com") || host.includes("b23.tv")) return "BiliBili";
   if (host.includes("youtube.com") || host.includes("youtu.be")) return "YouTube";
   if (host.includes("facebook.com")) return "Facebook";
-  if (host.includes("twitter.com") || host.includes("x.com")) return "Twitter";
+  if (host.includes("twitter.com") || host.includes("x.com")) return "Twitter/X";
   if (host.includes("instagram.com")) return "Instagram";
   if (host.includes("tiktok.com")) return "TikTok";
   if (host.includes("weibo.com")) return "微博";
+  if (host.includes("reddit.com")) return "Reddit";
+  if (host.includes("linkedin.com")) return "LinkedIn";
+  if (host.includes("zhihu.com")) return "知乎";
+  if (host.includes("tieba.baidu.com")) return "贴吧";
+  if (host.includes("xiaohongshu.com") || host.includes("xhslink.com")) return "小红书";
   return "";
 }
 
@@ -210,7 +216,8 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
       if (!Array.isArray(items) || items.length === 0) break;
 
       for (const item of items) {
-        const arcUrl = item.arcurl || (item.bvid ? `https://www.bilibili.com/video/${item.bvid}` : "");
+        const arcUrlRaw = item.arcurl || (item.bvid ? `https://www.bilibili.com/video/${item.bvid}` : "");
+        const arcUrl = normalizeHttpUrl(arcUrlRaw); // 确保始终存 https://
         if (!arcUrl || seenUrls.has(arcUrl)) continue;
 
         seenUrls.add(arcUrl);
