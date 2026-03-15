@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-10  
-> 版本: 4.0
+> 最后更新: 2026-03-15  
+> 版本: 4.4
 > 
 > ---
 > 
@@ -128,9 +128,10 @@ ideahub/
     │   │   ├── passport.js           # 认证策略
     │   │   └── cloudinary.js         # Cloudinary配置与启动校验
     │   │
-    │   ├── models/                   # 数据模型（20个）
+    │   ├── models/                   # 数据模型（21个）
     │   │   ├── User.js
     │   │   ├── Idea.js
+    │   │   ├── IdeaRecommendationFeedback.js
     │   │   ├── Comment.js
     │   │   ├── Like.js
     │   │   ├── Bookmark.js
@@ -474,6 +475,15 @@ return <>{children}</>;
 
 **功能**:
 - 浏览所有公开创意
+- **默认推荐流** [v4.1新增]: 默认排序从“最新”调整为“推荐”，基于用户最近搜索过的 tags（localStorage 中的 recentSearchTags）进行个性化推荐
+- **冷启动兜底** [v4.2新增]: 当用户没有搜索记录时，推荐流优先展示“近期高互动” idea，避免新用户首页质量不稳定
+- **已看过降权** [v4.3新增]: 推荐流会读取 `IdeaView` 浏览记录，对近期已看过的 idea 自动降权，减少首页重复曝光
+- **推荐反馈机制** [v4.3新增]: 登录用户可在推荐卡片上直接反馈“不感兴趣 / 已推荐过”，当前卡片立即移除，后端写入偏好用于后续降权或过滤
+- **推荐反馈可撤销** [v4.4新增]: 反馈提交后会弹出可撤销提示，用户可在短时间内一键撤销误点并恢复卡片展示
+- 支持三种排序：推荐 / 最新 / 热门
+- **多 tag 搜索增强** [v4.1新增]: 搜索多个 tag 时不再要求 `$all` 完全匹配，只要 idea 与任一 tag 相关即可进入结果集
+- 搜索结果按“tag 相关性 + 文本相关性 + idea 热度 + 新鲜度”综合排序
+- 搜索框显示显式的多 tag 相关搜索提示，命中的 tag 在结果卡片中高亮显示
 - 点击跳转详情页
 - 显示AI评审状态
 
@@ -1181,6 +1191,10 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-10 | 3.8 | **外部导入与封面能力增强**：新增 `TagMapPage` 与 `AdminScraperPage` 路由（`/tag-map`, `/admin/scraper`）；`scraper.controller.js` 扩展 BiliBili 批量导入、任务历史、封面转存与 Auto Fetch 平台/作者/封面返回；新增 `ScraperJob` 模型记录导入历史；`scraper.routes.js` 新增 `import-cover` 与 admin crawler/history API；`Idea` 新增 `coverImageUrl` 字段并在 `NewIdeaPage` 支持封面上传、Auto Fetch 预填与平台不在列表时自动切换 Other；`HomePage` 卡片支持半透明封面背景显示。 |
 | 2026-03-10 | 3.9 | **BiliBili 标签抓取修复与 UI 层级优化**：修复 BiliBili 标签抓取功能，使用独立标签 API (`/x/tag/archive/tags`) 替代不返回标签的视频信息 API，解决标签自动填充失败问题；创建 `test-tags-api.js` 测试脚本验证 API 可用性；UserHoverCard 组件重构为 React Portal 渲染模式（`createPortal`），添加智能边界检测（防止超出视口），提升 z-index 至 99999，彻底解决被其他元素遮挡问题；IdeaDetailPage iframe 安全权限优化，移除 `allow-top-navigation` 防止自动劫持父窗口导航，保留 `allow-top-navigation-by-user-activation` 支持用户点击跳转；为 scraper 和 auth 中间件添加详细调试日志便于排查 412 错误；前端 AdminScraperPage 添加针对性错误提示（412/401/403）。 |
 | 2026-03-10 | 4.0 | **Cloudinary 持久化与 TagMap 交互升级**：后端图片链路统一迁移到 Cloudinary（`config/cloudinary.js` + `middleware/upload.js`），`me.routes.js`、`uploads.routes.js`、`ideas.controller.js`、`scraper.controller.js` 的头像/内容图/封面转存改为云端持久化；`index.js` 启动新增 Cloudinary 配置校验；补充 `server/.env.example` 云存储环境变量。`TagMapPage.tsx` 新增 idea 小点 tooltip，支持桌面端 hover 显示 tags、移动端长按显示并防止误触跳转。 |
+| 2026-03-15 | 4.1 | **推荐流与多 Tag 搜索排序升级**：`HomePage.tsx` 默认排序新增“推荐（For You）”，基于用户最近搜索 tags 生成个性化 idea 列表，同时保留最新与热门排序。`ideas.controller.js` 的 `GET /api/ideas` 列表逻辑升级为打分排序：当存在搜索词时，多个 tag 改为“任一相关即召回”，并按 tag 相关性、文本相关性、互动热度（点赞/评论/收藏/浏览）和新鲜度综合排序；当排序为推荐时，使用 recentTags 参与个性化推荐打分。同步更新中英文首页文案。 |
+| 2026-03-15 | 4.2 | **推荐流冷启动与搜索命中高亮**：`ideas.controller.js` 为推荐流新增冷启动兜底，当用户尚无搜索记录时，优先推送近期高互动 idea；`HomePage.tsx` 搜索框新增多 tag 相关搜索提示，搜索结果中的命中 tag 使用高亮样式突出显示，帮助用户理解“任一相关即可召回”的排序机制。 |
+| 2026-03-15 | 4.3 | **推荐流去重与用户反馈**：新增 `IdeaRecommendationFeedback` 模型记录用户对推荐内容的负反馈；`GET /api/ideas` 在推荐模式下接入 `IdeaView` 浏览记录与推荐反馈，对近期已看过 idea 自动降权，对“不感兴趣”内容直接过滤，对“已推荐过”内容显著降权。`HomePage.tsx` 为登录用户新增“不感兴趣 / 已推荐过”反馈按钮，点击后当前推荐卡片立即移除，并通过新接口 `POST /api/ideas/:id/recommendation-feedback` 持久化用户偏好。 |
+| 2026-03-15 | 4.4 | **推荐反馈撤销能力**：新增 `DELETE /api/ideas/:id/recommendation-feedback` 用于撤销推荐反馈；`HomePage.tsx` 在用户点击“不感兴趣 / 已推荐过”后显示带“撤销”按钮的交互提示，允许快速纠正误点并恢复当前卡片展示。 |
 
 ---
 

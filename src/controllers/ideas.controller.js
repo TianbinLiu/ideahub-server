@@ -12,6 +12,7 @@ const { parseMentions } = require("../utils/mentionParser");
 const { validateFeedback } = require("../services/aiReview.service");
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
+const IdeaRecommendationFeedback = require("../models/IdeaRecommendationFeedback");
 
 
 require("../models/User"); // 确保 populate(User) 不报错
@@ -50,6 +51,124 @@ function normalizeImageUrls(input, limit = 8) {
 
 function escapeRegex(input) {
   return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeSearchTokens(raw) {
+  if (Array.isArray(raw)) {
+    return [...new Set(raw.map((item) => String(item || "").trim().replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, 20);
+  }
+
+  return [...new Set(
+    String(raw || "")
+      .split(/[#,，,\s]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+  )].slice(0, 20);
+}
+
+function getIdeaHotScore(idea) {
+  const stats = idea?.stats || {};
+  const likeCount = Number(stats.likeCount || 0);
+  const commentCount = Number(stats.commentCount || 0);
+  const bookmarkCount = Number(stats.bookmarkCount || 0);
+  const viewCount = Number(stats.viewCount || 0);
+  return likeCount * 6 + commentCount * 4 + bookmarkCount * 3 + Math.min(viewCount, 5000) * 0.04;
+}
+
+function getIdeaRecencyScore(idea) {
+  const createdAt = new Date(idea?.createdAt || 0).getTime() || 0;
+  const ageDays = Math.max((Date.now() - createdAt) / (24 * 60 * 60 * 1000), 0);
+  return Math.max(0, 30 - ageDays * 0.8);
+}
+
+function getColdStartRecommendationScore(idea) {
+  const hotScore = getIdeaHotScore(idea);
+  const recencyScore = getIdeaRecencyScore(idea);
+  const ageDays = Math.max((Date.now() - (new Date(idea?.createdAt || 0).getTime() || 0)) / (24 * 60 * 60 * 1000), 0);
+
+  let recentBoost = 0;
+  if (ageDays <= 3) recentBoost = 28;
+  else if (ageDays <= 7) recentBoost = 20;
+  else if (ageDays <= 14) recentBoost = 12;
+  else if (ageDays <= 30) recentBoost = 6;
+
+  return hotScore * 0.78 + recencyScore * 0.9 + recentBoost;
+}
+
+function scoreIdeaAgainstTokens(idea, tokens) {
+  const ideaTags = Array.isArray(idea?.tags) ? idea.tags.map((tag) => String(tag || "").trim().toLowerCase()).filter(Boolean) : [];
+  const title = String(idea?.title || "").toLowerCase();
+  const summary = String(idea?.summary || "").toLowerCase();
+  const content = String(idea?.content || "").toLowerCase();
+  const platform = String(idea?.externalSource?.platform || "").toLowerCase();
+
+  let matchedTokenCount = 0;
+  let matchedTagCount = 0;
+  let score = 0;
+
+  for (const token of tokens) {
+    let tokenMatched = false;
+
+    if (ideaTags.some((tag) => tag === token)) {
+      score += 18;
+      matchedTagCount += 1;
+      tokenMatched = true;
+    } else if (ideaTags.some((tag) => tag.includes(token) || token.includes(tag))) {
+      score += 10;
+      matchedTagCount += 1;
+      tokenMatched = true;
+    }
+
+    if (title.includes(token)) {
+      score += 8;
+      tokenMatched = true;
+    }
+    if (summary.includes(token)) {
+      score += 4;
+      tokenMatched = true;
+    }
+    if (content.includes(token)) {
+      score += 3;
+      tokenMatched = true;
+    }
+    if (platform.includes(token)) {
+      score += 5;
+      tokenMatched = true;
+    }
+
+    if (tokenMatched) matchedTokenCount += 1;
+  }
+
+  return {
+    matchedTokenCount,
+    matchedTagCount,
+    score,
+  };
+}
+
+function sortIdeasByScore(items) {
+  return items.sort((a, b) => {
+    if (b._rankScore !== a._rankScore) return b._rankScore - a._rankScore;
+    if ((b._matchedTokenCount || 0) !== (a._matchedTokenCount || 0)) return (b._matchedTokenCount || 0) - (a._matchedTokenCount || 0);
+    if ((b._matchedTagCount || 0) !== (a._matchedTagCount || 0)) return (b._matchedTagCount || 0) - (a._matchedTagCount || 0);
+    return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+  });
+}
+
+function getViewedPenalty(lastViewedAt) {
+  if (!lastViewedAt) return 0;
+  const viewedAt = new Date(lastViewedAt).getTime() || 0;
+  const ageDays = Math.max((Date.now() - viewedAt) / (24 * 60 * 60 * 1000), 0);
+  if (ageDays <= 1) return 55;
+  if (ageDays <= 3) return 35;
+  if (ageDays <= 7) return 20;
+  if (ageDays <= 30) return 8;
+  return 3;
+}
+
+function getFeedbackPenalty(reason) {
+  if (reason === "already_recommended") return 38;
+  return 0;
 }
 
 function normalizeHttpUrl(raw) {
@@ -296,9 +415,10 @@ async function createIdea(req, res, next) {
 }
 
 /**
- * GET /api/ideas?page=1&limit=20&sort=new|hot
+ * GET /api/ideas?page=1&limit=20&sort=recommended|new|hot
  * Phase 3：列表只返回 public（unlisted/private 不出现在列表）
  * sort:
+ *  - recommended: recent search tag affinity + engagement + recency
  *  - new: createdAt desc
  *  - hot: stats.likeCount desc, then comment/view counts, then createdAt desc
  */
@@ -307,45 +427,105 @@ async function listIdeas(req, res, next) {
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
 
-    const sort = String(req.query.sort || "new");
+    const sort = String(req.query.sort || "recommended");
     const sortSpec =
       sort === "hot"
         ? { "stats.likeCount": -1, "stats.commentCount": -1, "stats.viewCount": -1, createdAt: -1 }
         : { createdAt: -1 };
 
     const q = (req.query.q || req.query.keyword || req.query.tag || "").toString().trim();
+    const queryTokens = normalizeSearchTokens(q);
+    const recentSearchTokens = normalizeSearchTokens(req.query.recentTags || "");
+    const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
 
     // 列表：只返回 public
     const filter = { visibility: "public" };
 
-    if (q) {
-      // If q contains commas or spaces, treat as tag combination
-      if (q.includes(",") || q.includes("，") || q.includes(" ")) {
-        const tags = q.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
-        if (tags.length === 1) {
-          filter.tags = new RegExp(`^${escapeRegex(tags[0])}$`, "i");
-        } else if (tags.length > 1) {
-          filter.tags = {
-            $all: tags.map((tag) => new RegExp(`^${escapeRegex(tag)}$`, "i")),
-          };
-        }
-      } else {
-        // single token: match either tag or text
-        const re = new RegExp(escapeRegex(q), "i");
-        const exactTagRe = new RegExp(`^${escapeRegex(q)}$`, "i");
-        filter.$or = [{ title: re }, { summary: re }, { content: re }, { tags: exactTagRe }];
-      }
-    }
+    let items = [];
+    let total = 0;
 
-    const [items, total] = await Promise.all([
-      Idea.find(filter)
-        .sort(sortSpec)
-        .skip((page - 1) * limit)
-        .limit(limit)
+    if (useScoredRanking) {
+      const allPublicIdeas = await Idea.find(filter)
         .populate("author", "_id username role")
-        .lean(),
-      Idea.countDocuments(filter),
-    ]);
+        .lean();
+
+      let viewMap = new Map();
+      let feedbackMap = new Map();
+
+      if (req.user && allPublicIdeas.length > 0) {
+        const ideaIds = allPublicIdeas.map((item) => item._id);
+        const [views, feedbacks] = await Promise.all([
+          IdeaView.find({ user: req.user._id, idea: { $in: ideaIds } })
+            .select("idea lastViewedAt")
+            .lean(),
+          IdeaRecommendationFeedback.find({ user: req.user._id, idea: { $in: ideaIds } })
+            .select("idea reason")
+            .lean(),
+        ]);
+
+        viewMap = new Map(views.map((item) => [String(item.idea), item.lastViewedAt]));
+        feedbackMap = new Map(feedbacks.map((item) => [String(item.idea), item.reason]));
+      }
+
+      const ranked = allPublicIdeas
+        .map((item) => {
+          const itemId = String(item._id);
+          const hotScore = getIdeaHotScore(item);
+          const recencyScore = getIdeaRecencyScore(item);
+          const feedbackReason = feedbackMap.get(itemId) || null;
+          const viewedPenalty = getViewedPenalty(viewMap.get(itemId));
+
+          if (sort === "recommended" && queryTokens.length === 0 && feedbackReason === "not_interested") {
+            return null;
+          }
+
+          if (queryTokens.length > 0) {
+            const relevance = scoreIdeaAgainstTokens(item, queryTokens);
+            if (relevance.matchedTokenCount === 0) return null;
+            return {
+              ...item,
+              recommendationFeedbackReason: feedbackReason,
+              _matchedTokenCount: relevance.matchedTokenCount,
+              _matchedTagCount: relevance.matchedTagCount,
+              _rankScore: relevance.score + hotScore * 0.55 + recencyScore * 0.35,
+            };
+          }
+
+          const preference = recentSearchTokens.length > 0
+            ? scoreIdeaAgainstTokens(item, recentSearchTokens)
+            : { matchedTokenCount: 0, matchedTagCount: 0, score: 0 };
+
+          const coldStartScore = recentSearchTokens.length === 0
+            ? getColdStartRecommendationScore(item)
+            : 0;
+
+          return {
+            ...item,
+            recommendationFeedbackReason: feedbackReason,
+            _matchedTokenCount: preference.matchedTokenCount,
+            _matchedTagCount: preference.matchedTagCount,
+            _rankScore:
+              recentSearchTokens.length > 0
+                ? preference.score * 1.2 + hotScore * 0.45 + recencyScore * 0.3 - viewedPenalty - getFeedbackPenalty(feedbackReason)
+                : coldStartScore - viewedPenalty - getFeedbackPenalty(feedbackReason),
+          };
+        })
+        .filter(Boolean);
+
+      sortIdeasByScore(ranked);
+      total = ranked.length;
+      items = ranked.slice((page - 1) * limit, page * limit);
+    } else {
+      [items, total] = await Promise.all([
+        Idea.find(filter)
+          .sort(sortSpec)
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .populate("author", "_id username role")
+          .lean(),
+        Idea.countDocuments(filter),
+      ]);
+    }
 
     // Best-effort backfill/localization for old BiliBili items.
     const backfillCoverItems = items.filter((item) => {
@@ -390,8 +570,55 @@ async function listIdeas(req, res, next) {
       limit,
       total,
       totalPages,
-      ideas: items,
+      ideas: items.map((item) => {
+        if (!item || typeof item !== "object") return item;
+        const { _rankScore, _matchedTokenCount, _matchedTagCount, ...rest } = item;
+        return rest;
+      }),
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function submitRecommendationFeedback(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      invalidId("Invalid idea id");
+    }
+
+    const idea = await Idea.findById(id).select("_id visibility").lean();
+    if (!idea) {
+      notFound("Idea not found");
+    }
+
+    if (idea.visibility !== "public") {
+      forbidden("Forbidden");
+    }
+
+    const { reason } = req.body;
+    const feedback = await IdeaRecommendationFeedback.findOneAndUpdate(
+      { user: req.user._id, idea: id },
+      { $set: { reason } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    res.json({ ok: true, feedback });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function clearRecommendationFeedback(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      invalidId("Invalid idea id");
+    }
+
+    await IdeaRecommendationFeedback.deleteOne({ user: req.user._id, idea: id });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -614,4 +841,6 @@ module.exports = {
   deleteIdea,
   listMyIdeas,
   suggestTitles,
+  submitRecommendationFeedback,
+  clearRecommendationFeedback,
 };

@@ -55,6 +55,8 @@ const {
   updateIdea,
   deleteIdea,
   listMyIdeas,
+  submitRecommendationFeedback,
+  clearRecommendationFeedback,
 } = require("../controllers/ideas.controller");
 
 const {
@@ -67,11 +69,11 @@ const {
   listCommentReplies,
 } = require("../controllers/ideaInteractions.controller");
 
-const { createIdeaBody, updateIdeaBody } = require("../schemas/idea.schemas");
+const { createIdeaBody, updateIdeaBody, recommendationFeedbackBody } = require("../schemas/idea.schemas");
 const { addCommentBody } = require("../schemas/comment.schemas");
 
 // 列表：公开（+分页/排序）
-router.get("/", listIdeas);
+router.get("/", optionalAuth, listIdeas);
 
 // title suggestions for autocomplete
 router.get("/suggest", require("../controllers/ideas.controller").suggestTitles || ((req,res)=>res.json({ok:true, ideas:[]})));
@@ -91,6 +93,8 @@ router.delete("/:id", requireAuth, deleteIdea);
 // 互动
 router.post("/:id/like", requireAuth, toggleLike);
 router.post("/:id/bookmark", requireAuth, toggleBookmark);
+router.post("/:id/recommendation-feedback", requireAuth, validate({ body: recommendationFeedbackBody }), submitRecommendationFeedback);
+router.delete("/:id/recommendation-feedback", requireAuth, clearRecommendationFeedback);
 
 router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), addComment);

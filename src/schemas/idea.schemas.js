@@ -39,4 +39,8 @@ const updateIdeaBody = z.object({
   externalSource: externalSourceSchema.optional(),
 });
 
-module.exports = { createIdeaBody, updateIdeaBody };
+const recommendationFeedbackBody = z.object({
+  reason: z.enum(["not_interested", "already_recommended"]),
+});
+
+module.exports = { createIdeaBody, updateIdeaBody, recommendationFeedbackBody };
