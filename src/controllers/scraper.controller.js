@@ -191,28 +191,69 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
   const safePages = Math.min(Math.max(parseInt(maxPages || "5", 10), 1), 20);
   const candidates = [];
   const seenUrls = new Set();
+  let upstreamBlockedCount = 0;
   const terms = normalizeKeywordList(keywords);
   const effectiveTerms = terms.length > 0 ? terms : ["热门"];
+
+  const requestHeadersList = [
+    {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Referer: "https://www.bilibili.com/",
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      Origin: "https://www.bilibili.com",
+    },
+    {
+      "User-Agent":
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      Referer: "https://m.bilibili.com/",
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      Origin: "https://m.bilibili.com",
+    },
+  ];
 
   for (const keyword of effectiveTerms) {
     for (let page = 1; page <= safePages && candidates.length < safeLimit; page += 1) {
       const url = "https://api.bilibili.com/x/web-interface/search/type";
-      const res = await axios.get(url, {
-        params: {
-          search_type: "video",
-          keyword,
-          page,
-          order: "click",  // 按播放量降序，确保候选视频本身是高播放量的
-        },
-        timeout: 15000,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          Referer: "https://www.bilibili.com/",
-        },
-      });
+      let items = [];
+      let gotData = false;
+      let blockedByUpstream = false;
 
-      const items = res?.data?.data?.result || [];
+      for (const headers of requestHeadersList) {
+        const res = await axios.get(url, {
+          params: {
+            search_type: "video",
+            keyword,
+            page,
+            order: "click", // 按播放量降序，确保候选视频本身是高播放量的
+          },
+          timeout: 15000,
+          headers,
+          validateStatus: () => true,
+        });
+
+        if (res.status === 412 || res.status === 429) {
+          blockedByUpstream = true;
+          continue;
+        }
+
+        if (res.status < 200 || res.status >= 300) {
+          continue;
+        }
+
+        items = res?.data?.data?.result || [];
+        gotData = true;
+        break;
+      }
+
+      if (blockedByUpstream && !gotData) {
+        upstreamBlockedCount += 1;
+        // Current keyword is rate-limited/blocked, stop paging it and try next keyword.
+        break;
+      }
+
       if (!Array.isArray(items) || items.length === 0) break;
 
       for (const item of items) {
@@ -236,6 +277,15 @@ async function fetchBilibiliCandidates({ keywords, limit, maxPages }) {
         if (candidates.length >= safeLimit) break;
       }
     }
+  }
+
+  if (candidates.length === 0 && upstreamBlockedCount > 0) {
+    throw new AppError({
+      code: "SCRAPER_UPSTREAM_BLOCKED",
+      status: 503,
+      message: "Crawler is temporarily blocked by upstream platform (BiliBili returned 412/429). Please retry later or reduce crawl frequency.",
+      details: { upstreamBlockedCount },
+    });
   }
 
   return candidates;
