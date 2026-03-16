@@ -337,6 +337,7 @@ async function createIdeasFromCandidates({ candidates, minViews, adminUserId, ma
     }
 
     const idea = await Idea.create({
+      ideaType: "external",
       title: item.title.slice(0, 120),
       summary: summary.slice(0, 300),
       content: "",

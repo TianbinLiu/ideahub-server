@@ -181,13 +181,14 @@ function normalizeIdeaType(raw) {
 
 function inferIdeaType(idea) {
   const normalized = normalizeIdeaType(idea?.ideaType);
-  if (normalized) return normalized;
 
-  if (idea?.isFeedback) return "feedback";
+  if (normalized === "feedback" || idea?.isFeedback) return "feedback";
 
   const platform = String(idea?.externalSource?.platform || "").trim();
   const sourceUrl = String(idea?.externalSource?.url || "").trim();
   if (platform || sourceUrl) return "external";
+
+  if (normalized) return normalized;
 
   // Legacy items without explicit type are treated as daily ideas.
   return "daily";
@@ -553,9 +554,19 @@ async function listIdeas(req, res, next) {
       total = ranked.length;
       items = ranked.slice((page - 1) * limit, page * limit);
     } else {
-      const findFilter = requestedIdeaType
-        ? { ...filter, ideaType: requestedIdeaType }
-        : filter;
+      let findFilter = filter;
+      if (requestedIdeaType === "external") {
+        findFilter = {
+          ...filter,
+          $or: [
+            { ideaType: "external" },
+            { "externalSource.url": { $exists: true, $nin: [null, ""] } },
+            { "externalSource.platform": { $exists: true, $nin: [null, ""] } },
+          ],
+        };
+      } else if (requestedIdeaType) {
+        findFilter = { ...filter, ideaType: requestedIdeaType };
+      }
 
       [items, total] = await Promise.all([
         Idea.find(findFilter)
