@@ -171,6 +171,28 @@ function getFeedbackPenalty(reason) {
   return 0;
 }
 
+const IDEA_TYPES = new Set(["business", "feedback", "external", "daily"]);
+
+function normalizeIdeaType(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!IDEA_TYPES.has(value)) return null;
+  return value;
+}
+
+function inferIdeaType(idea) {
+  const normalized = normalizeIdeaType(idea?.ideaType);
+  if (normalized) return normalized;
+
+  if (idea?.isFeedback) return "feedback";
+
+  const platform = String(idea?.externalSource?.platform || "").trim();
+  const sourceUrl = String(idea?.externalSource?.url || "").trim();
+  if (platform || sourceUrl) return "external";
+
+  // Legacy items without explicit type are treated as daily ideas.
+  return "daily";
+}
+
 function normalizeHttpUrl(raw) {
   const val = String(raw || "").trim();
   if (!val) return "";
@@ -317,7 +339,7 @@ function validateExternalSource(externalSource) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
+    const { ideaType, title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -376,7 +398,17 @@ async function createIdea(req, res, next) {
     // Validate external source if provided
     const validatedExternalSource = validateExternalSource(externalSource);
 
+    let normalizedIdeaType = normalizeIdeaType(ideaType);
+    if (!normalizedIdeaType) {
+      normalizedIdeaType = Boolean(isFeedback)
+        ? "feedback"
+        : validatedExternalSource
+          ? "external"
+          : "daily";
+    }
+
     const idea = await Idea.create({
+      ideaType: normalizedIdeaType,
       title: title.trim(),
       summary: summary || "",
       content: content || "",
@@ -437,6 +469,7 @@ async function listIdeas(req, res, next) {
     const queryTokens = normalizeSearchTokens(q);
     const recentSearchTokens = normalizeSearchTokens(req.query.recentTags || "");
     const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
+    const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
 
     // 列表：只返回 public
     const filter = { visibility: "public" };
@@ -469,6 +502,10 @@ async function listIdeas(req, res, next) {
 
       const ranked = allPublicIdeas
         .map((item) => {
+          if (requestedIdeaType && inferIdeaType(item) !== requestedIdeaType) {
+            return null;
+          }
+
           const itemId = String(item._id);
           const hotScore = getIdeaHotScore(item);
           const recencyScore = getIdeaRecencyScore(item);
@@ -516,15 +553,43 @@ async function listIdeas(req, res, next) {
       total = ranked.length;
       items = ranked.slice((page - 1) * limit, page * limit);
     } else {
+      const findFilter = requestedIdeaType
+        ? { ...filter, ideaType: requestedIdeaType }
+        : filter;
+
       [items, total] = await Promise.all([
-        Idea.find(filter)
+        Idea.find(findFilter)
           .sort(sortSpec)
           .skip((page - 1) * limit)
           .limit(limit)
           .populate("author", "_id username role")
           .lean(),
-        Idea.countDocuments(filter),
+        Idea.countDocuments(findFilter),
       ]);
+
+      // For legacy ideas that were created before ideaType existed, keep them visible in daily/feedback/external views.
+      if (requestedIdeaType && (requestedIdeaType === "daily" || requestedIdeaType === "feedback" || requestedIdeaType === "external")) {
+        const legacyCandidates = await Idea.find({ visibility: "public", ideaType: { $exists: false } })
+          .sort(sortSpec)
+          .populate("author", "_id username role")
+          .lean();
+
+        const legacyMatched = legacyCandidates.filter((item) => inferIdeaType(item) === requestedIdeaType);
+        if (legacyMatched.length > 0) {
+          const merged = [...items, ...legacyMatched]
+            .sort((a, b) => {
+              if (sort === "hot") {
+                const ah = Number(a?.stats?.likeCount || 0) * 1000000 + Number(a?.stats?.commentCount || 0) * 1000 + Number(a?.stats?.viewCount || 0);
+                const bh = Number(b?.stats?.likeCount || 0) * 1000000 + Number(b?.stats?.commentCount || 0) * 1000 + Number(b?.stats?.viewCount || 0);
+                if (bh !== ah) return bh - ah;
+              }
+              return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+            });
+
+          total = merged.length;
+          items = merged.slice((page - 1) * limit, page * limit);
+        }
+      }
     }
 
     // Best-effort backfill/localization for old BiliBili items.
@@ -724,7 +789,7 @@ async function updateIdea(req, res, next) {
     }
 
 
-    const { title, summary, content, imageUrls, tags, visibility, isMonetizable, licenseType } = req.body;
+    const { ideaType, title, summary, content, imageUrls, tags, visibility, isMonetizable, licenseType } = req.body;
 
     if (title !== undefined) {
       if (!String(title).trim()) {
@@ -763,6 +828,10 @@ async function updateIdea(req, res, next) {
     if (visibility !== undefined) idea.visibility = visibility;
     if (isMonetizable !== undefined) idea.isMonetizable = Boolean(isMonetizable);
     if (licenseType !== undefined) idea.licenseType = String(licenseType);
+    if (ideaType !== undefined) {
+      const normalizedIdeaType = normalizeIdeaType(ideaType);
+      if (normalizedIdeaType) idea.ideaType = normalizedIdeaType;
+    }
     if (req.body.externalSource !== undefined) {
       idea.externalSource = validateExternalSource(req.body.externalSource);
     }

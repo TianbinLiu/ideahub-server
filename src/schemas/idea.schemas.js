@@ -15,6 +15,7 @@ const externalSourceSchema = z
   .partial();
 
 const createIdeaBody = z.object({
+  ideaType: z.enum(["business", "feedback", "external", "daily"]).optional().default("daily"),
   title: z.string().trim().min(1).max(120),
   summary: z.string().max(300).optional().default(""),
   content: z.string().optional().default(""),
@@ -28,6 +29,7 @@ const createIdeaBody = z.object({
 });
 
 const updateIdeaBody = z.object({
+  ideaType: z.enum(["business", "feedback", "external", "daily"]).optional(),
   title: z.string().trim().min(1).max(120).optional(),
   summary: z.string().max(300).optional(),
   content: z.string().optional(),

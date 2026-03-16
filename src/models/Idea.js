@@ -21,6 +21,13 @@ const statsSchema = new mongoose.Schema(
 
 const ideaSchema = new mongoose.Schema(
   {
+    ideaType: {
+      type: String,
+      enum: ["business", "feedback", "external", "daily"],
+      default: "daily",
+      index: true,
+    },
+
     title: { type: String, required: true, trim: true, maxlength: 120 },
     summary: { type: String, default: "", trim: true, maxlength: 300 },
     content: { type: String, default: "" },
