@@ -519,7 +519,7 @@ async function listIdeas(req, res, next) {
 
           if (queryTokens.length > 0) {
             const relevance = scoreIdeaAgainstTokens(item, queryTokens);
-            if (relevance.matchedTokenCount === 0) return null;
+            if (relevance.matchedTagCount === 0) return null;
             return {
               ...item,
               recommendationFeedbackReason: feedbackReason,
