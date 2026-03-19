@@ -4,7 +4,7 @@
 [![AI Workflow](https://img.shields.io/badge/AI%20Workflow-Enabled-green.svg)](.ai-instructions.md)
 [![Documentation](https://img.shields.io/badge/docs-up%20to%20date-brightgreen.svg)](PROJECT_STRUCTURE.md)
 
-一个全栈创意管理平台，支持 AI 评审、社交互动、排行榜，以及 Creative Workshop 模板市场与可视化布局编辑。**当前仓库的 AI 协作文档集中维护在 `server/` 目录，仓库根目录文件仅保留兼容入口。**
+一个全栈创意管理平台，支持 AI 评审、社交互动、排行榜，以及 Creative Workshop 模板市场与可视化布局编辑。**当前仓库的 AI 协作文档统一维护在 `server/` 目录。**
 
 ---
 
