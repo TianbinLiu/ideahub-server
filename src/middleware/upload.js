@@ -3,6 +3,14 @@ const { cloudinary } = require("../config/cloudinary");
 
 const ALLOWED_MIMES = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"];
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+const ALLOWED_MEDIA_MIMES = [
+  ...ALLOWED_MIMES,
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "video/quicktime",
+];
+const MAX_MEDIA_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
 
 // 使用内存存储，上传到 Cloudinary
 const storage = multer.memoryStorage();
@@ -20,6 +28,20 @@ const upload = multer({
   fileFilter,
   limits: {
     fileSize: MAX_IMAGE_SIZE_BYTES,
+  },
+});
+
+const uploadMedia = multer({
+  storage,
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MEDIA_MIMES.includes(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("Only image/video files are allowed"), false);
+  },
+  limits: {
+    fileSize: MAX_MEDIA_SIZE_BYTES,
   },
 });
 
@@ -59,7 +81,10 @@ async function uploadToCloudinary(buffer, folder, userId) {
 
 module.exports = {
   upload,
+  uploadMedia,
   uploadToCloudinary,
   ALLOWED_MIMES,
   MAX_IMAGE_SIZE_BYTES,
+  ALLOWED_MEDIA_MIMES,
+  MAX_MEDIA_SIZE_BYTES,
 };

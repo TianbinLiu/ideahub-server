@@ -21,6 +21,8 @@ const userSchema = new mongoose.Schema(
 
     avatarUrl: { type: String, default: "" },
 
+    activeWorkshopTemplate: { type: mongoose.Schema.Types.ObjectId, ref: "WorkshopTemplate", default: null },
+
     // ✅ 以后你做“邮箱必须验证码验证后才能登录”会用到
     emailVerified: { type: Boolean, default: false },
   },
