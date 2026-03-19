@@ -4,7 +4,7 @@
 [![AI Workflow](https://img.shields.io/badge/AI%20Workflow-Enabled-green.svg)](.ai-instructions.md)
 [![Documentation](https://img.shields.io/badge/docs-up%20to%20date-brightgreen.svg)](PROJECT_STRUCTURE.md)
 
-一个全栈创意管理平台，支持AI评审、社交互动、排行榜等功能。**最重要的是，本项目内置了系统化的AI开发工作流程，确保代码质量和文档的持续同步。**
+一个全栈创意管理平台，支持 AI 评审、社交互动、排行榜，以及 Creative Workshop 模板市场与可视化布局编辑。**当前仓库的 AI 协作文档集中维护在 `server/` 目录，仓库根目录文件仅保留兼容入口。**
 
 ---
 
@@ -15,8 +15,9 @@
 - 🤖 **AI智能评审** - 自动评估创意可行性和盈利潜力  
 - 💬 **社交互动** - 点赞、评论、收藏、关注
 - 🏆 **标签排行榜** - 基于标签的创意排名和投票
+- 🧩 **Creative Workshop** - 模板市场、拖拽布局编辑、AI 改版、热力图
 - 🔔 **实时通知** - 互动通知推送
-- 🌍 **完整国际化** - 中英文双语支持（17页面+8组件）
+- 🌍 **完整国际化** - 中英文双语支持（持续更新）
 - 👥 **角色权限** - 普通用户、公司用户、管理员
 - 🎨 **现代化UI** - Tailwind CSS响应式设计
 
@@ -25,11 +26,11 @@
 **这是本项目最独特的特性：一套系统化的AI协作开发机制**
 
 ```
-📖 .ai-instructions.md       →  AI开发工作流程指南  
-📋 .ai-file-header-templates.md  →  标准化文件头模板  
-📚 PROJECT_STRUCTURE.md      →  项目架构实时文档  
+📖 server/.ai-instructions.md       →  AI开发工作流程指南  
+📋 server/.ai-file-header-templates.md  →  标准化文件头模板  
+📚 server/PROJECT_STRUCTURE.md      →  项目架构实时文档  
 🔍 scripts/validate-project.js   →  自动化验证脚本  
-📝 .gitmessage               →  Git提交模板  
+📝 server/.gitmessage        →  Git提交模板  
 🪝 .git/hooks/pre-commit     →  提交前检查  
 ```
 
@@ -162,8 +163,8 @@ node scripts/seedAdmin.js
 
 **在对本项目进行任何修改之前，你必须：**
 
-1. **📖 阅读 `.ai-instructions.md`** - 了解完整的AI开发工作流程
-2. **📚 阅读 `PROJECT_STRUCTURE.md`** - 了解项目架构和文件关联
+1. **📖 阅读 `server/.ai-instructions.md`** - 了解完整的AI开发工作流程
+2. **📚 阅读 `server/PROJECT_STRUCTURE.md`** - 了解项目架构和文件关联
 3. **✅ 遵循必备功能清单** - 确保不遗漏关键功能
 4. **🔄 同步更新文档** - 修改后立即更新相关文档
 
@@ -173,9 +174,9 @@ node scripts/seedAdmin.js
 ```
 
 **关键文件：**
-- [`.ai-instructions.md`](.ai-instructions.md) - **主要指南，必读！**
-- [`.ai-file-header-templates.md`](.ai-file-header-templates.md) - 文件头模板
-- [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) - 项目架构文档
+- [`.ai-instructions.md`](./.ai-instructions.md) - **主要指南，必读！**
+- [`.ai-file-header-templates.md`](./.ai-file-header-templates.md) - 文件头模板
+- [`PROJECT_STRUCTURE.md`](./PROJECT_STRUCTURE.md) - 项目架构文档
 
 ### 👨‍💻 给人类开发者
 
@@ -218,31 +219,29 @@ npm run validate
 ```
 ideahub/
 │
-├── .ai-instructions.md          # 🤖 AI开发工作流程指南
-├── .ai-file-header-templates.md # 📋 标准文件头模板
-├── PROJECT_STRUCTURE.md         # 📚 项目架构文档（核心）
-├── .gitmessage                  # 📝 Git提交模板
-│
-├── scripts/
-│   └── validate-project.js      # 🔍 自动化验证脚本
-│
 ├── client/                      # 前端应用
 │   ├── src/
-│   │   ├── pages/              # 18个页面组件
-│   │   ├── components/         # 8个通用组件
+│   │   ├── pages/              # 28个页面组件（含 Workshop）
+│   │   ├── components/         # 10个通用组件（含 WorkshopLayoutCanvas）
 │   │   ├── utils/              # 工具函数
 │   │   ├── locales/            # 国际化资源
 │   │   ├── main.tsx            # 应用入口
 │   │   └── App.tsx             # 路由配置
 │   └── package.json
 │
-└── server/                      # 后端应用
+└── server/                      # 后端应用与文档中心
+  ├── .ai-instructions.md      # 🤖 AI开发工作流程指南
+  ├── .ai-file-header-templates.md # 📋 标准文件头模板
+  ├── PROJECT_STRUCTURE.md     # 📚 项目架构文档（核心）
+  ├── .gitmessage              # 📝 Git提交模板
+  ├── scripts/
+  │   └── validate-project.js  # 🔍 自动化验证脚本
     ├── src/
-    │   ├── routes/             # 10个路由模块
-    │   ├── controllers/        # 9个控制器
-    │   ├── models/             # 12个数据模型
+  │   ├── routes/             # 16个路由模块
+  │   ├── controllers/        # 16个控制器
+  │   ├── models/             # 25个数据模型
     │   ├── middleware/         # 5个中间件
-    │   ├── services/           # 4个服务
+  │   ├── services/           # 5个服务
     │   ├── workers/            # 后台任务
     │   ├── config/             # 配置
     │   ├── utils/              # 工具函数

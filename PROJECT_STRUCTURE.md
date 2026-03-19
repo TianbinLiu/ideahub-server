@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-15  
-> 版本: 4.4
+> 最后更新: 2026-03-19  
+> 版本: 4.5
 > 
 > ---
 > 
@@ -47,9 +47,10 @@
 ✅ 标签排行榜系统  
 ✅ 通知系统  
 ✅ 管理后台  
-✅ **完整国际化（17页面+4组件）**  
+✅ **完整国际化（持续更新）**  
 ✅ 公司兴趣表达功能  
 ✅ **外部来源导入功能（12个预设平台）**
+✅ **Creative Workshop 模板市场、布局编辑与热力图**
 
 ---
 
@@ -57,8 +58,6 @@
 
 ```
 ideahub/
-│
-├── PROJECT_STRUCTURE.md              # 本文档
 │
 ├── client/                           # 前端应用
 │   ├── src/
@@ -72,13 +71,16 @@ ideahub/
 │   │   ├── config.ts                 # 环境配置
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
-│   │   ├── components/               # 通用组件
+│   │   ├── components/               # 通用组件（10个）
+│   │   │   ├── AdminRoute.tsx        # 管理员路由守卫
 │   │   │   ├── Navbar.tsx            # 导航栏
+│   │   │   ├── NotificationsDropdown.tsx # 通知下拉面板
 │   │   │   ├── OAuthButtons.tsx      # OAuth按钮
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
-│   │   │   └── UserHoverCard.tsx     # 用户卡片
+│   │   │   ├── UserHoverCard.tsx     # 用户卡片
+│   │   │   └── WorkshopLayoutCanvas.tsx # 工坊布局画布
 │   │   │
-│   │   ├── pages/                    # 页面组件（24个）
+│   │   ├── pages/                    # 页面组件（28个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -102,7 +104,11 @@ ideahub/
 │   │   │   ├── AdminUsersPage.tsx
 │   │   │   ├── FeedbackAdminPage.tsx
 │   │   │   ├── DocsAdminPage.tsx
-│   │   │   └── AdminScraperPage.tsx
+│   │   │   ├── AdminScraperPage.tsx
+│   │   │   ├── WorkshopEditorPage.tsx
+│   │   │   ├── WorkshopPage.tsx
+│   │   │   ├── WorkshopTagMapPage.tsx
+│   │   │   └── WorkshopTemplateDetailPage.tsx
 │   │   │
 │   │   ├── locales/                  # 国际化资源
 │   │   │   ├── en.json               # 英文翻译（持续更新）
@@ -112,13 +118,21 @@ ideahub/
 │   │       ├── humanizeError.ts      # 错误国际化
 │   │       ├── safeNext.ts           # URL安全处理
 │   │       ├── localIdeas.ts         # 本地存储
-│   │       └── platformConfig.ts     # 外部平台配置
+│   │       ├── platformConfig.ts     # 外部平台配置
+│   │       ├── workshopLayout.ts     # 工坊默认布局与克隆工具
+│   │       ├── workshopTheme.ts      # 工坊主题持久化与应用
+│   │       └── workshopVersion.ts    # 工坊版本兼容工具
 │   │
 │   ├── package.json                  # 依赖管理
 │   ├── vite.config.ts               # Vite配置
 │   └── tailwind.config.js           # Tailwind配置
 │
-└── server/                           # 后端应用
+└── server/                           # 后端应用与文档中心
+  ├── .ai-instructions.md           # AI开发指南（权威版本）
+  ├── .ai-file-header-templates.md  # 文件头模板（权威版本）
+  ├── AI-WORKFLOW-SYSTEM.md         # AI工作流总说明
+  ├── PROJECT_STRUCTURE.md          # 本文档
+  ├── README.md                     # 服务端/文档入口说明
     ├── src/
     │   ├── index.js                  # 服务器入口
     │   ├── app.js                    # Express配置
@@ -126,9 +140,11 @@ ideahub/
     │   ├── config/                   # 配置
     │   │   ├── db.js                 # MongoDB连接
     │   │   ├── passport.js           # 认证策略
-    │   │   └── cloudinary.js         # Cloudinary配置与启动校验
+    │   │   ├── cloudinary.js         # Cloudinary配置与启动校验
+    │   │   ├── workshopLayout.js     # 默认工坊布局配置
+    │   │   └── workshopVersion.js    # 工坊模板版本常量
     │   │
-    │   ├── models/                   # 数据模型（21个）
+    │   ├── models/                   # 数据模型（25个）
     │   │   ├── User.js
     │   │   ├── Idea.js
     │   │   ├── IdeaRecommendationFeedback.js
@@ -139,15 +155,27 @@ ideahub/
     │   │   ├── Interest.js
     │   │   ├── OtpToken.js
     │   │   ├── AiJob.js
-    │   │   └── ScraperJob.js
+    │   │   ├── ScraperJob.js
+    │   │   ├── WorkshopTemplate.js
+    │   │   ├── WorkshopTemplateBookmark.js
+    │   │   ├── WorkshopTemplateComment.js
+    │   │   └── WorkshopTemplateLike.js
     │   │
-    │   ├── controllers/              # 控制器（15个）
+    │   ├── controllers/              # 控制器（16个）
     │   ├── routes/                   # 路由（16个）
     │   ├── middleware/               # 中间件（5个）
     │   ├── schemas/                  # 验证模式（2个）
-    │   ├── services/                 # 业务服务（4个）
+    │   ├── services/                 # 业务服务（5个）
     │   ├── workers/                  # 后台任务（2个）
     │   └── utils/                    # 工具（6个）
+    │
+    ├── scripts/                      # 文档/维护脚本
+    │   ├── add-file-headers.js
+    │   ├── cleanupEmptyLeaderboards.js
+    │   ├── copyProjectDocs.js
+    │   ├── migrateCommentParentId.js
+    │   ├── seedAdmin.js
+    │   └── validate-project.js
     │
     └── package.json                  # 依赖管理
 ```
@@ -211,6 +239,11 @@ i18n.use(initReactI18next).init({
 /feedback → FeedbackAdminPage
 /admin/docs → DocsAdminPage
 /admin/scraper → AdminScraperPage
+/workshop → WorkshopPage
+/workshop/new → WorkshopEditorPage
+/workshop/tag-map → WorkshopTagMapPage
+/workshop/templates/:id → WorkshopTemplateDetailPage
+/workshop/templates/:id/edit → WorkshopEditorPage
 ```
 
 ---
@@ -1061,22 +1094,24 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/controllers/`
-**15个控制器**（核心如下）:
+**16个控制器**（核心如下）:
 - `auth.controller.js` - 登录、注册
 - `authOtp.controller.js` - 邮箱验证码
 - `ideas.controller.js` - 创意CRUD
 - `ideaInteractions.controller.js` - 点赞、评论、收藏（含评论图片）
 - `interest.controller.js` - 公司兴趣
 - `notifications.controller.js` - 通知
+- `messages.controller.js` - 私信与请求处理
 - `aiReview.controller.js` - AI评审
 - `aiJobs.controller.js` - AI任务查询
 - `admin.controller.js` - 管理后台
 - `scraper.controller.js` - 外部内容抓取
+- `workshop.controller.js` - 工坊模板、评论、AI 改版与应用
 
 ---
 
 #### `server/src/routes/`
-**15个路由模块**:
+**16个路由模块**:
 - `health.routes.js` - 健康检查
 - `auth.routes.js` - 认证
 - `authOtp.routes.js` - OTP验证
@@ -1084,11 +1119,15 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `ideas.routes.js` - 创意
 - `me.routes.js` - 个人中心
 - `company.routes.js` - 公司
+- `messages.routes.js` - 私信与会话请求
 - `notifications.routes.js` - 通知
 - `aiJobs.routes.js` - AI任务
 - `admin.routes.js` - 管理
+- `tagRank.routes.js` - 标签排行榜
 - `scraper.routes.js` - 外部内容抓取
 - `uploads.routes.js` - 内容图片上传
+- `users.routes.js` - 用户资料与关注关系
+- `workshop.routes.js` - 工坊模板市场与编辑
 
 ---
 
@@ -1158,6 +1197,94 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 ---
 
+#### `server/src/routes/workshop.routes.js`
+**功能**: Creative Workshop 模板市场、模板编辑与应用路由  
+**端点**:
+- `GET /api/workshop/templates` - 浏览模板市场
+- `GET /api/workshop/templates/mine` - 获取我的模板
+- `GET /api/workshop/tag-insights` - 获取热门标签与热力图数据
+- `GET /api/workshop/templates/:id` - 获取模板详情
+- `GET /api/workshop/templates/:id/comments` - 获取模板评论
+- `POST /api/workshop/templates/:id/comments` - 发表评论
+- `POST /api/workshop/templates` - 创建模板
+- `PUT /api/workshop/templates/:id` - 更新模板
+- `POST /api/workshop/templates/:id/like` - 点赞模板
+- `POST /api/workshop/templates/:id/bookmark` - 收藏模板
+- `POST /api/workshop/templates/:id/apply` - 应用模板
+- `POST /api/workshop/ai/edit` - 获取 AI 安全改版草稿
+- `GET /api/workshop/active-template` - 获取当前用户正在使用的模板
+**中间件**: `optionalAuth`、`requireAuth`  
+**关联文件**: `workshop.controller.js`
+
+---
+
+#### `server/src/models/WorkshopTemplate.js`
+**功能**: 工坊模板主模型  
+**职责**:
+- 存储模板标题、摘要、预览图与 tags
+- 存储模板主题配置（颜色、背景、卡片样式、自定义 CSS）
+- 存储可拖拽首页布局 JSON（canvas + block items）
+- 记录模板统计（浏览、点赞、收藏、评论、应用次数）
+- 维护作者更新日志与模板版本兼容信息
+
+---
+
+#### `server/src/models/WorkshopTemplateComment.js`
+**功能**: 模板评论模型  
+**职责**:
+- 记录模板下的评论内容与作者
+- 支持模板详情页评论区
+- 与模板 `stats.commentCount` 联动
+
+---
+
+#### `server/src/services/workshopAi.service.js`
+**功能**: 工坊 AI 改版草稿服务  
+**职责**:
+- 将模板主题、布局与用户指令组合为 AI 提示
+- 对 AI 输出进行白名单解析与清洗
+- 返回可预览的安全 draft，而不是直接写库
+
+---
+
+#### `client/src/pages/WorkshopPage.tsx`
+**功能**: Creative Workshop 模板市场页  
+**职责**:
+- 展示推荐、最新、热门模板列表
+- 在搜索框旁展示热门 tags 与最近搜索 tags
+- 跳转到 workshop heat map 页面
+- 展示“我的模板”和模板市场入口
+
+---
+
+#### `client/src/pages/WorkshopEditorPage.tsx`
+**功能**: 工坊模板编辑器  
+**职责**:
+- 编辑模板基础信息、tags、主题和分享状态
+- 使用 `WorkshopLayoutCanvas` 进行可视化拖拽布局
+- 支持 AI 改版草稿预览与应用
+- 写入作者更新日志
+
+---
+
+#### `client/src/pages/WorkshopTemplateDetailPage.tsx`
+**功能**: 工坊模板详情页  
+**职责**:
+- 展示模板预览图、主题、布局摘要与兼容状态
+- 支持点赞、收藏、应用模板
+- 展示作者更新日志与评论区
+
+---
+
+#### `client/src/pages/WorkshopTagMapPage.tsx`
+**功能**: 工坊模板热力图页  
+**职责**:
+- 按 tags 聚合共享模板
+- 以热力图/聚类形式展示模板分布
+- 支持从标签点位跳转模板详情
+
+---
+
 #### `server/src/workers/`
 - `aiReview.worker.js` - AI评审队列消费者（Bull）
 
@@ -1195,6 +1322,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-15 | 4.2 | **推荐流冷启动与搜索命中高亮**：`ideas.controller.js` 为推荐流新增冷启动兜底，当用户尚无搜索记录时，优先推送近期高互动 idea；`HomePage.tsx` 搜索框新增多 tag 相关搜索提示，搜索结果中的命中 tag 使用高亮样式突出显示，帮助用户理解“任一相关即可召回”的排序机制。 |
 | 2026-03-15 | 4.3 | **推荐流去重与用户反馈**：新增 `IdeaRecommendationFeedback` 模型记录用户对推荐内容的负反馈；`GET /api/ideas` 在推荐模式下接入 `IdeaView` 浏览记录与推荐反馈，对近期已看过 idea 自动降权，对“不感兴趣”内容直接过滤，对“已推荐过”内容显著降权。`HomePage.tsx` 为登录用户新增“不感兴趣 / 已推荐过”反馈按钮，点击后当前推荐卡片立即移除，并通过新接口 `POST /api/ideas/:id/recommendation-feedback` 持久化用户偏好。 |
 | 2026-03-15 | 4.4 | **推荐反馈撤销能力**：新增 `DELETE /api/ideas/:id/recommendation-feedback` 用于撤销推荐反馈；`HomePage.tsx` 在用户点击“不感兴趣 / 已推荐过”后显示带“撤销”按钮的交互提示，允许快速纠正误点并恢复当前卡片展示。 |
+| 2026-03-19 | 4.5 | **文档与 Workshop 结构同步**：补回仓库根目录 AI 文档入口；修正文档中的实际目录位置与数量；新增 Creative Workshop 页面、布局画布、模板模型、评论、AI 改版、热门标签与 Heat Map 说明。 |
 
 ---
 
