@@ -98,6 +98,49 @@ function sanitizeCssBlock(input) {
   return declarations.join("; ");
 }
 
+function normalizeSiteDraft(input) {
+  const src = input && typeof input === "object" ? input : {};
+  const pagesInput = src.pages && typeof src.pages === "object" ? src.pages : {};
+  const pageEntries = Object.entries(pagesInput).slice(0, 40);
+  const pages = {};
+
+  for (const [rawPageKey, rawPageValue] of pageEntries) {
+    const pageKey = String(rawPageKey || "").trim().slice(0, 120);
+    if (!pageKey) continue;
+
+    const pageValue = rawPageValue && typeof rawPageValue === "object" ? rawPageValue : {};
+    const backgroundType = ["none", "image", "video", "gradient"].includes(String(pageValue.backgroundType || ""))
+      ? String(pageValue.backgroundType)
+      : "none";
+
+    const nodesInput = pageValue.nodes && typeof pageValue.nodes === "object" ? pageValue.nodes : {};
+    const nodeEntries = Object.entries(nodesInput).slice(0, 500);
+    const nodes = {};
+
+    for (const [rawNodeId, rawNodeValue] of nodeEntries) {
+      const nodeId = String(rawNodeId || "").trim().slice(0, 200);
+      if (!nodeId) continue;
+      const nodeValue = rawNodeValue && typeof rawNodeValue === "object" ? rawNodeValue : {};
+
+      nodes[nodeId] = {
+        x: clampNumber(nodeValue.x, 0, -4000, 4000),
+        y: clampNumber(nodeValue.y, 0, -4000, 4000),
+        width: clampNumber(nodeValue.width, 0, 0, 8000),
+        height: clampNumber(nodeValue.height, 0, 0, 8000),
+        css: sanitizeCssBlock(nodeValue.css || ""),
+      };
+    }
+
+    pages[pageKey] = {
+      backgroundType,
+      backgroundUrl: String(pageValue.backgroundUrl || "").trim().slice(0, 1000),
+      nodes,
+    };
+  }
+
+  return { pages };
+}
+
 function normalizeTheme(theme) {
   const src = theme && typeof theme === "object" ? theme : {};
   const backgroundType = ["none", "image", "video", "gradient"].includes(String(src.backgroundType || ""))
@@ -222,6 +265,7 @@ function toTemplatePayload(doc, ctx = {}) {
     shared: !!doc.shared,
     theme: normalizeTheme(doc.theme),
     layout: normalizeLayout(doc.layout),
+    siteDraft: normalizeSiteDraft(doc.siteDraft),
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
       likeCount: Number(doc?.stats?.likeCount || 0),
@@ -261,6 +305,7 @@ function buildDefaultTemplatePayload() {
       componentCss: { card: "", button: "", title: "" },
     },
     layout: createDefaultLayout(),
+    siteDraft: { pages: {} },
     stats: { viewCount: 0, likeCount: 0, bookmarkCount: 0, commentCount: 0 },
     appliedCount: 0,
     updateLogs: [
@@ -473,6 +518,7 @@ async function createTemplate(req, res, next) {
       shared: Boolean(req.body.shared),
       theme: normalizeTheme(req.body.theme),
       layout: normalizeLayout(req.body.layout),
+      siteDraft: normalizeSiteDraft(req.body.siteDraft),
       updateLogs: [
         createUpdateLogEntry({
           title: "Initial version",
@@ -508,6 +554,7 @@ async function updateTemplate(req, res, next) {
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.theme !== undefined) doc.theme = normalizeTheme(req.body.theme);
     if (req.body.layout !== undefined) doc.layout = normalizeLayout(req.body.layout);
+    if (req.body.siteDraft !== undefined) doc.siteDraft = normalizeSiteDraft(req.body.siteDraft);
 
     const changeSummary = String(req.body.changeSummary || "").trim().slice(0, 300);
     const changeSource = req.body.changeSource === "ai" ? "ai" : "manual";

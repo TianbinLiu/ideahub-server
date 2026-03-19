@@ -84,6 +84,7 @@ const workshopTemplateSchema = new mongoose.Schema(
     shared: { type: Boolean, default: false, index: true },
     theme: { type: workshopThemeSchema, default: () => ({}) },
     layout: { type: workshopLayoutSchema, default: () => ({}) },
+    siteDraft: { type: mongoose.Schema.Types.Mixed, default: () => ({ pages: {} }) },
     stats: {
       viewCount: { type: Number, default: 0 },
       likeCount: { type: Number, default: 0 },
