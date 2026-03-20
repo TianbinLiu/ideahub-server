@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-19  
-> 版本: 4.5
+> 最后更新: 2026-03-20  
+> 版本: 4.6
 > 
 > ---
 > 
@@ -51,6 +51,7 @@
 ✅ 公司兴趣表达功能  
 ✅ **外部来源导入功能（12个预设平台）**
 ✅ **Creative Workshop 模板市场、布局编辑与热力图**
+✅ **全站模板编辑（节点改样式/拖拽位移/页面背景/组件挂件）**
 
 ---
 
@@ -71,12 +72,14 @@ ideahub/
 │   │   ├── config.ts                 # 环境配置
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
-│   │   ├── components/               # 通用组件（10个）
+│   │   ├── components/               # 通用组件（12个）
 │   │   │   ├── AdminRoute.tsx        # 管理员路由守卫
 │   │   │   ├── Navbar.tsx            # 导航栏
 │   │   │   ├── NotificationsDropdown.tsx # 通知下拉面板
 │   │   │   ├── OAuthButtons.tsx      # OAuth按钮
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
+│   │   │   ├── SiteGlobalAiAssistant.tsx # 全站编辑 AI 助手面板
+│   │   │   ├── SiteTemplateEditOverlay.tsx # 全站编辑覆盖层
 │   │   │   ├── UserHoverCard.tsx     # 用户卡片
 │   │   │   └── WorkshopLayoutCanvas.tsx # 工坊布局画布
 │   │   │
@@ -119,8 +122,9 @@ ideahub/
 │   │       ├── safeNext.ts           # URL安全处理
 │   │       ├── localIdeas.ts         # 本地存储
 │   │       ├── platformConfig.ts     # 外部平台配置
+│   │       ├── siteDraft.ts          # 全站模板草稿类型与安全归一化
 │   │       ├── workshopLayout.ts     # 工坊默认布局与克隆工具
-│   │       ├── workshopTheme.ts      # 工坊主题持久化与应用
+│   │       ├── workshopTheme.ts      # 工坊主题与 siteDraft 渲染应用
 │   │       └── workshopVersion.ts    # 工坊版本兼容工具
 │   │
 │   ├── package.json                  # 依赖管理
@@ -240,7 +244,7 @@ i18n.use(initReactI18next).init({
 /admin/docs → DocsAdminPage
 /admin/scraper → AdminScraperPage
 /workshop → WorkshopPage
-/workshop/new → WorkshopEditorPage
+/workshop/new → WorkshopEditorPage（支持 ?fromSiteEdit=1 发布信息模式）
 /workshop/tag-map → WorkshopTagMapPage
 /workshop/templates/:id → WorkshopTemplateDetailPage
 /workshop/templates/:id/edit → WorkshopEditorPage
@@ -1127,7 +1131,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `scraper.routes.js` - 外部内容抓取
 - `uploads.routes.js` - 内容图片上传
 - `users.routes.js` - 用户资料与关注关系
-- `workshop.routes.js` - 工坊模板市场与编辑
+- `workshop.routes.js` - 工坊模板市场、编辑与全站 AI 改版
 
 ---
 
@@ -1144,6 +1148,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `otp.service.js` - OTP生成/验证
 - `notification.service.js` - 通知创建
 - `aiReview.service.js` - AI评审队列
+- `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
 
 ---
 
@@ -1212,6 +1217,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `POST /api/workshop/templates/:id/bookmark` - 收藏模板
 - `POST /api/workshop/templates/:id/apply` - 应用模板
 - `POST /api/workshop/ai/edit` - 获取 AI 安全改版草稿
+- `POST /api/workshop/ai/site-edit` - 获取全站编辑 AI 操作草案（节点/组件/页面背景）
 - `GET /api/workshop/active-template` - 获取当前用户正在使用的模板
 **中间件**: `optionalAuth`、`requireAuth`  
 **关联文件**: `workshop.controller.js`
@@ -1224,6 +1230,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 存储模板标题、摘要、预览图与 tags
 - 存储模板主题配置（颜色、背景、卡片样式、自定义 CSS）
 - 存储可拖拽首页布局 JSON（canvas + block items）
+- 存储 `siteDraft`（按路由页面分组的节点样式、背景和挂件组件）
 - 记录模板统计（浏览、点赞、收藏、评论、应用次数）
 - 维护作者更新日志与模板版本兼容信息
 
@@ -1239,11 +1246,12 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/services/workshopAi.service.js`
-**功能**: 工坊 AI 改版草稿服务  
+**功能**: 工坊 AI 改版草稿服务（模板编辑 + 全站编辑）  
 **职责**:
 - 将模板主题、布局与用户指令组合为 AI 提示
 - 对 AI 输出进行白名单解析与清洗
 - 返回可预览的安全 draft，而不是直接写库
+- 生成全站编辑操作集（`updateNodes`、`createWidgets`、`removeWidgetIds`、`pageBackground`）
 
 ---
 
@@ -1254,6 +1262,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 在搜索框旁展示热门 tags 与最近搜索 tags
 - 跳转到 workshop heat map 页面
 - 展示“我的模板”和模板市场入口
+- “新建模板”入口直接启动全站编辑模式（`/?siteEdit=1`）
 
 ---
 
@@ -1263,7 +1272,30 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 编辑模板基础信息、tags、主题和分享状态
 - 使用 `WorkshopLayoutCanvas` 进行可视化拖拽布局
 - 支持 AI 改版草稿预览与应用
+- 支持从全站编辑流程接收 `siteDraft` 并与模板一起保存
+- 当 `?fromSiteEdit=1` 时提供发布元信息页面（标题/摘要/标签/封面）
 - 写入作者更新日志
+
+---
+
+#### `client/src/components/SiteTemplateEditOverlay.tsx`
+**功能**: 全站模板编辑覆盖层（挂载于 `App.tsx`）  
+**职责**:
+- 在任意页面启用节点选中高亮、右键样式编辑
+- 支持 `Alt` 拖拽移动与 `Alt+Shift` 调整尺寸
+- 维护页面级背景（image/video/gradient）上传与清理
+- 管理本地草稿、撤销/重做（按钮 + 快捷键）和退出重置
+- 对接全局 AI 助手并将草稿交接到模板发布页
+
+---
+
+#### `client/src/components/SiteGlobalAiAssistant.tsx`
+**功能**: 全站编辑 AI 助手独立面板  
+**职责**:
+- 发送自然语言指令到 `/api/workshop/ai/site-edit`
+- 预览 AI 返回的多操作差异摘要
+- 用户确认后应用操作，支持一次修改多个节点并创建挂件
+- 支持挂件类型：`text`、`button`、`badge`、`image`、`card`、`link-list`、`form`
 
 ---
 
@@ -1323,6 +1355,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-15 | 4.3 | **推荐流去重与用户反馈**：新增 `IdeaRecommendationFeedback` 模型记录用户对推荐内容的负反馈；`GET /api/ideas` 在推荐模式下接入 `IdeaView` 浏览记录与推荐反馈，对近期已看过 idea 自动降权，对“不感兴趣”内容直接过滤，对“已推荐过”内容显著降权。`HomePage.tsx` 为登录用户新增“不感兴趣 / 已推荐过”反馈按钮，点击后当前推荐卡片立即移除，并通过新接口 `POST /api/ideas/:id/recommendation-feedback` 持久化用户偏好。 |
 | 2026-03-15 | 4.4 | **推荐反馈撤销能力**：新增 `DELETE /api/ideas/:id/recommendation-feedback` 用于撤销推荐反馈；`HomePage.tsx` 在用户点击“不感兴趣 / 已推荐过”后显示带“撤销”按钮的交互提示，允许快速纠正误点并恢复当前卡片展示。 |
 | 2026-03-19 | 4.5 | **文档与 Workshop 结构同步**：补回仓库根目录 AI 文档入口；修正文档中的实际目录位置与数量；新增 Creative Workshop 页面、布局画布、模板模型、评论、AI 改版、热门标签与 Heat Map 说明。 |
+| 2026-03-20 | 4.6 | **全站模板编辑与全局 AI 流程文档同步**：更新结构树（新增 `SiteTemplateEditOverlay`、`SiteGlobalAiAssistant`、`siteDraft`）；补充 `/api/workshop/ai/site-edit` 端点与操作模型；补充 `WorkshopTemplate.siteDraft` 存储说明；更新 `WorkshopPage` 全站编辑入口与 `WorkshopEditorPage` 的 `fromSiteEdit` 发布信息流程。 |
 
 ---
 
