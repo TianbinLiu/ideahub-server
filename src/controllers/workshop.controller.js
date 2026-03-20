@@ -6,7 +6,7 @@ const WorkshopTemplateComment = require("../models/WorkshopTemplateComment");
 const User = require("../models/User");
 const { DEFAULT_WORKSHOP_LAYOUT } = require("../config/workshopLayout");
 const { CURRENT_DEFAULT_TEMPLATE_VERSION } = require("../config/workshopVersion");
-const { generateWorkshopEditPlan } = require("../services/workshopAi.service");
+const { generateWorkshopEditPlan, generateSiteDraftEditPlan } = require("../services/workshopAi.service");
 const { badRequest, invalidId, unauthorized, forbidden, notFound } = require("../utils/http");
 
 const DEFAULT_TEMPLATE_ID = "default";
@@ -116,6 +116,8 @@ function normalizeSiteDraft(input) {
     const nodesInput = pageValue.nodes && typeof pageValue.nodes === "object" ? pageValue.nodes : {};
     const nodeEntries = Object.entries(nodesInput).slice(0, 500);
     const nodes = {};
+    const widgetsInput = Array.isArray(pageValue.widgets) ? pageValue.widgets : [];
+    const widgets = [];
 
     for (const [rawNodeId, rawNodeValue] of nodeEntries) {
       const nodeId = String(rawNodeId || "").trim().slice(0, 200);
@@ -131,10 +133,49 @@ function normalizeSiteDraft(input) {
       };
     }
 
+    for (let i = 0; i < Math.min(widgetsInput.length, 80); i += 1) {
+      const item = widgetsInput[i] && typeof widgetsInput[i] === "object" ? widgetsInput[i] : {};
+      const id = String(item.id || `widget_${i + 1}`).trim().slice(0, 120);
+      if (!id) continue;
+      const rawType = String(item.type || "text").toLowerCase();
+      const type = rawType === "button"
+        ? "button"
+        : rawType === "badge"
+          ? "badge"
+          : rawType === "image"
+            ? "image"
+            : rawType === "card"
+              ? "card"
+              : rawType === "link-list"
+                ? "link-list"
+                : rawType === "form"
+                  ? "form"
+                  : "text";
+      widgets.push({
+        id,
+        type,
+        text: String(item.text || "New widget").trim().slice(0, 200),
+        href: String(item.href || "").trim().slice(0, 600),
+        imageUrl: String(item.imageUrl || "").trim().slice(0, 1000),
+        items: Array.isArray(item.items)
+          ? item.items.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 20)
+          : [],
+        fields: Array.isArray(item.fields)
+          ? item.fields.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 12)
+          : [],
+        x: clampNumber(item.x, 0, -4000, 4000),
+        y: clampNumber(item.y, 0, -4000, 4000),
+        width: clampNumber(item.width, 180, 40, 2000),
+        height: clampNumber(item.height, 44, 20, 1200),
+        css: sanitizeCssBlock(item.css || ""),
+      });
+    }
+
     pages[pageKey] = {
       backgroundType,
       backgroundUrl: String(pageValue.backgroundUrl || "").trim().slice(0, 1000),
       nodes,
+      widgets,
     };
   }
 
@@ -619,6 +660,102 @@ async function previewAiEdit(req, res, next) {
   }
 }
 
+async function previewAiSiteEdit(req, res, next) {
+  try {
+    if (!req.user) unauthorized("Login required");
+    const instruction = String(req.body.instruction || "").trim();
+    if (!instruction) badRequest("Instruction is required");
+
+    const pageKey = String(req.body.pageKey || "/").trim() || "/";
+    const siteDraft = normalizeSiteDraft(req.body.siteDraft);
+    const history = Array.isArray(req.body.history)
+      ? req.body.history
+          .map((item) => ({ role: item?.role, content: String(item?.content || "").slice(0, 400) }))
+          .filter((item) => item.role === "user" || item.role === "assistant")
+      : [];
+
+    const nodeCatalog = Array.isArray(req.body.nodeCatalog)
+      ? req.body.nodeCatalog.slice(0, 300).map((item) => ({
+          nodeId: String(item?.nodeId || "").slice(0, 200),
+          hint: String(item?.hint || "").slice(0, 180),
+        })).filter((item) => item.nodeId)
+      : [];
+
+    const aiResult = await generateSiteDraftEditPlan({ instruction, history, pageKey, siteDraft, nodeCatalog });
+    const ops = aiResult.operations && typeof aiResult.operations === "object" ? aiResult.operations : {};
+
+    const updateNodes = Array.isArray(ops.updateNodes)
+      ? ops.updateNodes.slice(0, 120).map((item) => ({
+          nodeId: String(item?.nodeId || "").trim().slice(0, 200),
+          x: item?.x === undefined ? undefined : clampNumber(item.x, 0, -4000, 4000),
+          y: item?.y === undefined ? undefined : clampNumber(item.y, 0, -4000, 4000),
+          width: item?.width === undefined ? undefined : clampNumber(item.width, 0, 0, 8000),
+          height: item?.height === undefined ? undefined : clampNumber(item.height, 0, 0, 8000),
+          css: item?.css === undefined ? undefined : sanitizeCssBlock(item.css),
+        })).filter((item) => item.nodeId)
+      : [];
+
+    const createWidgets = Array.isArray(ops.createWidgets)
+      ? ops.createWidgets.slice(0, 60).map((item, index) => {
+          const rawType = String(item?.type || "text").toLowerCase();
+          const type = rawType === "button"
+            ? "button"
+            : rawType === "badge"
+              ? "badge"
+              : rawType === "image"
+                ? "image"
+                : rawType === "card"
+                  ? "card"
+                  : rawType === "link-list"
+                    ? "link-list"
+                    : rawType === "form"
+                      ? "form"
+                      : "text";
+          return {
+            id: String(item?.id || `widget_${Date.now()}_${index + 1}`).trim().slice(0, 120),
+            type,
+            text: String(item?.text || "New widget").trim().slice(0, 200),
+            href: String(item?.href || "").trim().slice(0, 600),
+            imageUrl: String(item?.imageUrl || "").trim().slice(0, 1000),
+            items: Array.isArray(item?.items)
+              ? item.items.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 20)
+              : [],
+            fields: Array.isArray(item?.fields)
+              ? item.fields.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 12)
+              : [],
+            x: clampNumber(item?.x, 0, -4000, 4000),
+            y: clampNumber(item?.y, 0, -4000, 4000),
+            width: clampNumber(item?.width, 180, 40, 2000),
+            height: clampNumber(item?.height, 44, 20, 1200),
+            css: sanitizeCssBlock(item?.css || ""),
+          };
+        }).filter((item) => item.id)
+      : [];
+
+    const removeWidgetIds = Array.isArray(ops.removeWidgetIds)
+      ? ops.removeWidgetIds.slice(0, 120).map((item) => String(item || "").trim().slice(0, 120)).filter(Boolean)
+      : [];
+
+    const pageBackground = ops.pageBackground && typeof ops.pageBackground === "object"
+      ? {
+          backgroundType: ["none", "image", "video", "gradient"].includes(String(ops.pageBackground.backgroundType || ""))
+            ? String(ops.pageBackground.backgroundType)
+            : undefined,
+          backgroundUrl: String(ops.pageBackground.backgroundUrl || "").trim().slice(0, 1000),
+        }
+      : undefined;
+
+    res.json({
+      ok: true,
+      assistantMessage: String(aiResult.assistantMessage || "已生成全站改版操作草案。"),
+      operations: { updateNodes, createWidgets, removeWidgetIds, pageBackground },
+      model: aiResult.model,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function listTemplateComments(req, res, next) {
   try {
     const { id } = req.params;
@@ -772,6 +909,7 @@ module.exports = {
   createTemplate,
   updateTemplate,
   previewAiEdit,
+  previewAiSiteEdit,
   listTemplateComments,
   addTemplateComment,
   toggleTemplateLike,

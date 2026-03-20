@@ -8,6 +8,7 @@ const {
   createTemplate,
   updateTemplate,
   previewAiEdit,
+  previewAiSiteEdit,
   listTemplateComments,
   addTemplateComment,
   toggleTemplateLike,
@@ -17,6 +18,7 @@ const {
 } = require("../controllers/workshop.controller");
 
 router.post("/ai/edit", requireAuth, previewAiEdit);
+router.post("/ai/site-edit", requireAuth, previewAiSiteEdit);
 router.get("/templates", optionalAuth, listTemplates);
 router.get("/templates/mine", requireAuth, listMyTemplates);
 router.get("/tag-insights", optionalAuth, listTemplateTagInsights);

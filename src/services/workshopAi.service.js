@@ -119,4 +119,89 @@ ${String(instruction || "").slice(0, 600)}
   };
 }
 
-module.exports = { generateWorkshopEditPlan };
+async function generateSiteDraftEditPlan({ instruction, history = [], pageKey, siteDraft, nodeCatalog = [] }) {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error("OPENAI_API_KEY is not set on server");
+    err.status = 501;
+    throw err;
+  }
+
+  const client = getClient();
+  const model = process.env.OPENAI_MODEL || "gpt-5.4";
+  const conversation = history
+    .filter((item) => item && (item.role === "user" || item.role === "assistant"))
+    .slice(-8)
+    .map((item) => `${item.role.toUpperCase()}: ${String(item.content || "").slice(0, 360)}`)
+    .join("\n");
+
+  const prompt = `
+You are a safe global site editor for IdeaHub full-site edit mode.
+Return STRICT JSON only with this shape:
+{
+  "assistantMessage": string,
+  "operations": {
+    "updateNodes"?: [
+      {
+        "nodeId": string,
+        "x"?: number,
+        "y"?: number,
+        "width"?: number,
+        "height"?: number,
+        "css"?: string
+      }
+    ],
+    "createWidgets"?: [
+      {
+        "id"?: string,
+        "type"?: "text" | "button" | "badge" | "image" | "card" | "link-list" | "form",
+        "text": string,
+        "href"?: string,
+        "imageUrl"?: string,
+        "items"?: string[],
+        "fields"?: string[],
+        "x": number,
+        "y": number,
+        "width"?: number,
+        "height"?: number,
+        "css"?: string
+      }
+    ],
+    "removeWidgetIds"?: string[],
+    "pageBackground"?: {
+      "backgroundType"?: "none" | "image" | "video" | "gradient",
+      "backgroundUrl"?: string
+    }
+  }
+}
+
+Safety rules:
+- Only reference nodeId values that exist in nodeCatalog.
+- CSS must contain only safe declarations; avoid url(), @import, script-like content.
+- createWidgets is the only way to add new components.
+- Keep numbers in reasonable viewport px ranges.
+- If instruction is unclear, keep operations minimal and explain in assistantMessage.
+
+Current pageKey: ${String(pageKey || "/")}
+Current page draft snapshot:
+${JSON.stringify(siteDraft?.pages?.[pageKey] || {}, null, 2).slice(0, 5000)}
+
+Selectable node catalog (id + hint):
+${JSON.stringify(nodeCatalog || [], null, 2).slice(0, 4000)}
+
+Conversation history:
+${conversation || "(none)"}
+
+User instruction:
+${String(instruction || "").slice(0, 800)}
+`;
+
+  const resp = await client.responses.create({ model, input: prompt });
+  const payload = parseJsonObject(resp.output_text || "") || {};
+  return {
+    assistantMessage: String(payload.assistantMessage || "已生成全站改版操作草案。"),
+    operations: payload.operations && typeof payload.operations === "object" ? payload.operations : {},
+    model,
+  };
+}
+
+module.exports = { generateWorkshopEditPlan, generateSiteDraftEditPlan };
