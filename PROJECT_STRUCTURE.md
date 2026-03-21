@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-20  
-> 版本: 4.6
+> 最后更新: 2026-03-21  
+> 版本: 4.10
 > 
 > ---
 > 
@@ -60,6 +60,15 @@
 ```
 ideahub/
 │
+├── AGENTS.md                        # OpenClaw 工作区总规则与记忆流程
+├── BOOT.md                          # OpenClaw 启动强制引导文件
+├── CLAUDE.md                        # OpenClaw/Claude 入口说明（桥接到 server 文档规范）
+├── HEARTBEAT.md                     # 心跳维护清单（任务记忆/文档一致性）
+├── MEMORY.md                        # OpenClaw 长期项目记忆
+├── SOUL.md                          # OpenClaw 角色与行为边界
+├── USER.md                          # 用户偏好与长期协作信息
+├── memory/                          # OpenClaw 每日任务日志
+├── memory.md                        # OpenClaw 项目知识库（框架/约定/坑点）
 ├── client/                           # 前端应用
 │   ├── src/
 │   │   ├── main.tsx                  # 应用入口 + i18n初始化
@@ -187,6 +196,60 @@ ideahub/
 ---
 
 ## 核心文件详解
+
+### 🧠 0. OpenClaw 工作区记忆层
+
+#### `AGENTS.md`
+**功能**: OpenClaw 工作区总规则与自动启动流程  
+**职责**:
+- 规定每次会话启动时要先读取身份、用户与记忆文件
+- 要求每个新任务自动读取 `CLAUDE.md` 和仓库文档，而不是等待用户粘贴开工模板
+- 规定非平凡任务完成后写入每日记忆文件
+
+---
+
+#### `CLAUDE.md`
+**功能**: IdeaHub 仓库级 OpenClaw 入口  
+**职责**:
+- 桥接到 `server/.ai-instructions.md`、`server/PROJECT_STRUCTURE.md` 和 `server/AI-WORKFLOW-SYSTEM.md`
+- 规定自动任务开始流程、文档同步规则和长期记忆规则
+- 让仓库任务具备“AI 员工”式的持续上下文
+
+---
+
+#### `BOOT.md`
+**功能**: OpenClaw 启动强制引导文件  
+**职责**:
+- 配合 `boot-md` hook 在 gateway 启动时注入默认工作契约
+- 强制 agent 先确认 workspace、读取记忆与仓库规则文件
+- 规定每个任务默认先做影响范围分析，再进入改动执行
+
+---
+
+#### `MEMORY.md`
+**功能**: OpenClaw 长期项目记忆  
+**职责**:
+- 记录稳定的用户偏好、仓库规则和项目框架事实
+- 为后续任务提供跨会话延续能力
+- 承接从每日记忆文件提炼出的长期知识
+
+---
+
+#### `memory.md`
+**功能**: OpenClaw 项目知识库  
+**职责**:
+- 记录 IdeaHub 的框架结构、接口约定、工作流不变量和常见坑点
+- 与 `MEMORY.md` 分层：前者偏项目知识，后者偏长期协作事实
+- 配合 `bootstrap-extra-files` hook 在 agent bootstrap 时自动注入
+
+---
+
+#### `memory/YYYY-MM-DD.md`
+**功能**: OpenClaw 每日任务日志  
+**职责**:
+- 记录当天完成的任务、重要决策和后续事项
+- 作为短期工作记忆，为新会话提供最近上下文
+- 定期沉淀到 `MEMORY.md`
 
 ### 🎯 1. 应用入口和配置
 
@@ -1356,6 +1419,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-15 | 4.4 | **推荐反馈撤销能力**：新增 `DELETE /api/ideas/:id/recommendation-feedback` 用于撤销推荐反馈；`HomePage.tsx` 在用户点击“不感兴趣 / 已推荐过”后显示带“撤销”按钮的交互提示，允许快速纠正误点并恢复当前卡片展示。 |
 | 2026-03-19 | 4.5 | **文档与 Workshop 结构同步**：补回仓库根目录 AI 文档入口；修正文档中的实际目录位置与数量；新增 Creative Workshop 页面、布局画布、模板模型、评论、AI 改版、热门标签与 Heat Map 说明。 |
 | 2026-03-20 | 4.6 | **全站模板编辑与全局 AI 流程文档同步**：更新结构树（新增 `SiteTemplateEditOverlay`、`SiteGlobalAiAssistant`、`siteDraft`）；补充 `/api/workshop/ai/site-edit` 端点与操作模型；补充 `WorkshopTemplate.siteDraft` 存储说明；更新 `WorkshopPage` 全站编辑入口与 `WorkshopEditorPage` 的 `fromSiteEdit` 发布信息流程。 |
+| 2026-03-20 | 4.7 | **OpenClaw 仓库入口接入**：在仓库根目录新增 `CLAUDE.md`，将 OpenClaw/Claude 风格代理统一桥接到 `server/.ai-instructions.md`、`server/PROJECT_STRUCTURE.md` 与 `server/AI-WORKFLOW-SYSTEM.md`，避免规则源分叉。 |
+| 2026-03-21 | 4.8 | **OpenClaw AI 员工记忆层接入**：新增 `MEMORY.md` 与 `memory/2026-03-21.md`，强化 `AGENTS.md`、`CLAUDE.md`、`USER.md` 与 `HEARTBEAT.md` 的自动启动、任务记忆与长期知识沉淀规则，让 OpenClaw 默认按仓库文档和记忆体系工作。 |
+| 2026-03-21 | 4.9 | **OpenClaw 强化 hook 与知识分层接入**：新增 `BOOT.md` 与 `memory.md`，将记忆拆分为长期协作事实、项目知识库与每日任务日志；启用 `boot-md`、`bootstrap-extra-files`、`session-memory`、`command-logger` hook，使 OpenClaw 启动时更强制地读取规则与记忆，并在会话重置时自动沉淀上下文。 |
 
 ---
 
@@ -2697,6 +2763,9 @@ useEffect(() => {
 | 2026-02-27 | 1.0 | 初始版本，完整项目结构文档 | AI Assistant |
 | 2026-02-27 | 1.1 | 添加完整国际化模块说明 | AI Assistant |
 | 2026-02-27 | 1.2 | 添加"所有页面必备功能"章节，包含完整的开发检查清单 | AI Assistant |
+| 2026-03-21 | 4.8 | 初始化 OpenClaw AI 员工模式记忆层（AGENTS.md, BOOT.md, MEMORY.md 等） | GitHub Copilot |
+| 2026-03-21 | 4.9 | 启用 4 个 OpenClaw 内部 hook（boot-md、bootstrap-extra-files、session-memory、command-logger）；分层化项目知识（memory.md 分离） | GitHub Copilot |
+| 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：工具层（`tools.fs.workspaceOnly`, `tools.deny`）、沙箱层（`agents.defaults.sandbox.mode`）、网关层（12项命令黑名单扩展） | GitHub Copilot |
 
 ---
 
