@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-21  
-> 版本: 4.11
+> 版本: 4.12
 > 
 > ---
 > 
@@ -81,10 +81,16 @@ openclaw config set tools.allow '["read","write","edit","exec","process","web_se
 openclaw config set tools.deny '["gateway.*","nodes.*","browser.*"]' --strict-json
 openclaw config set tools.fs.workspaceOnly true
 
+# 需要 Docker 的团队成员：
 openclaw config set agents.defaults.sandbox.mode all
+
+# 没有 Docker 的团队成员（Windows 常见）：
+openclaw config set agents.defaults.sandbox.mode off
 
 openclaw config set gateway.nodes.denyCommands '["camera.snap","camera.clip","screen.record","contacts.add","calendar.add","reminders.add","sms.send","file.delete","file.move","process.kill","network.request","system.shutdown"]' --strict-json
 ```
+
+> 注意：如果出现 `Sandbox mode requires Docker`，说明本机没有可用 Docker，请改用 `agents.defaults.sandbox.mode=off`。
 
 ### 6) 验证配置并启动
 
@@ -1500,6 +1506,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.9 | **OpenClaw 强化 hook 与知识分层接入**：新增 `BOOT.md` 与 `memory.md`，将记忆拆分为长期协作事实、项目知识库与每日任务日志；启用 `boot-md`、`bootstrap-extra-files`、`session-memory`、`command-logger` hook，使 OpenClaw 启动时更强制地读取规则与记忆，并在会话重置时自动沉淀上下文。 |
 | 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：启用 `tools.fs.workspaceOnly`、`tools.deny`、`agents.defaults.sandbox.mode=all`，并将 `gateway.nodes.denyCommands` 扩展到 12 项，形成工具层/沙箱层/网关层三层防线。 |
 | 2026-03-21 | 4.11 | **补充 OpenClaw 团队上手教程**：在本文新增“OpenClaw 团队快速上手”章节，提供安装、onboard、复制记忆文件、启用 hooks、同步安全策略、启动与验证命令，便于组员快速接入现有工作流。 |
+| 2026-03-21 | 4.12 | **修复无 Docker 启动失败指引**：在上手教程中补充 sandbox 双路径（Docker=all / 无Docker=off），并明确 `Sandbox mode requires Docker` 的处理方式，避免 boot 阶段失败。 |
 
 ---
 
@@ -2845,6 +2852,7 @@ useEffect(() => {
 | 2026-03-21 | 4.9 | 启用 4 个 OpenClaw 内部 hook（boot-md、bootstrap-extra-files、session-memory、command-logger）；分层化项目知识（memory.md 分离） | GitHub Copilot |
 | 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：工具层（`tools.fs.workspaceOnly`, `tools.deny`）、沙箱层（`agents.defaults.sandbox.mode`）、网关层（12项命令黑名单扩展） | GitHub Copilot |
 | 2026-03-21 | 4.11 | 补充 OpenClaw 团队快速上手教程（安装、onboard、复制记忆文件、启用 hooks、启动验证） | GitHub Copilot |
+| 2026-03-21 | 4.12 | 修复 sandbox 教程：补充 Docker 必要条件与无 Docker 回退到 `agents.defaults.sandbox.mode=off` 的命令 | GitHub Copilot |
 
 ---
 
