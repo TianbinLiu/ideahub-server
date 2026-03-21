@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-21  
-> 版本: 4.10
+> 版本: 4.11
 > 
 > ---
 > 
@@ -21,9 +21,85 @@
 ## 📋 目录
 
 1. [项目概述](#项目概述)
-2. [项目结构树](#项目结构树)
-3. [核心文件详解](#核心文件详解)
-4. [更新记录](#更新记录)
+2. [OpenClaw 团队快速上手](#openclaw-团队快速上手)
+3. [项目结构树](#项目结构树)
+4. [核心文件详解](#核心文件详解)
+5. [更新记录](#更新记录)
+
+---
+
+## OpenClaw 团队快速上手
+
+本节用于让新同学在本项目中快速跑通 OpenClaw。按顺序执行即可。
+
+### 1) 安装 OpenClaw（首次）
+
+```bash
+npm install -g openclaw@latest
+openclaw --version
+```
+
+### 2) 初始化并安装后台服务（首次）
+
+```bash
+openclaw onboard --install-daemon
+```
+
+### 3) 克隆仓库并准备项目记忆文件
+
+仓库中以下文件/目录是本项目 OpenClaw 工作流的关键上下文，请确保存在：
+
+- `AGENTS.md`
+- `BOOT.md`
+- `CLAUDE.md`
+- `HEARTBEAT.md`
+- `MEMORY.md`
+- `memory.md`
+- `memory/`（含 `memory/YYYY-MM-DD.md`）
+
+如果你是从同组成员处同步，请把以上文件与目录一并复制到仓库根目录。
+
+### 4) 绑定本地工作区并启用项目 hook（推荐）
+
+```bash
+openclaw config set agents.defaults.workspace "C:\\Users\\<你的用户名>\\ideahub"
+
+openclaw hooks enable boot-md
+openclaw hooks enable bootstrap-extra-files
+openclaw hooks enable session-memory
+openclaw hooks enable command-logger
+
+openclaw config set hooks.internal.enabled true
+openclaw config set hooks.internal.entries.bootstrap-extra-files.paths '["MEMORY.md","memory.md","HEARTBEAT.md","USER.md","SOUL.md","TOOLS.md"]' --strict-json
+openclaw config set hooks.internal.entries.session-memory.messages 25
+```
+
+### 5) 同步当前项目的安全策略（推荐）
+
+```bash
+openclaw config set tools.allow '["read","write","edit","exec","process","web_search","web_fetch","memory_search","memory_get","sessions_list","sessions_history","sessions_send","sessions_spawn","sessions_yield","subagents","session_status","cron"]' --strict-json
+openclaw config set tools.deny '["gateway.*","nodes.*","browser.*"]' --strict-json
+openclaw config set tools.fs.workspaceOnly true
+
+openclaw config set agents.defaults.sandbox.mode all
+
+openclaw config set gateway.nodes.denyCommands '["camera.snap","camera.clip","screen.record","contacts.add","calendar.add","reminders.add","sms.send","file.delete","file.move","process.kill","network.request","system.shutdown"]' --strict-json
+```
+
+### 6) 验证配置并启动
+
+```bash
+openclaw config validate
+openclaw gateway restart
+openclaw gateway status
+openclaw dashboard
+```
+
+### 7) 日常使用建议（团队统一）
+
+- 开新任务前先确认已读取 `AGENTS.md`、`CLAUDE.md`、`MEMORY.md`、`memory.md`。
+- 完成非平凡任务后更新 `memory/YYYY-MM-DD.md`。
+- 若修改了结构/路由/API/规则，同步更新本文档的对应章节和更新记录。
 
 ---
 
@@ -1422,6 +1498,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-20 | 4.7 | **OpenClaw 仓库入口接入**：在仓库根目录新增 `CLAUDE.md`，将 OpenClaw/Claude 风格代理统一桥接到 `server/.ai-instructions.md`、`server/PROJECT_STRUCTURE.md` 与 `server/AI-WORKFLOW-SYSTEM.md`，避免规则源分叉。 |
 | 2026-03-21 | 4.8 | **OpenClaw AI 员工记忆层接入**：新增 `MEMORY.md` 与 `memory/2026-03-21.md`，强化 `AGENTS.md`、`CLAUDE.md`、`USER.md` 与 `HEARTBEAT.md` 的自动启动、任务记忆与长期知识沉淀规则，让 OpenClaw 默认按仓库文档和记忆体系工作。 |
 | 2026-03-21 | 4.9 | **OpenClaw 强化 hook 与知识分层接入**：新增 `BOOT.md` 与 `memory.md`，将记忆拆分为长期协作事实、项目知识库与每日任务日志；启用 `boot-md`、`bootstrap-extra-files`、`session-memory`、`command-logger` hook，使 OpenClaw 启动时更强制地读取规则与记忆，并在会话重置时自动沉淀上下文。 |
+| 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：启用 `tools.fs.workspaceOnly`、`tools.deny`、`agents.defaults.sandbox.mode=all`，并将 `gateway.nodes.denyCommands` 扩展到 12 项，形成工具层/沙箱层/网关层三层防线。 |
+| 2026-03-21 | 4.11 | **补充 OpenClaw 团队上手教程**：在本文新增“OpenClaw 团队快速上手”章节，提供安装、onboard、复制记忆文件、启用 hooks、同步安全策略、启动与验证命令，便于组员快速接入现有工作流。 |
 
 ---
 
@@ -2766,6 +2844,7 @@ useEffect(() => {
 | 2026-03-21 | 4.8 | 初始化 OpenClaw AI 员工模式记忆层（AGENTS.md, BOOT.md, MEMORY.md 等） | GitHub Copilot |
 | 2026-03-21 | 4.9 | 启用 4 个 OpenClaw 内部 hook（boot-md、bootstrap-extra-files、session-memory、command-logger）；分层化项目知识（memory.md 分离） | GitHub Copilot |
 | 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：工具层（`tools.fs.workspaceOnly`, `tools.deny`）、沙箱层（`agents.defaults.sandbox.mode`）、网关层（12项命令黑名单扩展） | GitHub Copilot |
+| 2026-03-21 | 4.11 | 补充 OpenClaw 团队快速上手教程（安装、onboard、复制记忆文件、启用 hooks、启动验证） | GitHub Copilot |
 
 ---
 
