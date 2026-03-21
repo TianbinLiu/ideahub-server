@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-21  
-> 版本: 4.15
+> 版本: 4.16
 > 
 > ---
 > 
@@ -126,6 +126,27 @@ openclaw dashboard
 - 开新任务前先确认已读取 `AGENTS.md`、`CLAUDE.md`、`MEMORY.md`、`memory.md`。
 - 完成非平凡任务后更新 `memory/YYYY-MM-DD.md`。
 - 若修改了结构/路由/API/规则，同步更新本文档的对应章节和更新记录。
+
+### 8) Dashboard 稳定编辑模式（避免 EPERM/批量改写冲突）
+
+在 dashboard 中执行代码修改时，团队统一使用以下串行策略：
+
+- 一次只改一个文件，不并发批量修改同一目录。
+- 同一文件一次只下达一个编辑指令，等待成功后再发下一条。
+- 每条编辑指令提供唯一上下文（函数名 + 前后几行），避免纯关键词替换。
+- 涉及大改动时，临时关闭 VS Code 自动保存和保存时格式化，完成后恢复。
+- 每完成 1-2 个文件，先读回文件确认结果，再继续下一个文件。
+
+推荐在仓库级 `.vscode/settings.json` 临时切换：
+
+```json
+{
+  "files.autoSave": "off",
+  "editor.formatOnSave": false
+}
+```
+
+改动完成后恢复为团队默认设置。
 
 ---
 
@@ -1530,6 +1551,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.13 | **补充 Docker 安装版本要求**：在 OpenClaw 上手教程中明确要求安装 Docker Desktop 最新稳定版 `Windows - AMD64`，并给出 `docker --version` 验证命令。 |
 | 2026-03-21 | 4.14 | **补充 Docker 安装细节**：新增 Docker Desktop 官方下载入口，并在安装步骤中明确建议启用 `WSL 2 based engine`，减少新同学安装后二次排障。 |
 | 2026-03-21 | 4.15 | **补充 WSL 修复命令**：在 Docker 安装小节新增“WSL 未启用”处理命令（`wsl --install` + 重启），减少安装后卡住问题。 |
+| 2026-03-21 | 4.16 | **补充 Dashboard 稳定编辑规约**：新增“单文件串行编辑”规则（单文件、单指令、唯一上下文、临时关闭自动保存/保存格式化、1-2 文件回读确认），降低 OpenClaw 编辑失败与冲突风险。 |
 
 ---
 
@@ -2879,6 +2901,7 @@ useEffect(() => {
 | 2026-03-21 | 4.13 | 明确 Docker 安装版本：Docker Desktop 最新稳定版 `Windows - AMD64`，并补充 `docker --version` 验证 | GitHub Copilot |
 | 2026-03-21 | 4.14 | 补充 Docker 下载入口与安装勾选项：加入 Docker Desktop 官网链接，并明确启用 `WSL 2 based engine` | GitHub Copilot |
 | 2026-03-21 | 4.15 | 补充 WSL 未启用修复命令：在 Docker 小节新增 `wsl --install` 与重启步骤 | GitHub Copilot |
+| 2026-03-21 | 4.16 | 补充 Dashboard 稳定编辑规约：单文件串行、单指令唯一上下文、大改动临时关闭自动保存/保存格式化、1-2 文件回读确认 | GitHub Copilot |
 
 ---
 
