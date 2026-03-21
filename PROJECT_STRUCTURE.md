@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-21  
-> 版本: 4.16
+> 版本: 4.17
 > 
 > ---
 > 
@@ -25,6 +25,26 @@
 3. [项目结构树](#项目结构树)
 4. [核心文件详解](#核心文件详解)
 5. [更新记录](#更新记录)
+
+---
+
+## AI 启动默认读取范围（研发最小集）
+
+为降低上下文占用，默认只读取 `PROJECT_STRUCTURE.md` 的以下研发相关章节：
+
+- `项目结构树`
+- `核心文件详解`
+- `更新记录`（仅最近与当前任务相关条目）
+
+默认跳过以下与具体研发改动无直接关系的段落（除非任务明确要求）：
+
+- `OpenClaw 团队快速上手`
+- `⚠️ AI开发提示`
+- `所有页面必备功能`
+- `开发指南`
+- `功能完整性自查` 等通用流程性重复说明
+
+执行建议：进入 `PROJECT_STRUCTURE.md` 时优先按标题锚点跳转到目标章节，不顺序通读整篇文档。
 
 ---
 
@@ -90,14 +110,14 @@ openclaw hooks enable session-memory
 openclaw hooks enable command-logger
 
 openclaw config set hooks.internal.enabled true
-openclaw config set hooks.internal.entries.bootstrap-extra-files.paths '["MEMORY.md","memory.md","HEARTBEAT.md","USER.md","SOUL.md","TOOLS.md"]' --strict-json
-openclaw config set hooks.internal.entries.session-memory.messages 25
+openclaw config set hooks.internal.entries.bootstrap-extra-files.paths '["MEMORY.md","memory.md"]' --strict-json
+openclaw config set hooks.internal.entries.session-memory.messages 4
 ```
 
 ### 5) 同步当前项目的安全策略（推荐）
 
 ```bash
-openclaw config set tools.allow '["read","write","edit","exec","process","web_search","web_fetch","memory_search","memory_get","sessions_list","sessions_history","sessions_send","sessions_spawn","sessions_yield","subagents","session_status","cron"]' --strict-json
+openclaw config set tools.allow '["read","write","edit","exec","process","web_search","web_fetch","memory_search","memory_get","sessions_list","sessions_history","sessions_send","sessions_spawn","sessions_yield","subagents","session_status"]' --strict-json
 openclaw config set tools.deny '["gateway.*","nodes.*","browser.*"]' --strict-json
 openclaw config set tools.fs.workspaceOnly true
 
@@ -1552,6 +1572,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.14 | **补充 Docker 安装细节**：新增 Docker Desktop 官方下载入口，并在安装步骤中明确建议启用 `WSL 2 based engine`，减少新同学安装后二次排障。 |
 | 2026-03-21 | 4.15 | **补充 WSL 修复命令**：在 Docker 安装小节新增“WSL 未启用”处理命令（`wsl --install` + 重启），减少安装后卡住问题。 |
 | 2026-03-21 | 4.16 | **补充 Dashboard 稳定编辑规约**：新增“单文件串行编辑”规则（单文件、单指令、唯一上下文、临时关闭自动保存/保存格式化、1-2 文件回读确认），降低 OpenClaw 编辑失败与冲突风险。 |
+| 2026-03-21 | 4.17 | **OpenClaw 启动降耗优化**：将 bootstrap 默认注入文件收敛为 `MEMORY.md` 与 `memory.md`，`session-memory.messages` 下调至 `4`，并同步 `tools.allow` 去除 `cron`，降低重复读取与上下文占用。 |
 
 ---
 
@@ -2902,6 +2923,7 @@ useEffect(() => {
 | 2026-03-21 | 4.14 | 补充 Docker 下载入口与安装勾选项：加入 Docker Desktop 官网链接，并明确启用 `WSL 2 based engine` | GitHub Copilot |
 | 2026-03-21 | 4.15 | 补充 WSL 未启用修复命令：在 Docker 小节新增 `wsl --install` 与重启步骤 | GitHub Copilot |
 | 2026-03-21 | 4.16 | 补充 Dashboard 稳定编辑规约：单文件串行、单指令唯一上下文、大改动临时关闭自动保存/保存格式化、1-2 文件回读确认 | GitHub Copilot |
+| 2026-03-21 | 4.17 | OpenClaw 启动降耗优化：bootstrap 注入仅保留 `MEMORY.md`/`memory.md`，`session-memory.messages` 调整为 `4`，并移除 `tools.allow` 中不可用的 `cron` | GitHub Copilot |
 
 ---
 
