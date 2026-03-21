@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-21  
-> 版本: 4.12
+> 版本: 4.15
 > 
 > ---
 > 
@@ -43,6 +43,26 @@ openclaw --version
 
 ```bash
 openclaw onboard --install-daemon
+```
+
+### 2.5) 使用 sandbox 前先安装 Docker（推荐）
+
+本项目如果启用 `agents.defaults.sandbox.mode=all`，要求本机有可用 Docker。
+
+- 下载入口：https://www.docker.com/products/docker-desktop/
+- Windows x64（Intel/AMD）统一安装：**Docker Desktop 最新稳定版 - Windows - AMD64**
+- 安装向导中建议勾选/启用 **Use WSL 2 based engine（WSL2 backend）**
+- 安装完成后验证：
+
+```bash
+docker --version
+```
+
+- 若安装后提示 WSL 未启用，可在管理员 PowerShell 执行：
+
+```powershell
+wsl --install
+shutdown /r /t 0
 ```
 
 ### 3) 克隆仓库并准备项目记忆文件
@@ -1507,6 +1527,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：启用 `tools.fs.workspaceOnly`、`tools.deny`、`agents.defaults.sandbox.mode=all`，并将 `gateway.nodes.denyCommands` 扩展到 12 项，形成工具层/沙箱层/网关层三层防线。 |
 | 2026-03-21 | 4.11 | **补充 OpenClaw 团队上手教程**：在本文新增“OpenClaw 团队快速上手”章节，提供安装、onboard、复制记忆文件、启用 hooks、同步安全策略、启动与验证命令，便于组员快速接入现有工作流。 |
 | 2026-03-21 | 4.12 | **修复无 Docker 启动失败指引**：在上手教程中补充 sandbox 双路径（Docker=all / 无Docker=off），并明确 `Sandbox mode requires Docker` 的处理方式，避免 boot 阶段失败。 |
+| 2026-03-21 | 4.13 | **补充 Docker 安装版本要求**：在 OpenClaw 上手教程中明确要求安装 Docker Desktop 最新稳定版 `Windows - AMD64`，并给出 `docker --version` 验证命令。 |
+| 2026-03-21 | 4.14 | **补充 Docker 安装细节**：新增 Docker Desktop 官方下载入口，并在安装步骤中明确建议启用 `WSL 2 based engine`，减少新同学安装后二次排障。 |
+| 2026-03-21 | 4.15 | **补充 WSL 修复命令**：在 Docker 安装小节新增“WSL 未启用”处理命令（`wsl --install` + 重启），减少安装后卡住问题。 |
 
 ---
 
@@ -2853,6 +2876,9 @@ useEffect(() => {
 | 2026-03-21 | 4.10 | **OpenClaw 深度安全加固**：工具层（`tools.fs.workspaceOnly`, `tools.deny`）、沙箱层（`agents.defaults.sandbox.mode`）、网关层（12项命令黑名单扩展） | GitHub Copilot |
 | 2026-03-21 | 4.11 | 补充 OpenClaw 团队快速上手教程（安装、onboard、复制记忆文件、启用 hooks、启动验证） | GitHub Copilot |
 | 2026-03-21 | 4.12 | 修复 sandbox 教程：补充 Docker 必要条件与无 Docker 回退到 `agents.defaults.sandbox.mode=off` 的命令 | GitHub Copilot |
+| 2026-03-21 | 4.13 | 明确 Docker 安装版本：Docker Desktop 最新稳定版 `Windows - AMD64`，并补充 `docker --version` 验证 | GitHub Copilot |
+| 2026-03-21 | 4.14 | 补充 Docker 下载入口与安装勾选项：加入 Docker Desktop 官网链接，并明确启用 `WSL 2 based engine` | GitHub Copilot |
+| 2026-03-21 | 4.15 | 补充 WSL 未启用修复命令：在 Docker 小节新增 `wsl --install` 与重启步骤 | GitHub Copilot |
 
 ---
 
