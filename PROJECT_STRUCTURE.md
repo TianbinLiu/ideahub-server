@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-21  
-> 版本: 4.17
+> 最后更新: 2026-03-22  
+> 版本: 4.20
 > 
 > ---
 > 
@@ -206,6 +206,9 @@ ideahub/
 ├── AGENTS.md                        # OpenClaw 工作区总规则与记忆流程
 ├── BOOT.md                          # OpenClaw 启动强制引导文件
 ├── CLAUDE.md                        # OpenClaw/Claude 入口说明（桥接到 server 文档规范）
+├── MAINTENANCE.md                   # OpenClaw 长时自维护模式单一来源规则
+├── start-openclaw-maintenance.cmd   # OpenClaw Windows 一键自维护启动脚本
+├── open-latest-maintenance-log.cmd  # OpenClaw Windows 最近一次维护日志快速打开脚本
 ├── HEARTBEAT.md                     # 心跳维护清单（任务记忆/文档一致性）
 ├── MEMORY.md                        # OpenClaw 长期项目记忆
 ├── SOUL.md                          # OpenClaw 角色与行为边界
@@ -366,6 +369,15 @@ ideahub/
 - 配合 `boot-md` hook 在 gateway 启动时注入默认工作契约
 - 强制 agent 先确认 workspace、读取记忆与仓库规则文件
 - 规定每个任务默认先做影响范围分析，再进入改动执行
+
+---
+
+#### `MAINTENANCE.md`
+**功能**: OpenClaw 长时自维护模式单一来源规则  
+**职责**:
+- 定义全仓巡检/修复时的执行优先级、批次策略与停止条件
+- 约束长时 unattended 维护时的 token 控制、验证粒度与编辑纪律
+- 作为 `AGENTS.md` 与 `CLAUDE.md` 在“Autonomous Maintenance Mode”下的唯一规则源
 
 ---
 
@@ -1573,6 +1585,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.15 | **补充 WSL 修复命令**：在 Docker 安装小节新增“WSL 未启用”处理命令（`wsl --install` + 重启），减少安装后卡住问题。 |
 | 2026-03-21 | 4.16 | **补充 Dashboard 稳定编辑规约**：新增“单文件串行编辑”规则（单文件、单指令、唯一上下文、临时关闭自动保存/保存格式化、1-2 文件回读确认），降低 OpenClaw 编辑失败与冲突风险。 |
 | 2026-03-21 | 4.17 | **OpenClaw 启动降耗优化**：将 bootstrap 默认注入文件收敛为 `MEMORY.md` 与 `memory.md`，`session-memory.messages` 下调至 `4`，并同步 `tools.allow` 去除 `cron`，降低重复读取与上下文占用。 |
+| 2026-03-21 | 4.18 | **新增 OpenClaw 自维护模式**：新增仓库根目录 `MAINTENANCE.md` 作为长时 unattended 巡检/修复的单一规则源，并让 `AGENTS.md`/`CLAUDE.md` 只保留入口引用，便于让 OpenClaw 长时间自主维护项目。 |
+| 2026-03-21 | 4.19 | **新增一键自维护启动脚本**：新增仓库根目录 `start-openclaw-maintenance.cmd`，可直接创建独立 maintenance 会话并发送启动指令，把输出写入 `memory/maintenance-logs/`，省去手动打开 dashboard 和粘贴首条消息。 |
+| 2026-03-22 | 4.20 | **增强一键自维护可用性**：`start-openclaw-maintenance.cmd` 新增“自动打开对应 dashboard 会话”能力，并新增 `open-latest-maintenance-log.cmd` 用于一键查看最新维护结果。 |
 
 ---
 
@@ -2924,6 +2939,9 @@ useEffect(() => {
 | 2026-03-21 | 4.15 | 补充 WSL 未启用修复命令：在 Docker 小节新增 `wsl --install` 与重启步骤 | GitHub Copilot |
 | 2026-03-21 | 4.16 | 补充 Dashboard 稳定编辑规约：单文件串行、单指令唯一上下文、大改动临时关闭自动保存/保存格式化、1-2 文件回读确认 | GitHub Copilot |
 | 2026-03-21 | 4.17 | OpenClaw 启动降耗优化：bootstrap 注入仅保留 `MEMORY.md`/`memory.md`，`session-memory.messages` 调整为 `4`，并移除 `tools.allow` 中不可用的 `cron` | GitHub Copilot |
+| 2026-03-21 | 4.18 | 新增 OpenClaw 自维护模式：添加 `MAINTENANCE.md` 作为长时自主巡检/修复的规则源，并在 `AGENTS.md`/`CLAUDE.md` 接入入口引用 | GitHub Copilot |
+| 2026-03-21 | 4.19 | 新增一键自维护启动脚本：添加 `start-openclaw-maintenance.cmd`，自动创建 maintenance 会话、发送启动语并将 JSON 结果落盘到 `memory/maintenance-logs/` | GitHub Copilot |
+| 2026-03-22 | 4.20 | 增强自维护入口：`start-openclaw-maintenance.cmd` 增加自动打开对应 dashboard 会话链接，并新增 `open-latest-maintenance-log.cmd` 快速打开最新维护日志 | GitHub Copilot |
 
 ---
 
