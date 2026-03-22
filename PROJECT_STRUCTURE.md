@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-22  
-> 版本: 4.23
+> 版本: 4.25
 > 
 > ---
 > 
@@ -210,6 +210,7 @@ ideahub/
 ├── start-openclaw-maintenance.cmd   # OpenClaw Windows 一键自维护启动脚本
 ├── continue-latest-maintenance.cmd  # OpenClaw Windows 继续最近维护会话脚本
 ├── open-latest-maintenance-log.cmd  # OpenClaw Windows 最近一次维护日志快速打开脚本
+├── show-latest-maintenance-summary.cmd # OpenClaw Windows 最近一次维护结果摘要查看脚本
 ├── check-latest-maintenance-status.cmd # OpenClaw Windows 最近维护状态查看脚本
 ├── HEARTBEAT.md                     # 心跳维护清单（任务记忆/文档一致性）
 ├── MEMORY.md                        # OpenClaw 长期项目记忆
@@ -1593,6 +1594,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-22 | 4.21 | **增强运行可观测性与稳定跳转**：`start-openclaw-maintenance.cmd` 新增运行/完成状态标记（`*.status.txt`、`*.running`、`*.done`）与窗口状态提示，dashboard chat 解析改为独立 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd`。 |
 | 2026-03-22 | 4.22 | **优化维护入口与续跑体验**：`start-openclaw-maintenance.cmd` 取消启动时自动打开默认 dashboard，仅保留结束后 chat 跳转；新增 `continue-latest-maintenance.cmd` 复用最近 session 一键续跑，并在启动脚本结束时给出续跑提示。 |
 | 2026-03-22 | 4.23 | **增强续跑容错与文档指引**：`continue-latest-maintenance.cmd` 续跑提示词新增 read offset 越界自愈策略（检测到 `Offset beyond end of file` 时改为新边界重读并继续）；`MAINTENANCE.md` 新增对应 runtime noise 说明与处置步骤。 |
+| 2026-03-22 | 4.24 | **增强续跑编辑容错**：`continue-latest-maintenance.cmd` 续跑提示词新增“Found N occurrences”歧义编辑自愈策略（改为重读文件并使用函数名/唯一上下文的小范围编辑）；`MAINTENANCE.md` 新增对应 runtime noise 说明与处置步骤。 |
+| 2026-03-22 | 4.25 | **同步首跑容错并新增摘要 helper**：`start-openclaw-maintenance.cmd` 同步 read offset / 歧义 edit 自愈提示，避免首跑与续跑规则分叉；新增 `show-latest-maintenance-summary.cmd`，可直接查看最近维护结果摘要而不打开整段 JSON 日志。 |
 
 ---
 
@@ -2950,6 +2953,7 @@ useEffect(() => {
 | 2026-03-22 | 4.21 | 增强可观测性与稳定性：`start-openclaw-maintenance.cmd` 增加状态文件和运行/完成标记，chat 跳转解析迁移到 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd` | GitHub Copilot |
 | 2026-03-22 | 4.22 | 优化维护入口与续跑体验：`start-openclaw-maintenance.cmd` 取消启动即打开默认 dashboard，新增 `continue-latest-maintenance.cmd` 自动复用最近 maintenance session 继续下一批，并在启动脚本结束输出续跑提示 | GitHub Copilot |
 | 2026-03-22 | 4.23 | 增强续跑容错与维护指引：`continue-latest-maintenance.cmd` 新增 read offset 越界自愈提示（改为新边界重读并继续）；`MAINTENANCE.md` 新增该告警的可忽略条件与处置步骤 | GitHub Copilot |
+| 2026-03-22 | 4.24 | 增强续跑编辑容错：`continue-latest-maintenance.cmd` 新增非唯一文本编辑失败的自愈提示（重读文件并改用函数名/唯一上下文的小范围编辑）；`MAINTENANCE.md` 新增该告警的可忽略条件与处置步骤 | GitHub Copilot |
 
 ---
 
