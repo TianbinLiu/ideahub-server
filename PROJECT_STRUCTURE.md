@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-22  
-> 版本: 4.22
+> 版本: 4.23
 > 
 > ---
 > 
@@ -1592,6 +1592,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-22 | 4.20 | **增强一键自维护可用性**：`start-openclaw-maintenance.cmd` 新增“自动打开对应 dashboard 会话”能力，并新增 `open-latest-maintenance-log.cmd` 用于一键查看最新维护结果。 |
 | 2026-03-22 | 4.21 | **增强运行可观测性与稳定跳转**：`start-openclaw-maintenance.cmd` 新增运行/完成状态标记（`*.status.txt`、`*.running`、`*.done`）与窗口状态提示，dashboard chat 解析改为独立 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd`。 |
 | 2026-03-22 | 4.22 | **优化维护入口与续跑体验**：`start-openclaw-maintenance.cmd` 取消启动时自动打开默认 dashboard，仅保留结束后 chat 跳转；新增 `continue-latest-maintenance.cmd` 复用最近 session 一键续跑，并在启动脚本结束时给出续跑提示。 |
+| 2026-03-22 | 4.23 | **增强续跑容错与文档指引**：`continue-latest-maintenance.cmd` 续跑提示词新增 read offset 越界自愈策略（检测到 `Offset beyond end of file` 时改为新边界重读并继续）；`MAINTENANCE.md` 新增对应 runtime noise 说明与处置步骤。 |
 
 ---
 
@@ -2948,6 +2949,7 @@ useEffect(() => {
 | 2026-03-22 | 4.20 | 增强自维护入口：`start-openclaw-maintenance.cmd` 增加自动打开对应 dashboard 会话链接，并新增 `open-latest-maintenance-log.cmd` 快速打开最新维护日志 | GitHub Copilot |
 | 2026-03-22 | 4.21 | 增强可观测性与稳定性：`start-openclaw-maintenance.cmd` 增加状态文件和运行/完成标记，chat 跳转解析迁移到 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd` | GitHub Copilot |
 | 2026-03-22 | 4.22 | 优化维护入口与续跑体验：`start-openclaw-maintenance.cmd` 取消启动即打开默认 dashboard，新增 `continue-latest-maintenance.cmd` 自动复用最近 maintenance session 继续下一批，并在启动脚本结束输出续跑提示 | GitHub Copilot |
+| 2026-03-22 | 4.23 | 增强续跑容错与维护指引：`continue-latest-maintenance.cmd` 新增 read offset 越界自愈提示（改为新边界重读并继续）；`MAINTENANCE.md` 新增该告警的可忽略条件与处置步骤 | GitHub Copilot |
 
 ---
 
