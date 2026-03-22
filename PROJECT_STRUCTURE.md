@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-22  
-> 版本: 4.20
+> 版本: 4.21
 > 
 > ---
 > 
@@ -138,7 +138,7 @@ openclaw config set gateway.nodes.denyCommands '["camera.snap","camera.clip","sc
 openclaw config validate
 openclaw gateway restart
 openclaw gateway status
-openclaw dashboard
+openclaw dashboard ##openclaw tui
 ```
 
 ### 7) 日常使用建议（团队统一）
@@ -209,6 +209,7 @@ ideahub/
 ├── MAINTENANCE.md                   # OpenClaw 长时自维护模式单一来源规则
 ├── start-openclaw-maintenance.cmd   # OpenClaw Windows 一键自维护启动脚本
 ├── open-latest-maintenance-log.cmd  # OpenClaw Windows 最近一次维护日志快速打开脚本
+├── check-latest-maintenance-status.cmd # OpenClaw Windows 最近维护状态查看脚本
 ├── HEARTBEAT.md                     # 心跳维护清单（任务记忆/文档一致性）
 ├── MEMORY.md                        # OpenClaw 长期项目记忆
 ├── SOUL.md                          # OpenClaw 角色与行为边界
@@ -1588,6 +1589,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-21 | 4.18 | **新增 OpenClaw 自维护模式**：新增仓库根目录 `MAINTENANCE.md` 作为长时 unattended 巡检/修复的单一规则源，并让 `AGENTS.md`/`CLAUDE.md` 只保留入口引用，便于让 OpenClaw 长时间自主维护项目。 |
 | 2026-03-21 | 4.19 | **新增一键自维护启动脚本**：新增仓库根目录 `start-openclaw-maintenance.cmd`，可直接创建独立 maintenance 会话并发送启动指令，把输出写入 `memory/maintenance-logs/`，省去手动打开 dashboard 和粘贴首条消息。 |
 | 2026-03-22 | 4.20 | **增强一键自维护可用性**：`start-openclaw-maintenance.cmd` 新增“自动打开对应 dashboard 会话”能力，并新增 `open-latest-maintenance-log.cmd` 用于一键查看最新维护结果。 |
+| 2026-03-22 | 4.21 | **增强运行可观测性与稳定跳转**：`start-openclaw-maintenance.cmd` 新增运行/完成状态标记（`*.status.txt`、`*.running`、`*.done`）与窗口状态提示，dashboard chat 解析改为独立 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd`。 |
 
 ---
 
@@ -2942,6 +2944,7 @@ useEffect(() => {
 | 2026-03-21 | 4.18 | 新增 OpenClaw 自维护模式：添加 `MAINTENANCE.md` 作为长时自主巡检/修复的规则源，并在 `AGENTS.md`/`CLAUDE.md` 接入入口引用 | GitHub Copilot |
 | 2026-03-21 | 4.19 | 新增一键自维护启动脚本：添加 `start-openclaw-maintenance.cmd`，自动创建 maintenance 会话、发送启动语并将 JSON 结果落盘到 `memory/maintenance-logs/` | GitHub Copilot |
 | 2026-03-22 | 4.20 | 增强自维护入口：`start-openclaw-maintenance.cmd` 增加自动打开对应 dashboard 会话链接，并新增 `open-latest-maintenance-log.cmd` 快速打开最新维护日志 | GitHub Copilot |
+| 2026-03-22 | 4.21 | 增强可观测性与稳定性：`start-openclaw-maintenance.cmd` 增加状态文件和运行/完成标记，chat 跳转解析迁移到 `scripts/openclaw/open-dashboard-chat.ps1`，并新增 `check-latest-maintenance-status.cmd` | GitHub Copilot |
 
 ---
 

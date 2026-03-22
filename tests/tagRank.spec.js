@@ -24,12 +24,12 @@ test('create leaderboard and query paginated results', async () => {
   const TagVote = require('../src/models/TagVote');
 
   // create sample ideas
-  const a = await Idea.create({ title: 'One', summary: '', content: '', author: mongoose.Types.ObjectId(), tags: ['alpha','beta'], visibility: 'public' });
-  const b = await Idea.create({ title: 'Two', summary: '', content: '', author: mongoose.Types.ObjectId(), tags: ['alpha'], visibility: 'public' });
+  const a = await Idea.create({ title: 'One', summary: '', content: '', author: new mongoose.Types.ObjectId(), tags: ['alpha','beta'], visibility: 'public' });
+  const b = await Idea.create({ title: 'Two', summary: '', content: '', author: new mongoose.Types.ObjectId(), tags: ['alpha'], visibility: 'public' });
 
   // votes
-  await TagVote.create({ idea: a._id, tags: ['alpha','beta'], tagsKey: 'alpha|beta', user: mongoose.Types.ObjectId(), vote: 1 });
-  await TagVote.create({ idea: b._id, tags: ['alpha'], tagsKey: 'alpha', user: mongoose.Types.ObjectId(), vote: 1 });
+  await TagVote.create({ idea: a._id, tags: ['alpha','beta'], tagsKey: 'alpha|beta', user: new mongoose.Types.ObjectId(), vote: 1 });
+  await TagVote.create({ idea: b._id, tags: ['alpha'], tagsKey: 'alpha', user: new mongoose.Types.ObjectId(), vote: 1 });
 
   // create leaderboard for alpha|beta
   const createRes = await request(app).post('/api/tag-rank/leaderboard').send({ tags: 'alpha,beta' }).expect(200);

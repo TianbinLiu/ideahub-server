@@ -107,7 +107,7 @@ async function vote(req, res, next) {
 
     // return updated score
     const agg = await TagVote.aggregate([
-      { $match: { idea: mongoose.Types.ObjectId(ideaId), tagsKey } },
+      { $match: { idea: new mongoose.Types.ObjectId(ideaId), tagsKey } },
       { $group: { _id: "$idea", score: { $sum: "$vote" }, votes: { $sum: 1 } } },
     ]);
     const score = agg[0]?.score || 0;
