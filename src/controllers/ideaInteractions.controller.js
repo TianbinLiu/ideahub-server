@@ -5,6 +5,7 @@ const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
 const CommentBlock = require("../models/CommentBlock");
 const Notification = require("../models/Notification");
+const AppError = require("../utils/AppError");
 const { createNotification } = require("../services/notification.service");
 const { canReadIdea, canInteractIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden, commentCooldown } = require("../utils/http");
@@ -300,60 +301,111 @@ async function addComment(req, res, next) {
   }
 }
 
+async function toggleCommentVote(req, res, mode) {
+  const { id, commentId } = req.params;
+  const userId = req.user._id;
+
+  const idea = await getIdeaOr404(id, req, res);
+  const comment = await Comment.findOne({ _id: commentId, idea: idea._id });
+  if (!comment) {
+    notFound("Comment not found");
+  }
+
+  if (!Array.isArray(comment.likes)) comment.likes = [];
+  if (!Array.isArray(comment.dislikes)) comment.dislikes = [];
+
+  const uid = String(userId);
+  const likeIdx = comment.likes.findIndex((u) => String(u) === uid);
+  const dislikeIdx = comment.dislikes.findIndex((u) => String(u) === uid);
+
+  let liked = likeIdx >= 0;
+  let disliked = dislikeIdx >= 0;
+
+  if (mode === "like") {
+    if (liked) {
+      comment.likes.splice(likeIdx, 1);
+      comment.likesCount = Math.max(0, (comment.likesCount || 0) - 1);
+      liked = false;
+    } else {
+      comment.likes.push(userId);
+      comment.likesCount = (comment.likesCount || 0) + 1;
+      liked = true;
+
+      if (disliked) {
+        comment.dislikes = comment.dislikes.filter((u) => String(u) !== uid);
+        comment.dislikesCount = Math.max(0, (comment.dislikesCount || 0) - 1);
+        disliked = false;
+      }
+    }
+  } else {
+    if (disliked) {
+      comment.dislikes.splice(dislikeIdx, 1);
+      comment.dislikesCount = Math.max(0, (comment.dislikesCount || 0) - 1);
+      disliked = false;
+    } else {
+      comment.dislikes.push(userId);
+      comment.dislikesCount = (comment.dislikesCount || 0) + 1;
+      disliked = true;
+
+      if (liked) {
+        comment.likes = comment.likes.filter((u) => String(u) !== uid);
+        comment.likesCount = Math.max(0, (comment.likesCount || 0) - 1);
+        liked = false;
+      }
+    }
+  }
+
+  await comment.save();
+
+  if (mode === "like" && liked && String(comment.author) !== uid) {
+    await createNotification({
+      userId: comment.author,
+      actorId: userId,
+      ideaId: idea._id,
+      type: "LIKE_COMMENT",
+      payload: { commentId: comment._id },
+    });
+  }
+
+  if (mode === "dislike" && disliked && String(comment.author) !== uid) {
+    await createNotification({
+      userId: comment.author,
+      actorId: userId,
+      ideaId: idea._id,
+      type: "DISLIKE_COMMENT",
+      payload: { commentId: comment._id },
+    });
+  }
+
+  return {
+    liked,
+    disliked,
+    likesCount: comment.likesCount || 0,
+    dislikesCount: comment.dislikesCount || 0,
+  };
+}
+
 /**
  * POST /api/ideas/:id/comments/:commentId/like
  * Toggle like on a comment
  */
 async function likeComment(req, res, next) {
   try {
-    const { id, commentId } = req.params;
-    const userId = req.user._id;
+    const result = await toggleCommentVote(req, res, "like");
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+}
 
-    console.log(`[likeComment] userId=${userId}, commentId=${commentId}, ideaId=${id}`);
-
-    const idea = await getIdeaOr404(id, req, res);
-    
-    const comment = await Comment.findOne({ _id: commentId, idea: idea._id });
-    console.log(`[likeComment] Found comment:`, { _id: comment?._id, author: comment?.author, content: comment?.content?.substring(0, 20) });
-
-    if (!comment) {
-      return res.status(404).json({ ok: false, message: "Comment not found" });
-    }
-
-    const uid = String(userId);
-    const idx = comment.likes.findIndex(u => String(u) === uid);
-    let liked = false;
-
-    if (idx >= 0) {
-      // unlike
-      comment.likes.splice(idx, 1);
-      comment.likesCount = Math.max(0, comment.likesCount - 1);
-      liked = false;
-    } else {
-      // like
-      comment.likes.push(userId);
-      comment.likesCount = (comment.likesCount || 0) + 1;
-      liked = true;
-    }
-
-    await comment.save();
-    console.log(`[likeComment] Saved comment, liked=${liked}, likesCount=${comment.likesCount}`);
-
-    // Create LIKE notification for comment author if not self
-    if (liked && String(comment.author) !== uid) {
-      console.log(`[likeComment] Creating notification for author=${comment.author}`);
-      await createNotification({
-        userId: comment.author,
-        actorId: userId,
-        ideaId: idea._id,
-        type: "LIKE_COMMENT",
-        payload: { commentId: comment._id },
-      });
-    } else {
-      console.log(`[likeComment] Skipped notification: liked=${liked}, authorEqualsUser=${String(comment.author) === uid}`);
-    }
-
-    res.json({ ok: true, liked, likesCount: comment.likesCount });
+/**
+ * POST /api/ideas/:id/comments/:commentId/dislike
+ * Toggle dislike on a comment (mutually exclusive with like)
+ */
+async function dislikeComment(req, res, next) {
+  try {
+    const result = await toggleCommentVote(req, res, "dislike");
+    res.json({ ok: true, ...result });
   } catch (err) {
     next(err);
   }
@@ -432,4 +484,13 @@ async function listCommentReplies(req, res, next) {
   }
 }
 
-module.exports = { toggleLike, toggleBookmark, listComments, addComment, likeComment, deleteComment, listCommentReplies };
+module.exports = {
+  toggleLike,
+  toggleBookmark,
+  listComments,
+  addComment,
+  likeComment,
+  dislikeComment,
+  deleteComment,
+  listCommentReplies,
+};

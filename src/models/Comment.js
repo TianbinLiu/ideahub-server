@@ -9,6 +9,8 @@ const commentSchema = new mongoose.Schema(
     mentions: [{ type: mongoose.Schema.Types.ObjectId, ref: "User", index: true }],
     likes: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     likesCount: { type: Number, default: 0 },
+    dislikes: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    dislikesCount: { type: Number, default: 0 },
     parentCommentId: { type: mongoose.Schema.Types.ObjectId, ref: "Comment", default: null, index: true },
     replyCount: { type: Number, default: 0 },
   },

@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-22  
-> 版本: 4.25
+> 最后更新: 2026-03-26  
+> 版本: 4.28
 > 
 > ---
 > 
@@ -616,19 +616,21 @@ return <>{children}</>;
 - `authContext.tsx` - 用户认证状态
 - `React Router` - 菜单项导航
 
-**菜单项** (5个):
+**菜单项** (7个):
 1. My Messages → /message-requests
 2. System Messages → /notifications?tab=system
 3. @Mentions → /notifications?tab=mentions
-4. **⭐ Replies → /notifications?tab=replies** [新增]
+4. **⭐ Likes/Downvotes Overview → /notifications?tab=reactions** [新增]
 5. Likes Received → /notifications?tab=likes
+6. Downvotes Received → /notifications?tab=dislikes
+7. **⭐ Replies → /notifications?tab=replies**
 
 **功能**:
 - **动态计数显示**
   - 按类型统计未读通知数
   - System：顶级评论 + 收藏 + 公司兴趣（不包含回复）
   - Replies：只统计回复评论通知（parentCommentId存在）
-  - @Mentions、Likes：按通知类型统计
+  - @Mentions、Likes/Dislikes：按通知类型统计
 - **点击导航** - 点击菜单项跳转到对应类别的通知页面
 - **加载态提示** - 获取计数时显示加载状态
 
@@ -1037,7 +1039,10 @@ return <>{children}</>;
   - 显示有人回复你的评论的通知
   - 标记已读后语气提示消失
   - 点击跳转到对应创意的回复位置
+- **⭐ Likes/Downvotes Overview选项卡** [新增]: 赞/踩总览
+  - 同时展示点赞与点踩通知，便于快速总览互动反馈
 - **Likes选项卡**: 点赞通知
+- **Dislikes选项卡**: 点踩通知
 - **Messages选项卡**: 私信对话列表
   - 显示对话列表（最新消息优先）
   - 删除对话（带可选黑名单操作）
@@ -1596,6 +1601,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-22 | 4.23 | **增强续跑容错与文档指引**：`continue-latest-maintenance.cmd` 续跑提示词新增 read offset 越界自愈策略（检测到 `Offset beyond end of file` 时改为新边界重读并继续）；`MAINTENANCE.md` 新增对应 runtime noise 说明与处置步骤。 |
 | 2026-03-22 | 4.24 | **增强续跑编辑容错**：`continue-latest-maintenance.cmd` 续跑提示词新增“Found N occurrences”歧义编辑自愈策略（改为重读文件并使用函数名/唯一上下文的小范围编辑）；`MAINTENANCE.md` 新增对应 runtime noise 说明与处置步骤。 |
 | 2026-03-22 | 4.25 | **同步首跑容错并新增摘要 helper**：`start-openclaw-maintenance.cmd` 同步 read offset / 歧义 edit 自愈提示，避免首跑与续跑规则分叉；新增 `show-latest-maintenance-summary.cmd`，可直接查看最近维护结果摘要而不打开整段 JSON 日志。 |
+| 2026-03-26 | 4.26 | **评论互动增强**：新增评论/回复评论点踩能力（与点赞互斥并展示点踩数）；`IdeaDetailPage` 在回复列表中新增“引用原评论”块，展示被回复评论内容及其点赞/点踩计数，便于直观对比观点反馈。 |
+| 2026-03-26 | 4.27 | **点踩评论接入通知中心**：后端新增 `DISLIKE_COMMENT` 通知类型并在评论点踩时触发；通知中心新增“收到的踩”分类（`/notifications?tab=dislikes`），支持单独筛选和下拉菜单未读计数展示。 |
+| 2026-03-26 | 4.28 | **通知中心赞/踩总览补充**：`NotificationsPage` 新增“收到的赞/踩总览”分类（`/notifications?tab=reactions`）聚合点赞与点踩通知；同时保留 likes/dislikes 子分类用于精细筛选，`NotificationsDropdown` 同步新增总览入口与未读计数。 |
 
 ---
 

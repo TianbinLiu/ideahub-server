@@ -17,7 +17,8 @@
  * @endpoint POST /:id/bookmark - 收藏/取消收藏（需认证）
  * @endpoint GET /:id/comments - 获取评论列表（公开）
  * @endpoint POST /:id/comments - 添加评论（需认证）
- * @endpoint POST /comments/:commentId/like - 点赞评论（需认证）
+ * @endpoint POST /:id/comments/:commentId/like - 点赞评论（需认证）
+ * @endpoint POST /:id/comments/:commentId/dislike - 点踩评论（需认证）
  * @endpoint POST /:id/ai-review - 请求AI评审（需认证）
  * @endpoint POST /:id/interest - 公司表达兴趣（需company角色）
  * @endpoint GET /:id/interests - 获取创意的兴趣表达列表
@@ -65,6 +66,7 @@ const {
   listComments,
   addComment,
   likeComment,
+  dislikeComment,
   deleteComment,
   listCommentReplies,
 } = require("../controllers/ideaInteractions.controller");
@@ -100,6 +102,7 @@ router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: addCommentBody }), addComment);
 router.get("/:id/comments/:commentId/replies", optionalAuth, listCommentReplies);
 router.post("/:id/comments/:commentId/like", requireAuth, likeComment);
+router.post("/:id/comments/:commentId/dislike", requireAuth, dislikeComment);
 router.delete("/:id/comments/:commentId", requireAuth, deleteComment);
 
 router.post("/:id/ai-review", requireAuth, requestAiReview);
