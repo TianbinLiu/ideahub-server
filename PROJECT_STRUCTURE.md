@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-29  
-> 版本: 4.32
+> 版本: 4.33
 > 
 > ---
 > 
@@ -801,7 +801,7 @@ return <>{children}</>;
 - 创建本地创意（私密）
 - 支持本地图片上传（idea场景），单图大小限制5MB，最多8张
 - 上传后支持预览和单张移除，提交时写入`imageUrls`
-- **⭐ business/daily 内容优先AI草稿** [新增]: 用户先输入内容，再一键由AI生成并回填标题/摘要/标签，后续可手动微调
+- **⭐ business/daily/feedback 内容优先AI草稿** [新增]: 用户先输入内容，再一键由AI生成并回填标题/摘要/标签，后续可手动微调（feedback 提交时会与固定反馈标签合并）
 - business模式可请求AI评审
 - external模式支持URL自动检测和内容自动抓取
 - 新建页移除手动 `licenseType` 输入框，提交时默认写入 `default`
@@ -1611,6 +1611,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-29 | 4.30 | **商业想法AI评审兜底与编辑页字段对齐**：`requestAiReview` 增加 worker 未启用时的同步执行兜底，避免“请求后无效果”；`EditIdeaPage` 按 `ideaType` 对齐模式表单，business 模式隐藏 `licenseType`、`isMonetizable`、外部来源开关，消除与新建页不一致字段。 |
 | 2026-03-29 | 4.31 | **移除新建想法 licenseType 字段**：`NewIdeaPage` 新建请求不再发送 `licenseType`；后端 `createIdeaBody` 移除创建时 `licenseType` 校验字段，`createIdea` 统一按默认值写入，确保所有新建想法流程都不再暴露或依赖该输入。 |
 | 2026-03-29 | 4.32 | **隐藏详情页 licenseType 展示**：`IdeaDetailPage` 详情元信息区移除 `licenseType` 标签显示，仅保留可见性展示，前端不再向用户暴露该字段。 |
+| 2026-03-29 | 4.33 | **反馈模式接入AI草稿**：`NewIdeaPage` 的 feedback 模式新增 AI 生成标题/摘要/标签能力；生成标签在提交时会与固定反馈标签合并写入，兼顾自动补全与反馈分类稳定性。 |
 
 ---
 
