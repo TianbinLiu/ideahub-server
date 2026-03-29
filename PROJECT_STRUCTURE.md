@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-29  
-> 版本: 4.29
+> 版本: 4.32
 > 
 > ---
 > 
@@ -823,6 +823,7 @@ return <>{children}</>;
 - 加载现有创意数据（包括externalSource）
 - 更新创意信息
 - **⭐ 编辑外部来源信息** [v3.3新增]: 保留外部来源表单（与NewIdeaPage相同）
+- **⭐ 商业想法编辑页与新建页对齐** [v4.30]: business 模式隐藏 `licenseType`、`isMonetizable`、外部来源开关，避免出现与模式不一致的多余字段
 - 权限检查
 - 请求AI重新评审
 
@@ -1607,6 +1608,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-26 | 4.27 | **点踩评论接入通知中心**：后端新增 `DISLIKE_COMMENT` 通知类型并在评论点踩时触发；通知中心新增“收到的踩”分类（`/notifications?tab=dislikes`），支持单独筛选和下拉菜单未读计数展示。 |
 | 2026-03-26 | 4.28 | **通知中心赞/踩总览补充**：`NotificationsPage` 新增“收到的赞/踩总览”分类（`/notifications?tab=reactions`）聚合点赞与点踩通知；同时保留 likes/dislikes 子分类用于精细筛选，`NotificationsDropdown` 同步新增总览入口与未读计数。 |
 | 2026-03-29 | 4.29 | **新建想法内容优先AI草稿**：新增 `POST /api/ideas/draft`，支持根据用户输入内容生成标题/摘要/标签草稿；`NewIdeaPage` 在 business/daily 模式新增“一键AI预填”并自动回填可编辑字段；移除新建页手动 `licenseType` 输入，统一提交 `default`。 |
+| 2026-03-29 | 4.30 | **商业想法AI评审兜底与编辑页字段对齐**：`requestAiReview` 增加 worker 未启用时的同步执行兜底，避免“请求后无效果”；`EditIdeaPage` 按 `ideaType` 对齐模式表单，business 模式隐藏 `licenseType`、`isMonetizable`、外部来源开关，消除与新建页不一致字段。 |
+| 2026-03-29 | 4.31 | **移除新建想法 licenseType 字段**：`NewIdeaPage` 新建请求不再发送 `licenseType`；后端 `createIdeaBody` 移除创建时 `licenseType` 校验字段，`createIdea` 统一按默认值写入，确保所有新建想法流程都不再暴露或依赖该输入。 |
+| 2026-03-29 | 4.32 | **隐藏详情页 licenseType 展示**：`IdeaDetailPage` 详情元信息区移除 `licenseType` 标签显示，仅保留可见性展示，前端不再向用户暴露该字段。 |
 
 ---
 

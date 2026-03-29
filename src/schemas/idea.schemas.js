@@ -23,7 +23,6 @@ const createIdeaBody = z.object({
   tags: tagsSchema,
   visibility: z.enum(["public", "private", "unlisted"]).optional().default("public"),
   isMonetizable: z.coerce.boolean().optional().default(false),
-  licenseType: z.string().optional().default("default"),
   isFeedback: z.coerce.boolean().optional().default(false),
   externalSource: externalSourceSchema.optional(),
 });

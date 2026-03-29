@@ -336,11 +336,11 @@ function validateExternalSource(externalSource) {
 /**
  * POST /api/ideas
  * 需要登录：req.user
- * body: title, summary, content, tags, visibility, isMonetizable, licenseType
+ * body: title, summary, content, tags, visibility, isMonetizable
  */
 async function createIdea(req, res, next) {
   try {
-    const { ideaType, title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, licenseType, tags, isFeedback, externalSource } = req.body;
+    const { ideaType, title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, tags, isFeedback, externalSource } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -419,7 +419,7 @@ async function createIdea(req, res, next) {
       tags: feedbackTags,
       visibility: visibility || "public",
       isMonetizable: Boolean(isMonetizable),
-      licenseType: licenseType || "default",
+      licenseType: "default",
       invitedUsers: mentionedUserIds,
       isFeedback: Boolean(isFeedback),
       feedbackType,

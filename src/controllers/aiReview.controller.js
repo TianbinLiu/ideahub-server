@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const Idea = require("../models/Idea");
 const AiJob = require("../models/AiJob");
 const { canReadIdea } = require("../utils/permissions");
+const { runAiReview } = require("../services/aiReview.service");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -39,6 +40,45 @@ async function requestAiReview(req, res, next) {
       status: "pending",
       attempts: 0,
     });
+
+    // Fallback mode: if worker is not enabled, execute review synchronously to avoid "queued but never processed".
+    if (process.env.ENABLE_AI_WORKER !== "true") {
+      try {
+        await AiJob.updateOne(
+          { _id: job._id },
+          { $set: { status: "running", startedAt: new Date() }, $inc: { attempts: 1 } }
+        );
+
+        const out = await runAiReview(idea);
+        idea.aiReview = {
+          feasibilityScore: out.feasibilityScore,
+          profitPotentialScore: out.profitPotentialScore,
+          analysisText: out.analysisText || "",
+          model: out.model || "",
+          createdAt: new Date(),
+        };
+        await idea.save();
+
+        await AiJob.updateOne(
+          { _id: job._id },
+          { $set: { status: "succeeded", finishedAt: new Date(), lastError: "" } }
+        );
+
+        return res.status(202).json({ ok: true, jobId: job._id, status: "succeeded", inline: true });
+      } catch (inlineErr) {
+        await AiJob.updateOne(
+          { _id: job._id },
+          {
+            $set: {
+              status: "failed",
+              finishedAt: new Date(),
+              lastError: inlineErr?.message || "AI review failed",
+            },
+          }
+        );
+        return res.status(202).json({ ok: true, jobId: job._id, status: "failed", inline: true });
+      }
+    }
 
     res.status(202).json({ ok: true, jobId: job._id, status: job.status });
   } catch (err) {
