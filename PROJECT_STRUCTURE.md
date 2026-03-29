@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-03-26  
-> 版本: 4.28
+> 最后更新: 2026-03-29  
+> 版本: 4.29
 > 
 > ---
 > 
@@ -801,8 +801,10 @@ return <>{children}</>;
 - 创建本地创意（私密）
 - 支持本地图片上传（idea场景），单图大小限制5MB，最多8张
 - 上传后支持预览和单张移除，提交时写入`imageUrls`
+- **⭐ business/daily 内容优先AI草稿** [新增]: 用户先输入内容，再一键由AI生成并回填标题/摘要/标签，后续可手动微调
 - business模式可请求AI评审
 - external模式支持URL自动检测和内容自动抓取
+- 新建页移除手动 `licenseType` 输入框，提交时默认写入 `default`
 - 顶部新增“当前模式徽章 + 一键切换模式”条
 - 平台“其他/Other”选项支持中英文显示切换
 
@@ -1604,6 +1606,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-26 | 4.26 | **评论互动增强**：新增评论/回复评论点踩能力（与点赞互斥并展示点踩数）；`IdeaDetailPage` 在回复列表中新增“引用原评论”块，展示被回复评论内容及其点赞/点踩计数，便于直观对比观点反馈。 |
 | 2026-03-26 | 4.27 | **点踩评论接入通知中心**：后端新增 `DISLIKE_COMMENT` 通知类型并在评论点踩时触发；通知中心新增“收到的踩”分类（`/notifications?tab=dislikes`），支持单独筛选和下拉菜单未读计数展示。 |
 | 2026-03-26 | 4.28 | **通知中心赞/踩总览补充**：`NotificationsPage` 新增“收到的赞/踩总览”分类（`/notifications?tab=reactions`）聚合点赞与点踩通知；同时保留 likes/dislikes 子分类用于精细筛选，`NotificationsDropdown` 同步新增总览入口与未读计数。 |
+| 2026-03-29 | 4.29 | **新建想法内容优先AI草稿**：新增 `POST /api/ideas/draft`，支持根据用户输入内容生成标题/摘要/标签草稿；`NewIdeaPage` 在 business/daily 模式新增“一键AI预填”并自动回填可编辑字段；移除新建页手动 `licenseType` 输入，统一提交 `default`。 |
 
 ---
 

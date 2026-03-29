@@ -131,4 +131,80 @@ Content: ${content || ""}
   };
 }
 
-module.exports = { generateIdeaReview, runAiReview, validateFeedback };
+async function generateIdeaDraftFromContent({ content, ideaType }) {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error("OPENAI_API_KEY is not set on server");
+    err.status = 501;
+    throw err;
+  }
+
+  const normalizedContent = String(content || "").trim();
+  if (!normalizedContent) {
+    const err = new Error("content is required");
+    err.status = 400;
+    throw err;
+  }
+
+  const mode = String(ideaType || "daily").trim().toLowerCase();
+  const client = getClient();
+  const model = process.env.OPENAI_MODEL || "gpt-5.2";
+
+  const prompt = `
+You are helping users draft an idea post.
+Return STRICT JSON with keys:
+- title (string, max 80 chars, concise and catchy)
+- summary (string, max 220 chars, 1-2 sentences)
+- tags (array of 3-6 short tags, each <= 20 chars)
+
+Constraints:
+- Keep the same language as the input.
+- Do not include markdown or code fences.
+- No explanations outside JSON.
+- If input is vague, still provide a best-effort draft.
+
+Idea mode: ${mode}
+User content:
+${normalizedContent}
+`;
+
+  const resp = await client.responses.create({
+    model,
+    input: prompt,
+  });
+
+  const text = resp.output_text || "";
+  const jsonTextMatch = text.match(/\{[\s\S]*\}/);
+  const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
+
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    const fallbackTitle = normalizedContent.slice(0, 36) || "Untitled Idea";
+    const fallbackSummary = normalizedContent.slice(0, 200);
+    data = {
+      title: fallbackTitle,
+      summary: fallbackSummary,
+      tags: [],
+    };
+  }
+
+  const toStringArray = (input) => {
+    if (!input) return [];
+    if (Array.isArray(input)) {
+      return input.map((item) => String(item || "").trim()).filter(Boolean);
+    }
+    return String(input)
+      .split(/[#,，,\s]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  };
+
+  const title = String(data.title || "").trim().slice(0, 80) || normalizedContent.slice(0, 36) || "Untitled Idea";
+  const summary = String(data.summary || "").trim().slice(0, 220) || normalizedContent.slice(0, 200);
+  const tags = Array.from(new Set(toStringArray(data.tags))).slice(0, 6);
+
+  return { title, summary, tags, model };
+}
+
+module.exports = { generateIdeaReview, runAiReview, validateFeedback, generateIdeaDraftFromContent };

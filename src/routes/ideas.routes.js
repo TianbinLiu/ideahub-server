@@ -52,6 +52,7 @@ const { toggleInterest, listIdeaInterests } = require("../controllers/interest.c
 const {
   createIdea,
   listIdeas,
+  generateIdeaDraft,
   getIdeaById,
   updateIdea,
   deleteIdea,
@@ -81,6 +82,8 @@ router.get("/", optionalAuth, listIdeas);
 router.get("/suggest", require("../controllers/ideas.controller").suggestTitles || ((req,res)=>res.json({ok:true, ideas:[]})));
 
 router.get("/mine", requireAuth, listMyIdeas);
+
+router.post("/draft", requireAuth, generateIdeaDraft);
 
 // 详情：公开/未列出任何人可看；私密仅作者
 router.get("/:id", optionalAuth, getIdeaById);

@@ -9,7 +9,7 @@ const Notification = require("../models/Notification");
 const { canReadIdea, canWriteIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
-const { validateFeedback } = require("../services/aiReview.service");
+const { validateFeedback, generateIdeaDraftFromContent } = require("../services/aiReview.service");
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
 const IdeaRecommendationFeedback = require("../models/IdeaRecommendationFeedback");
@@ -913,6 +913,22 @@ async function suggestTitles(req, res, next) {
   }
 }
 
+async function generateIdeaDraft(req, res, next) {
+  try {
+    const content = String(req.body?.content || "").trim();
+    const ideaType = String(req.body?.ideaType || "daily").trim().toLowerCase();
+
+    if (!content) {
+      return res.status(400).json({ ok: false, message: "content is required" });
+    }
+
+    const draft = await generateIdeaDraftFromContent({ content, ideaType });
+    res.json({ ok: true, draft });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   createIdea,
   listIdeas,
@@ -921,6 +937,7 @@ module.exports = {
   deleteIdea,
   listMyIdeas,
   suggestTitles,
+  generateIdeaDraft,
   submitRecommendationFeedback,
   clearRecommendationFeedback,
 };
