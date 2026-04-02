@@ -1,7 +1,9 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-03-29  
-> 版本: 4.33
+> 版本: 4.34
+
+> 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
 > ---
 > 
@@ -556,10 +558,12 @@ apiUploadImage(file: File, scope?: "idea" | "comment" | "leaderboard")
 **使用页面**: `LoginPage.tsx`, `RegisterPage.tsx`  
 **关联文件**:
 - `config.ts` - API_BASE_URL配置
+- `api.ts` - 读取 `/api/auth/capabilities` 后按可用 provider 动态渲染
 
 **功能**:
 - 重定向到后端OAuth端点
 - 传递next参数（用于回调后跳转）
+- 支持按后端能力配置仅显示可用 provider（google/github 子集）
 
 **国际化**: ✅ 完整支持（auth模块）
 
@@ -652,10 +656,11 @@ return <>{children}</>;
 **关联文件**:
 - `authContext.tsx` - 调用login()
 - `OAuthButtons.tsx` - OAuth登录
+- `api.ts` - 获取 `/api/auth/capabilities`
 - `locales/*.json` - auth模块
 
 **表单字段**: 邮箱/用户名、密码  
-**功能**: 本地登录、OAuth登录、跳转注册/重置密码  
+**功能**: 本地登录、按地区能力动态显示OAuth登录、跳转注册/重置密码  
 **国际化**: ✅ 完整支持
 
 ---
@@ -672,6 +677,10 @@ return <>{children}</>;
 2. 发送验证码
 3. 输入验证码
 4. 创建账户并自动登录
+
+**补充**:
+- 页面会读取 `/api/auth/capabilities`，按地区能力动态显示/隐藏 OAuth 入口
+- 保留前端兜底开关（环境变量与 query 参数）
 
 **国际化**: ✅ 完整支持
 
@@ -1612,6 +1621,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-29 | 4.31 | **移除新建想法 licenseType 字段**：`NewIdeaPage` 新建请求不再发送 `licenseType`；后端 `createIdeaBody` 移除创建时 `licenseType` 校验字段，`createIdea` 统一按默认值写入，确保所有新建想法流程都不再暴露或依赖该输入。 |
 | 2026-03-29 | 4.32 | **隐藏详情页 licenseType 展示**：`IdeaDetailPage` 详情元信息区移除 `licenseType` 标签显示，仅保留可见性展示，前端不再向用户暴露该字段。 |
 | 2026-03-29 | 4.33 | **反馈模式接入AI草稿**：`NewIdeaPage` 的 feedback 模式新增 AI 生成标题/摘要/标签能力；生成标签在提交时会与固定反馈标签合并写入，兼顾自动补全与反馈分类稳定性。 |
+| 2026-03-29 | 4.34 | **地区化认证能力开关**：后端新增 `GET /api/auth/capabilities`，基于请求国家头（如 `cf-ipcountry` / `x-vercel-ip-country`）返回 OAuth 可用性与 provider 列表；`LoginPage`/`RegisterPage` 按返回结果动态显示 OAuth，并保留前端环境变量与 query 参数兜底开关。 |
 
 ---
 

@@ -4,6 +4,44 @@ const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const { signToken } = require("../utils/jwt");
 
+function parseBooleanEnv(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return null;
+}
+
+function detectRegion(req) {
+  const countryHeader =
+    req.headers["cf-ipcountry"] ||
+    req.headers["x-vercel-ip-country"] ||
+    req.headers["x-country-code"] ||
+    req.headers["x-appengine-country"];
+
+  const country = String(countryHeader || "").trim().toUpperCase();
+  if (!country || country === "XX" || country === "T1") {
+    return { country: "", region: "UNKNOWN" };
+  }
+
+  if (country === "CN") {
+    return { country, region: "CN" };
+  }
+
+  return { country, region: "GLOBAL" };
+}
+
+function getAvailableOauthProviders() {
+  const providers = [];
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    providers.push("google");
+  }
+  if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
+    providers.push("github");
+  }
+  return providers;
+}
+
 async function register(req, res, next) {
   try {
     const { username, email, password, role } = req.body;
@@ -85,5 +123,35 @@ async function me(req, res) {
   res.json({ ok: true, user: req.user });
 }
 
+function getAuthCapabilities(req, res) {
+  const providers = getAvailableOauthProviders();
+  const forceOauth = parseBooleanEnv(process.env.AUTH_FORCE_OAUTH);
+  const forceOauthInCn = parseBooleanEnv(process.env.AUTH_FORCE_OAUTH_IN_CN);
+  const { country, region } = detectRegion(req);
 
-module.exports = { register, login, me};
+  let oauthEnabledByRegion = region !== "CN";
+  if (region === "CN" && forceOauthInCn !== null) {
+    oauthEnabledByRegion = forceOauthInCn;
+  }
+
+  const oauthEnabled =
+    forceOauth !== null
+      ? forceOauth
+      : oauthEnabledByRegion;
+
+  res.json({
+    ok: true,
+    region,
+    country,
+    emailPasswordEnabled: true,
+    oauthEnabled: oauthEnabled && providers.length > 0,
+    providers,
+    fallback: {
+      forceOauth,
+      forceOauthInCn,
+    },
+  });
+}
+
+
+module.exports = { register, login, me, getAuthCapabilities };
