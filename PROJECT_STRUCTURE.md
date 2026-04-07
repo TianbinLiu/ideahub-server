@@ -387,8 +387,51 @@ ideahub/
 ---
 
 #### `MEMORY.md`
-**功能**: OpenClaw 长期项目记忆  
-**职责**:
+**功能**: OpenClaw 长期项目记忆
+**职责**: 
+
+---
+
+## 部署与运维状态（2026-04-07）
+
+简短记录当前线上部署与运维相关的关键信息与进展，供日常维护与对外支持使用。
+
+- **ECS / 服务**:
+  - 公网 IP: 39.106.7.215
+  - 部署用户: `deploy`
+  - 部署脚本: `/var/www/ideahub/server/deploy.sh`
+  - 后端（pm2）: 进程名 `ideahub-server`，监听 `127.0.0.1:4000`
+  - 前端构建输出: `/var/www/ideahub/client-dist`
+
+- **nginx / TLS / Cloudflare**:
+  - nginx 配置位置示例: `/etc/nginx/sites-available/api.ideahubs.org`
+  - Cloudflare Origin CA 证书: `/etc/ssl/certs/cloudflare-origin.pem`
+  - 私钥: `/etc/ssl/private/cloudflare-origin.key`
+  - 当前问题: Cloudflare 代理到 origin 时出现 HTTP 525（TLS handshake failed），nginx error log 中有多条 `SSL_do_handshake() failed ... bad key share`。通过直连（`curl --resolve api.ideahubs.org:443:39.106.7.215`）可以正常返回 200，说明 origin 可用但存在 Cloudflare edge → origin TLS 互操作问题。
+  - 已尝试项：去重重复 server block、添加 `ssl_ecdh_curve X25519:secp384r1:secp256r1`、抓包（tcpdump pcap）、openssl s_client 测试、临时切换灰云（DNS-only）验证直连。
+
+- **SSH / Deploy keys / Actions secrets**:
+  - 生产用主私钥指纹（deploy 私钥 `/home/deploy/.ssh/id_ed25519`）: `SHA256:lcOMYf69NFJs1+CbaEiZh4NNbo3efdQXRz96eAm32rc`。
+  - 从私钥派生的公钥已写到 `/tmp/pub_from_priv.pub`（内容可直接用于 GitHub Deploy key）。
+  - `/home/deploy/.ssh/authorized_keys` 已备份为 `/home/deploy/.ssh/authorized_keys.bak` 并去重；当前只含两把公钥条目。
+  - 因 GitHub 不允许同一 deploy key 同时作为两个仓库的 deploy key 使用，已为 `ideahub-client` 生成一把新的 keypair: `/home/deploy/.ssh/id_ed25519_client`（私钥）和 `/home/deploy/.ssh/id_ed25519_client.pub`（公钥），并将公钥追加到 `authorized_keys`。建议把新公钥作为 `ideahub-client` 的 Deploy key（只读），并把对应私钥上传为该仓库 Actions secret（示例名 `DEPLOY_SSH_KEY` 或 `DEPLOY_SSH_KEY_CLIENT`）。
+  - GitHub Actions 的 secret 值不可被读取；确保 CI 能 SSH 的办法是把 `/home/deploy/.ssh/id_ed25519` 的私钥内容作为 `DEPLOY_SSH_KEY` secret 上传到需要的仓库（`ideahub-server`），并把 `/home/deploy/.ssh/id_ed25519_client` 的私钥上传到 `ideahub-client` 的 secret（若你选择分离密钥）。
+
+- **CI / 工作流**:
+  - 已在仓库侧准备 `.github/workflows/deploy.yml`（本地），需要 commit & push。workflow 示例使用 `secrets.DEPLOY_SSH_KEY` 将私钥写入 `~/.ssh/id_ed25519` 并通过 SSH 登录 `deploy@39.106.7.215` 执行 `server/deploy.sh`。
+
+- **日志与证据归档位置（服务器）**:
+  - nginx 错误日志示例: `/var/log/nginx/api.ideahubs.error.log`（包含 `bad key share` 条目）
+  - tcpdump 捕获文件: `/tmp/cf_after_fix.pcap`, `/tmp/cf_after_curve_fix.pcap`
+  - openssl / curl 测试命令输出已保存于运维会话记录（memory/ 与 maintenance-logs/ 中的对应文件）。
+
+- **下一步建议（优先级）**:
+  1. 若需恢复 Cloudflare 代理（orange cloud），准备支持包（CF‑RAY、nginx error log、pcap、openssl 输出）并联系 Cloudflare 支持或请求他们检查受影响 POP。  
+  2. 在仓库中 commit 并 push `deploy.yml`，并把对应私钥上传到 `DEPLOY_SSH_KEY` secret，然后触发一次 Actions 验证自动部署链路。  
+  3. 中长期：计划升级 origin 的 OpenSSL/nginx 至更高版本以改善 TLS1.3 互操作性，或考虑通过 Cloudflare Workers/Load Balancer 做受控回退。 
+
+> 记录人: 运维/开发联调会话（自动摘要）
+
 - 记录稳定的用户偏好、仓库规则和项目框架事实
 - 为后续任务提供跨会话延续能力
 - 承接从每日记忆文件提炼出的长期知识

@@ -88,3 +88,42 @@ Where to look next
 
 Change log
 - 2026-04-02: Initial migration summary added; GitHub Actions workflow `.github/workflows/deploy.yml` added; front-end env updated to VITE_API_BASE=https://api.ideahubs.org
+
+---
+
+## 部署与运维状态（2026-04-07 摘要）
+
+简要记录当前部署与运维的关键信息与建议，便于运维/支持快速定位问题。
+
+- ECS / 服务:
+	- 公网 IP: 39.106.7.215
+	- 部署用户: `deploy`
+	- 部署脚本: `/var/www/ideahub/server/deploy.sh`
+	- 后端（pm2）: `ideahub-server`，监听 `127.0.0.1:4000`
+	- 前端构建输出: `/var/www/ideahub/client-dist`
+
+- nginx / TLS / Cloudflare:
+	- nginx 配置示例: `/etc/nginx/sites-available/api.ideahubs.org`
+	- Cloudflare Origin CA 证书: `/etc/ssl/certs/cloudflare-origin.pem`
+	- 私钥: `/etc/ssl/private/cloudflare-origin.key`
+	- 当前问题: Cloudflare 代理到 origin 时有 HTTP 525（TLS handshake failed），nginx error log 包含 `SSL_do_handshake() failed ... bad key share`；直连 origin（`curl --resolve api.ideahubs.org:443:39.106.7.215`）返回 200，表明 origin 可用但 Cloudflare edge→origin TLS 存在互操作问题。
+	- 已尝试修复/排查项：移除重复 server block、添加 `ssl_ecdh_curve X25519:secp384r1:secp256r1`、抓包（tcpdump）、openssl s_client 测试、临时切换为 DNS-only 验证直连。
+
+- SSH / Deploy keys / Actions secrets:
+	- 主私钥指纹（`/home/deploy/.ssh/id_ed25519`）: `SHA256:lcOMYf69NFJs1+CbaEiZh4NNbo3efdQXRz96eAm32rc`。
+	- 已从私钥派生公钥并保存在 `/tmp/pub_from_priv.pub`，可用于添加为 GitHub Deploy key。
+	- `/home/deploy/.ssh/authorized_keys` 已备份为 `/home/deploy/.ssh/authorized_keys.bak` 并去重；当前包含两把公钥条目。
+	- 因 GitHub 不允许同一 deploy key 被重复用于多个仓库，已为 `ideahub-client` 生成单独的 keypair (`/home/deploy/.ssh/id_ed25519_client*`) 并将公钥追加到 `authorized_keys`。请将该公钥添加为 `ideahub-client` 的 Deploy key（只读），并把对应私钥上传为该仓库的 Actions secret（例如 `DEPLOY_SSH_KEY` 或 `DEPLOY_SSH_KEY_CLIENT`）。
+
+- CI / 工作流:
+	- 本地已准备 `.github/workflows/deploy.yml`，需要 commit & push；Workflow 使用 `secrets.DEPLOY_SSH_KEY` 将私钥写入 `~/.ssh/id_ed25519` 并通过 SSH 执行 `server/deploy.sh`。
+
+- 证据与日志位置（服务器）:
+	- nginx error log: `/var/log/nginx/api.ideahubs.error.log`（包含 `bad key share` 日志）
+	- tcpdump pcap: `/tmp/cf_after_fix.pcap`, `/tmp/cf_after_curve_fix.pcap`
+
+- 优先建议：
+	1. 准备 Cloudflare 支持包（CF‑RAY、nginx error log 片段、pcap、openssl 输出），并联系 Cloudflare 支持或请其检查受影响 POP。  
+	2. 在仓库里 push workflow，并把对应私钥作为 `DEPLOY_SSH_KEY` 上传到仓库 Secrets，触发一次 Actions 流程验证部署链路。  
+	3. 中长期：计划升级 origin 的 OpenSSL/nginx 或采用受控回退策略以改善 TLS1.3 互操作性。
+
