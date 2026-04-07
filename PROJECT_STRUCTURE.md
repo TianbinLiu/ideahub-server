@@ -398,6 +398,18 @@ ideahub/
 
 - **ECS / 服务**:
   - 公网 IP: 39.106.7.215
+  
+**部署/验收（2026-04-07）**
+
+- 前端部署位置: `/var/www/ideahub/client-dist`，由 `nginx` 提供静态服务。
+- 快速验收命令（在本地或服务器上运行）:
+  - `curl -I https://ideahubs.org`
+  - `curl -I --resolve ideahubs.org:443:39.106.7.215 https://ideahubs.org`
+- 若遇到 Cloudflare 返回 `525`（TLS handshake failed）：
+  1. 在服务器上收集 nginx 错误日志（`/var/log/nginx/error.log` 或相应 site log）并摘取包含 `bad key share` 的片段。
+  2. 使用 `tcpdump` 抓包并生成 pcap（示例: `sudo tcpdump -i any -w /tmp/cf_tls.pcap host 39.106.7.215 and port 443`）。
+  3. 准备 Cloudflare 支持包（CF‑RAY、pcap、nginx error log、openssl s_client 输出）并联系 Cloudflare 支持。
+
   - 部署用户: `deploy`
   - 部署脚本: `/var/www/ideahub/server/deploy.sh`
   - 后端（pm2）: 进程名 `ideahub-server`，监听 `127.0.0.1:4000`

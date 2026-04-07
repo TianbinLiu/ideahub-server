@@ -127,3 +127,26 @@ Change log
 	2. 在仓库里 push workflow，并把对应私钥作为 `DEPLOY_SSH_KEY` 上传到仓库 Secrets，触发一次 Actions 流程验证部署链路。  
 	3. 中长期：计划升级 origin 的 OpenSSL/nginx 或采用受控回退策略以改善 TLS1.3 互操作性。
 
+	## 前端验收与检查（2026-04-07）
+
+	- 前端静态文件位于 `/var/www/ideahub/client-dist`，由 nginx 提供服务。
+	- 建议的快速验证步骤（在本地或服务器上运行）：
+
+	```bash
+	curl -I https://ideahubs.org
+	curl -I --resolve ideahubs.org:443:39.106.7.215 https://ideahubs.org
+	```
+
+	- 如果 Cloudflare 代理返回 `525`，请按下列顺序收集证据并联系 Cloudflare 支持：
+		1. 抓取 nginx 错误日志中包含 `SSL_do_handshake() failed`/`bad key share` 的条目。
+		2. 在服务器上用 `tcpdump` 抓包（示例: `sudo tcpdump -i any -w /tmp/cf_tls.pcap host 39.106.7.215 and port 443`），并打包 pcap。
+		3. 运行 `openssl s_client -connect 39.106.7.215:443 -servername ideahubs.org -tls1_3` 并保存输出。
+		4. 将 CF‑RAY（Cloudflare edge 报告的请求 id）、上述日志、pcap 和 openssl 输出一并提交给 Cloudflare 支持。
+
+	---
+
+	已做 / 建议的下一步：
+	- 在确认 origin 成功响应并且 `curl --resolve` 返回 200 后，再次启用 Cloudflare Proxy（orange cloud）并监控是否重现 `525`。
+	- 若仍复现，准备并提交 Cloudflare 支持包。
+
+
