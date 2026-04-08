@@ -6,6 +6,32 @@ Purpose
 - Centralize recent operational facts for ECS deployment so an engineer or an AI agent reading the repo can quickly find where runtime artifacts and deployment automation live.
 - Do NOT store secret values here; list only file paths and secret variable names.
 
+Target architecture for V1 rebuild (confirmed 2026-04-08)
+- Primary node: Alibaba Cloud ECS in Hong Kong.
+- Frontend and backend remain in two separate GitHub repositories and deploy independently.
+- Domain split: `ideahubs.org` serves the frontend; `api.ideahubs.org` serves the backend API.
+- Phase 1 keeps Cloudinary and MongoDB as-is; Phase 2 may migrate media to OSS and database to Alibaba Cloud MongoDB if mainland performance requires it.
+- Recommended origin TLS for Hong Kong ECS: use a public certificate on nginx so the same origin can serve both Cloudflare-proxied traffic and direct fallback traffic if needed.
+
+Recommended server layout for the Hong Kong ECS
+- Backend repo root: `/var/www/ideahub-server`
+- Frontend build output: `/var/www/ideahub-client-dist`
+- Backend env file: `/var/www/ideahub-server/.env`
+- Backend deploy script: `/var/www/ideahub-server/deploy.sh`
+- Frontend deploy target: `/var/www/ideahub-client-dist`
+
+Recommended deployment model for separate repos
+- `server` repository workflow: SSH to ECS and run `/var/www/ideahub-server/deploy.sh`.
+- `client` repository workflow: build on GitHub Actions, then `rsync --delete` the generated `dist/` to `/var/www/ideahub-client-dist`.
+- Do not let the server deploy script build the client. The two repositories should be released independently.
+
+Mainland access strategy for V1
+- Keep the primary origin in Hong Kong for compatibility with OpenAI, Cloudinary, and MongoDB.
+- Use Cloudflare for the main public entry, but retain the option of a direct or alternate mainland-facing entry later if Cloudflare routing quality is inconsistent from mainland networks.
+- If Cloudinary delivery is slow in mainland China, add a dedicated media domain and reverse-proxy or cache media before migrating to OSS.
+- If MongoDB access becomes unstable from the Hong Kong origin, whitelist the ECS IP first; if mainland acceleration is still insufficient, move to Alibaba Cloud MongoDB in Phase 2.
+- AI provider choice should be abstracted at the application layer later so mainland users can switch from OpenAI to providers such as Doubao without changing deployment topology.
+
 Quick facts
 - ECS public IP: 39.106.7.215
 - ECS private IP: 172.26.139.58
@@ -88,6 +114,7 @@ Where to look next
 
 Change log
 - 2026-04-02: Initial migration summary added; GitHub Actions workflow `.github/workflows/deploy.yml` added; front-end env updated to VITE_API_BASE=https://api.ideahubs.org
+- 2026-04-08: Confirmed V1 rebuild target as Alibaba Cloud Hong Kong with separate client/server deployments and `ideahubs.org` + `api.ideahubs.org` split.
 
 ---
 
@@ -148,5 +175,11 @@ Change log
 	已做 / 建议的下一步：
 	- 在确认 origin 成功响应并且 `curl --resolve` 返回 200 后，再次启用 Cloudflare Proxy（orange cloud）并监控是否重现 `525`。
 	- 若仍复现，准备并提交 Cloudflare 支持包。
+
+	- 已部署状态（如果你刚在服务器写入证书/私钥）:
+		- 证书路径: `/etc/ssl/certs/cloudflare-origin.pem`
+		- 私钥路径: `/etc/ssl/private/cloudflare-origin.key`（请确认权限为 `600`，属主 `root:root`）
+		- 如在 Cloudflare 创建时下载了私钥，请删除在临时工作站或云剪贴板中保存的私钥副本，确保仅在服务器的安全位置保存一份。
+		- 若需要重新生成 Origin Certificate，可在 Cloudflare → SSL/TLS → Origin Server 中创建新证书并替换服务器端文件。
 
 

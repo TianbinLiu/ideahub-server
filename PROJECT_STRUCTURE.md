@@ -221,6 +221,8 @@ ideahub/
 ├── memory/                          # OpenClaw 每日任务日志
 ├── memory.md                        # OpenClaw 项目知识库（框架/约定/坑点）
 ├── client/                           # 前端应用
+│   ├── .env.example                 # 前端环境变量示例（API 子域）
+│   ├── .github/workflows/deploy.yml # 前端仓库独立发布工作流
 │   ├── src/
 │   │   ├── main.tsx                  # 应用入口 + i18n初始化
 │   │   ├── App.tsx                   # 根组件 + 路由配置
@@ -292,11 +294,14 @@ ideahub/
 │   └── tailwind.config.js           # Tailwind配置
 │
 └── server/                           # 后端应用与文档中心
+  ├── .env.example                  # 服务端环境变量示例（阿里云香港 / API 子域）
   ├── .ai-instructions.md           # AI开发指南（权威版本）
   ├── .ai-file-header-templates.md  # 文件头模板（权威版本）
+  ├── ALIYUN_HK_DEPLOYMENT_RUNBOOK.md # 阿里云香港双仓库部署手册
   ├── AI-WORKFLOW-SYSTEM.md         # AI工作流总说明
   ├── PROJECT_STRUCTURE.md          # 本文档
   ├── README.md                     # 服务端/文档入口说明
+  ├── deploy.sh                     # 服务端仓库独立部署脚本
     ├── src/
     │   ├── index.js                  # 服务器入口
     │   ├── app.js                    # Express配置
@@ -443,6 +448,13 @@ ideahub/
   3. 中长期：计划升级 origin 的 OpenSSL/nginx 至更高版本以改善 TLS1.3 互操作性，或考虑通过 Cloudflare Workers/Load Balancer 做受控回退。 
 
 > 记录人: 运维/开发联调会话（自动摘要）
+
+**证书部署已记录**：若你已将 Cloudflare Origin Certificate 与私钥部署到服务器，请确保文件位置与权限如下并记录到运维文档：
+
+- `/etc/ssl/certs/cloudflare-origin.pem`  (证书，建议 `644`)
+- `/etc/ssl/private/cloudflare-origin.key` (私钥，必须 `600`，root:root)
+
+在 Cloudflare 仪表盘生成私钥后请立即保存并仅保留服务器上那一份私钥副本；若私钥遗失或泄露，请在 Cloudflare 重新生成并替换。
 
 - 记录稳定的用户偏好、仓库规则和项目框架事实
 - 为后续任务提供跨会话延续能力
@@ -1677,6 +1689,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-29 | 4.32 | **隐藏详情页 licenseType 展示**：`IdeaDetailPage` 详情元信息区移除 `licenseType` 标签显示，仅保留可见性展示，前端不再向用户暴露该字段。 |
 | 2026-03-29 | 4.33 | **反馈模式接入AI草稿**：`NewIdeaPage` 的 feedback 模式新增 AI 生成标题/摘要/标签能力；生成标签在提交时会与固定反馈标签合并写入，兼顾自动补全与反馈分类稳定性。 |
 | 2026-03-29 | 4.34 | **地区化认证能力开关**：后端新增 `GET /api/auth/capabilities`，基于请求国家头（如 `cf-ipcountry` / `x-vercel-ip-country`）返回 OAuth 可用性与 provider 列表；`LoginPage`/`RegisterPage` 按返回结果动态显示 OAuth，并保留前端环境变量与 query 参数兜底开关。 |
+| 2026-04-08 | 4.35 | **阿里云香港 V1 部署基线**：明确主站节点为阿里云香港，保留 Cloudinary 与 MongoDB 的第一阶段方案；新增阿里云香港部署手册、前后端环境变量示例，并将 `server/deploy.sh` 收敛为仅部署服务端仓库，为双 GitHub 仓库独立发布做准备。 |
 
 ---
 

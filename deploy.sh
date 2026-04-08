@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple deploy script for IdeaHub
+# Simple deploy script for IdeaHub server repository
 # - runs on the server (deploy user)
-# - fetches latest, installs server deps, builds client, copies static files, restarts pm2
+# - fetches latest server code, installs dependencies, restarts pm2
 # - appends stdout/stderr to /var/log/ideahub/deploy.log (ensure directory exists and owned by deploy)
 
 LOGFILE="/var/log/ideahub/deploy.log"
@@ -13,13 +13,11 @@ echo "$(ts) [deploy] starting deploy" >> "$LOGFILE" 2>&1
 
 # determine directories
 SERVER_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SERVER_DIR")"
 
 mkdir -p "$(dirname "$LOGFILE")" || true
 chown -R $(whoami):$(whoami) "$(dirname "$LOGFILE")" 2>/dev/null || true
 
 echo "$(ts) [deploy] server dir: $SERVER_DIR" >> "$LOGFILE" 2>&1
-echo "$(ts) [deploy] project dir: $PROJECT_DIR" >> "$LOGFILE" 2>&1
 
 # Update server repository
 if [ -d "$SERVER_DIR/.git" ]; then
@@ -32,17 +30,6 @@ fi
 
 echo "$(ts) [deploy] installing server dependencies" >> "$LOGFILE" 2>&1
 (cd "$SERVER_DIR" && npm ci --omit=dev) >> "$LOGFILE" 2>&1 || (cd "$SERVER_DIR" && npm install --omit=dev) >> "$LOGFILE" 2>&1
-
-if [ -d "$PROJECT_DIR/client" ]; then
-  echo "$(ts) [deploy] building frontend" >> "$LOGFILE" 2>&1
-  (cd "$PROJECT_DIR/client" && git fetch --all --prune) >> "$LOGFILE" 2>&1 || true
-  (cd "$PROJECT_DIR/client" && git reset --hard origin/main) >> "$LOGFILE" 2>&1 || true
-  (cd "$PROJECT_DIR/client" && npm ci --omit=dev) >> "$LOGFILE" 2>&1 || (cd "$PROJECT_DIR/client" && npm install --omit=dev) >> "$LOGFILE" 2>&1
-  (cd "$PROJECT_DIR/client" && npm run build) >> "$LOGFILE" 2>&1
-  mkdir -p "$PROJECT_DIR/client-dist"
-  rsync -a --delete "$PROJECT_DIR/client/dist/" "$PROJECT_DIR/client-dist/" >> "$LOGFILE" 2>&1 || rsync -a --delete "$PROJECT_DIR/client/dist/" "$PROJECT_DIR/client-dist/" >> "$LOGFILE" 2>&1
-  chown -R deploy:deploy "$PROJECT_DIR/client-dist" >> "$LOGFILE" 2>&1 || true
-fi
 
 echo "$(ts) [deploy] restarting pm2 process ideahub-server" >> "$LOGFILE" 2>&1
 if pm2 describe ideahub-server >/dev/null 2>&1; then
