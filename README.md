@@ -57,7 +57,7 @@
 - **运行时**: Node.js + Express
 - **数据库**: MongoDB + Mongoose
 - **认证**: Passport.js (Local + OAuth)
-- **队列**: Bull + Redis（AI任务队列）
+- **后台任务**: MongoDB `AiJob` + 轮询 worker（AI任务处理）
 - **邮件**: Nodemailer
 - **AI**: OpenAI API
 
@@ -68,7 +68,6 @@
 ### 前置要求
 - Node.js >= 18
 - MongoDB >= 6.0
-- Redis >= 6.0（用于任务队列）
 - npm 或 yarn
 
 ### 安装
@@ -95,8 +94,7 @@ cd ..
 **后端 `server/.env`**:
 ```env
 # 数据库
-MONGODB_URI=mongodb://localhost:27017/ideahub
-REDIS_URL=redis://localhost:6379
+MONGO_URI=mongodb://localhost:27017/ideahub
 
 # JWT
 JWT_SECRET=your-secret-key-change-this
@@ -126,7 +124,7 @@ PROJECT_DOCS_URL=https://raw.githubusercontent.com/TianbinLiu/ideahub-server/mai
 
 **前端 `client/.env`** (如需要):
 ```env
-VITE_API_BASE_URL=http://localhost:4000
+VITE_API_BASE=http://localhost:4000
 VITE_GITHUB_REPO_URL=https://github.com/TianbinLiu/ideahub-server
 VITE_GITHUB_DOCS_URL=https://github.com/TianbinLiu/ideahub-server/blob/main/PROJECT_STRUCTURE.md
 ```

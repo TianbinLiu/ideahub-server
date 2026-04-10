@@ -1,6 +1,6 @@
 # IdeaHub Aliyun HK Deployment Runbook
 
-Last updated: 2026-04-08
+Last updated: 2026-04-10
 
 ## Scope
 
@@ -12,6 +12,15 @@ This runbook is for the confirmed V1 deployment topology:
 - Backend API served from `api.ideahubs.org`
 - Phase 1 keeps Cloudinary and MongoDB
 - Phase 2 may move media to OSS and database to Alibaba Cloud MongoDB
+
+Current completion status (2026-04-10)
+
+- Hong Kong ECS host is provisioned and reachable.
+- `server` repository is deployed at `/var/www/ideahub-server`.
+- `client` repository publishes built assets to `/var/www/ideahub-client-dist` through GitHub Actions.
+- PM2 runs `ideahub-server` successfully under the `deploy` user.
+- nginx serves `https://ideahubs.org` and proxies `https://api.ideahubs.org`.
+- Let's Encrypt certificate for `ideahubs.org`, `www.ideahubs.org`, and `api.ideahubs.org` is active.
 
 ## Why Hong Kong for V1
 
@@ -235,6 +244,10 @@ The workflow should:
 2. build `dist/`
 3. `rsync --delete` to `/var/www/ideahub-client-dist`
 
+Current workflow note:
+
+- The client workflow opts into GitHub Actions Node 24 runtime compatibility and builds the frontend with Node.js 22.
+
 ## OAuth checklist
 
 After changing domains, update both the environment file and provider consoles.
@@ -271,6 +284,13 @@ curl -I --resolve api.ideahubs.org:443:<ecs_public_ip> https://api.ideahubs.org/
 - OAuth login succeeds
 - image upload succeeds
 - AI review succeeds
+
+### Completed baseline checks on 2026-04-10
+
+- `curl -I https://ideahubs.org` returned `200`
+- `curl -I https://api.ideahubs.org/api/health` returned `200`
+- PM2 reports `ideahub-server` as `online`
+- nginx configuration test passed
 
 ### Process checks
 
@@ -317,3 +337,9 @@ Recommended Phase 2 direction:
 - Rotate any secret that has ever been exposed outside a locked-down secrets store
 - Restrict MongoDB network access to the ECS public IP or VPC path you actually use
 - Keep SSH deploy keys separate per repository
+
+## Immediate post-cutover tasks
+
+- Verify browser-side login, image upload, and AI flows from the public domain.
+- Update Google and GitHub OAuth console callback URLs if they still point to older hosting platforms.
+- Keep `api.ideahubs.org` on DNS only until Cloudflare proxy behavior is re-validated against the Hong Kong origin.
