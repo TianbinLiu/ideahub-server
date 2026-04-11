@@ -100,8 +100,11 @@ async function login(req, res, next) {
     const { emailOrUsername, password } = req.body;
 
     if (!emailOrUsername || !password) {
-      res.status(400);
-      throw new Error("emailOrUsername and password are required");
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "emailOrUsername and password are required",
+      });
     }
 
     const user = await User.findOne({
@@ -109,14 +112,20 @@ async function login(req, res, next) {
     });
 
     if (!user) {
-      res.status(401);
-      throw new Error("Invalid credentials");
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "Invalid credentials",
+      });
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash || "");
     if (!ok) {
-      res.status(401);
-      throw new Error("Invalid credentials");
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "Invalid credentials",
+      });
     }
 
     const token = signToken(user);

@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-04-11  
-> 版本: 4.43
+> 版本: 4.48
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -26,7 +26,8 @@
 2. [OpenClaw 团队快速上手](#openclaw-团队快速上手)
 3. [项目结构树](#项目结构树)
 4. [核心文件详解](#核心文件详解)
-5. [更新记录](#更新记录)
+5. [账号安全联调 Checklist](#账号安全联调-checklist)
+6. [更新记录](#更新记录)
 
 ---
 
@@ -298,6 +299,7 @@ ideahub/
   ├── .ai-instructions.md           # AI开发指南（权威版本）
   ├── .ai-file-header-templates.md  # 文件头模板（权威版本）
   ├── ALIYUN_HK_DEPLOYMENT_RUNBOOK.md # 阿里云香港双仓库部署手册
+  ├── ACCOUNT_SECURITY_CHECKLIST.md  # 账号安全联调清单（改密轮换 token / 退出所有设备）
   ├── AI-WORKFLOW-SYSTEM.md         # AI工作流总说明
   ├── PROJECT_STRUCTURE.md          # 本文档
   ├── README.md                     # 服务端/文档入口说明
@@ -1650,6 +1652,24 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 ---
 
+## 账号安全联调 Checklist
+
+完整联调清单已独立沉淀到 `server/ACCOUNT_SECURITY_CHECKLIST.md`。
+
+建议在以下场景直接使用独立文档：
+
+- 前后端联调前做逐项勾选
+- 上线前做账号安全回归
+- 排查 stale token、错误留存登录态、退出所有设备未生效等问题
+
+覆盖范围：
+
+- 改密轮换当前 token
+- 退出所有设备使全部现有 token 失效
+- 前置检查、操作步骤、成功判定、失败信号、联调结论模板
+
+---
+
 ## 更新记录
 
 | 日期 | 版本 | 更新内容 |
@@ -1721,6 +1741,11 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-11 | 4.41 | **已设密码用户修改密码流程**：新增受保护的 `POST /api/auth/change-password` 接口，要求提交当前密码后才允许修改；`MePage` 的账号安全卡新增修改密码表单；补充当前密码错误、未启用密码登录等错误码与中英文提示。 |
 | 2026-04-11 | 4.42 | **改密后当前会话 token 轮换**：`User` 新增 `tokenVersion`，JWT 签发与校验链路改为携带并校验版本号；设密码或修改密码时会递增版本、返回新的 token，并让前端当前会话立即切换到新 token，旧 token 自动失效。 |
 | 2026-04-11 | 4.43 | **退出所有设备显式入口**：新增受保护的 `POST /api/auth/logout-all` 接口，通过递增 `tokenVersion` 使所有现有 JWT 立即失效；`MePage` 新增“退出所有设备”危险操作入口，确认后会清除当前本地 token 并跳转回登录页。 |
+| 2026-04-11 | 4.44 | **补充账号安全联调 Checklist**：在文档中新增专门的联调清单，聚焦“改密轮换 token”和“退出所有设备”两条安全链路，覆盖前置准备、操作步骤、成功判定、失败信号和结论模板。 |
+| 2026-04-11 | 4.45 | **账号安全联调清单独立成文档**：新增 `server/ACCOUNT_SECURITY_CHECKLIST.md` 作为独立联调文档，并将 `PROJECT_STRUCTURE.md` 中的对应章节收敛为索引说明，减少重复维护。 |
+| 2026-04-11 | 4.46 | **记录首次真实账号安全联调结果**：在 `server/ACCOUNT_SECURITY_CHECKLIST.md` 追加本地真实运行验证记录，确认改密换 token 与退出所有设备的失效语义成立，但同时暴露旧 token / 旧密码失败场景被错误包装成 `500 SERVER_ERROR` 而非 `401`。 |
+| 2026-04-11 | 4.47 | **修复账号安全失败场景返回码并完成回归**：`auth.controller.js` 的本地登录失败改为抛结构化 `401 UNAUTHORIZED`；`middleware/auth.js` 不再把 stale token 等鉴权失败重新包装成普通 `Error`。第二轮真实联调已确认改密与退出所有设备相关失败场景统一返回 `401/UNAUTHORIZED`。 |
+| 2026-04-11 | 4.48 | **补齐前端 401 清理与浏览器态回归**：`client/src/api.ts` 在带 token 的请求收到 `401` 时统一触发 token 清理；`client/src/authContext.tsx` 监听全局 auth-expired 事件并清空用户态、跳转登录页且保留 `next`；`middleware/auth.js` 的 `requireRole` 也改为结构化 `401/403` 错误。浏览器自动回归已确认本地 token 清理与跳转体验生效。 |
 
 ---
 
