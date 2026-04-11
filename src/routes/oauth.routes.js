@@ -3,7 +3,10 @@
 const router = require("express").Router();
 const passport = require("passport");
 const User = require("../models/User");
-const { signToken } = require("../utils/jwt");
+const { requireAuth } = require("../middleware/auth");
+const AppError = require("../utils/AppError");
+const CODES = require("../utils/errorCodes");
+const { signToken, signOauthState, verifyOauthState } = require("../utils/jwt");
 
 function safeUsername(base) {
   return String(base || "user")
@@ -34,16 +37,20 @@ function safeNextPath(next) {
 }
 
 function encodeState(obj) {
-  return Buffer.from(JSON.stringify(obj || {}), "utf8").toString("base64url");
+  return signOauthState(obj || {});
 }
 
 function decodeState(s) {
   try {
     if (!s) return {};
-    const raw = Buffer.from(String(s), "base64url").toString("utf8");
-    return JSON.parse(raw);
+    return verifyOauthState(String(s));
   } catch {
-    return {};
+    try {
+      const raw = Buffer.from(String(s), "base64url").toString("utf8");
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
   }
 }
 
@@ -51,10 +58,36 @@ function getClientBase() {
   return process.env.CLIENT_BASE_URL || "http://localhost:5173";
 }
 
+function getServerBase() {
+  return process.env.SERVER_BASE_URL || "http://localhost:4000";
+}
+
+function getAvailableOauthProviders() {
+  const providers = [];
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    providers.push("google");
+  }
+  if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
+    providers.push("github");
+  }
+  return providers;
+}
+
 function redirectSuccess(res, token, nextPath) {
   const client = getClientBase();
   const url = new URL(`${client}/oauth/callback`);
   url.searchParams.set("token", token);
+  url.searchParams.set("next", safeNextPath(nextPath));
+  return res.redirect(url.toString());
+}
+
+function redirectLinkSuccess(res, provider, token, nextPath) {
+  const client = getClientBase();
+  const url = new URL(`${client}/oauth/callback`);
+  url.searchParams.set("linked", String(provider));
+  if (token) {
+    url.searchParams.set("token", token);
+  }
   url.searchParams.set("next", safeNextPath(nextPath));
   return res.redirect(url.toString());
 }
@@ -67,6 +100,135 @@ function redirectFail(res, error, message, nextPath) {
   url.searchParams.set("next", safeNextPath(nextPath));
   return res.redirect(url.toString());
 }
+
+function getOauthConflictMessage(provider) {
+  return `${provider} email is already linked to another IdeaHub login method. Please use the original sign-in method for that account.`;
+}
+
+function getOauthAlreadyLinkedMessage(provider) {
+  return `${provider} is already linked to a different third-party account on this IdeaHub profile.`;
+}
+
+function countLoginMethods(user) {
+  const passwordCount = user?.passwordHash ? 1 : 0;
+  const googleCount = user?.providers?.google ? 1 : 0;
+  const githubCount = user?.providers?.github ? 1 : 0;
+  return passwordCount + googleCount + githubCount;
+}
+
+function buildOauthLinksPayload(user) {
+  const linkedProviders = {
+    google: Boolean(user?.providers?.google),
+    github: Boolean(user?.providers?.github),
+  };
+
+  return {
+    ok: true,
+    availableProviders: getAvailableOauthProviders(),
+    hasPassword: Boolean(user?.passwordHash),
+    linkedProviders,
+    canUnlink: {
+      google: linkedProviders.google && countLoginMethods(user) > 1,
+      github: linkedProviders.github && countLoginMethods(user) > 1,
+    },
+  };
+}
+
+router.get("/oauth/links", requireAuth, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user._id).select("providers passwordHash").lean();
+    res.json(buildOauthLinksPayload(user));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/oauth/links/:provider", requireAuth, async (req, res, next) => {
+  try {
+    const provider = String(req.params.provider || "").toLowerCase();
+    if (!["google", "github"].includes(provider)) {
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "Invalid OAuth provider",
+      });
+    }
+
+    const user = await User.findById(req.user._id).select("providers passwordHash");
+    if (!user) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "User not found",
+      });
+    }
+
+    if (!user.providers?.[provider]) {
+      throw new AppError({
+        code: CODES.OAUTH_NOT_LINKED,
+        status: 400,
+        message: `${provider} is not linked to this account`,
+      });
+    }
+
+    if (countLoginMethods(user) <= 1) {
+      throw new AppError({
+        code: CODES.OAUTH_UNLINK_LAST_METHOD,
+        status: 400,
+        message: "You must keep at least one login method on your account",
+      });
+    }
+
+    user.providers[provider] = "";
+    await user.save();
+
+    res.json(buildOauthLinksPayload(user.toObject()));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/oauth/link/start", requireAuth, async (req, res, next) => {
+  try {
+    const provider = String(req.body?.provider || "").toLowerCase();
+    const nextPath = safeNextPath(req.body?.next || "/me");
+    const availableProviders = getAvailableOauthProviders();
+
+    if (!availableProviders.includes(provider)) {
+      res.status(400);
+      throw new Error("OAuth provider is not available");
+    }
+
+    const state = encodeState({
+      mode: "link",
+      provider,
+      next: nextPath,
+      linkUserId: req.user._id.toString(),
+    });
+
+    const redirectUrl = new URL(`${getServerBase()}/api/auth/oauth/${provider}/link`);
+    redirectUrl.searchParams.set("state", state);
+
+    res.json({ ok: true, redirectUrl: redirectUrl.toString() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/oauth/google/link", (req, res, next) => {
+  const state = String(req.query.state || "");
+  passport.authenticate("google", {
+    session: false,
+    scope: ["profile", "email"],
+    prompt: "select_account",
+    state,
+  })(req, res, next);
+});
+
+router.get("/oauth/github/link", (req, res, next) => {
+  const state = String(req.query.state || "");
+  passport.authenticate("github", { session: false, state })(req, res, next);
+});
 
 // ---------------- Google ----------------
 router.get("/oauth/google", (req, res, next) => {
@@ -99,15 +261,45 @@ router.get(
 
       if (!email) return redirectFail(res, "oauth_failed", "Google email not available", nextPath);
 
+      if (st.mode === "link") {
+        const linkUserId = String(st.linkUserId || "");
+        if (!linkUserId) {
+          return redirectFail(res, "oauth_failed", "Missing link user", nextPath);
+        }
+
+        const linkUser = await User.findById(linkUserId);
+        if (!linkUser) {
+          return redirectFail(res, "oauth_failed", "Link target user not found", nextPath);
+        }
+
+        const providerOwner = await User.findOne({ "providers.google": googleId });
+        if (providerOwner && providerOwner._id.toString() !== linkUserId) {
+          return redirectFail(res, "oauth_conflict", getOauthConflictMessage("Google"), nextPath);
+        }
+
+        const emailOwner = await User.findOne({ email });
+        if (emailOwner && emailOwner._id.toString() !== linkUserId) {
+          return redirectFail(res, "oauth_conflict", getOauthConflictMessage("Google"), nextPath);
+        }
+
+        if (linkUser.providers.google && linkUser.providers.google !== googleId) {
+          return redirectFail(res, "oauth_conflict", getOauthAlreadyLinkedMessage("Google"), nextPath);
+        }
+
+        linkUser.providers.google = googleId;
+        if (!linkUser.avatarUrl && avatarUrl) linkUser.avatarUrl = avatarUrl;
+        linkUser.emailVerified = true;
+        await linkUser.save();
+
+        return redirectLinkSuccess(res, "google", signToken(linkUser), nextPath);
+      }
+
       let user = await User.findOne({ "providers.google": googleId });
 
       if (!user) {
-        user = await User.findOne({ email });
-        if (user) {
-          user.providers.google = googleId;
-          if (!user.avatarUrl && avatarUrl) user.avatarUrl = avatarUrl;
-          user.emailVerified = true;
-          await user.save();
+        const existingUserWithEmail = await User.findOne({ email });
+        if (existingUserWithEmail) {
+          return redirectFail(res, "oauth_conflict", getOauthConflictMessage("Google"), nextPath);
         }
       }
 
@@ -158,15 +350,47 @@ router.get(
       const avatarUrl = profile.photos?.[0]?.value || "";
       const email = (profile.emails?.[0]?.value || "").toLowerCase();
 
+      if (st.mode === "link") {
+        const linkUserId = String(st.linkUserId || "");
+        if (!linkUserId) {
+          return redirectFail(res, "oauth_failed", "Missing link user", nextPath);
+        }
+
+        const linkUser = await User.findById(linkUserId);
+        if (!linkUser) {
+          return redirectFail(res, "oauth_failed", "Link target user not found", nextPath);
+        }
+
+        const providerOwner = await User.findOne({ "providers.github": githubId });
+        if (providerOwner && providerOwner._id.toString() !== linkUserId) {
+          return redirectFail(res, "oauth_conflict", getOauthConflictMessage("GitHub"), nextPath);
+        }
+
+        if (email) {
+          const emailOwner = await User.findOne({ email });
+          if (emailOwner && emailOwner._id.toString() !== linkUserId) {
+            return redirectFail(res, "oauth_conflict", getOauthConflictMessage("GitHub"), nextPath);
+          }
+        }
+
+        if (linkUser.providers.github && linkUser.providers.github !== githubId) {
+          return redirectFail(res, "oauth_conflict", getOauthAlreadyLinkedMessage("GitHub"), nextPath);
+        }
+
+        linkUser.providers.github = githubId;
+        if (!linkUser.avatarUrl && avatarUrl) linkUser.avatarUrl = avatarUrl;
+        if (email) linkUser.emailVerified = true;
+        await linkUser.save();
+
+        return redirectLinkSuccess(res, "github", signToken(linkUser), nextPath);
+      }
+
       let user = await User.findOne({ "providers.github": githubId });
 
       if (!user && email) {
-        user = await User.findOne({ email });
-        if (user) {
-          user.providers.github = githubId;
-          if (!user.avatarUrl && avatarUrl) user.avatarUrl = avatarUrl;
-          if (email) user.emailVerified = true;
-          await user.save();
+        const existingUserWithEmail = await User.findOne({ email });
+        if (existingUserWithEmail) {
+          return redirectFail(res, "oauth_conflict", getOauthConflictMessage("GitHub"), nextPath);
         }
       }
 

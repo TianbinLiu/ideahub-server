@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-04-10  
-> 版本: 4.36
+> 最后更新: 2026-04-11  
+> 版本: 4.43
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -186,7 +186,7 @@ openclaw dashboard ##openclaw tui
 - **网页抓取**: axios + cheerio
 
 ### 核心特性
-✅ 完整认证系统（邮箱/OAuth）  
+✅ 完整认证系统（邮箱/OAuth/显式第三方账号绑定与解绑/设密码与改密码/JWT 轮换/退出所有设备安全兜底）  
 ✅ 创意CRUD + AI智能评审  
 ✅ 社交互动（点赞/评论/收藏）  
 ✅ 标签排行榜系统  
@@ -779,9 +779,30 @@ return <>{children}</>;
 **逻辑**:
 - 从URL获取token
 - 调用loginWithToken()
+- 兼容“第三方账号绑定成功”回调并显示绑定成功提示
 - 跳转到next参数指定页面
 
 **国际化**: ✅ 完整支持
+
+---
+
+##### `MePage.tsx`
+**补充功能**: 第三方账号绑定/解绑入口  
+**关联文件**:
+- `api.ts` - 读取当前 OAuth 绑定状态并发起绑定/解绑流程
+- `OAuthCallbackPage.tsx` - 绑定完成后回跳并提示成功
+
+**功能补充**:
+- 显示 Google / GitHub 当前是否已绑定
+- 已登录用户可显式发起“绑定 Google / GitHub”流程
+- 已绑定的第三方账号支持显式解绑
+- 对仅有第三方登录的账号，支持在个人中心先设置密码
+- 当某个第三方账号是当前最后一种登录方式时，前后端都会阻止解绑
+- 设置密码后，最后一个第三方登录方式才会允许解绑
+- 已启用密码登录的账号，可在个人中心通过当前密码修改密码
+- 设密码或改密码后，当前会话 JWT 会立刻轮换，旧 token 自动失效
+- 个人中心提供“退出所有设备”显式入口，可使所有现有会话立即失效
+- 不再依赖按邮箱自动并号来完成账号合并
 
 ---
 
@@ -1424,9 +1445,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 #### `server/src/routes/`
 **16个路由模块**:
 - `health.routes.js` - 健康检查
-- `auth.routes.js` - 认证
+- `auth.routes.js` - 邮箱密码认证、当前用户状态、登录能力探测、已登录设密码
 - `authOtp.routes.js` - OTP验证
-- `oauth.routes.js` - OAuth
+- `oauth.routes.js` - OAuth（登录 + 显式第三方账号绑定/解绑；不再按 email 自动并号）
 - `ideas.routes.js` - 创意
 - `me.routes.js` - 个人中心
 - `company.routes.js` - 公司
@@ -1693,6 +1714,13 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-03-29 | 4.34 | **地区化认证能力开关**：后端新增 `GET /api/auth/capabilities`，基于请求国家头（如 `cf-ipcountry` / `x-vercel-ip-country`）返回 OAuth 可用性与 provider 列表；`LoginPage`/`RegisterPage` 按返回结果动态显示 OAuth，并保留前端环境变量与 query 参数兜底开关。 |
 | 2026-04-08 | 4.35 | **阿里云香港 V1 部署基线**：明确主站节点为阿里云香港，保留 Cloudinary 与 MongoDB 的第一阶段方案；新增阿里云香港部署手册、前后端环境变量示例，并将 `server/deploy.sh` 收敛为仅部署服务端仓库，为双 GitHub 仓库独立发布做准备。 |
 | 2026-04-10 | 4.36 | **阿里云香港首版上线完成**：`server` 仓库已部署到 `/var/www/ideahub-server`，`client` 仓库通过 GitHub Actions 发布到 `/var/www/ideahub-client-dist`；主站 `https://ideahubs.org` 与 API `https://api.ideahubs.org/api/health` 已公网验证通过，TLS 切换为 Let's Encrypt。 |
+| 2026-04-11 | 4.37 | **OAuth 账号隔离修复**：`oauth.routes.js` 不再按 email 自动把 GitHub/Google 并入已有账号；当第三方邮箱已被其他登录方式占用时，回调会返回冲突错误，避免 logout 后切换 provider 被静默登录到原账号。 |
+| 2026-04-11 | 4.38 | **显式第三方账号绑定流程**：新增受保护的 OAuth 绑定发起接口与绑定状态查询；`MePage` 新增 Google/GitHub 绑定入口，`OAuthCallbackPage` 兼容绑定成功回调；第三方账号绑定改为用户显式操作，不再依赖隐式并号。 |
+| 2026-04-11 | 4.39 | **显式第三方账号解绑流程**：新增受保护的 OAuth 解绑接口与 `canUnlink` 状态返回；`MePage` 新增 Google/GitHub 解绑按钮与禁用提示；当账号只剩最后一种登录方式时，前后端都会阻止解绑，避免用户把自己锁在账号外。 |
+| 2026-04-11 | 4.40 | **设密码后再解绑最后一个第三方登录**：新增受保护的 `POST /api/auth/set-password` 接口；`/api/auth/me` 与 OAuth 绑定状态返回 `hasPassword`；`MePage` 新增密码登录状态与设密码表单，引导用户先启用密码登录，再解绑最后一个 Google/GitHub 登录方式。 |
+| 2026-04-11 | 4.41 | **已设密码用户修改密码流程**：新增受保护的 `POST /api/auth/change-password` 接口，要求提交当前密码后才允许修改；`MePage` 的账号安全卡新增修改密码表单；补充当前密码错误、未启用密码登录等错误码与中英文提示。 |
+| 2026-04-11 | 4.42 | **改密后当前会话 token 轮换**：`User` 新增 `tokenVersion`，JWT 签发与校验链路改为携带并校验版本号；设密码或修改密码时会递增版本、返回新的 token，并让前端当前会话立即切换到新 token，旧 token 自动失效。 |
+| 2026-04-11 | 4.43 | **退出所有设备显式入口**：新增受保护的 `POST /api/auth/logout-all` 接口，通过递增 `tokenVersion` 使所有现有 JWT 立即失效；`MePage` 新增“退出所有设备”危险操作入口，确认后会清除当前本地 token 并跳转回登录页。 |
 
 ---
 

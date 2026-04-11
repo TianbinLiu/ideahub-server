@@ -8,6 +8,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, trim: true, unique: true },
 
     passwordHash: { type: String, default: "" },
+  tokenVersion: { type: Number, default: 0 },
 
     role: { type: String, enum: ["user", "company", "admin"], default: "user" },
     displayName: { type: String, default: "" },

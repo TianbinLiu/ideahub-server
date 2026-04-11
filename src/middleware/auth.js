@@ -1,5 +1,7 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const AppError = require("../utils/AppError");
+const CODES = require("../utils/errorCodes");
 
 async function requireAuth(req, res, next) {
   try {
@@ -15,11 +17,19 @@ async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const userId = payload.sub;
 
-    const user = await User.findById(userId).select("_id username email role bio createdAt");
+    const user = await User.findById(userId).select("_id username email role bio createdAt tokenVersion");
     if (!user) {
       console.log('[Auth] User not found:', userId);
       res.status(401);
       throw new Error("User not found");
+    }
+
+    if (Number(payload.tokenVersion || 0) !== Number(user.tokenVersion || 0)) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "Session expired. Please log in again.",
+      });
     }
 
     console.log('[Auth] User authenticated:', user._id, 'role:', user.role);
@@ -59,8 +69,10 @@ async function optionalAuth(req, res, next) {
     }
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(payload.sub).select("_id username email role bio createdAt");
-    if (user) req.user = user;
+    const user = await User.findById(payload.sub).select("_id username email role bio createdAt tokenVersion");
+    if (user && Number(payload.tokenVersion || 0) === Number(user.tokenVersion || 0)) {
+      req.user = user;
+    }
 
     next();
   } catch {

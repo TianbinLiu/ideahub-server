@@ -2,7 +2,19 @@
 
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
+const AppError = require("../utils/AppError");
+const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
+
+function serializeAuthUser(user) {
+  return {
+    _id: user._id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    hasPassword: Boolean(user.passwordHash),
+  };
+}
 
 function parseBooleanEnv(value) {
   if (typeof value !== "string") return null;
@@ -76,7 +88,7 @@ async function register(req, res, next) {
     res.status(201).json({
       ok: true,
       token,
-      user: { id: user._id, username: user.username, email: user.email, role: user.role },
+      user: serializeAuthUser(user),
     });
   } catch (err) {
     next(err);
@@ -112,15 +124,143 @@ async function login(req, res, next) {
     res.json({
       ok: true,
       token,
-      user: { id: user._id, username: user.username, email: user.email, role: user.role },
+      user: serializeAuthUser(user),
     });
   } catch (err) {
     next(err);
   }
 }
 
-async function me(req, res) {
-  res.json({ ok: true, user: req.user });
+async function me(req, res, next) {
+  try {
+    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    if (!user) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "User not found",
+      });
+    }
+
+    res.json({ ok: true, user: serializeAuthUser(user) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function setPassword(req, res, next) {
+  try {
+    const { newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 6) {
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "Password must be at least 6 characters",
+      });
+    }
+
+    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    if (!user) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "User not found",
+      });
+    }
+
+    if (user.passwordHash) {
+      throw new AppError({
+        code: CODES.PASSWORD_ALREADY_SET,
+        status: 400,
+        message: "Password login is already enabled for this account",
+      });
+    }
+
+    user.passwordHash = await bcrypt.hash(String(newPassword), 10);
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1;
+    await user.save();
+
+    const token = signToken(user);
+    res.json({ ok: true, token, user: serializeAuthUser(user) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function changePassword(req, res, next) {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword) {
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "Current password and new password are required",
+      });
+    }
+
+    if (String(newPassword).length < 6) {
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "Password must be at least 6 characters",
+      });
+    }
+
+    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    if (!user) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "User not found",
+      });
+    }
+
+    if (!user.passwordHash) {
+      throw new AppError({
+        code: CODES.PASSWORD_NOT_SET,
+        status: 400,
+        message: "Password login is not enabled for this account",
+      });
+    }
+
+    const ok = await bcrypt.compare(String(currentPassword), user.passwordHash);
+    if (!ok) {
+      throw new AppError({
+        code: CODES.INVALID_CURRENT_PASSWORD,
+        status: 400,
+        message: "Current password is incorrect",
+      });
+    }
+
+    user.passwordHash = await bcrypt.hash(String(newPassword), 10);
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1;
+    await user.save();
+
+    const token = signToken(user);
+    res.json({ ok: true, token, user: serializeAuthUser(user) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function logoutAllSessions(req, res, next) {
+  try {
+    const user = await User.findById(req.user._id).select("_id tokenVersion");
+    if (!user) {
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "User not found",
+      });
+    }
+
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1;
+    await user.save();
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 }
 
 function getAuthCapabilities(req, res) {
@@ -154,4 +294,4 @@ function getAuthCapabilities(req, res) {
 }
 
 
-module.exports = { register, login, me, getAuthCapabilities };
+module.exports = { register, login, me, setPassword, changePassword, logoutAllSessions, getAuthCapabilities };
