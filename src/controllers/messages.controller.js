@@ -9,6 +9,7 @@ const DirectMessage = require("../models/DirectMessage");
 const DmRequestBlock = require("../models/DmRequestBlock");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
+const { assertCanCreateBlock } = require("../utils/blocking");
 const { createNotification } = require("../services/notification.service");
 
 /**
@@ -511,6 +512,8 @@ async function blockDmUser(req, res, next) {
     if (!targetUser) {
       throw new AppError("User not found", 404);
     }
+
+    await assertCanCreateBlock(blockerUserId, userId);
 
     await DmRequestBlock.findOneAndUpdate(
       { blockerUserId, blockedUserId: userId },

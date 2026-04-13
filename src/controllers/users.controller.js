@@ -4,6 +4,13 @@ const Bookmark = require("../models/Bookmark");
 const TagLeaderboard = require("../models/TagLeaderboard");
 const LeaderboardPost = require("../models/LeaderboardPost");
 const AppError = require("../utils/AppError");
+const {
+  ensureNoBlockForInteraction,
+  ensureUsersVisibleOrThrow,
+  filterItemsByBlockedUsers,
+  listBlockedUserIds,
+  toIdString,
+} = require("../utils/blocking");
 
 /**
  * GET /api/users/search?q=username&limit=8
@@ -13,6 +20,7 @@ async function searchUsers(req, res, next) {
   try {
     const q = (req.query.q || "").toString().trim().toLowerCase();
     const limit = Math.min(Math.max(parseInt(req.query.limit || "8", 10), 1), 20);
+    const currentUserId = req.user?._id;
     
     if (!q || q.length < 1) {
       return res.json({ ok: true, users: [] });
@@ -25,7 +33,10 @@ async function searchUsers(req, res, next) {
       .limit(limit)
       .lean();
 
-    res.json({ ok: true, users });
+    const blockedUserIds = currentUserId ? await listBlockedUserIds(currentUserId) : new Set();
+    const visibleUsers = filterItemsByBlockedUsers(users, blockedUserIds, (user) => user._id);
+
+    res.json({ ok: true, users: visibleUsers });
   } catch (err) {
     next(err);
   }
@@ -39,6 +50,10 @@ async function getUserProfile(req, res, next) {
   try {
     const { id } = req.params;
     const currentUserId = req.user?._id?.toString();
+
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
 
     const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt');
     if (!user) {
@@ -94,6 +109,8 @@ async function toggleFollow(req, res, next) {
       throw new AppError('User not found', 404, 'USER_NOT_FOUND');
     }
 
+    await ensureNoBlockForInteraction(currentUserId, id, 'Blocked users cannot follow each other.');
+
     const existing = await Follow.findOne({ follower: currentUserId, following: id });
 
     if (existing) {
@@ -117,20 +134,34 @@ async function toggleFollow(req, res, next) {
 async function getFollowers(req, res, next) {
   try {
     const { id } = req.params;
+    const currentUserId = req.user?._id?.toString() || "";
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
 
-    const followers = await Follow.find({ following: id })
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
+
+    const rows = await Follow.find({ following: id })
       .populate('follower', 'username displayName avatarUrl')
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit);
+      .lean();
 
-    const total = await Follow.countDocuments({ following: id });
+    const [subjectBlockedUserIds, viewerBlockedUserIds] = await Promise.all([
+      listBlockedUserIds(id),
+      currentUserId ? listBlockedUserIds(currentUserId) : Promise.resolve(new Set()),
+    ]);
+    const hiddenUserIds = new Set([...subjectBlockedUserIds, ...viewerBlockedUserIds]);
+    const filteredFollowers = filterItemsByBlockedUsers(rows, hiddenUserIds, (row) => row.follower?._id || row.follower);
+    const total = filteredFollowers.length;
+    const followers = filteredFollowers
+      .slice((page - 1) * limit, page * limit)
+      .map((row) => row.follower)
+      .filter(Boolean);
 
     res.json({
       ok: true,
-      followers: followers.map(f => f.follower),
+      followers,
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -145,20 +176,34 @@ async function getFollowers(req, res, next) {
 async function getFollowing(req, res, next) {
   try {
     const { id } = req.params;
+    const currentUserId = req.user?._id?.toString() || "";
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
 
-    const following = await Follow.find({ follower: id })
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
+
+    const rows = await Follow.find({ follower: id })
       .populate('following', 'username displayName avatarUrl')
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit);
+      .lean();
 
-    const total = await Follow.countDocuments({ follower: id });
+    const [subjectBlockedUserIds, viewerBlockedUserIds] = await Promise.all([
+      listBlockedUserIds(id),
+      currentUserId ? listBlockedUserIds(currentUserId) : Promise.resolve(new Set()),
+    ]);
+    const hiddenUserIds = new Set([...subjectBlockedUserIds, ...viewerBlockedUserIds]);
+    const filteredFollowing = filterItemsByBlockedUsers(rows, hiddenUserIds, (row) => row.following?._id || row.following);
+    const total = filteredFollowing.length;
+    const following = filteredFollowing
+      .slice((page - 1) * limit, page * limit)
+      .map((row) => row.following)
+      .filter(Boolean);
 
     res.json({
       ok: true,
-      following: following.map(f => f.following),
+      following,
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -175,6 +220,10 @@ async function getUserBookmarks(req, res, next) {
     const { id } = req.params;
     const currentUserId = req.user?._id?.toString();
 
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
+
     // Only show bookmarks if viewing own profile or if user is admin
     const isOwnProfile = currentUserId === id;
     const isAdmin = req.user?.role === 'admin';
@@ -189,16 +238,20 @@ async function getUserBookmarks(req, res, next) {
 
     const bookmarks = await Bookmark.find({ user: id })
       .populate('idea', 'title summary tags createdAt author')
-      .populate('leaderboard', 'tags computedAt')
+      .populate('leaderboard', 'tags computedAt author')
       .sort({ createdAt: -1 });
+
+    const blockedUserIds = await listBlockedUserIds(id);
 
     const ideas = bookmarks
       .filter(b => b.type === 'idea' && b.idea)
-      .map(b => b.idea);
+      .map(b => b.idea)
+      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)));
 
     const leaderboards = bookmarks
       .filter(b => b.type === 'leaderboard' && b.leaderboard)
-      .map(b => b.leaderboard);
+      .map(b => b.leaderboard)
+      .filter((leaderboard) => !blockedUserIds.has(toIdString(leaderboard.author)));
 
     res.json({ ok: true, ideas, leaderboards });
   } catch (err) {
@@ -215,6 +268,11 @@ async function getUserLeaderboards(req, res, next) {
     const { id } = req.params;
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const currentUserId = req.user?._id?.toString();
+
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
 
     const [items, total] = await Promise.all([
       TagLeaderboard.find({ author: id })

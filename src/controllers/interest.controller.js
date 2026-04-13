@@ -4,6 +4,7 @@ const Interest = require("../models/Interest");
 const { createNotification } = require("../services/notification.service");
 const { canCompanyInterest } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
+const { ensureNoBlockForInteraction, filterItemsByBlockedUsers, listBlockedUserIds } = require("../utils/blocking");
 
 
 
@@ -29,6 +30,8 @@ async function toggleInterest(req, res, next) {
     if (!canCompanyInterest(idea, req.user)) {
       forbidden("Forbidden");
     }
+
+    await ensureNoBlockForInteraction(req.user._id, idea.author, "Blocked users cannot send interests.");
 
 
     // 只有企业用户能操作（也可以用 requireRole("company")）
@@ -98,7 +101,10 @@ async function listIdeaInterests(req, res, next) {
       .populate("companyUser", "username email role")
       .lean();
 
-    res.json({ ok: true, interests });
+    const blockedUserIds = await listBlockedUserIds(req.user._id);
+    const visibleInterests = filterItemsByBlockedUsers(interests, blockedUserIds, (item) => item.companyUser?._id || item.companyUser);
+
+    res.json({ ok: true, interests: visibleInterests });
   } catch (err) {
     next(err);
   }
@@ -120,7 +126,10 @@ async function listCompanyInterests(req, res, next) {
       })
       .lean();
 
-    const ideas = rows.map(r => ({ ...r.idea, interestMessage: r.message, interestedAt: r.createdAt })).filter(Boolean);
+    const blockedUserIds = await listBlockedUserIds(req.user._id);
+    const ideas = rows
+      .map(r => ({ ...r.idea, interestMessage: r.message, interestedAt: r.createdAt }))
+      .filter((idea) => idea && !blockedUserIds.has(String(idea.author?._id || idea.author || "")));
     res.json({ ok: true, ideas });
   } catch (err) {
     next(err);
@@ -139,7 +148,10 @@ async function listReceivedInterests(req, res, next) {
       .populate("idea", "title visibility")
       .lean();
 
-    res.json({ ok: true, interests });
+    const blockedUserIds = await listBlockedUserIds(req.user._id);
+    const visibleInterests = filterItemsByBlockedUsers(interests, blockedUserIds, (item) => item.companyUser?._id || item.companyUser);
+
+    res.json({ ok: true, interests: visibleInterests });
   } catch (err) {
     next(err);
   }

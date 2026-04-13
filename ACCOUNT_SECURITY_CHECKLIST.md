@@ -1,6 +1,6 @@
 # IdeaHub 账号安全联调 Checklist
 
-> 最后更新: 2026-04-11  
+> 最后更新: 2026-04-12  
 > 适用范围: 改密轮换 token / 退出所有设备
 
 本清单专门覆盖当前账号安全体系里最容易出线上回归的两条链路：
@@ -210,3 +210,54 @@
 - 401 后的登录页跳转体验：通过
 - `next` 参数保留：通过
 - 运行中会话失效后的前端自恢复行为：通过
+
+## 8. 黑名单防滥用与互相隐藏联调记录
+
+> 本节为 2026-04-12 新增附录，记录“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”的真实联调结果。
+
+### 联调脚本入口
+
+- 脚本文件：`server/scripts/runBlockingIntegration.js`
+- 运行命令：`node scripts/runBlockingIntegration.js`
+- 验证环境：本地临时 Express app + `mongodb-memory-server`
+- 验证方式：脚本真实创建用户、idea、评论与 block 关系，并调用现网同一套路由处理链
+
+### 覆盖场景
+
+- 场景 1：A 先对 B 发起回复后，A 立即拉黑 B，应失败
+- 场景 2：在 B 至少回复 A 一次后，A 再次拉黑 B，应成功
+- 场景 3：任一方向建立 block 后，双方资料页与对方内容评论接口都应互相不可见
+
+### 2026-04-12 本次真实脚本运行结果
+
+- 运行时间：2026-04-12
+- 运行命令：`node scripts/runBlockingIntegration.js`
+
+#### 脚本输出摘要
+
+- 环境准备：成功创建 3 个测试账号（Alice / Bob / Carol）和 3 条公开 idea（Alice / Bob / Carol 各 1 条）
+- 运行时日志附带两条既有 Mongoose warning：`tagsKey` 与 `expiresAt` 存在 duplicate schema index 提示；本次 blacklist 联调脚本未因该 warning 中断，最终断言全部通过
+- 场景一：Alice 先回复 Bob 后，调用 `POST /api/messages/blacklist/:userId` 返回 `403 FORBIDDEN`
+- 场景一失败消息：`You can only block this user after they have replied to you at least once.`
+- 场景二：Bob 对 Alice 回帖后，Alice 再调用 `POST /api/messages/blacklist/:userId` 返回 `200` 且 `ok=true`
+- 场景三：Bob 查看 Alice 资料返回 `404 NOT_FOUND`
+- 场景三：Alice 查看 Bob 资料返回 `404 NOT_FOUND`
+- 场景三：Bob 查看 Alice idea 评论返回 `404 NOT_FOUND`
+- 场景三：Alice 查看 Bob idea 评论返回 `404 NOT_FOUND`
+- 场景三：Bob 的 `/api/ideas` 列表不再包含 Alice 的 idea
+- 场景三：Alice 的 `/api/ideas` 列表不再包含 Bob 的 idea
+- 场景三：Alice / Bob 的 `/api/ideas` 列表仍能看到第三方 Carol 的内容，说明过滤范围未误伤无关用户
+
+#### 本次结论
+
+- 先攻击后拉黑失败：通过
+- 被回帖后允许拉黑：通过
+- 双向资料隐藏：通过
+- 双向评论隐藏：通过
+- 双向公开内容列表隐藏：通过
+- 是否发现 block 误伤第三方内容：无
+
+#### 备注
+
+- 本轮覆盖的是服务端规则与接口可见性，不包含浏览器端页面跳转细节
+- 浏览器端相关 UX 已在前一轮账号安全文档中记录过 401 清理与跳转回归；本轮重点是 block 规则本身是否被服务端严格执行

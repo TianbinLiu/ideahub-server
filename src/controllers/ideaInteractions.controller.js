@@ -10,6 +10,12 @@ const { createNotification } = require("../services/notification.service");
 const { canReadIdea, canInteractIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden, commentCooldown } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
+const {
+  ensureNoBlockForInteraction,
+  ensureUsersVisibleOrThrow,
+  filterItemsByBlockedUsers,
+  listBlockedUserIds,
+} = require("../utils/blocking");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -36,6 +42,9 @@ async function getIdeaOr404(id, req, res) {
       unauthorized("Login required")
     }
     forbidden("Forbidden");
+  }
+  if (req.user) {
+    await ensureUsersVisibleOrThrow(req.user._id, idea.author, { message: "Idea not found" });
   }
   return idea;
 }
@@ -150,7 +159,10 @@ async function listComments(req, res, next) {
       .populate("author", "_id username role")
       .lean();
 
-    res.json({ ok: true, comments });
+    const blockedUserIds = req.user ? await listBlockedUserIds(req.user._id) : new Set();
+    const visibleComments = filterItemsByBlockedUsers(comments, blockedUserIds, (comment) => comment.author?._id || comment.author);
+
+    res.json({ ok: true, comments: visibleComments });
   } catch (err) {
     next(err);
   }
@@ -173,7 +185,11 @@ async function addComment(req, res, next) {
       if (!parentComment) {
         throw new AppError("Parent comment not found", 404);
       }
+
+      await ensureNoBlockForInteraction(req.user._id, parentComment.author, "Blocked users cannot reply to each other.");
     }
+
+    await ensureNoBlockForInteraction(req.user._id, idea.author, "Blocked users cannot comment on this user's content.");
 
     // Block users who have been flagged for rapid comment spam on this idea
     const now = new Date();
@@ -310,6 +326,8 @@ async function toggleCommentVote(req, res, mode) {
   if (!comment) {
     notFound("Comment not found");
   }
+
+  await ensureNoBlockForInteraction(userId, comment.author, "Blocked users cannot interact with each other's comments.");
 
   if (!Array.isArray(comment.likes)) comment.likes = [];
   if (!Array.isArray(comment.dislikes)) comment.dislikes = [];
@@ -471,6 +489,12 @@ async function listCommentReplies(req, res, next) {
       throw new AppError("Parent comment not found", 404);
     }
 
+    if (req.user) {
+      await ensureUsersVisibleOrThrow(req.user._id, parentComment.author, {
+        message: "Parent comment not found",
+      });
+    }
+
     // 获取所有回复，按时间正序排列
     const replies = await Comment.find({ parentCommentId: commentId })
       .sort({ createdAt: 1 })
@@ -478,7 +502,10 @@ async function listCommentReplies(req, res, next) {
       .populate("author", "_id username role")
       .lean();
 
-    res.json({ ok: true, replies });
+    const blockedUserIds = req.user ? await listBlockedUserIds(req.user._id) : new Set();
+    const visibleReplies = filterItemsByBlockedUsers(replies, blockedUserIds, (reply) => reply.author?._id || reply.author);
+
+    res.json({ ok: true, replies: visibleReplies });
   } catch (err) {
     next(err);
   }

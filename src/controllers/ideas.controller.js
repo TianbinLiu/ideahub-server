@@ -13,6 +13,11 @@ const { validateFeedback, generateIdeaDraftFromContent } = require("../services/
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
 const IdeaRecommendationFeedback = require("../models/IdeaRecommendationFeedback");
+const {
+  ensureNoBlockForInteraction,
+  ensureUsersVisibleOrThrow,
+  listBlockedUserIds,
+} = require("../utils/blocking");
 
 
 require("../models/User"); // 确保 populate(User) 不报错
@@ -459,6 +464,10 @@ async function listIdeas(req, res, next) {
   try {
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 50);
+    const blockedUserIds = req.user ? await listBlockedUserIds(req.user._id) : new Set();
+    const blockedAuthorFilter = blockedUserIds.size > 0
+      ? { author: { $nin: Array.from(blockedUserIds).map((userId) => new mongoose.Types.ObjectId(userId)) } }
+      : {};
 
     const sort = String(req.query.sort || "recommended");
     const sortSpec =
@@ -473,7 +482,7 @@ async function listIdeas(req, res, next) {
     const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
 
     // 列表：只返回 public
-    const filter = { visibility: "public" };
+    const filter = { visibility: "public", ...blockedAuthorFilter };
 
     let items = [];
     let total = 0;
@@ -728,6 +737,12 @@ async function getIdeaById(req, res, next) {
         unauthorized("Login required")
       }
       forbidden("Forbidden")
+    }
+
+    if (req.user) {
+      await ensureUsersVisibleOrThrow(req.user._id, idea.author?._id || idea.author, {
+        message: "Idea not found",
+      });
     }
 
 

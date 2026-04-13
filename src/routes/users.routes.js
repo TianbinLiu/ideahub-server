@@ -13,7 +13,7 @@ const { voteUser, getUserReputation } = require("../controllers/reputation.contr
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 
 // GET /api/users/search?q=username&limit=8
-router.get("/search", searchUsers);
+router.get("/search", optionalAuth, searchUsers);
 
 // GET /api/users/:id - Get user profile (public)
 router.get("/:id", optionalAuth, getUserProfile);
@@ -22,10 +22,10 @@ router.get("/:id", optionalAuth, getUserProfile);
 router.post("/:id/follow", requireAuth, toggleFollow);
 
 // GET /api/users/:id/followers - Get user's followers
-router.get("/:id/followers", getFollowers);
+router.get("/:id/followers", optionalAuth, getFollowers);
 
 // GET /api/users/:id/following - Get users that user follows
-router.get("/:id/following", getFollowing);
+router.get("/:id/following", optionalAuth, getFollowing);
 
 // GET /api/users/:id/bookmarks - Get user's bookmarks
 router.get("/:id/bookmarks", optionalAuth, getUserBookmarks);

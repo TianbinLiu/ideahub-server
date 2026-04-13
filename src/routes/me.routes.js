@@ -5,6 +5,7 @@ const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const User = require("../models/User");
 const { listReceivedInterests } = require("../controllers/interest.controller");
+const { listBlockedUserIds, toIdString } = require("../utils/blocking");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
   try {
@@ -17,7 +18,10 @@ router.get("/likes", requireAuth, async (req, res, next) => {
       })
       .lean();
 
-    const ideas = rows.map(r => r.idea).filter(Boolean);
+    const blockedUserIds = await listBlockedUserIds(req.user._id);
+    const ideas = rows
+      .map(r => r.idea)
+      .filter((idea) => idea && !blockedUserIds.has(toIdString(idea.author)));
     res.json({ ok: true, ideas });
   } catch (err) {
     next(err);
@@ -39,8 +43,16 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
       })
       .lean();
 
-    const ideas = rows.filter(r => r.type === "idea" && r.idea).map(r => r.idea);
-    const leaderboards = rows.filter(r => r.type === "leaderboard" && r.leaderboard).map(r => r.leaderboard);
+    const blockedUserIds = await listBlockedUserIds(req.user._id);
+
+    const ideas = rows
+      .filter(r => r.type === "idea" && r.idea)
+      .map(r => r.idea)
+      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)));
+    const leaderboards = rows
+      .filter(r => r.type === "leaderboard" && r.leaderboard)
+      .map(r => r.leaderboard)
+      .filter((leaderboard) => !blockedUserIds.has(toIdString(leaderboard.author)));
     
     res.json({ ok: true, ideas, leaderboards });
   } catch (err) {

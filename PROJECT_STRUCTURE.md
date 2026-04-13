@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-04-11  
-> 版本: 4.49
+> 最后更新: 2026-04-12  
+> 版本: 4.50
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -1667,6 +1667,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 改密轮换当前 token
 - 退出所有设备使全部现有 token 失效
 - 前置检查、操作步骤、成功判定、失败信号、联调结论模板
+- 附录记录：黑名单防滥用与互相隐藏真实联调结果
 
 ---
 
@@ -1747,6 +1748,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-11 | 4.47 | **修复账号安全失败场景返回码并完成回归**：`auth.controller.js` 的本地登录失败改为抛结构化 `401 UNAUTHORIZED`；`middleware/auth.js` 不再把 stale token 等鉴权失败重新包装成普通 `Error`。第二轮真实联调已确认改密与退出所有设备相关失败场景统一返回 `401/UNAUTHORIZED`。 |
 | 2026-04-11 | 4.48 | **补齐前端 401 清理与浏览器态回归**：`client/src/api.ts` 在带 token 的请求收到 `401` 时统一触发 token 清理；`client/src/authContext.tsx` 监听全局 auth-expired 事件并清空用户态、跳转登录页且保留 `next`；`middleware/auth.js` 的 `requireRole` 也改为结构化 `401/403` 错误。浏览器自动回归已确认本地 token 清理与跳转体验生效。 |
 | 2026-04-11 | 4.49 | **修复服务端 GitHub Actions 部署路径**：`server/.github/workflows/deploy.yml` 及镜像目录中的同名 workflow 不再使用历史路径 `/var/www/ideahub/server`，改为直接执行当前生产脚本 `/var/www/ideahub-server/deploy.sh`，与 ECS 现网目录保持一致。 |
+| 2026-04-12 | 4.50 | **新增黑名单真实联调脚本并记录结果**：新增 `server/scripts/runBlockingIntegration.js`，可复跑验证“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”；`server/ACCOUNT_SECURITY_CHECKLIST.md` 追加 2026-04-12 真实联调记录，沉淀本轮 block 规则验证结果。 |
 
 ---
 
