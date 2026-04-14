@@ -42,6 +42,12 @@ function errorHandler(err, req, res, next) {
     message = "Invalid id";
   }
 
+  if (err.code === "LIMIT_FILE_SIZE") {
+    status = 400;
+    code = CODES.VALIDATION_ERROR;
+    message = "Uploaded file is too large";
+  }
+
   res.status(status).json({
     ok: false,
     code,

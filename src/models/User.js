@@ -2,6 +2,32 @@
 
 const mongoose = require("mongoose");
 
+const live2dComponentSettingsSchema = new mongoose.Schema(
+  {
+    enabled: { type: Boolean, default: false },
+    source: { type: String, enum: ["remote", "uploaded"], default: "remote" },
+    modelJsonUrl: { type: String, default: "" },
+    uploadedModelJsonUrl: { type: String, default: "" },
+    uploadedBundleName: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+const simpleToggleComponentSchema = new mongoose.Schema(
+  {
+    enabled: { type: Boolean, default: false },
+  },
+  { _id: false }
+);
+
+const siteComponentsSchema = new mongoose.Schema(
+  {
+    live2d: { type: live2dComponentSettingsSchema, default: () => ({}) },
+    tagRank: { type: simpleToggleComponentSchema, default: () => ({}) },
+  },
+  { _id: false }
+);
+
 const userSchema = new mongoose.Schema(
   {
     username: { type: String, required: true, trim: true, unique: true },
@@ -23,6 +49,7 @@ const userSchema = new mongoose.Schema(
     avatarUrl: { type: String, default: "" },
 
     activeWorkshopTemplate: { type: mongoose.Schema.Types.ObjectId, ref: "WorkshopTemplate", default: null },
+    siteComponents: { type: siteComponentsSchema, default: () => ({}) },
 
     // ✅ 以后你做“邮箱必须验证码验证后才能登录”会用到
     emailVerified: { type: Boolean, default: false },

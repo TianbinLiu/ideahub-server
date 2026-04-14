@@ -5,6 +5,12 @@ const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const User = require("../models/User");
 const { listReceivedInterests } = require("../controllers/interest.controller");
+const {
+  getMyComponents,
+  updateMyComponents,
+  uploadLive2dBundle,
+  uploadMyLive2dBundle,
+} = require("../controllers/components.controller");
 const { listBlockedUserIds, toIdString } = require("../utils/blocking");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
@@ -61,6 +67,9 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
 });
 
 router.get("/received-interests", requireAuth, listReceivedInterests);
+router.get("/components", requireAuth, getMyComponents);
+router.put("/components", requireAuth, updateMyComponents);
+router.post("/components/live2d/upload", requireAuth, uploadLive2dBundle.single("bundle"), uploadMyLive2dBundle);
 
 // POST /api/me/avatar - Upload avatar image
 router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, next) => {

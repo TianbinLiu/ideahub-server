@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-04-12  
-> 版本: 4.50
+> 最后更新: 2026-04-14  
+> 版本: 4.53
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -235,18 +235,24 @@ ideahub/
 │   │   ├── config.ts                 # 环境配置
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
-│   │   ├── components/               # 通用组件（12个）
+│   │   ├── components/               # 通用组件（14个）
 │   │   │   ├── AdminRoute.tsx        # 管理员路由守卫
 │   │   │   ├── Navbar.tsx            # 导航栏
 │   │   │   ├── NotificationsDropdown.tsx # 通知下拉面板
 │   │   │   ├── OAuthButtons.tsx      # OAuth按钮
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
+│   │   │   ├── SiteLive2D.tsx        # 全站 Live2D 看板娘挂载器
+│   │   │   ├── SiteLive2D.css        # 看板娘右下角与移动端覆盖样式
 │   │   │   ├── SiteGlobalAiAssistant.tsx # 全站编辑 AI 助手面板
 │   │   │   ├── SiteTemplateEditOverlay.tsx # 全站编辑覆盖层
 │   │   │   ├── UserHoverCard.tsx     # 用户卡片
 │   │   │   └── WorkshopLayoutCanvas.tsx # 工坊布局画布
 │   │   │
-│   │   ├── pages/                    # 页面组件（28个）
+│   │   ├── public/                   # 原样静态资源
+│   │   │   ├── vite.svg
+│   │   │   └── live2d-widget/        # 自托管 Live2D dist 资源（waifu.css / waifu-tips.js / chunk / live2d.min.js）
+│   │   │
+│   │   ├── pages/                    # 页面组件（31个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -267,6 +273,9 @@ ideahub/
 │   │   │   ├── MessagesPage.tsx
 │   │   │   ├── MessageRequestsPage.tsx
 │   │   │   ├── BlacklistPage.tsx
+│   │   │   ├── ComponentsPage.tsx    # 组件中心
+│   │   │   ├── Live2DSettingsPage.tsx # Live2D 组件设置页
+│   │   │   ├── TagRankSettingsPage.tsx # Tag Rank 组件设置页
 │   │   │   ├── AdminUsersPage.tsx
 │   │   │   ├── FeedbackAdminPage.tsx
 │   │   │   ├── DocsAdminPage.tsx
@@ -1236,6 +1245,58 @@ return <>{children}</>;
 
 ---
 
+##### `ComponentsPage.tsx` ⭐ **新增**
+**功能**: 用户级组件中心页面  
+**关联文件**:
+- `api.ts` - 获取/更新组件开关
+- `Live2DSettingsPage.tsx` - 进入 Live2D 专属设置页
+- `TagRankSettingsPage.tsx` - 进入 Tag Rank 专属设置页
+- `SiteLive2D.tsx` - 接收设置变更并在全站生效
+
+**功能**:
+- 列出当前可配置的额外网站组件
+- 允许用户直接启用/停用组件
+- 为每个组件提供独立“打开设置”入口
+- 当前已落地组件为 Live2D 看板娘与 Tag Rank 搜索
+
+**国际化**: ✅ 完整支持（components 模块）
+
+---
+
+##### `Live2DSettingsPage.tsx` ⭐ **新增**
+**功能**: Live2D 组件专属设置页  
+**关联文件**:
+- `api.ts` - 读取/保存 Live2D 设置，上传本地模型 zip 包
+- `client/public/live2d-widget/` - 自托管 widget 静态资源
+- `SiteLive2D.tsx` - 运行时读取并应用用户配置
+
+**功能**:
+- 控制 Live2D 全站是否启用
+- 在“远程模型 URL”和“我上传的模型包”之间切换
+- 支持填写外部可访问的模型 JSON URL
+- 支持上传本地 Live2D zip 包，并自动解析其中的 `.model3.json` 或 `index.json`
+- 保存后通过前端事件通知全站挂载器刷新配置
+
+**国际化**: ✅ 完整支持（components 模块）
+
+---
+
+##### `TagRankSettingsPage.tsx` ⭐ **新增**
+**功能**: Tag Rank 组件专属设置页  
+**关联文件**:
+- `api.ts` - 读取/保存 Tag Rank 组件开关
+- `HomePage.tsx` - 根据组件状态决定是否显示 Tag Rank 搜索模式切换按钮
+- `TagRankPage.tsx` - 接收首页带参跳转并自动执行 Tag Rank 搜索
+
+**功能**:
+- 控制首页是否显示 Tag Rank 搜索模式开关
+- 通过组件总线事件通知首页刷新组件状态
+- 让用户可以把首页搜索栏临时切换成 Tag Rank 搜索栏
+
+**国际化**: ✅ 完整支持（components 模块）
+
+---
+
 #### 管理后台页面组（2个）
 
 ##### `AdminUsersPage.tsx`
@@ -1619,6 +1680,36 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 ---
 
+#### `client/src/components/SiteLive2D.tsx`
+**功能**: 全站 Live2D 看板娘挂载器（挂载于 `App.tsx`）  
+**职责**:
+- 仅在 SPA 生命周期中初始化一次 Live2D widget，避免路由切换时重复创建节点
+- 从 `client/public/live2d-widget/` 加载自托管 `waifu.css`、`waifu-tips.js`、`live2d.min.js` 与 chunk 文件
+- 使用 `ideahub-waifu-tips.json` 提供适配 IdeaHub 导航和按钮的自定义提示语
+- 启用基础工具按钮（随机一言、切换模型、截图、隐藏）并允许拖拽
+- 通过 `SiteLive2D.css` 将看板娘固定到右下角，并在移动端缩放避免过度遮挡页面
+
+**实现备注**:
+- 按 `live2d-widget-master/README.md` 的自托管思路集成，不直接使用写死 CDN 路径的 `autoload.js`
+- 仓库未内置任何模型文件，当前模型 JSON 仍指向外部公开模型资源
+
+---
+
+#### `client/src/pages/HomePage.tsx`
+**新增职责补充**:
+- 当用户启用 `tagRank` 组件后，在首页搜索区显示 Tag Rank 搜索模式切换按钮
+- 切换后复用原搜索输入框，但把建议来源切换为 Tag Rank 标签建议
+- 在 Tag Rank 模式下提交搜索时，跳转到 `TagRankPage` 并通过 `?q=` 传入标签查询
+
+---
+
+#### `client/src/pages/TagRankPage.tsx`
+**新增职责补充**:
+- 支持读取 URL 查询参数 `q`
+- 当从首页 Tag Rank 搜索模式跳转进入时，自动填充标签输入框并执行搜索
+
+---
+
 #### `client/src/components/SiteGlobalAiAssistant.tsx`
 **功能**: 全站编辑 AI 助手独立面板  
 **职责**:
@@ -1749,6 +1840,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-11 | 4.48 | **补齐前端 401 清理与浏览器态回归**：`client/src/api.ts` 在带 token 的请求收到 `401` 时统一触发 token 清理；`client/src/authContext.tsx` 监听全局 auth-expired 事件并清空用户态、跳转登录页且保留 `next`；`middleware/auth.js` 的 `requireRole` 也改为结构化 `401/403` 错误。浏览器自动回归已确认本地 token 清理与跳转体验生效。 |
 | 2026-04-11 | 4.49 | **修复服务端 GitHub Actions 部署路径**：`server/.github/workflows/deploy.yml` 及镜像目录中的同名 workflow 不再使用历史路径 `/var/www/ideahub/server`，改为直接执行当前生产脚本 `/var/www/ideahub-server/deploy.sh`，与 ECS 现网目录保持一致。 |
 | 2026-04-12 | 4.50 | **新增黑名单真实联调脚本并记录结果**：新增 `server/scripts/runBlockingIntegration.js`，可复跑验证“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”；`server/ACCOUNT_SECURITY_CHECKLIST.md` 追加 2026-04-12 真实联调记录，沉淀本轮 block 规则验证结果。 |
+| 2026-04-13 | 4.51 | **接入全站 Live2D 看板娘**：将 `live2d-widget-master/dist` 自托管到 `client/public/live2d-widget/`，新增 `client/src/components/SiteLive2D.tsx` 作为全站挂载器，并使用 `ideahub-waifu-tips.json` 替换默认 Hexo 风格提示语和选择器，完成 IdeaHub 全站看板娘接入。 |
+| 2026-04-13 | 4.52 | **新增组件中心与 Live2D 用户级设置**：`User` 新增 `siteComponents.live2d` 配置；`/api/me/components` 与 `/api/me/components/live2d/upload` 支持保存组件开关、远程模型 URL 和本地 zip 模型包上传；前端新增 `ComponentsPage.tsx` 与 `Live2DSettingsPage.tsx`，并把 `SiteLive2D.tsx` 改为按当前用户配置决定是否加载及使用哪个模型。 |
+| 2026-04-14 | 4.53 | **将 Tag Rank 改造为组件并接入首页搜索切换**：`User.siteComponents` 新增 `tagRank.enabled`；组件中心新增 Tag Rank 条目与 `TagRankSettingsPage.tsx`；首页 `HomePage.tsx` 会在启用后显示 Tag Rank 搜索模式开关，并在切换后把原 Idea 搜索栏改为 Tag Rank 搜索入口，跳转到 `TagRankPage.tsx` 自动执行查询。 |
 
 ---
 
