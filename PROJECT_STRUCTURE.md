@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
 > 最后更新: 2026-04-14  
-> 版本: 4.53
+> 版本: 4.54
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -235,7 +235,7 @@ ideahub/
 │   │   ├── config.ts                 # 环境配置
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
-│   │   ├── components/               # 通用组件（14个）
+│   │   ├── components/               # 通用组件（15个）
 │   │   │   ├── AdminRoute.tsx        # 管理员路由守卫
 │   │   │   ├── Navbar.tsx            # 导航栏
 │   │   │   ├── NotificationsDropdown.tsx # 通知下拉面板
@@ -243,6 +243,7 @@ ideahub/
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
 │   │   │   ├── SiteLive2D.tsx        # 全站 Live2D 看板娘挂载器
 │   │   │   ├── SiteLive2D.css        # 看板娘右下角与移动端覆盖样式
+│   │   │   ├── TagRankAccessGate.tsx # Tag Rank 组件访问门禁
 │   │   │   ├── SiteGlobalAiAssistant.tsx # 全站编辑 AI 助手面板
 │   │   │   ├── SiteTemplateEditOverlay.tsx # 全站编辑覆盖层
 │   │   │   ├── UserHoverCard.tsx     # 用户卡片
@@ -1077,12 +1078,14 @@ return <>{children}</>;
 **功能**: 标签排行榜发现页  
 **关联文件**:
 - `api.ts` - 搜索标签、获取排行榜
+- `TagRankAccessGate.tsx` - 进入页面前校验用户是否已启用 Tag Rank 组件
 
 **功能**:
 - 搜索标签
 - 显示标签建议
 - 创建新排行榜
 - 浏览现有排行榜（热门/最新）
+- 若组件未启用，则显示启用提示并引导到组件设置页
 
 **国际化**: ✅ 完整支持（tagRank模块 15个键）
 
@@ -1111,6 +1114,7 @@ return <>{children}</>;
 **关联文件**:
 - `api.ts` - 获取排行榜、提名创意、投票、删除提名、图片上传
 - `authContext.tsx` - 用户状态
+- `TagRankAccessGate.tsx` - 统一拦截未启用 Tag Rank 组件的访问
 
 **功能**:
 - 显示排行榜信息
@@ -1120,6 +1124,7 @@ return <>{children}</>;
 - 创意排序（最新/多数投票/点赞/收藏）
 - 删除提名（自己的或管理员）
 - 收藏排行榜
+- 若组件未启用，则不允许从 Profile / 收藏 / 直链进入详情页
 
 **国际化**: ✅ 完整支持（leaderboard模块 21个键）
 
@@ -1287,11 +1292,30 @@ return <>{children}</>;
 - `api.ts` - 读取/保存 Tag Rank 组件开关
 - `HomePage.tsx` - 根据组件状态决定是否显示 Tag Rank 搜索模式切换按钮
 - `TagRankPage.tsx` - 接收首页带参跳转并自动执行 Tag Rank 搜索
+- `TagRankAccessGate.tsx` - 未启用组件时作为统一跳转目标页入口
 
 **功能**:
 - 控制首页是否显示 Tag Rank 搜索模式开关
 - 通过组件总线事件通知首页刷新组件状态
 - 让用户可以把首页搜索栏临时切换成 Tag Rank 搜索栏
+
+**实现备注**:
+- Tag Rank 搜索页和排行榜详情页都必须先通过组件开关校验，避免用户绕过首页入口直接访问
+
+---
+
+##### `TagRankAccessGate.tsx` ⭐ **新增**
+**功能**: Tag Rank 页面访问门禁  
+**关联文件**:
+- `api.ts` - 读取当前用户组件状态
+- `TagRankPage.tsx` - 受门禁保护的搜索页
+- `LeaderboardDetailPage.tsx` - 受门禁保护的排行榜详情页
+- `TagRankSettingsPage.tsx` - 用户点击提示后前往启用组件
+
+**功能**:
+- 在渲染 Tag Rank 页面主体前检查 `tagRank.enabled`
+- 用户未启用组件时展示统一提示文案
+- 提供直达组件设置页的按钮，方便立刻启用 Tag Rank 组件
 
 **国际化**: ✅ 完整支持（components 模块）
 
@@ -1842,6 +1866,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-12 | 4.50 | **新增黑名单真实联调脚本并记录结果**：新增 `server/scripts/runBlockingIntegration.js`，可复跑验证“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”；`server/ACCOUNT_SECURITY_CHECKLIST.md` 追加 2026-04-12 真实联调记录，沉淀本轮 block 规则验证结果。 |
 | 2026-04-13 | 4.51 | **接入全站 Live2D 看板娘**：将 `live2d-widget-master/dist` 自托管到 `client/public/live2d-widget/`，新增 `client/src/components/SiteLive2D.tsx` 作为全站挂载器，并使用 `ideahub-waifu-tips.json` 替换默认 Hexo 风格提示语和选择器，完成 IdeaHub 全站看板娘接入。 |
 | 2026-04-13 | 4.52 | **新增组件中心与 Live2D 用户级设置**：`User` 新增 `siteComponents.live2d` 配置；`/api/me/components` 与 `/api/me/components/live2d/upload` 支持保存组件开关、远程模型 URL 和本地 zip 模型包上传；前端新增 `ComponentsPage.tsx` 与 `Live2DSettingsPage.tsx`，并把 `SiteLive2D.tsx` 改为按当前用户配置决定是否加载及使用哪个模型。 |
+| 2026-04-14 | 4.54 | **补齐 Tag Rank 访问门禁**：新增 `TagRankAccessGate.tsx` 统一包裹 `TagRankPage.tsx` 与 `LeaderboardDetailPage.tsx`；当用户未启用 `tagRank` 组件时，不再允许从 Profile、收藏或直接 URL 进入 Tag Rank 页面，而是先显示提示并允许直接跳转到 `TagRankSettingsPage.tsx`。 |
 | 2026-04-14 | 4.53 | **将 Tag Rank 改造为组件并接入首页搜索切换**：`User.siteComponents` 新增 `tagRank.enabled`；组件中心新增 Tag Rank 条目与 `TagRankSettingsPage.tsx`；首页 `HomePage.tsx` 会在启用后显示 Tag Rank 搜索模式开关，并在切换后把原 Idea 搜索栏改为 Tag Rank 搜索入口，跳转到 `TagRankPage.tsx` 自动执行查询。 |
 
 ---
