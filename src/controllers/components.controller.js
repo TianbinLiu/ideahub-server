@@ -33,7 +33,7 @@ const uploadLive2dBundle = multer({
 
 function serializeLive2dSettings(raw = {}) {
   return {
-    enabled: Boolean(raw.enabled),
+    enabled: raw.enabled !== false,
     source: raw.source === "uploaded" ? "uploaded" : "remote",
     modelJsonUrl: String(raw.modelJsonUrl || DEFAULT_REMOTE_MODEL_URL),
     uploadedModelJsonUrl: String(raw.uploadedModelJsonUrl || ""),
@@ -43,7 +43,7 @@ function serializeLive2dSettings(raw = {}) {
 
 function serializeSimpleToggleSettings(raw = {}) {
   return {
-    enabled: Boolean(raw.enabled),
+    enabled: raw.enabled !== false,
   };
 }
 

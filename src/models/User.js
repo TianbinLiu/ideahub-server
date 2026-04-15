@@ -4,7 +4,7 @@ const mongoose = require("mongoose");
 
 const live2dComponentSettingsSchema = new mongoose.Schema(
   {
-    enabled: { type: Boolean, default: false },
+    enabled: { type: Boolean, default: true },
     source: { type: String, enum: ["remote", "uploaded"], default: "remote" },
     modelJsonUrl: { type: String, default: "" },
     uploadedModelJsonUrl: { type: String, default: "" },
@@ -15,7 +15,7 @@ const live2dComponentSettingsSchema = new mongoose.Schema(
 
 const simpleToggleComponentSchema = new mongoose.Schema(
   {
-    enabled: { type: Boolean, default: false },
+    enabled: { type: Boolean, default: true },
   },
   { _id: false }
 );
