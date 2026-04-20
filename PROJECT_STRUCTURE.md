@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-04-14  
-> 版本: 4.54
+> 最后更新: 2026-04-19  
+> 版本: 4.55
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -235,25 +235,30 @@ ideahub/
 │   │   ├── config.ts                 # 环境配置
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
-│   │   ├── components/               # 通用组件（15个）
+│   │   ├── components/               # 通用组件（16个）
 │   │   │   ├── AdminRoute.tsx        # 管理员路由守卫
+│   │   │   ├── CharCount.tsx         # 字数统计与限制提示
+│   │   │   ├── LanguageSwitcher.tsx  # 语言切换器
+│   │   │   ├── MentionTextarea.tsx   # @提及输入框
 │   │   │   ├── Navbar.tsx            # 导航栏
 │   │   │   ├── NotificationsDropdown.tsx # 通知下拉面板
 │   │   │   ├── OAuthButtons.tsx      # OAuth按钮
 │   │   │   ├── ProtectedRoute.tsx    # 路由守卫
+│   │   │   ├── SettingsComponentsPanel.tsx # 组件设置复用面板
 │   │   │   ├── SiteLive2D.tsx        # 全站 Live2D 看板娘挂载器
 │   │   │   ├── SiteLive2D.css        # 看板娘右下角与移动端覆盖样式
 │   │   │   ├── TagRankAccessGate.tsx # Tag Rank 组件访问门禁
 │   │   │   ├── SiteGlobalAiAssistant.tsx # 全站编辑 AI 助手面板
 │   │   │   ├── SiteTemplateEditOverlay.tsx # 全站编辑覆盖层
 │   │   │   ├── UserHoverCard.tsx     # 用户卡片
-│   │   │   └── WorkshopLayoutCanvas.tsx # 工坊布局画布
+│   │   │   ├── WorkshopLayoutCanvas.tsx # 工坊布局画布
+│   │   │   └── WorkshopSiteEditorAccessGate.tsx # 工坊站点模板编辑门禁
 │   │   │
 │   │   ├── public/                   # 原样静态资源
 │   │   │   ├── vite.svg
 │   │   │   └── live2d-widget/        # 自托管 Live2D dist 资源（waifu.css / waifu-tips.js / chunk / live2d.min.js）
 │   │   │
-│   │   ├── pages/                    # 页面组件（31个）
+│   │   ├── pages/                    # 页面组件（32个）
 │   │   │   ├── HomePage.tsx
 │   │   │   ├── LoginPage.tsx
 │   │   │   ├── RegisterPage.tsx
@@ -274,6 +279,7 @@ ideahub/
 │   │   │   ├── MessagesPage.tsx
 │   │   │   ├── MessageRequestsPage.tsx
 │   │   │   ├── BlacklistPage.tsx
+│   │   │   ├── SettingsPage.tsx      # 统一设置页
 │   │   │   ├── ComponentsPage.tsx    # 组件中心
 │   │   │   ├── Live2DSettingsPage.tsx # Live2D 组件设置页
 │   │   │   ├── TagRankSettingsPage.tsx # Tag Rank 组件设置页
@@ -543,15 +549,19 @@ i18n.use(initReactI18next).init({
 /messages → MessagesPage
 /message-requests → MessageRequestsPage
 /blacklist → BlacklistPage
+/settings → SettingsPage
+/components → ComponentsPage
+/components/live2d → Live2DSettingsPage
+/components/tag-rank → TagRankSettingsPage
 /admin/users → AdminUsersPage
 /feedback → FeedbackAdminPage
 /admin/docs → DocsAdminPage
 /admin/scraper → AdminScraperPage
 /workshop → WorkshopPage
-/workshop/new → WorkshopEditorPage（支持 ?fromSiteEdit=1 发布信息模式）
+/workshop/new → WorkshopEditorPage（需先通过 WorkshopSiteEditorAccessGate；支持 ?fromSiteEdit=1 发布信息模式）
 /workshop/tag-map → WorkshopTagMapPage
 /workshop/templates/:id → WorkshopTemplateDetailPage
-/workshop/templates/:id/edit → WorkshopEditorPage
+/workshop/templates/:id/edit → WorkshopEditorPage（需先通过 WorkshopSiteEditorAccessGate）
 ```
 
 ---
@@ -725,6 +735,42 @@ return <>{children}</>;
 - Replies过滤条件：`(n.type === "COMMENT" && n.payload?.parentCommentId)`
 
 **国际化**: ✅ 完整支持（nav和notifications模块）
+
+---
+
+#### `client/src/components/SettingsComponentsPanel.tsx`
+**功能**: 可复用的组件设置面板  
+**使用页面**: `ComponentsPage.tsx`, `WorkshopPage.tsx`  
+**关联文件**:
+- `api.ts` - 获取/更新用户组件开关
+- `Live2DSettingsPage.tsx` - Live2D 专属设置入口
+- `TagRankSettingsPage.tsx` - Tag Rank 专属设置入口
+- `WorkshopPage.tsx` - 将组件设置区嵌入创意工坊顶部
+
+**功能**:
+- 列出当前用户可控制的站点组件
+- 支持直接启用/停用组件并广播 `ideahub:components-updated`
+- 为带子设置的组件提供“打开设置”入口
+- 当前已接入组件为 `live2d`、`tagRank`、`siteTemplateEditor`
+
+**国际化**: ✅ 完整支持（components 模块）
+
+---
+
+#### `client/src/components/WorkshopSiteEditorAccessGate.tsx`
+**功能**: 工坊站点模板编辑门禁  
+**使用页面**: `App.tsx` 中的 `/workshop/new`、`/workshop/templates/:id/edit`  
+**关联文件**:
+- `api.ts` - 读取 `siteTemplateEditor` 组件状态
+- `WorkshopPage.tsx` - 用户被引导回创意工坊顶部组件设置区
+- `SiteTemplateEditOverlay.tsx` - 共享同一站点模板编辑组件权限模型
+
+**功能**:
+- 在进入模板新建/编辑页前检查 `siteTemplateEditor.enabled`
+- 未启用时展示统一访问限制提示
+- 提供直达 `/workshop#workshop-component-settings` 的启用入口
+
+**国际化**: ✅ 完整支持（components 模块）
 
 ---
 
@@ -1050,6 +1096,7 @@ return <>{children}</>;
   - 共同关注显示在列表前列
   - 仅在查看他人列表时显示
 - 编辑个人资料（自己）
+- 自己的资料页不再单独显示 Creative Workshop 快捷按钮，统一从 `/settings` 或 `/workshop` 进入组件设置与工坊功能
 - **⭐ 账号注销** [新增]
   - 仅在自己的资料页面显示"Delete Account"按钮
   - 点击后显示确认对话框，警示操作不可撤销
@@ -1250,19 +1297,36 @@ return <>{children}</>;
 
 ---
 
+##### `SettingsPage.tsx` ⭐ **新增**
+**功能**: 用户统一设置页面  
+**关联文件**:
+- `LanguageSwitcher.tsx` - 语言切换入口
+- `WorkshopPage.tsx` - 作为组件设置主入口页
+- `BlacklistPage.tsx` - 黑名单管理页入口
+- `api.ts` - 账号删除接口
+
+**功能**:
+- 集中提供语言设置
+- 提供跳转到创意工坊和黑名单管理页的入口
+- 提供删除账号等危险操作入口
+- 不再直接承载组件开关面板，组件管理主入口已调整为 `/workshop`
+
+**国际化**: ✅ 完整支持（settings、common、profile 模块）
+
+---
+
 ##### `ComponentsPage.tsx` ⭐ **新增**
 **功能**: 用户级组件中心页面  
 **关联文件**:
-- `api.ts` - 获取/更新组件开关
+- `SettingsComponentsPanel.tsx` - 复用组件管理面板
 - `Live2DSettingsPage.tsx` - 进入 Live2D 专属设置页
 - `TagRankSettingsPage.tsx` - 进入 Tag Rank 专属设置页
-- `SiteLive2D.tsx` - 接收设置变更并在全站生效
+- `WorkshopPage.tsx` - 当前面向用户的主组件设置页
 
 **功能**:
-- 列出当前可配置的额外网站组件
-- 允许用户直接启用/停用组件
-- 为每个组件提供独立“打开设置”入口
-- 当前已落地组件为 Live2D 看板娘与 Tag Rank 搜索
+- 复用 `SettingsComponentsPanel` 展示组件管理内容
+- 保留 `/components` 独立路由，作为组件中心包装页
+- 当前对用户的主要组件设置入口已经迁移到 `/workshop` 顶部
 
 **国际化**: ✅ 完整支持（components 模块）
 
@@ -1274,6 +1338,7 @@ return <>{children}</>;
 - `api.ts` - 读取/保存 Live2D 设置，上传本地模型 zip 包
 - `client/public/live2d-widget/` - 自托管 widget 静态资源
 - `SiteLive2D.tsx` - 运行时读取并应用用户配置
+- `WorkshopPage.tsx` - 返回到创意工坊顶部组件设置区
 
 **功能**:
 - 控制 Live2D 全站是否启用
@@ -1281,6 +1346,7 @@ return <>{children}</>;
 - 支持填写外部可访问的模型 JSON URL
 - 支持上传本地 Live2D zip 包，并自动解析其中的 `.model3.json` 或 `index.json`
 - 保存后通过前端事件通知全站挂载器刷新配置
+- 返回/取消操作统一回到 `/workshop#workshop-component-settings`
 
 **国际化**: ✅ 完整支持（components 模块）
 
@@ -1293,11 +1359,13 @@ return <>{children}</>;
 - `HomePage.tsx` - 根据组件状态决定是否显示 Tag Rank 搜索模式切换按钮
 - `TagRankPage.tsx` - 接收首页带参跳转并自动执行 Tag Rank 搜索
 - `TagRankAccessGate.tsx` - 未启用组件时作为统一跳转目标页入口
+- `WorkshopPage.tsx` - 返回到创意工坊顶部组件设置区
 
 **功能**:
 - 控制首页是否显示 Tag Rank 搜索模式开关
 - 通过组件总线事件通知首页刷新组件状态
 - 让用户可以把首页搜索栏临时切换成 Tag Rank 搜索栏
+- 返回/取消操作统一回到 `/workshop#workshop-component-settings`
 
 **实现备注**:
 - Tag Rank 搜索页和排行榜详情页都必须先通过组件开关校验，避免用户绕过首页入口直接访问
@@ -1671,13 +1739,15 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `client/src/pages/WorkshopPage.tsx`
-**功能**: Creative Workshop 模板市场页  
+**功能**: Creative Workshop 模板市场页兼组件设置主入口  
 **职责**:
+- 在页面顶部嵌入 `SettingsComponentsPanel`，作为当前用户级组件设置主入口
 - 展示推荐、最新、热门模板列表
 - 在搜索框旁展示热门 tags 与最近搜索 tags
 - 跳转到 workshop heat map 页面
 - 展示“我的模板”和模板市场入口
-- “新建模板”入口直接启动全站编辑模式（`/?siteEdit=1`）
+- 根据 `siteTemplateEditor` 组件状态动态切换“新建模板”、编辑入口和禁用提示
+- 监听 `ideahub:components-updated`，让顶部开关与下方模板入口实时联动
 
 ---
 
@@ -1701,6 +1771,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 维护页面级背景（image/video/gradient）上传与清理
 - 管理本地草稿、撤销/重做（按钮 + 快捷键）和退出重置
 - 对接全局 AI 助手并将草稿交接到模板发布页
+- 启动前校验 `siteTemplateEditor` 组件是否已启用，未启用时拒绝进入全站编辑模式
 
 ---
 
@@ -1715,7 +1786,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 **实现备注**:
 - 按 `live2d-widget-master/README.md` 的自托管思路集成，不直接使用写死 CDN 路径的 `autoload.js`
-- 仓库未内置任何模型文件，当前模型 JSON 仍指向外部公开模型资源
+- 仓库未内置任何模型文件，当前匿名默认模型 JSON 指向外部公开的 Hiyori 模型资源
 
 ---
 
@@ -1866,6 +1937,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-12 | 4.50 | **新增黑名单真实联调脚本并记录结果**：新增 `server/scripts/runBlockingIntegration.js`，可复跑验证“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”；`server/ACCOUNT_SECURITY_CHECKLIST.md` 追加 2026-04-12 真实联调记录，沉淀本轮 block 规则验证结果。 |
 | 2026-04-13 | 4.51 | **接入全站 Live2D 看板娘**：将 `live2d-widget-master/dist` 自托管到 `client/public/live2d-widget/`，新增 `client/src/components/SiteLive2D.tsx` 作为全站挂载器，并使用 `ideahub-waifu-tips.json` 替换默认 Hexo 风格提示语和选择器，完成 IdeaHub 全站看板娘接入。 |
 | 2026-04-13 | 4.52 | **新增组件中心与 Live2D 用户级设置**：`User` 新增 `siteComponents.live2d` 配置；`/api/me/components` 与 `/api/me/components/live2d/upload` 支持保存组件开关、远程模型 URL 和本地 zip 模型包上传；前端新增 `ComponentsPage.tsx` 与 `Live2DSettingsPage.tsx`，并把 `SiteLive2D.tsx` 改为按当前用户配置决定是否加载及使用哪个模型。 |
+| 2026-04-19 | 4.55 | **同步 Workshop 组件化与设置入口调整文档**：补充 `SettingsComponentsPanel.tsx`、`WorkshopSiteEditorAccessGate.tsx`、`SettingsPage.tsx`；更新结构树中的实际组件/页面数量；更新 `/settings`、`/components/*` 与 Workshop 编辑门禁路由；补充 `/workshop` 顶部组件设置区、`siteTemplateEditor` 门禁和个人主页入口调整说明。 |
 | 2026-04-14 | 4.54 | **补齐 Tag Rank 访问门禁**：新增 `TagRankAccessGate.tsx` 统一包裹 `TagRankPage.tsx` 与 `LeaderboardDetailPage.tsx`；当用户未启用 `tagRank` 组件时，不再允许从 Profile、收藏或直接 URL 进入 Tag Rank 页面，而是先显示提示并允许直接跳转到 `TagRankSettingsPage.tsx`。 |
 | 2026-04-14 | 4.53 | **将 Tag Rank 改造为组件并接入首页搜索切换**：`User.siteComponents` 新增 `tagRank.enabled`；组件中心新增 Tag Rank 条目与 `TagRankSettingsPage.tsx`；首页 `HomePage.tsx` 会在启用后显示 Tag Rank 搜索模式开关，并在切换后把原 Idea 搜索栏改为 Tag Rank 搜索入口，跳转到 `TagRankPage.tsx` 自动执行查询。 |
 
