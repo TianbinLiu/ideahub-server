@@ -24,6 +24,7 @@ const siteComponentsSchema = new mongoose.Schema(
   {
     live2d: { type: live2dComponentSettingsSchema, default: () => ({}) },
     tagRank: { type: simpleToggleComponentSchema, default: () => ({}) },
+    siteTemplateEditor: { type: simpleToggleComponentSchema, default: () => ({}) },
   },
   { _id: false }
 );

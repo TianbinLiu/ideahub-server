@@ -50,11 +50,13 @@ function serializeSimpleToggleSettings(raw = {}) {
 function serializeSiteComponents(user) {
   const live2d = serializeLive2dSettings(user?.siteComponents?.live2d || {});
   const tagRank = serializeSimpleToggleSettings(user?.siteComponents?.tagRank || {});
+  const siteTemplateEditor = serializeSimpleToggleSettings(user?.siteComponents?.siteTemplateEditor || {});
   return {
     ok: true,
     components: {
       live2d,
       tagRank,
+      siteTemplateEditor,
     },
     catalog: [
       {
@@ -72,6 +74,13 @@ function serializeSiteComponents(user) {
         enabled: tagRank.enabled,
         hasSettings: true,
         settingsPath: "/components/tag-rank",
+      },
+      {
+        key: "siteTemplateEditor",
+        title: "创意工坊前端 UI 编辑",
+        description: "启用后，可以进入全站前端 UI 编辑模式，并在创意工坊中创建或编辑站点模板。",
+        enabled: siteTemplateEditor.enabled,
+        hasSettings: false,
       },
     ],
   };
@@ -218,6 +227,7 @@ async function updateMyComponents(req, res, next) {
   try {
     const live2dInput = req.body?.live2d;
     const tagRankInput = req.body?.tagRank;
+    const siteTemplateEditorInput = req.body?.siteTemplateEditor;
     const currentUser = await User.findById(req.user._id).select("siteComponents");
     if (!currentUser) {
       throw new AppError({ code: CODES.UNAUTHORIZED, status: 401, message: "User not found" });
@@ -225,6 +235,7 @@ async function updateMyComponents(req, res, next) {
 
     const currentLive2d = serializeLive2dSettings(currentUser.siteComponents?.live2d || {});
     const currentTagRank = serializeSimpleToggleSettings(currentUser.siteComponents?.tagRank || {});
+    const currentSiteTemplateEditor = serializeSimpleToggleSettings(currentUser.siteComponents?.siteTemplateEditor || {});
     const nextLive2d =
       live2dInput === undefined
         ? currentLive2d
@@ -244,6 +255,12 @@ async function updateMyComponents(req, res, next) {
         : {
             enabled: Boolean(tagRankInput.enabled),
           };
+    const nextSiteTemplateEditor =
+      siteTemplateEditorInput === undefined
+        ? currentSiteTemplateEditor
+        : {
+            enabled: Boolean(siteTemplateEditorInput.enabled),
+          };
 
     if (nextLive2d.source === "uploaded" && !nextLive2d.uploadedModelJsonUrl) {
       throw new AppError({
@@ -257,6 +274,7 @@ async function updateMyComponents(req, res, next) {
       ...(currentUser.siteComponents?.toObject ? currentUser.siteComponents.toObject() : currentUser.siteComponents || {}),
       live2d: nextLive2d,
       tagRank: nextTagRank,
+      siteTemplateEditor: nextSiteTemplateEditor,
     };
     await currentUser.save();
 
