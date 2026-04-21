@@ -14,6 +14,4 @@ const TagLeaderboardSchema = new mongoose.Schema({
   computedAt: { type: Date, default: Date.now },
 });
 
-TagLeaderboardSchema.index({ tagsKey: 1 }, { unique: true });
-
 module.exports = mongoose.model("TagLeaderboard", TagLeaderboardSchema);

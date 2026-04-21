@@ -18,6 +18,13 @@ const {
   ensureUsersVisibleOrThrow,
   listBlockedUserIds,
 } = require("../utils/blocking");
+const {
+  WORLD_GROUP_SLUG,
+  getAccessibleGroupSlugs,
+  getIdeaGroupSlug,
+  normalizeGroupSlug,
+  resolveGroupSnapshot,
+} = require("../utils/groups");
 
 
 require("../models/User"); // 确保 populate(User) 不报错
@@ -176,7 +183,7 @@ function getFeedbackPenalty(reason) {
   return 0;
 }
 
-const IDEA_TYPES = new Set(["business", "feedback", "external", "daily"]);
+const IDEA_TYPES = new Set(["business", "feedback", "external", "daily", "dynamic"]);
 
 function normalizeIdeaType(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -345,7 +352,7 @@ function validateExternalSource(externalSource) {
  */
 async function createIdea(req, res, next) {
   try {
-    const { ideaType, title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, tags, isFeedback, externalSource } = req.body;
+    const { ideaType, title, summary, content, imageUrls, coverImageUrl, visibility, isMonetizable, tags, isFeedback, externalSource, groupSlug } = req.body;
 
     if (!title || !title.trim()) {
       invalidId("Invalid idea id")
@@ -404,6 +411,25 @@ async function createIdea(req, res, next) {
     // Validate external source if provided
     const validatedExternalSource = validateExternalSource(externalSource);
 
+    const normalizedGroupSlug = normalizeGroupSlug(groupSlug || WORLD_GROUP_SLUG);
+    const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
+    if (!accessibleGroupSlugs.includes(normalizedGroupSlug)) {
+      throw new AppError({
+        code: "GROUP_ACCESS_DENIED",
+        status: 403,
+        message: "You must join this group before posting there.",
+      });
+    }
+
+    const groupSnapshot = await resolveGroupSnapshot(normalizedGroupSlug);
+    if (!groupSnapshot) {
+      throw new AppError({
+        code: "GROUP_NOT_FOUND",
+        status: 404,
+        message: "Group not found.",
+      });
+    }
+
     let normalizedIdeaType = normalizeIdeaType(ideaType);
     if (!normalizedIdeaType) {
       normalizedIdeaType = Boolean(isFeedback)
@@ -422,6 +448,8 @@ async function createIdea(req, res, next) {
       coverImageUrl: /^https?:\/\//i.test(String(coverImageUrl || "").trim()) ? String(coverImageUrl).trim() : "",
       author: req.user._id,
       tags: feedbackTags,
+      groupSlug: groupSnapshot.groupSlug,
+      groupName: groupSnapshot.groupName,
       visibility: visibility || "public",
       isMonetizable: Boolean(isMonetizable),
       licenseType: "default",
@@ -480,9 +508,15 @@ async function listIdeas(req, res, next) {
     const recentSearchTokens = normalizeSearchTokens(req.query.recentTags || "");
     const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
     const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
+    const requestedGroupSlug = normalizeGroupSlug(req.query.group || req.query.groupSlug || WORLD_GROUP_SLUG);
+    const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
+
+    if (!accessibleGroupSlugs.includes(requestedGroupSlug)) {
+      return res.json({ ok: true, page, limit, total: 0, totalPages: 1, ideas: [] });
+    }
 
     // 列表：只返回 public
-    const filter = { visibility: "public", ...blockedAuthorFilter };
+    const filter = { visibility: "public", groupSlug: requestedGroupSlug, ...blockedAuthorFilter };
 
     let items = [];
     let total = 0;
@@ -512,6 +546,10 @@ async function listIdeas(req, res, next) {
 
       const ranked = allPublicIdeas
         .map((item) => {
+          if (getIdeaGroupSlug(item) !== requestedGroupSlug) {
+            return null;
+          }
+
           if (requestedIdeaType && inferIdeaType(item) !== requestedIdeaType) {
             return null;
           }
@@ -589,7 +627,7 @@ async function listIdeas(req, res, next) {
 
       // For legacy ideas that were created before ideaType existed, keep them visible in daily/feedback/external views.
       if (requestedIdeaType && (requestedIdeaType === "daily" || requestedIdeaType === "feedback" || requestedIdeaType === "external")) {
-        const legacyCandidates = await Idea.find({ visibility: "public", ideaType: { $exists: false } })
+        const legacyCandidates = await Idea.find({ visibility: "public", groupSlug: requestedGroupSlug, ideaType: { $exists: false } })
           .sort(sortSpec)
           .populate("author", "_id username role")
           .lean();
@@ -815,7 +853,7 @@ async function updateIdea(req, res, next) {
     }
 
 
-    const { ideaType, title, summary, content, imageUrls, tags, visibility, isMonetizable, licenseType } = req.body;
+    const { ideaType, title, summary, content, imageUrls, tags, visibility, isMonetizable, licenseType, groupSlug } = req.body;
 
     if (title !== undefined) {
       if (!String(title).trim()) {
@@ -857,6 +895,29 @@ async function updateIdea(req, res, next) {
     if (ideaType !== undefined) {
       const normalizedIdeaType = normalizeIdeaType(ideaType);
       if (normalizedIdeaType) idea.ideaType = normalizedIdeaType;
+    }
+    if (groupSlug !== undefined) {
+      const normalizedGroupSlug = normalizeGroupSlug(groupSlug);
+      const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
+      if (!accessibleGroupSlugs.includes(normalizedGroupSlug)) {
+        throw new AppError({
+          code: "GROUP_ACCESS_DENIED",
+          status: 403,
+          message: "You must join this group before moving an idea there.",
+        });
+      }
+
+      const groupSnapshot = await resolveGroupSnapshot(normalizedGroupSlug);
+      if (!groupSnapshot) {
+        throw new AppError({
+          code: "GROUP_NOT_FOUND",
+          status: 404,
+          message: "Group not found.",
+        });
+      }
+
+      idea.groupSlug = groupSnapshot.groupSlug;
+      idea.groupName = groupSnapshot.groupName;
     }
     if (req.body.externalSource !== undefined) {
       idea.externalSource = validateExternalSource(req.body.externalSource);
@@ -917,7 +978,8 @@ async function suggestTitles(req, res, next) {
     const q = (req.query.q || "").toString().trim();
     if (!q) return res.json({ ok: true, ideas: [] });
     const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
-    const items = await Idea.find({ visibility: "public", title: re })
+    const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
+    const items = await Idea.find({ visibility: "public", title: re, groupSlug: { $in: accessibleGroupSlugs } })
       .sort({ createdAt: -1 })
       .limit(10)
       .select("title")

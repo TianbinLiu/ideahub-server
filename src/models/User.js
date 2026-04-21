@@ -49,6 +49,8 @@ const userSchema = new mongoose.Schema(
 
     avatarUrl: { type: String, default: "" },
 
+    joinedGroupSlugs: { type: [String], default: [] },
+
     activeWorkshopTemplate: { type: mongoose.Schema.Types.ObjectId, ref: "WorkshopTemplate", default: null },
     siteComponents: { type: siteComponentsSchema, default: () => ({}) },
 

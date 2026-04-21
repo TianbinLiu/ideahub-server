@@ -15,12 +15,13 @@ const externalSourceSchema = z
   .partial();
 
 const createIdeaBody = z.object({
-  ideaType: z.enum(["business", "feedback", "external", "daily"]).optional().default("daily"),
+  ideaType: z.enum(["business", "feedback", "external", "daily", "dynamic"]).optional().default("daily"),
   title: z.string().trim().min(1).max(120),
   summary: z.string().max(300).optional().default(""),
   content: z.string().optional().default(""),
   imageUrls: z.array(z.string().url()).max(8).optional().default([]),
   tags: tagsSchema,
+  groupSlug: z.string().trim().min(1).max(40).optional().default("world"),
   visibility: z.enum(["public", "private", "unlisted"]).optional().default("public"),
   isMonetizable: z.coerce.boolean().optional().default(false),
   isFeedback: z.coerce.boolean().optional().default(false),
@@ -28,12 +29,13 @@ const createIdeaBody = z.object({
 });
 
 const updateIdeaBody = z.object({
-  ideaType: z.enum(["business", "feedback", "external", "daily"]).optional(),
+  ideaType: z.enum(["business", "feedback", "external", "daily", "dynamic"]).optional(),
   title: z.string().trim().min(1).max(120).optional(),
   summary: z.string().max(300).optional(),
   content: z.string().optional(),
   imageUrls: z.array(z.string().url()).max(8).optional(),
   tags: tagsSchema.optional(),
+  groupSlug: z.string().trim().min(1).max(40).optional(),
   visibility: z.enum(["public", "private", "unlisted"]).optional(),
   isMonetizable: z.coerce.boolean().optional(),
   licenseType: z.string().optional(),

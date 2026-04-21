@@ -79,7 +79,7 @@ const { addCommentBody } = require("../schemas/comment.schemas");
 router.get("/", optionalAuth, listIdeas);
 
 // title suggestions for autocomplete
-router.get("/suggest", require("../controllers/ideas.controller").suggestTitles || ((req,res)=>res.json({ok:true, ideas:[]})));
+router.get("/suggest", optionalAuth, require("../controllers/ideas.controller").suggestTitles || ((req,res)=>res.json({ok:true, ideas:[]})));
 
 router.get("/mine", requireAuth, listMyIdeas);
 

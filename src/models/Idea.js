@@ -23,7 +23,7 @@ const ideaSchema = new mongoose.Schema(
   {
     ideaType: {
       type: String,
-      enum: ["business", "feedback", "external", "daily"],
+      enum: ["business", "feedback", "external", "daily", "dynamic"],
       default: "daily",
       index: true,
     },
@@ -37,6 +37,9 @@ const ideaSchema = new mongoose.Schema(
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
 
     tags: { type: [String], default: [] },
+
+    groupSlug: { type: String, default: "world", trim: true, lowercase: true, index: true },
+    groupName: { type: String, default: "World", trim: true, maxlength: 80 },
 
     visibility: { type: String, enum: ["public", "private", "unlisted"], default: "public" },
 

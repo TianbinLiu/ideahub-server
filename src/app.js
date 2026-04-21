@@ -33,6 +33,7 @@ const messagesRoutes = require("./routes/messages.routes");
 const scraperRoutes = require("./routes/scraper.routes");
 const uploadsRoutes = require("./routes/uploads.routes");
 const workshopRoutes = require("./routes/workshop.routes");
+const groupsRoutes = require("./routes/groups.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
@@ -79,6 +80,7 @@ app.use("/api/messages", messagesRoutes);
 app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);
+app.use("/api/groups", groupsRoutes);
 
 app.use(notFound);
 app.use(errorHandler);

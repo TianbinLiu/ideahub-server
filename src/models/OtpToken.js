@@ -9,7 +9,7 @@ const otpTokenSchema = new mongoose.Schema(
     codeHash: { type: String, required: true },
     attempts: { type: Number, default: 0 },
     usedAt: { type: Date, default: null },
-    expiresAt: { type: Date, required: true, index: true },
+    expiresAt: { type: Date, required: true },
     // resend 冷却
     lastSentAt: { type: Date, default: null },
   },

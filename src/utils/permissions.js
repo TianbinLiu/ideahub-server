@@ -1,3 +1,5 @@
+const { canAccessIdeaGroup } = require("./groups");
+
 // src/utils/permissions.js
 function isOwner(idea, user) {
   if (!idea || !user || !user._id) return false;
@@ -8,6 +10,7 @@ function isOwner(idea, user) {
 
 function canReadIdea(idea, user) {
   if (!idea) return false;
+  if (!canAccessIdeaGroup(idea, user)) return false;
   if (idea.visibility === "public") return true;
   if (idea.visibility === "unlisted") return true;
 

@@ -1,7 +1,7 @@
 # IdeaHub 项目架构文档
 
-> 最后更新: 2026-04-19  
-> 版本: 4.55
+> 最后更新: 2026-04-21  
+> 版本: 4.56
 
 > 部署笔记（ECS / Cloudflare / CI）请参见：`server/DEPLOYMENT_NOTES.md` — 包含 ECS IP、证书路径、部署脚本与 GitHub Actions secrets 名称索引（不包含明文 secret）。
 > 
@@ -222,7 +222,7 @@ ideahub/
 ├── memory/                          # OpenClaw 每日任务日志
 ├── memory.md                        # OpenClaw 项目知识库（框架/约定/坑点）
 ├── client/                           # 前端应用
-│   ├── .env.example                 # 前端环境变量示例（API 子域）
+│   ├── .env.example                 # 前端环境变量示例（本地开发默认指向 localhost:4000，生产需显式覆盖）
 │   ├── .github/workflows/deploy.yml # 前端仓库独立发布工作流
 │   ├── src/
 │   │   ├── main.tsx                  # 应用入口 + i18n初始化
@@ -232,7 +232,7 @@ ideahub/
 │   │   ├── api.ts                    # HTTP请求封装
 │   │   ├── auth.ts                   # 认证API
 │   │   ├── authContext.tsx           # 认证上下文
-│   │   ├── config.ts                 # 环境配置
+│   │   ├── config.ts                 # 环境配置（开发环境默认走同源 /api，由 Vite 代理到本地 :4000）
 │   │   ├── errorToast.ts            # 错误提示
 │   │   │
 │   │   ├── components/               # 通用组件（16个）
@@ -307,7 +307,7 @@ ideahub/
 │   │       └── workshopVersion.ts    # 工坊版本兼容工具
 │   │
 │   ├── package.json                  # 依赖管理
-│   ├── vite.config.ts               # Vite配置
+│   ├── vite.config.ts               # Vite配置（开发环境将 /api 代理到 VITE_API_BASE 或 localhost:4000）
 │   └── tailwind.config.js           # Tailwind配置
 │
 └── server/                           # 后端应用与文档中心
@@ -1861,6 +1861,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 | 日期 | 版本 | 更新内容 |
 |------|------|---------|
+| 2026-04-21 | 4.58 | **补充前端开发代理**：`client/vite.config.ts` 新增 `/api` 开发代理，默认转发到 `http://localhost:4000`，如显式设置 `VITE_API_BASE` 则改用对应目标；`client/src/config.ts` 改为开发环境优先使用同源相对路径，OAuth 跳转也统一复用同一 API 基址策略，减少本地联调时跨域和绝对地址心智负担。 |
+| 2026-04-21 | 4.57 | **修正前端本地开发 API 默认指向**：`client/src/config.ts` 在开发环境未显式配置 `VITE_API_BASE` 时，默认回落到当前主机的 `:4000`，避免本地联调误连线上 API；`client/.env.example` 同步改为本地开发默认值，并明确生产/预发需显式覆盖。 |
+| 2026-04-21 | 4.56 | **补充 Group 社交生态与动态发布链路**：新增 `/api/groups`、`Group` 模型、用户 `joinedGroupSlugs` 与 Idea `groupSlug/groupName`；前端新增 `/groups` 页面、首页 group 过滤、新建想法 group 选择与 `dynamic` 发布类型；Profile 页新增 `home / ideas / dynamics` 视图并支持总览预览入口。 |
 | 2026-02-27 | 1.0 | 初始版本 |
 | 2026-02-27 | 1.1 | 添加国际化模块说明 |
 | 2026-02-27 | 1.2 | 添加所有页面必备功能章节 |

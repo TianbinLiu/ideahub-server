@@ -3,7 +3,9 @@ const Follow = require("../models/Follow");
 const Bookmark = require("../models/Bookmark");
 const TagLeaderboard = require("../models/TagLeaderboard");
 const LeaderboardPost = require("../models/LeaderboardPost");
+const Idea = require("../models/Idea");
 const AppError = require("../utils/AppError");
+const { canReadIdea } = require("../utils/permissions");
 const {
   ensureNoBlockForInteraction,
   ensureUsersVisibleOrThrow,
@@ -246,7 +248,7 @@ async function getUserBookmarks(req, res, next) {
     const ideas = bookmarks
       .filter(b => b.type === 'idea' && b.idea)
       .map(b => b.idea)
-      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)));
+      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)) && canReadIdea(idea, req.user));
 
     const leaderboards = bookmarks
       .filter(b => b.type === 'leaderboard' && b.leaderboard)
@@ -254,6 +256,40 @@ async function getUserBookmarks(req, res, next) {
       .filter((leaderboard) => !blockedUserIds.has(toIdString(leaderboard.author)));
 
     res.json({ ok: true, ideas, leaderboards });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getUserIdeas(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user?._id?.toString();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10), 1), 100);
+    const requestedIdeaType = String(req.query.ideaType || "").trim().toLowerCase();
+
+    if (currentUserId && currentUserId !== id) {
+      await ensureUsersVisibleOrThrow(currentUserId, id);
+    }
+
+    const baseFilter = { author: id };
+    if (requestedIdeaType) {
+      baseFilter.ideaType = requestedIdeaType;
+    }
+
+    const blockedUserIds = currentUserId ? await listBlockedUserIds(currentUserId) : new Set();
+    const rows = await Idea.find(baseFilter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate("author", "_id username role")
+      .lean();
+
+    const ideas = rows.filter((idea) => {
+      if (blockedUserIds.has(toIdString(idea.author))) return false;
+      return canReadIdea(idea, req.user);
+    });
+
+    res.json({ ok: true, ideas });
   } catch (err) {
     next(err);
   }
@@ -340,6 +376,7 @@ module.exports = {
   getFollowers,
   getFollowing,
   getUserBookmarks,
+  getUserIdeas,
   getUserLeaderboards,
   deleteAccount,
 };

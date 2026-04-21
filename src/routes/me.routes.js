@@ -4,6 +4,7 @@ const { upload } = require("../middleware/upload");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const User = require("../models/User");
+const { canReadIdea } = require("../utils/permissions");
 const { listReceivedInterests } = require("../controllers/interest.controller");
 const {
   getMyComponents,
@@ -27,7 +28,7 @@ router.get("/likes", requireAuth, async (req, res, next) => {
     const blockedUserIds = await listBlockedUserIds(req.user._id);
     const ideas = rows
       .map(r => r.idea)
-      .filter((idea) => idea && !blockedUserIds.has(toIdString(idea.author)));
+      .filter((idea) => idea && !blockedUserIds.has(toIdString(idea.author)) && canReadIdea(idea, req.user));
     res.json({ ok: true, ideas });
   } catch (err) {
     next(err);
@@ -54,7 +55,7 @@ router.get("/bookmarks", requireAuth, async (req, res, next) => {
     const ideas = rows
       .filter(r => r.type === "idea" && r.idea)
       .map(r => r.idea)
-      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)));
+      .filter((idea) => !blockedUserIds.has(toIdString(idea.author)) && canReadIdea(idea, req.user));
     const leaderboards = rows
       .filter(r => r.type === "leaderboard" && r.leaderboard)
       .map(r => r.leaderboard)

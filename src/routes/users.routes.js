@@ -6,6 +6,7 @@ const {
   getFollowers, 
   getFollowing,
   getUserBookmarks,
+  getUserIdeas,
   getUserLeaderboards,
   deleteAccount,
 } = require("../controllers/users.controller");
@@ -29,6 +30,9 @@ router.get("/:id/following", optionalAuth, getFollowing);
 
 // GET /api/users/:id/bookmarks - Get user's bookmarks
 router.get("/:id/bookmarks", optionalAuth, getUserBookmarks);
+
+// GET /api/users/:id/ideas - Get user's visible ideas/dynamics
+router.get("/:id/ideas", optionalAuth, getUserIdeas);
 
 // GET /api/users/:id/leaderboards - Get user's leaderboards
 router.get("/:id/leaderboards", optionalAuth, getUserLeaderboards);
