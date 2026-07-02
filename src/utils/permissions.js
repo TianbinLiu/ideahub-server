@@ -1,4 +1,4 @@
-const { canAccessIdeaGroup } = require("./groups");
+const { canAccessIdeaGroup, isGroupManagerBySlug } = require("./groups");
 
 // src/utils/permissions.js
 function isOwner(idea, user) {
@@ -31,6 +31,11 @@ function canWriteIdea(idea, user) {
   return isOwner(idea, user) || user.role === "admin";
 }
 
+async function canModerateIdea(idea, user) {
+  if (canWriteIdea(idea, user)) return true;
+  return isGroupManagerBySlug(idea?.groupSlug, user);
+}
+
 function canInteractIdea(idea, user) {
   // 点赞/评论/收藏：至少要能 read，并且必须登录
   if (!user) return false;
@@ -50,6 +55,7 @@ module.exports = {
   isOwner,
   canReadIdea,
   canWriteIdea,
+  canModerateIdea,
   canInteractIdea,
   canCompanyInterest,
 };

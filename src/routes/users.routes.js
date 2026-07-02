@@ -8,6 +8,7 @@ const {
   getUserBookmarks,
   getUserIdeas,
   getUserLeaderboards,
+  getUserGroupReferrals,
   deleteAccount,
 } = require("../controllers/users.controller");
 const { voteUser, getUserReputation } = require("../controllers/reputation.controller");
@@ -36,6 +37,9 @@ router.get("/:id/ideas", optionalAuth, getUserIdeas);
 
 // GET /api/users/:id/leaderboards - Get user's leaderboards
 router.get("/:id/leaderboards", optionalAuth, getUserLeaderboards);
+
+// GET /api/users/:id/group-referrals - Private invite/referral records
+router.get("/:id/group-referrals", requireAuth, getUserGroupReferrals);
 
 // POST /api/users/:id/reputation - Vote for user (like/dislike)
 router.post("/:userId/reputation", requireAuth, voteUser);

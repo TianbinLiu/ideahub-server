@@ -3,10 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const Idea = require("../models/Idea");
+const Group = require("../models/Group");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
 const Notification = require("../models/Notification");
-const { canReadIdea, canWriteIdea } = require("../utils/permissions");
+const { canReadIdea, canWriteIdea, canModerateIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
 const { validateFeedback, generateIdeaDraftFromContent } = require("../services/aiReview.service");
@@ -450,6 +451,7 @@ async function createIdea(req, res, next) {
       tags: feedbackTags,
       groupSlug: groupSnapshot.groupSlug,
       groupName: groupSnapshot.groupName,
+      groupVisibility: groupSnapshot.groupVisibility || "public",
       visibility: visibility || "public",
       isMonetizable: Boolean(isMonetizable),
       licenseType: "default",
@@ -509,14 +511,32 @@ async function listIdeas(req, res, next) {
     const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
     const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
     const requestedGroupSlug = normalizeGroupSlug(req.query.group || req.query.groupSlug || WORLD_GROUP_SLUG);
+    const preferredGroupSlugs = String(req.query.preferredGroups || "")
+      .split(",")
+      .map((item) => normalizeGroupSlug(item))
+      .filter((item) => item && item !== WORLD_GROUP_SLUG);
     const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
+    const publicGroupSlugs = (await Group.find({ visibility: "public" }).select("slug").lean()).map((group) => group.slug);
 
-    if (!accessibleGroupSlugs.includes(requestedGroupSlug)) {
-      return res.json({ ok: true, page, limit, total: 0, totalPages: 1, ideas: [] });
+    let groupFilter;
+    if (requestedGroupSlug === WORLD_GROUP_SLUG) {
+      groupFilter = {
+        $or: [
+          { groupSlug: WORLD_GROUP_SLUG },
+          { groupSlug: { $in: publicGroupSlugs }, groupVisibility: "public" },
+        ],
+      };
+    } else {
+      const requestedGroup = await Group.findOne({ slug: requestedGroupSlug }).select("slug visibility").lean();
+      const canReadRequestedGroup = requestedGroup?.visibility === "public" || accessibleGroupSlugs.includes(requestedGroupSlug);
+      if (!canReadRequestedGroup) {
+        return res.json({ ok: true, page, limit, total: 0, totalPages: 1, ideas: [] });
+      }
+      groupFilter = { groupSlug: requestedGroupSlug };
     }
 
     // 列表：只返回 public
-    const filter = { visibility: "public", groupSlug: requestedGroupSlug, ...blockedAuthorFilter };
+    const filter = { visibility: "public", ...groupFilter, ...blockedAuthorFilter };
 
     let items = [];
     let total = 0;
@@ -546,7 +566,7 @@ async function listIdeas(req, res, next) {
 
       const ranked = allPublicIdeas
         .map((item) => {
-          if (getIdeaGroupSlug(item) !== requestedGroupSlug) {
+          if (requestedGroupSlug !== WORLD_GROUP_SLUG && getIdeaGroupSlug(item) !== requestedGroupSlug) {
             return null;
           }
 
@@ -591,8 +611,8 @@ async function listIdeas(req, res, next) {
             _matchedTagCount: preference.matchedTagCount,
             _rankScore:
               recentSearchTokens.length > 0
-                ? preference.score * 1.2 + hotScore * 0.45 + recencyScore * 0.3 - viewedPenalty - getFeedbackPenalty(feedbackReason)
-                : coldStartScore - viewedPenalty - getFeedbackPenalty(feedbackReason),
+                ? preference.score * 1.2 + hotScore * 0.45 + recencyScore * 0.3 - viewedPenalty - getFeedbackPenalty(feedbackReason) + (preferredGroupSlugs.includes(getIdeaGroupSlug(item)) ? 24 : 0)
+                : coldStartScore - viewedPenalty - getFeedbackPenalty(feedbackReason) + (preferredGroupSlugs.includes(getIdeaGroupSlug(item)) ? 24 : 0),
           };
         })
         .filter(Boolean);
@@ -627,7 +647,7 @@ async function listIdeas(req, res, next) {
 
       // For legacy ideas that were created before ideaType existed, keep them visible in daily/feedback/external views.
       if (requestedIdeaType && (requestedIdeaType === "daily" || requestedIdeaType === "feedback" || requestedIdeaType === "external")) {
-        const legacyCandidates = await Idea.find({ visibility: "public", groupSlug: requestedGroupSlug, ideaType: { $exists: false } })
+        const legacyCandidates = await Idea.find({ visibility: "public", ...groupFilter, ideaType: { $exists: false } })
           .sort(sortSpec)
           .populate("author", "_id username role")
           .lean();
@@ -918,6 +938,7 @@ async function updateIdea(req, res, next) {
 
       idea.groupSlug = groupSnapshot.groupSlug;
       idea.groupName = groupSnapshot.groupName;
+      idea.groupVisibility = groupSnapshot.groupVisibility || "public";
     }
     if (req.body.externalSource !== undefined) {
       idea.externalSource = validateExternalSource(req.body.externalSource);
@@ -948,7 +969,7 @@ async function deleteIdea(req, res, next) {
       notFound("Idea not found");
     }
 
-    if (!canWriteIdea(idea, req.user)) {
+    if (!(await canModerateIdea(idea, req.user))) {
       forbidden("Forbidden")
     }
 
@@ -979,7 +1000,15 @@ async function suggestTitles(req, res, next) {
     if (!q) return res.json({ ok: true, ideas: [] });
     const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
     const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
-    const items = await Idea.find({ visibility: "public", title: re, groupSlug: { $in: accessibleGroupSlugs } })
+    const publicGroupSlugs = (await Group.find({ visibility: "public" }).select("slug").lean()).map((group) => group.slug);
+    const items = await Idea.find({
+      visibility: "public",
+      title: re,
+      $or: [
+        { groupSlug: { $in: accessibleGroupSlugs } },
+        { groupSlug: { $in: publicGroupSlugs }, groupVisibility: "public" },
+      ],
+    })
       .sort({ createdAt: -1 })
       .limit(10)
       .select("title")

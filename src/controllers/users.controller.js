@@ -4,6 +4,7 @@ const Bookmark = require("../models/Bookmark");
 const TagLeaderboard = require("../models/TagLeaderboard");
 const LeaderboardPost = require("../models/LeaderboardPost");
 const Idea = require("../models/Idea");
+const GroupJoinReferral = require("../models/GroupJoinReferral");
 const AppError = require("../utils/AppError");
 const { canReadIdea } = require("../utils/permissions");
 const {
@@ -342,6 +343,29 @@ async function getUserLeaderboards(req, res, next) {
   }
 }
 
+async function getUserGroupReferrals(req, res, next) {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user?._id?.toString();
+    const isOwnProfile = currentUserId === id;
+    const isAdmin = req.user?.role === "admin";
+
+    if (!isOwnProfile && !isAdmin) {
+      return res.json({ ok: true, referrals: [] });
+    }
+
+    const referrals = await GroupJoinReferral.find({ referrer: id })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .populate("invitee", "_id username displayName avatarUrl")
+      .lean();
+
+    res.json({ ok: true, referrals });
+  } catch (err) {
+    next(err);
+  }
+}
+
 /**
  * DELETE /api/users/:id
  * Delete user account (irreversible)
@@ -378,6 +402,7 @@ module.exports = {
   getUserBookmarks,
   getUserIdeas,
   getUserLeaderboards,
+  getUserGroupReferrals,
   deleteAccount,
 };
 

@@ -306,3 +306,109 @@ test('world group stays implicitly accessible for posting, listing, and detail a
 
   expect(anonWorldDetail.body.idea.groupSlug).toBe('world');
 });
+
+test('group invite links join users, create referral records, and follow each other', async () => {
+  const Follow = require('../src/models/Follow');
+  const Group = require('../src/models/Group');
+  const GroupJoinReferral = require('../src/models/GroupJoinReferral');
+
+  const alice = await createUser({ username: 'invite_alice', email: 'invite_alice@test.local' });
+  const bob = await createUser({ username: 'invite_bob', email: 'invite_bob@test.local' });
+
+  await request(app)
+    .post('/api/groups')
+    .set(authHeader(alice.token))
+    .send({ name: 'Invite Lab', visibility: 'private', joinCode: 'secret123' })
+    .expect(201);
+
+  await request(app)
+    .post('/api/groups/invite-lab/join')
+    .set(authHeader(bob.token))
+    .expect(403);
+
+  const inviteRes = await request(app)
+    .post('/api/groups/invite-lab/invites')
+    .set(authHeader(alice.token))
+    .expect(201);
+
+  expect(inviteRes.body.invite.groupSlug).toBe('invite-lab');
+  expect(inviteRes.body.invite.sharePath).toContain('/groups/invite-lab?joinToken=');
+
+  await request(app)
+    .post('/api/groups/invite-lab/join')
+    .set(authHeader(bob.token))
+    .send({ inviteToken: inviteRes.body.invite.token })
+    .expect(200);
+
+  const groupAfterJoin = await Group.findOne({ slug: 'invite-lab' }).lean();
+  expect(groupAfterJoin.memberCount).toBe(2);
+
+  const referral = await GroupJoinReferral.findOne({ groupSlug: 'invite-lab', invitee: bob.user._id }).lean();
+  expect(referral).toBeTruthy();
+  expect(String(referral.referrer)).toBe(String(alice.user._id));
+  expect(referral.joinMethod).toBe('invite');
+
+  await request(app)
+    .post('/api/groups/invite-lab/join')
+    .set(authHeader(bob.token))
+    .send({ inviteToken: inviteRes.body.invite.token })
+    .expect(200);
+
+  expect(await GroupJoinReferral.countDocuments({ groupSlug: 'invite-lab', invitee: bob.user._id })).toBe(1);
+  expect(await Follow.countDocuments({ follower: alice.user._id, following: bob.user._id })).toBe(1);
+  expect(await Follow.countDocuments({ follower: bob.user._id, following: alice.user._id })).toBe(1);
+
+  const aliceReferrals = await request(app)
+    .get(`/api/users/${alice.user._id}/group-referrals`)
+    .set(authHeader(alice.token))
+    .expect(200);
+
+  expect(aliceReferrals.body.referrals).toHaveLength(1);
+  expect(aliceReferrals.body.referrals[0].groupSlug).toBe('invite-lab');
+  expect(aliceReferrals.body.referrals[0].invitee.username).toBe('invite_bob');
+
+  const bobReadingAliceReferrals = await request(app)
+    .get(`/api/users/${alice.user._id}/group-referrals`)
+    .set(authHeader(bob.token))
+    .expect(200);
+
+  expect(bobReadingAliceReferrals.body.referrals).toEqual([]);
+});
+
+test('public group ideas keep public group visibility in world feed and suggestions', async () => {
+  const alice = await createUser({ username: 'public_group_alice', email: 'public_group_alice@test.local' });
+
+  await request(app)
+    .post('/api/groups')
+    .set(authHeader(alice.token))
+    .send({ name: 'Open Studio', visibility: 'public', description: 'public posts' })
+    .expect(201);
+
+  const ideaRes = await createIdea(alice.token, {
+    title: 'Open studio update',
+    summary: 'public group summary',
+    groupSlug: 'open-studio',
+    ideaType: 'dynamic',
+  }).expect(201);
+
+  expect(ideaRes.body.idea.groupSlug).toBe('open-studio');
+  expect(ideaRes.body.idea.groupVisibility).toBe('public');
+
+  const worldFeed = await request(app)
+    .get('/api/ideas?group=world&ideaType=dynamic')
+    .expect(200);
+
+  expect((worldFeed.body.ideas || []).map((idea) => idea._id)).toContain(ideaRes.body.idea._id);
+
+  const anonDetail = await request(app)
+    .get(`/api/ideas/${ideaRes.body.idea._id}`)
+    .expect(200);
+
+  expect(anonDetail.body.idea.groupSlug).toBe('open-studio');
+
+  const anonSuggest = await request(app)
+    .get('/api/ideas/suggest?q=Open%20studio')
+    .expect(200);
+
+  expect((anonSuggest.body.ideas || []).map((idea) => idea.title)).toContain('Open studio update');
+});

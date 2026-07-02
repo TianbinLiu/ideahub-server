@@ -7,7 +7,7 @@ const CommentBlock = require("../models/CommentBlock");
 const Notification = require("../models/Notification");
 const AppError = require("../utils/AppError");
 const { createNotification } = require("../services/notification.service");
-const { canReadIdea, canInteractIdea } = require("../utils/permissions");
+const { canReadIdea, canInteractIdea, canModerateIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden, commentCooldown } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
 const {
@@ -444,9 +444,9 @@ async function deleteComment(req, res, next) {
     }
 
     const isAuthor = String(comment.author) === String(req.user._id);
-    const isAdmin = req.user?.role === "admin";
-    if (!isAuthor && !isAdmin) {
-      forbidden("Only the comment author or admin can delete this comment");
+    const canModerate = await canModerateIdea(idea, req.user);
+    if (!isAuthor && !canModerate) {
+      forbidden("Only the comment author or group manager can delete this comment");
     }
 
     const parentCommentId = comment.parentCommentId ? String(comment.parentCommentId) : null;

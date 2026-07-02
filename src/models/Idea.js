@@ -40,6 +40,7 @@ const ideaSchema = new mongoose.Schema(
 
     groupSlug: { type: String, default: "world", trim: true, lowercase: true, index: true },
     groupName: { type: String, default: "World", trim: true, maxlength: 80 },
+    groupVisibility: { type: String, enum: ["public", "private", "unlisted"], default: "public", index: true },
 
     visibility: { type: String, enum: ["public", "private", "unlisted"], default: "public" },
 
