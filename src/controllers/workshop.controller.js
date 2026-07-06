@@ -42,6 +42,26 @@ function clampNumber(value, fallback, min, max) {
   return Math.max(min, Math.min(max, num));
 }
 
+function normalizeSafeUrl(input) {
+  const raw = String(input || "").trim().slice(0, 1000);
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return "";
+
+  if (raw.startsWith("/") && !raw.startsWith("//")) {
+    return raw;
+  }
+
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.toString();
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
 function toTags(raw) {
   if (!raw) return [];
   if (Array.isArray(raw)) {
@@ -155,8 +175,8 @@ function normalizeSiteDraft(input) {
         id,
         type,
         text: String(item.text || "New widget").trim().slice(0, 200),
-        href: String(item.href || "").trim().slice(0, 600),
-        imageUrl: String(item.imageUrl || "").trim().slice(0, 1000),
+        href: normalizeSafeUrl(item.href),
+        imageUrl: normalizeSafeUrl(item.imageUrl),
         items: Array.isArray(item.items)
           ? item.items.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 20)
           : [],
@@ -173,7 +193,7 @@ function normalizeSiteDraft(input) {
 
     pages[pageKey] = {
       backgroundType,
-      backgroundUrl: String(pageValue.backgroundUrl || "").trim().slice(0, 1000),
+      backgroundUrl: normalizeSafeUrl(pageValue.backgroundUrl),
       nodes,
       widgets,
     };
@@ -190,7 +210,7 @@ function normalizeTheme(theme) {
 
   return {
     backgroundType,
-    backgroundUrl: String(src.backgroundUrl || "").trim().slice(0, 1000),
+    backgroundUrl: normalizeSafeUrl(src.backgroundUrl),
     accentColor: String(src.accentColor || "#22d3ee").trim().slice(0, 40),
     textColor: String(src.textColor || "#f3f4f6").trim().slice(0, 40),
     cardRadius: clampNumber(src.cardRadius, 16, 0, 48),
@@ -553,7 +573,7 @@ async function createTemplate(req, res, next) {
       author: req.user._id,
       title: title.slice(0, 80),
       summary: String(req.body.summary || "").trim().slice(0, 300),
-      previewImageUrl: String(req.body.previewImageUrl || "").trim().slice(0, 1000),
+      previewImageUrl: normalizeSafeUrl(req.body.previewImageUrl),
       tags: toTags(req.body.tags),
       templateVersion: CURRENT_DEFAULT_TEMPLATE_VERSION,
       shared: Boolean(req.body.shared),
@@ -590,7 +610,7 @@ async function updateTemplate(req, res, next) {
 
     if (req.body.title !== undefined) doc.title = String(req.body.title || "").trim().slice(0, 80);
     if (req.body.summary !== undefined) doc.summary = String(req.body.summary || "").trim().slice(0, 300);
-    if (req.body.previewImageUrl !== undefined) doc.previewImageUrl = String(req.body.previewImageUrl || "").trim().slice(0, 1000);
+    if (req.body.previewImageUrl !== undefined) doc.previewImageUrl = normalizeSafeUrl(req.body.previewImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.theme !== undefined) doc.theme = normalizeTheme(req.body.theme);
@@ -715,8 +735,8 @@ async function previewAiSiteEdit(req, res, next) {
             id: String(item?.id || `widget_${Date.now()}_${index + 1}`).trim().slice(0, 120),
             type,
             text: String(item?.text || "New widget").trim().slice(0, 200),
-            href: String(item?.href || "").trim().slice(0, 600),
-            imageUrl: String(item?.imageUrl || "").trim().slice(0, 1000),
+            href: normalizeSafeUrl(item?.href),
+            imageUrl: normalizeSafeUrl(item?.imageUrl),
             items: Array.isArray(item?.items)
               ? item.items.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 20)
               : [],
@@ -741,7 +761,7 @@ async function previewAiSiteEdit(req, res, next) {
           backgroundType: ["none", "image", "video", "gradient"].includes(String(ops.pageBackground.backgroundType || ""))
             ? String(ops.pageBackground.backgroundType)
             : undefined,
-          backgroundUrl: String(ops.pageBackground.backgroundUrl || "").trim().slice(0, 1000),
+          backgroundUrl: normalizeSafeUrl(ops.pageBackground.backgroundUrl),
         }
       : undefined;
 

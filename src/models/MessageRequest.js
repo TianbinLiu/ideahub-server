@@ -47,6 +47,8 @@ const MessageRequestSchema = new mongoose.Schema(
     initialMessage: {
       type: String,
       required: true,
+      trim: true,
+      maxlength: 500,
     },
     
     // 接收者查看时间
@@ -64,6 +66,8 @@ const MessageRequestSchema = new mongoose.Schema(
     // 拒绝时附带的回复消息（可选）
     responseMessage: {
       type: String,
+      trim: true,
+      maxlength: 500,
       default: null,
     },
   },

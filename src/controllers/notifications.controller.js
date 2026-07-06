@@ -1,5 +1,6 @@
 const Notification = require("../models/Notification");
 const MessageRequest = require("../models/MessageRequest");
+const DirectMessage = require("../models/DirectMessage");
 
 async function listMyNotifications(req, res, next) {
   try {
@@ -52,9 +53,15 @@ async function getUnreadCount(req, res, next) {
       status: "pending",
       viewedAt: null
     });
+
+    const directMessageCount = await DirectMessage.countDocuments({
+      toUserId: userId,
+      readAt: null,
+      deletedFor: { $ne: userId },
+    });
     
-    const totalCount = notificationCount + messageRequestCount;
-    console.log(`[getUnreadCount] Found ${notificationCount} unread notifications + ${messageRequestCount} unread message requests = ${totalCount} total`);
+    const totalCount = notificationCount + messageRequestCount + directMessageCount;
+    console.log(`[getUnreadCount] Found ${notificationCount} unread notifications + ${messageRequestCount} unread message requests + ${directMessageCount} unread direct messages = ${totalCount} total`);
     res.json({ ok: true, count: totalCount });
   } catch (err) {
     next(err);
