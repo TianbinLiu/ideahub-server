@@ -270,6 +270,43 @@ test('dynamic ideas can be created and filtered by group and ideaType together',
   expect(suggestionTitles).toContain('Launch update');
 });
 
+test('home feed can list all idea categories or filter by multiple category tags', async () => {
+  const alice = await createUser({ username: 'category_alice', email: 'category_alice@test.local' });
+
+  const dailyRes = await createIdea(alice.token, {
+    title: 'Daily category post',
+    ideaType: 'daily',
+    tags: ['category-daily'],
+  }).expect(201);
+
+  const dynamicRes = await createIdea(alice.token, {
+    title: 'Dynamic category post',
+    ideaType: 'dynamic',
+    tags: ['category-dynamic'],
+  }).expect(201);
+
+  const allList = await request(app)
+    .get('/api/ideas?group=world&sort=new')
+    .expect(200);
+  const allIds = (allList.body.ideas || []).map((idea) => idea._id);
+  expect(allIds).toContain(dailyRes.body.idea._id);
+  expect(allIds).toContain(dynamicRes.body.idea._id);
+
+  const multiList = await request(app)
+    .get('/api/ideas?group=world&sort=new&ideaTypes=daily,dynamic')
+    .expect(200);
+  const multiIds = (multiList.body.ideas || []).map((idea) => idea._id);
+  expect(multiIds).toContain(dailyRes.body.idea._id);
+  expect(multiIds).toContain(dynamicRes.body.idea._id);
+
+  const dynamicOnlyList = await request(app)
+    .get('/api/ideas?group=world&sort=new&ideaTypes=dynamic')
+    .expect(200);
+  const dynamicOnlyIds = (dynamicOnlyList.body.ideas || []).map((idea) => idea._id);
+  expect(dynamicOnlyIds).toContain(dynamicRes.body.idea._id);
+  expect(dynamicOnlyIds).not.toContain(dailyRes.body.idea._id);
+});
+
 test('world group stays implicitly accessible for posting, listing, and detail access', async () => {
   const User = require('../src/models/User');
 

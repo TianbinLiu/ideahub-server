@@ -510,6 +510,14 @@ async function listIdeas(req, res, next) {
     const recentSearchTokens = normalizeSearchTokens(req.query.recentTags || "");
     const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
     const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
+    const requestedIdeaTypes = [
+      ...String(req.query.ideaTypes || "")
+        .split(",")
+        .map((item) => normalizeIdeaType(item))
+        .filter(Boolean),
+      ...(requestedIdeaType ? [requestedIdeaType] : []),
+    ];
+    const requestedIdeaTypeSet = new Set(requestedIdeaTypes);
     const requestedGroupSlug = normalizeGroupSlug(req.query.group || req.query.groupSlug || WORLD_GROUP_SLUG);
     const preferredGroupSlugs = String(req.query.preferredGroups || "")
       .split(",")
@@ -570,7 +578,7 @@ async function listIdeas(req, res, next) {
             return null;
           }
 
-          if (requestedIdeaType && inferIdeaType(item) !== requestedIdeaType) {
+          if (requestedIdeaTypeSet.size > 0 && !requestedIdeaTypeSet.has(inferIdeaType(item))) {
             return null;
           }
 
@@ -622,7 +630,22 @@ async function listIdeas(req, res, next) {
       items = ranked.slice((page - 1) * limit, page * limit);
     } else {
       let findFilter = filter;
-      if (requestedIdeaType === "external") {
+      if (requestedIdeaTypeSet.size > 0) {
+        if (requestedIdeaTypeSet.has("external")) {
+          const explicitTypes = Array.from(requestedIdeaTypeSet).filter((item) => item !== "external");
+          findFilter = {
+            ...filter,
+            $or: [
+              ...(explicitTypes.length > 0 ? [{ ideaType: { $in: explicitTypes } }] : []),
+              { ideaType: "external" },
+              { "externalSource.url": { $exists: true, $nin: [null, ""] } },
+              { "externalSource.platform": { $exists: true, $nin: [null, ""] } },
+            ],
+          };
+        } else {
+          findFilter = { ...filter, ideaType: { $in: Array.from(requestedIdeaTypeSet) } };
+        }
+      } else if (requestedIdeaType === "external") {
         findFilter = {
           ...filter,
           $or: [
@@ -646,13 +669,13 @@ async function listIdeas(req, res, next) {
       ]);
 
       // For legacy ideas that were created before ideaType existed, keep them visible in daily/feedback/external views.
-      if (requestedIdeaType && (requestedIdeaType === "daily" || requestedIdeaType === "feedback" || requestedIdeaType === "external")) {
+      if (requestedIdeaTypeSet.size > 0 && ["daily", "feedback", "external"].some((item) => requestedIdeaTypeSet.has(item))) {
         const legacyCandidates = await Idea.find({ visibility: "public", ...groupFilter, ideaType: { $exists: false } })
           .sort(sortSpec)
           .populate("author", "_id username role")
           .lean();
 
-        const legacyMatched = legacyCandidates.filter((item) => inferIdeaType(item) === requestedIdeaType);
+        const legacyMatched = legacyCandidates.filter((item) => requestedIdeaTypeSet.has(inferIdeaType(item)));
         if (legacyMatched.length > 0) {
           const merged = [...items, ...legacyMatched]
             .sort((a, b) => {
