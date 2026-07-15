@@ -34,6 +34,13 @@ const scraperRoutes = require("./routes/scraper.routes");
 const uploadsRoutes = require("./routes/uploads.routes");
 const workshopRoutes = require("./routes/workshop.routes");
 const groupsRoutes = require("./routes/groups.routes");
+const arenaRoutes = require("./routes/arena.routes");
+const scenarioRoutes = require("./routes/scenario.routes");
+const standpointRoutes = require("./routes/standpoint.routes");
+const bountyRoutes = require("./routes/bounty.routes");
+const speakingStyleRoutes = require("./routes/speakingStyle.routes");
+const personaRoutes = require("./routes/persona.routes");
+const memeRoutes = require("./routes/meme.routes");
 const { initPassport } = require("./config/passport");
 
 const app = express();
@@ -81,6 +88,13 @@ app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);
 app.use("/api/groups", groupsRoutes);
+app.use("/api/arena", arenaRoutes);
+app.use("/api/scenarios", scenarioRoutes);
+app.use("/api/standpoint", standpointRoutes);
+app.use("/api/bounties", bountyRoutes);
+app.use("/api/speaking-style", speakingStyleRoutes);
+app.use("/api/personas", personaRoutes);
+app.use("/api/memes", memeRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
