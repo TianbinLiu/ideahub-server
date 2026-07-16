@@ -99,6 +99,7 @@ function serializeComment(doc) {
     author: serializeUserRef(doc.author),
     text: doc.text || "",
     imageUrl: doc.imageUrl || "",
+    parentId: doc.parentId || null,
     createdAt: doc.createdAt,
   };
 }
@@ -479,8 +480,13 @@ async function listComments(req, res, next) {
     const total = await BountyComment.countDocuments(filter);
     const totalPages = Math.max(Math.ceil(total / limit), 1);
 
+    // 升序（与情景/人格讨论区一致）。此处【不能】用倒序：楼中楼必然比它的顶楼更新，
+    // 倒序分页会把回复排到比父级更靠前的页上 —— 首屏只拿到回复、父级还在后面的页里，
+    // 那条回复就会以「顶楼」身份错位渲染，直到用户点「加载更多」才归位。
+    // 升序则结构上保证「父级必先于其回复被加载」。
+    // 唯一消费方是前端共用的 CommentThread（它本就按升序展示），故改序无回归。
     const items = await BountyComment.find(filter)
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: 1 })
       .skip((page - 1) * limit)
       .limit(limit)
       .populate("author", "_id username")
@@ -499,6 +505,25 @@ async function listComments(req, res, next) {
   }
 }
 
+// parentId 校验：非法 id -> 400；父评论必须【属于同一 bounty】，
+// 否则可以拿悬赏 A 的评论 id 当悬赏 B 的父级，把评论注入到别人的楼里。
+// 只允许一层楼中楼：回复楼中楼时归到它所在的那个顶楼，不产生第三层。
+async function resolveCommentParentId(rawParentId, bountyId) {
+  if (rawParentId === undefined || rawParentId === null || String(rawParentId).trim() === "") {
+    return null;
+  }
+
+  const parentId = String(rawParentId).trim();
+  if (!isValidId(parentId)) invalidId("Invalid parent comment id");
+
+  const parent = await BountyComment.findOne({ _id: parentId, bounty: bountyId })
+    .select("_id parentId")
+    .lean();
+  if (!parent) notFound("Parent comment not found");
+
+  return parent.parentId ? parent.parentId : parent._id;
+}
+
 async function addComment(req, res, next) {
   try {
     const { id } = req.params;
@@ -507,16 +532,58 @@ async function addComment(req, res, next) {
     const bounty = await Bounty.findById(id).select("_id").lean();
     if (!bounty) notFound("Bounty not found");
 
+    const parentId = await resolveCommentParentId(req.body.parentId, id);
+
     const doc = await BountyComment.create({
       bounty: id,
       author: req.user._id,
       text: String(req.body.text || "").trim().slice(0, 2000),
       imageUrl: normalizeSafeUrl(req.body.imageUrl),
+      parentId,
     });
     await Bounty.updateOne({ _id: id }, { $inc: { "stats.commentCount": 1 } });
 
     const populated = await BountyComment.findById(doc._id).populate("author", "_id username").lean();
     res.status(201).json({ ok: true, comment: serializeComment(populated) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// 授权：仅评论作者本人 或 悬赏作者（版主）可删。
+// 与情景/人格讨论区（arenaComment.controller.js remove）保持同一套规则。
+async function removeComment(req, res, next) {
+  try {
+    const { id, commentId } = req.params;
+    if (!isValidId(id)) invalidId("Invalid bounty id");
+    if (!isValidId(commentId)) invalidId("Invalid comment id");
+
+    const bounty = await Bounty.findById(id).select("_id author").lean();
+    if (!bounty) notFound("Bounty not found");
+
+    const comment = await BountyComment.findOne({ _id: commentId, bounty: id })
+      .select("_id author parentId")
+      .lean();
+    if (!comment) notFound("Comment not found");
+
+    const isCommentAuthor = String(comment.author) === String(req.user._id);
+    if (!isCommentAuthor && !ownedBy(bounty, req.user)) forbidden("Forbidden");
+
+    await BountyComment.deleteOne({ _id: commentId });
+    // 删顶楼时级联删掉楼中楼，避免留下挂在不存在父级上的孤儿
+    let cascaded = 0;
+    if (!comment.parentId) {
+      const r = await BountyComment.deleteMany({ bounty: id, parentId: commentId });
+      cascaded = (r && r.deletedCount) || 0;
+    }
+
+    // 重新计数而非 $inc -n：级联删除条数不定，$inc 容易把 commentCount 减成负数
+    const commentCount = await BountyComment.countDocuments({ bounty: id });
+    await Bounty.updateOne({ _id: id }, { $set: { "stats.commentCount": commentCount } });
+
+    // deleted = 实际删除总数（含级联）。前端按「已加载的回复数」自行推算会少减，
+    // 导致 total 偏高、冒出「幽灵加载更多」。commentCount 是重算后的权威值，一并给回。
+    res.json({ ok: true, deleted: 1 + cascaded, commentCount });
   } catch (err) {
     next(err);
   }
@@ -535,4 +602,5 @@ module.exports = {
   reviewSubmission,
   listComments,
   addComment,
+  removeComment,
 };

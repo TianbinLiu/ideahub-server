@@ -25,6 +25,7 @@ const {
   reviewSubmission,
   listComments,
   addComment,
+  removeComment,
 } = require("../controllers/bounty.controller");
 
 router.get("/", optionalAuth, listBounties);
@@ -39,5 +40,6 @@ router.post("/:id/submissions", requireAuth, validate({ body: submitBody }), sub
 router.post("/:id/submissions/:sid/review", requireAuth, validate({ body: reviewBody }), reviewSubmission);
 router.get("/:id/comments", optionalAuth, listComments);
 router.post("/:id/comments", requireAuth, validate({ body: commentBody }), addComment);
+router.delete("/:id/comments/:commentId", requireAuth, removeComment);
 
 module.exports = router;

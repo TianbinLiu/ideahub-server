@@ -43,6 +43,9 @@ const reviewBody = z.object({
 const commentBody = z.object({
   text: z.string().trim().min(1).max(2000),
   imageUrl: z.string().trim().max(2000).optional().default(""),
+  // 顶楼回复时不传 / 传 null；楼中楼传其顶楼的评论 id。
+  // 合法性（是否属于同一 bounty、是否只有一层）由控制器判定，见 bounty.controller.js
+  parentId: z.string().trim().optional().nullable(),
 });
 
 module.exports = { createBody, updateBody, statusBody, submitBody, reviewBody, commentBody };
