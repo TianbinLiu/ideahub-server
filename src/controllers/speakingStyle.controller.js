@@ -53,7 +53,6 @@ function serializeStat(s) {
 function serializeProfile(doc, { includeTally = true } = {}) {
   if (!doc) return null;
   const out = {
-    standName: doc.standName || "",
     summary: doc.summary || "",
     catchphrases: Array.isArray(doc.catchphrases) ? doc.catchphrases : [],
     stats: Array.isArray(doc.stats) ? doc.stats.map(serializeStat) : [],
@@ -145,7 +144,6 @@ async function generate(req, res, next) {
 
     const update = {
       user: userId,
-      standName: result.standName || "",
       summary: result.summary || "",
       catchphrases: Array.isArray(result.catchphrases) ? result.catchphrases : [],
       stats: Array.isArray(result.stats) ? result.stats : [],

@@ -1,16 +1,15 @@
 // src/services/arenaSuggest.service.js
 //
-// 卢本伟广场 · 浏览器插件后端：为用户当前的评论输入实时生成三条不同风格的发言方案，
-// 每条附带「破防等级 / 叠甲等级 / 被举报吞评风险」三项数据。
+// 卢本伟广场 · 浏览器插件后端：为用户当前的评论输入实时生成三条不同风格的发言方案。
 //
-// 复用项目既有的 OpenAI Responses API + STRICT-JSON + 解析兜底 的模式
-// （见 services/aiReview.service.js）。无 OPENAI_API_KEY 时抛出 501，
+// 复用项目既有的 AI 调用 + STRICT-JSON + 解析兜底 的模式（见 services/aiReview.service.js）。
+// 统一经由 services/aiClient.js 出口（provider 由 env 驱动）。无 API key 时抛出 501，
 // 由插件端回退到本地启发式引擎。
 //
 // 📖 [AI] 修改前必读: /.ai-instructions.md #修改API必备步骤
 // 🔄 [AI] 修改后必须: 同步更新 PROJECT_STRUCTURE.md
 
-const OpenAI = require("openai");
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 /** 发言风格目录：styleKey -> 中文标签。插件端与之保持一致。 */
 const STYLE_CATALOG = {
@@ -23,14 +22,6 @@ const STYLE_CATALOG = {
 };
 
 const DEFAULT_STYLES = ["rational", "troll", "deflect"];
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
-
-function clampScore(n) {
-  return Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
-}
 
 function styleLabel(key) {
   return STYLE_CATALOG[key] || String(key || "").trim() || "自定义";
@@ -47,14 +38,11 @@ function styleLabel(key) {
  * @returns {Promise<{schemes: Array, model: string}>}
  */
 async function generateReplySchemes({ draft, platform, context, persona, styleHints } = {}) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
   }
-
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
   const wantedStyles = Array.isArray(styleHints) && styleHints.length
     ? styleHints.filter((s) => STYLE_CATALOG[s]).slice(0, 3)
@@ -73,15 +61,10 @@ ${catalogText}
 
 优先采用这三个风格（按顺序，若上下文明显不合适可替换为目录中更贴切的风格）：${styleOrder.join(", ")}
 
-每条方案给出三项 0-100 的数据：
-- breakdown（破防等级）：这条话让对方破防/上头的程度。
-- armor（叠甲等级）：这条话给自己叠甲、留有余地、不容易被抓把柄的程度。
-- banRisk（被举报吞评风险）：这条话被平台吞评/被举报/被删的风险。
-
 严格返回 JSON（不要 markdown、不要多余文字），结构：
 {
   "schemes": [
-    { "styleKey": "rational", "text": "……回复正文……", "ratings": { "breakdown": 40, "armor": 85, "banRisk": 10 }, "note": "一句话点评/风险提示" }
+    { "styleKey": "rational", "text": "……回复正文……", "note": "一句话点评/风险提示" }
   ]
 }
 
@@ -97,8 +80,7 @@ ${persona ? `用户人格/个人风格：${String(persona).slice(0, 400)}` : ""}
 用户草稿：${String(draft || "").slice(0, 600)}
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const jsonTextMatch = text.match(/\{[\s\S]*\}/);
   const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
 
@@ -114,18 +96,12 @@ ${persona ? `用户人格/个人风格：${String(persona).slice(0, 400)}` : ""}
     .slice(0, 3)
     .map((s, i) => {
       const styleKey = STYLE_CATALOG[s?.styleKey] ? s.styleKey : styleOrder[i] || DEFAULT_STYLES[i] || "rational";
-      const ratings = s?.ratings || {};
       return {
         id: `srv-${i}`,
         styleKey,
         styleLabel: styleLabel(styleKey),
         text: String(s?.text || "").trim().slice(0, 400),
         note: String(s?.note || "").trim().slice(0, 200),
-        ratings: {
-          breakdown: clampScore(ratings.breakdown),
-          armor: clampScore(ratings.armor),
-          banRisk: clampScore(ratings.banRisk),
-        },
       };
     })
     .filter((s) => s.text);

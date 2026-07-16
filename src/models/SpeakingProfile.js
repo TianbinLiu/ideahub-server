@@ -1,6 +1,6 @@
 // src/models/SpeakingProfile.js
-// 发言风格面板（Speaking Style Panel）——每个用户一张“JOJO 替身”能力面板。
-// AI（或启发式）汇总用户在情景模拟/赏金/评论区的发言，生成 6 项固定能力 + 替身名。
+// 发言风格面板（Speaking Style Panel）——每个用户一张能力面板。
+// AI（或启发式）汇总用户在情景模拟/赏金/评论区的发言，生成 6 项固定能力 + 点评。
 const mongoose = require("mongoose");
 
 // 6 项能力子文档（key 顺序固定；value 0-100；grade 由 value 派生）
@@ -17,7 +17,6 @@ const styleStatSchema = new mongoose.Schema(
 const speakingProfileSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
-    standName: { type: String, default: "", maxlength: 120 },
     summary: { type: String, default: "", maxlength: 2000 },
     catchphrases: { type: [String], default: [] },
     stats: { type: [styleStatSchema], default: [] },
