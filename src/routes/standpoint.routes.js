@@ -3,7 +3,7 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { configBody, statusBody, accountBody, simulateBody } = require("../schemas/standpoint.schemas");
+const { configBody, statusBody, accountBody, simulateBody, ingestBody } = require("../schemas/standpoint.schemas");
 const {
   getAgent,
   updateConfig,
@@ -12,6 +12,7 @@ const {
   removeAccount,
   listEvents,
   simulateEvent,
+  ingestEvent,
   regenerateReply,
   sendReply,
   dismissEvent,
@@ -24,6 +25,7 @@ router.post("/accounts", requireAuth, validate({ body: accountBody }), addAccoun
 router.delete("/accounts/:accountId", requireAuth, removeAccount);
 router.get("/events", requireAuth, listEvents);
 router.post("/events/simulate", requireAuth, validate({ body: simulateBody }), simulateEvent);
+router.post("/ingest", requireAuth, validate({ body: ingestBody }), ingestEvent);
 router.post("/events/:id/regenerate", requireAuth, regenerateReply);
 router.post("/events/:id/send", requireAuth, sendReply);
 router.post("/events/:id/dismiss", requireAuth, dismissEvent);
