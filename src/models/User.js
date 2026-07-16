@@ -56,6 +56,10 @@ const userSchema = new mongoose.Schema(
 
     // ✅ 以后你做“邮箱必须验证码验证后才能登录”会用到
     emailVerified: { type: Boolean, default: false },
+
+    // ✅ 账号注销（软删除）：只打时间戳标记，不删任何内容数据，可恢复。
+    // null = 正常账号；有值 = 已注销，auth 中间件一律视为未授权。
+    deactivatedAt: { type: Date, default: null },
   },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );

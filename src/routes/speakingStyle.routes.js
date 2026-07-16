@@ -7,6 +7,7 @@ const { generateBody, samplesBody } = require("../schemas/speakingStyle.schemas"
 const {
   getMine,
   generate,
+  removeProfile,
   getByUser,
   addSamples,
   listSamples,
@@ -15,6 +16,8 @@ const {
 } = require("../controllers/speakingStyle.controller");
 
 router.get("/", requireAuth, getMine);
+// 与上面的 GET / 同路径不同方法：express 按 method 分发，互不覆盖
+router.delete("/", requireAuth, removeProfile);
 router.post("/generate", requireAuth, validate({ body: generateBody }), generate);
 
 // 风格记忆样本：只收录用户自己提供的发言（粘贴 / 插件在本人主页评论页就地收集）

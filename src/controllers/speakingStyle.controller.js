@@ -166,6 +166,17 @@ async function generate(req, res, next) {
   }
 }
 
+// DELETE /api/speaking-style —— 删除当前用户的档案（可随时重新 generate 生成）
+// 只删 SpeakingProfile，不动 StyleSample（清空样本走 DELETE /samples）。
+async function removeProfile(req, res, next) {
+  try {
+    const result = await SpeakingProfile.deleteOne({ user: req.user._id });
+    res.json({ ok: true, deleted: !!(result && result.deletedCount) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/speaking-style/user/:userId —— 公开查看某用户档案（未生成过则 null）
 async function getByUser(req, res, next) {
   try {
@@ -315,4 +326,4 @@ async function clearSamples(req, res, next) {
   }
 }
 
-module.exports = { getMine, generate, getByUser, addSamples, listSamples, deleteSample, clearSamples };
+module.exports = { getMine, generate, removeProfile, getByUser, addSamples, listSamples, deleteSample, clearSamples };

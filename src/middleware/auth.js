@@ -28,13 +28,25 @@ async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const userId = payload.sub;
 
-    const user = await User.findById(userId).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs");
+    const user = await User.findById(userId).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs deactivatedAt");
     if (!user) {
       authDebug("User not found:", userId);
       throw new AppError({
         code: CODES.UNAUTHORIZED,
         status: 401,
         message: "User not found",
+      });
+    }
+
+    // 已注销（软删除）账号：一律视为未授权。
+    // 放在 tokenVersion 校验【之前】，这样注销后旧 token 得到的是明确的
+    // "Account deactivated" 而不是笼统的 "Session expired"。
+    if (user.deactivatedAt) {
+      authDebug("Account deactivated:", userId);
+      throw new AppError({
+        code: CODES.UNAUTHORIZED,
+        status: 401,
+        message: "Account deactivated",
       });
     }
 
@@ -102,8 +114,9 @@ async function optionalAuth(req, res, next) {
     }
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(payload.sub).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs");
-    if (user && Number(payload.tokenVersion || 0) === Number(user.tokenVersion || 0)) {
+    const user = await User.findById(payload.sub).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs deactivatedAt");
+    // 已注销账号当匿名处理：不挂 req.user，也不阻塞公开接口
+    if (user && !user.deactivatedAt && Number(payload.tokenVersion || 0) === Number(user.tokenVersion || 0)) {
       req.user = user;
     }
 

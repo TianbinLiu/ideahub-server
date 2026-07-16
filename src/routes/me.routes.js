@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
+const { validate } = require("../middleware/validate");
 const { upload } = require("../middleware/upload");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
@@ -12,6 +13,8 @@ const {
   uploadLive2dBundle,
   uploadMyLive2dBundle,
 } = require("../controllers/components.controller");
+const { deactivateAccount } = require("../controllers/me.controller");
+const { deactivateBody } = require("../schemas/me.schemas");
 const { listBlockedUserIds, toIdString } = require("../utils/blocking");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
@@ -122,5 +125,8 @@ router.put("/profile", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+// POST /api/me/deactivate - 注销账号（软删除：打标记 + 使所有旧 token 失效）
+router.post("/deactivate", requireAuth, validate({ body: deactivateBody }), deactivateAccount);
 
 module.exports = router;
