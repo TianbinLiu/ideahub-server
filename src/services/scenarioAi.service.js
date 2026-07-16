@@ -1,13 +1,9 @@
 // src/services/scenarioAi.service.js
 // 情景模拟 AI 服务：生成种子评论区 + AI 扮演页面账号与用户对线
-const OpenAI = require("openai");
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 function requireKey() {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
@@ -140,8 +136,6 @@ function mapSeedComments(rawComments) {
 async function generateSeedComments({ topic, platform = "generic", intensity = "heated", count = 12 }) {
   requireKey();
 
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
   const n = clampInt(count, 12, 4, 20);
   const platformLabel = PLATFORM_LABEL[platform] || PLATFORM_LABEL.generic;
   const intensityLabel = INTENSITY_LABEL[intensity] || INTENSITY_LABEL.heated;
@@ -169,8 +163,7 @@ async function generateSeedComments({ topic, platform = "generic", intensity = "
 不要输出 JSON 以外的任何内容。
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const payload = parseJsonObject(text);
   const rawComments = payload && Array.isArray(payload.comments) && payload.comments.length
     ? payload.comments
@@ -195,9 +188,6 @@ function buildFallbackReplies(accountList, userMessage) {
 
 async function generateRolePlayReplies({ scenario, history = [], userMessage }) {
   requireKey();
-
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
   const accountList = dedupeAccounts(scenario?.comments).slice(0, 20);
   const roster = accountList
@@ -243,8 +233,7 @@ ${String(userMessage?.text || "").slice(0, 600)}
 不要输出 JSON 以外的任何内容。
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const payload = parseJsonObject(text);
   const rawReplies = payload && Array.isArray(payload.replies) && payload.replies.length
     ? payload.replies
