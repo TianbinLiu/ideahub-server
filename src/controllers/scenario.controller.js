@@ -575,10 +575,20 @@ async function captureScenario(req, res, next) {
   }
 }
 
+// 生成种子评论区。两条入口：topic（用户自拟话题）或 sourceText（真实评论素材）。
+//
+// ★★ sourceText 是【一次性入参】，只在本次请求的生命周期里存在：透传给 AI 当输入素材，
+// 拿到 AI 重新生成的评论就丢弃。它【绝不】写进 Scenario 或任何其它 model，也【绝不】
+// 出现在任何持久化字段里 —— 本函数不落库（只有 createScenario/updateScenario 落库，
+// 而它们从不读 req.body.sourceText）。
+// 理由（合规红线）：PIPL 第25条「不得公开其处理的个人信息」对「已合法公开的信息」没有豁免口；
+// 只换名字而正文逐字保留属【去标识化】（拿原文一搜即可复原），不是【匿名化】。
+// 故真实评论只作为 AI 的输入，发布出去的永远是 AI 重新生成的版本。
 async function generateScenario(req, res, next) {
   try {
     const topic = String(req.body.topic || "").trim();
-    if (!topic) badRequest("Topic is required");
+    const sourceText = String(req.body.sourceText || "").trim();
+    if (!topic && !sourceText) badRequest("请提供话题或素材");
 
     const platform = normalizePlatform(req.body.platform);
     const intensity = ["mild", "heated", "flame"].includes(String(req.body.intensity))
@@ -586,7 +596,8 @@ async function generateScenario(req, res, next) {
       : "heated";
     const count = clampInt(req.body.count, 12, 4, 20);
 
-    const { comments, model } = await generateSeedComments({ topic, platform, intensity, count });
+    // 无 AI key 时 generateSeedComments 内的 requireKey() 抛 501 → next(err)，行为不变。
+    const { comments, model } = await generateSeedComments({ topic, sourceText, platform, intensity, count });
     res.json({ ok: true, comments: normalizeComments(comments), model });
   } catch (err) {
     next(err);
