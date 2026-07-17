@@ -27,12 +27,17 @@ function clampInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, num));
 }
 
+// 喂给 prompt 的平台自然语言描述。key 必须是 models/Scenario.js 的 SCENARIO_PLATFORMS 之一；
+// 漏了某个平台不会报错，只会 fallback 成「通用社交平台评论区」——AI 写出来的语感就跟着退化，
+// 所以新增平台时记得一起补。
 const PLATFORM_LABEL = {
   bilibili: "哔哩哔哩（B站）视频评论区",
   weibo: "微博评论区",
   tieba: "百度贴吧",
   zhihu: "知乎回答/评论区",
   instagram: "Instagram 评论区",
+  douyin: "抖音短视频评论区",
+  xiaohongshu: "小红书笔记评论区",
   generic: "通用社交平台评论区",
 };
 
