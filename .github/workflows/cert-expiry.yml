@@ -1,0 +1,51 @@
+# .github/workflows/cert-expiry.yml
+# ideahubs.org 三域名 TLS 证书外部到期监控。
+#
+# 【为什么放在 GitHub Actions 而不是服务器上】
+#   1. 真·外部：跑在 GitHub 的机器上，不在被监控的 ECS 上 —— 服务器整体故障时它照样出声。
+#   2. 自带告警：job 变红时 GitHub 会给仓库 owner 发邮件，无需自备 SMTP
+#      （阿里云香港默认封 25 端口出站，on-box 直发 Gmail 本就发不出去）。
+#   3. 不看 certbot 日志：脚本只握手看服务端实际证书 —— 续期静默失败时 certbot 日志可能是空的。
+#
+# 【上线后务必确认两件事，否则告警不会到你手上】
+#   A. GitHub → Settings → Notifications → Actions：勾选 email、"Send notifications for
+#      failed workflows only"。默认对 owner 的失败通知是开的，但确认一下。
+#   B. 计划任务的静默失效：GitHub 会把【60 天无仓库提交】的 cron 工作流自动停用（停用前发一封警告邮件）。
+#      本仓库有部署提交就不会触发；若某仓库长期不动，那封警告邮件本身就是"监控要死了"的信号，别忽略。
+#      想彻底免疫，见下面 healthchecks 死人开关（可选）。
+
+name: cert-expiry
+
+on:
+  schedule:
+    - cron: "17 1 * * *"   # 每天 01:17 UTC 跑一次。错开整点，别和全网 cron 峰值撞（GitHub 高峰会延迟/跳过）。
+  workflow_dispatch: {}     # 允许手动触发，用来验证告警链路真的通
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # 从 secret 提到 job 级 —— step 级 if: 只能可靠读到 job/workflow 级的 env context，
+      # 读不到同一 step 里自己定义的 env。secret 未设置时这里是空串。
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查三域名证书到期
+        run: bash scripts/cert-expiry-check.sh
+        env:
+          WARN_DAYS: "21"
+          # HOSTS / EXPECT_SANS 用脚本默认值（三域名）
+
+      # ↓↓↓ 可选：死人开关（dead-man's switch）。它补上 GitHub 方案的唯一盲区 ——
+      #     "监控自己死了"（工作流被停用 / 仓库删了 / Actions 故障）。
+      #     原理：只在【上面检查全过】时 ping 一下 healthchecks.io；一旦该 ping 没按时到，
+      #     healthchecks 反过来给你发邮件。于是"证书要过期"和"监控自己没跑"两种情况都能收到告警。
+      #     用法：去 healthchecks.io（免费）建一个 check，把它的 ping URL 存成仓库 secret
+      #           HEALTHCHECK_URL。不设这个 secret 则整步跳过，工作流照常工作。
+      - name: 心跳（可选，仅在检查通过时）
+        if: success() && env.HEALTHCHECK_URL != ''
+        run: curl -fsS -m 10 --retry 3 "$HEALTHCHECK_URL" >/dev/null
