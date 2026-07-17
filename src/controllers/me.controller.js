@@ -1,7 +1,8 @@
 // src/controllers/me.controller.js
-// 当前用户账号级操作。目前只有「注销账号」（软删除）。
+// 当前用户账号级操作：注销账号（软删除）、虚拟点数余额与流水。
 const User = require("../models/User");
-const { badRequest } = require("../utils/http");
+const PointsLedger = require("../models/PointsLedger");
+const { badRequest, notFound } = require("../utils/http");
 
 // POST /api/me/deactivate —— 注销账号（软删除，可恢复）
 //
@@ -33,4 +34,65 @@ async function deactivateAccount(req, res, next) {
   }
 }
 
-module.exports = { deactivateAccount };
+// ── 虚拟点数 ──────────────────────────────────────────────────────
+// ★这是平台【虚拟点数】，不是真钱：无现金价值，不可提现/兑换，不接任何真实支付。
+
+// GET /api/me/points —— 当前余额
+async function getMyPoints(req, res, next) {
+  try {
+    const user = await User.findById(req.user._id).select("points").lean();
+    if (!user) notFound("User not found");
+
+    // ★不给缺字段的账号兜底成 1000。缺 points 说明这个账号还没跑过 `npm run backfill:points`，
+    //   而写入侧（points.service 的 {points:{$gte:X}} 条件更新）对它同样匹配不到 ——
+    //   读写口径必须一致。宁可显示 0（去跑迁移），也不能显示一个账本里根本没有的余额。
+    const points = Number.isFinite(user.points) ? user.points : 0;
+    res.json({ ok: true, points });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/me/points/ledger?page&limit —— 我的点数流水（分页）
+async function listMyPointsLedger(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "20", 10) || 20, 1), 50);
+
+    // ★只查 user = 本人。托管分录（user:null）是平台内部账，不属于任何人，
+    //   不得出现在任何用户的流水里 —— 这个 filter 就是那道边界，别加 $or。
+    const filter = { user: req.user._id };
+
+    const total = await PointsLedger.countDocuments(filter);
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
+
+    // _id 是 createdAt 之外的第二排序键：一次转账的两条分录 createdAt 往往同一毫秒，
+    // 只按 createdAt 排序时它们的相对顺序不稳定，翻页会重复或漏条。
+    const rows = await PointsLedger.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    res.json({
+      ok: true,
+      entries: rows.map((row) => ({
+        _id: row._id,
+        delta: Number(row.delta || 0),
+        reason: row.reason,
+        balanceAfter: row.balanceAfter === undefined ? null : row.balanceAfter,
+        bounty: row.bounty || null,
+        memo: row.memo || "",
+        createdAt: row.createdAt,
+      })),
+      total,
+      page,
+      limit,
+      totalPages,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { deactivateAccount, getMyPoints, listMyPointsLedger };

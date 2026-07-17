@@ -12,6 +12,11 @@ const bountySubmissionSchema = new mongoose.Schema(
     screenshotUrl: { type: String, default: "" },
     note: { type: String, default: "", trim: true, maxlength: 2000 },
     status: { type: String, enum: BOUNTY_SUBMISSION_STATUSES, default: "pending", index: true },
+
+    // 审批通过时【实际入账】的点数，审批那一刻写死。
+    // 为什么不直接用 Bounty.reward 显示：reward 事后可以被发布者改，
+    // 用它去渲染「已入账 N 点」就会对猎人说一个和账本不符的数。这里存的是账本上的真值。
+    awardedPoints: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );

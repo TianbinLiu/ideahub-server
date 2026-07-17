@@ -1577,6 +1577,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `Interest.js` - 公司兴趣表达
 - `OtpToken.js` - 邮箱验证码
 - `AiJob.js` - AI评审任务队列
+- `PointsLedger.js` - 虚拟点数账本（只追加的记账分录；`user:null` = 悬赏托管账户）
 
 ---
 
@@ -1604,7 +1605,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `authOtp.routes.js` - OTP验证
 - `oauth.routes.js` - OAuth（登录 + 显式第三方账号绑定/解绑；不再按 email 自动并号）
 - `ideas.routes.js` - 创意
-- `me.routes.js` - 个人中心
+- `me.routes.js` - 个人中心（含 `GET /points` 余额、`GET /points/ledger` 点数流水）
 - `company.routes.js` - 公司
 - `messages.routes.js` - 私信与会话请求
 - `notifications.routes.js` - 通知
@@ -1940,6 +1941,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 | 2026-04-12 | 4.50 | **新增黑名单真实联调脚本并记录结果**：新增 `server/scripts/runBlockingIntegration.js`，可复跑验证“先攻击后拉黑失败 / 被回帖后允许拉黑 / 双向资料与评论隐藏”；`server/ACCOUNT_SECURITY_CHECKLIST.md` 追加 2026-04-12 真实联调记录，沉淀本轮 block 规则验证结果。 |
 | 2026-04-13 | 4.51 | **接入全站 Live2D 看板娘**：将 `live2d-widget-master/dist` 自托管到 `client/public/live2d-widget/`，新增 `client/src/components/SiteLive2D.tsx` 作为全站挂载器，并使用 `ideahub-waifu-tips.json` 替换默认 Hexo 风格提示语和选择器，完成 IdeaHub 全站看板娘接入。 |
 | 2026-04-13 | 4.52 | **新增组件中心与 Live2D 用户级设置**：`User` 新增 `siteComponents.live2d` 配置；`/api/me/components` 与 `/api/me/components/live2d/upload` 支持保存组件开关、远程模型 URL 和本地 zip 模型包上传；前端新增 `ComponentsPage.tsx` 与 `Live2DSettingsPage.tsx`，并把 `SiteLive2D.tsx` 改为按当前用户配置决定是否加载及使用哪个模型。 |
+| 2026-07-16 | 4.56 | **赏金虚拟点数与双边记账落地**：赏金从「只有 UI 文案」变成真实入账。新增 `PointsLedger.js`（只追加的记账分录，`user:null` = 悬赏托管账户）、`config/points.js`、`services/points.service.js`（点数变动的唯一入口）；`User` 新增 `points`（default 1000 = 注册赠送），`Bounty` 新增 `escrowPoints` / `refundedAt`，`BountySubmission` 新增 `awardedPoints`。发布悬赏先托管 `reward × slots`（扣款成功才建悬赏），审批从托管付给猎人，关闭/完成/删除退还剩余托管。新增 `GET /api/me/points`、`GET /api/me/points/ledger`；四条注册路径（password / OTP / google / github 新建用户支）接入幂等的注册赠送。**三条硬不变量**由 `tests/points.spec.js` 钉死：I1 除 signup 外每次变动成对写账且和为零、I2 一切扣减用条件原子更新（并发审批不超付）、I3 退款幂等（`refundedAt` 原子抢占）。★点数是【虚拟点数】，无现金价值、不可提现/兑换，不接任何真实支付。既有数据需跑一次 `npm run backfill:points`（幂等）。审批通过改为**终态**（不可再改回 rejected），随之取消了旧的「completed 可退回 open」行为。 |
 | 2026-04-19 | 4.55 | **同步 Workshop 组件化与设置入口调整文档**：补充 `SettingsComponentsPanel.tsx`、`WorkshopSiteEditorAccessGate.tsx`、`SettingsPage.tsx`；更新结构树中的实际组件/页面数量；更新 `/settings`、`/components/*` 与 Workshop 编辑门禁路由；补充 `/workshop` 顶部组件设置区、`siteTemplateEditor` 门禁和个人主页入口调整说明。 |
 | 2026-04-14 | 4.54 | **补齐 Tag Rank 访问门禁**：新增 `TagRankAccessGate.tsx` 统一包裹 `TagRankPage.tsx` 与 `LeaderboardDetailPage.tsx`；当用户未启用 `tagRank` 组件时，不再允许从 Profile、收藏或直接 URL 进入 Tag Rank 页面，而是先显示提示并允许直接跳转到 `TagRankSettingsPage.tsx`。 |
 | 2026-04-14 | 4.53 | **将 Tag Rank 改造为组件并接入首页搜索切换**：`User.siteComponents` 新增 `tagRank.enabled`；组件中心新增 Tag Rank 条目与 `TagRankSettingsPage.tsx`；首页 `HomePage.tsx` 会在启用后显示 Tag Rank 搜索模式开关，并在切换后把原 Idea 搜索栏改为 Tag Rank 搜索入口，跳转到 `TagRankPage.tsx` 自动执行查询。 |

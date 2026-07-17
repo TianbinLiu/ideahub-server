@@ -6,6 +6,7 @@ const { signToken } = require("../utils/jwt");
 const { badRequest } = require("../utils/http");
 const { normEmail, createOtp, verifyOtp } = require("../services/otp.service");
 const { sendEmailOtp } = require("../services/email.service");
+const { grantSignupBonus } = require("../services/points.service");
 
 // POST /api/auth/email/register/start
 async function emailRegisterStart(req, res, next) {
@@ -53,6 +54,10 @@ async function emailRegisterVerify(req, res, next) {
       role: role === "company" ? "company" : "user",
       bio: "",
     });
+
+    // 注册赠送虚拟点数（唯一的印钱口）。只接在【新建用户】这一支上：
+    // register/start 不建用户，reset/verify 是既有用户改密码，都不能赠送。
+    await grantSignupBonus(user._id);
 
     const token = signToken(user);
     res.status(201).json({

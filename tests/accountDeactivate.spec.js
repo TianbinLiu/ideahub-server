@@ -76,9 +76,10 @@ describe('POST /api/me/deactivate', () => {
     expect(fresh.tokenVersion).toBe(Number(user.tokenVersion || 0) + 1);
   });
 
-  test('即使拿到 tokenVersion 匹配的新 token，已注销账号仍 401', async () => {
-    // 证明拦截真正来自 deactivatedAt，而不是只靠 tokenVersion 自增；
-    // 否则 deactivatedAt 就是死代码，「注销」只是换了一次 token。
+  test('signToken 拒绝为已注销账号签发 token', async () => {
+    // 注销后不能只是「旧 token 失效」，还必须【签不出新 token】——
+    // 否则用户能登录成功拿到 token，然后每个接口都 401，陷入登录→被踹的死循环，
+    // 而界面还写着「账号将无法登录」＝对用户撒谎。
     const { user, token } = await createUser();
     await request(app)
       .post('/api/me/deactivate')
@@ -89,11 +90,36 @@ describe('POST /api/me/deactivate', () => {
     const User = require('../src/models/User');
     const { signToken } = require('../src/utils/jwt');
     const fresh = await User.findById(user._id);
-    const freshToken = signToken(fresh); // tokenVersion 与库里完全一致
+    expect(() => signToken(fresh)).toThrow('Account deactivated');
+  });
+
+  test('即使伪造一个 tokenVersion 匹配的 token，已注销账号仍 401', async () => {
+    // 证明拦截真正来自 deactivatedAt，而不是只靠 tokenVersion 自增；
+    // 否则 deactivatedAt 就是死代码，「注销」只是换了一次 token。
+    //
+    // ★这里【绕过 signToken 直接用 jwt.sign】：signToken 现在会拒绝为已注销账号签名
+    // （见上一条用例），所以拿不到这种 token。而本用例要模拟的正是
+    // 「攻击者/陈旧客户端手里有一个 tokenVersion 恰好对得上的 token」——
+    // 那种 token 现实中不经过 signToken，测试也不该经过。
+    const jwt = require('jsonwebtoken');
+    const { user, token } = await createUser();
+    await request(app)
+      .post('/api/me/deactivate')
+      .set(authHeader(token))
+      .send({ confirmUsername: user.username })
+      .expect(200);
+
+    const User = require('../src/models/User');
+    const fresh = await User.findById(user._id);
+    const forged = jwt.sign(
+      { sub: String(fresh._id), role: fresh.role, tokenVersion: Number(fresh.tokenVersion || 0) },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    ); // tokenVersion 与库里完全一致 → 只可能被 deactivatedAt 拦下
 
     const res = await request(app)
       .get('/api/speaking-style')
-      .set(authHeader(freshToken))
+      .set(authHeader(forged))
       .expect(401);
     expect(res.body.message).toBe('Account deactivated');
   });

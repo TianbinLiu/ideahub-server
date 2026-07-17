@@ -38,6 +38,23 @@ const bountySchema = new mongoose.Schema(
     deadline: { type: Date, default: null },
     stats: { type: bountyStatsSchema, default: () => ({}) },
     approvedCount: { type: Number, default: 0, min: 0 },
+
+    // ── 托管（escrow）：发布时从发布者账上扣下来、锁在这个悬赏里的点数 ──
+    //
+    // escrowPoints 是「该 bounty 下所有 user:null 分录 delta 之和」的镜像，两者必须恒等。
+    // 为什么要存这个冗余字段：账本求和【没法做条件原子更新】。有了它才能写出
+    //   findOneAndUpdate({_id, escrowPoints:{$gte:reward}}, {$inc:{escrowPoints:-reward}})
+    // 这种「判断+扣减」一次完成的更新 —— 这是并发审批不超付（I2）的唯一保证。
+    // ★任何改动 escrowPoints 的地方都必须同时写一对和为零的分录（I1），反之亦然。
+    escrowPoints: { type: Number, default: 0, min: 0 },
+
+    // 结算时间戳：托管已退还发布者。null = 还没结算。
+    // ★这是「反复点关闭不会反复退款」（I3）的那把锁：退款前用
+    //   findOneAndUpdate({_id, refundedAt:null}, {$set:{refundedAt:now, escrowPoints:0}})
+    //   原子地抢占，抢不到的调用者直接跳过。绝不能改成先 find 再 save。
+    // 有值即视为【终态】：不能再审批通过、不能设回 open、不能改 reward/slots
+    //   —— 托管已经空了，再放行只会得到一个永远发不出赏金的悬赏。
+    refundedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
