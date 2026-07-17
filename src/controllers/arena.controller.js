@@ -15,8 +15,8 @@ const { generateReplySchemes } = require("../services/arenaSuggest.service");
 
 async function suggestReplies(req, res, next) {
   try {
-    const { draft, platform, context, persona, styleHints } = req.body || {};
-    const result = await generateReplySchemes({ draft, platform, context, persona, styleHints });
+    const { draft, platform, context, persona, count, avoid } = req.body || {};
+    const result = await generateReplySchemes({ draft, platform, context, persona, count, avoid });
 
     if (!result.schemes.length) {
       // 模型没给出可用方案时，用 200 + fallback 标记，交由插件回退本地引擎。
