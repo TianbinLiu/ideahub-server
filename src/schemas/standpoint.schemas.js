@@ -27,4 +27,14 @@ const simulateBody = z.object({
   incomingText: z.string().trim().min(1).max(4000),
 });
 
-module.exports = { configBody, statusBody, accountBody, simulateBody };
+// 立场展开·真实到消息 ingest：真实来消息永远只出草稿，绝不自动发送。
+// fromHandle 必填但允许为空（插件"起草回击"场景发 fromHandle:''），threadUrl 可选。
+const ingestBody = z.object({
+  kind: z.enum(["dm", "reply"]),
+  platform: z.string().trim().min(1).max(40),
+  fromHandle: z.string().trim().max(80),
+  incomingText: z.string().trim().min(1).max(4000),
+  threadUrl: z.string().trim().max(2000).optional(),
+});
+
+module.exports = { configBody, statusBody, accountBody, simulateBody, ingestBody };

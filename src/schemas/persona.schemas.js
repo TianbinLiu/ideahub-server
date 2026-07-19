@@ -23,7 +23,6 @@ const tagsSchema = z.union([z.array(z.string()), z.string()]);
 const createBody = z.object({
   name: z.string().trim().min(1).max(120),
   description: z.string().trim().max(1000).optional().default(""),
-  standName: z.string().trim().max(120).optional().default(""),
   coverEmoji: z.string().trim().max(8).optional().default("🎭"),
   tags: tagsSchema.optional().default([]),
   style: styleBody.optional().default({}),
@@ -33,7 +32,6 @@ const createBody = z.object({
 const updateBody = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(1000).optional(),
-  standName: z.string().trim().max(120).optional(),
   coverEmoji: z.string().trim().max(8).optional(),
   tags: tagsSchema.optional(),
   style: styleBody.optional(),

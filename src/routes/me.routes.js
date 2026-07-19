@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
+const { validate } = require("../middleware/validate");
 const { upload } = require("../middleware/upload");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
@@ -12,6 +13,8 @@ const {
   uploadLive2dBundle,
   uploadMyLive2dBundle,
 } = require("../controllers/components.controller");
+const { deactivateAccount, getMyPoints, listMyPointsLedger } = require("../controllers/me.controller");
+const { deactivateBody } = require("../schemas/me.schemas");
 const { listBlockedUserIds, toIdString } = require("../utils/blocking");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
@@ -122,5 +125,14 @@ router.put("/profile", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+// POST /api/me/deactivate - 注销账号（软删除：打标记 + 使所有旧 token 失效）
+router.post("/deactivate", requireAuth, validate({ body: deactivateBody }), deactivateAccount);
+
+// ── 虚拟点数（★不是真钱：无现金价值，不可提现/兑换）──
+// GET /api/me/points        - 当前余额
+// GET /api/me/points/ledger - 我的点数流水（分页；只看自己的，托管分录不外露）
+router.get("/points", requireAuth, getMyPoints);
+router.get("/points/ledger", requireAuth, listMyPointsLedger);
 
 module.exports = router;

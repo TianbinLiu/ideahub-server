@@ -7,7 +7,9 @@ const { generateRolePlayReplies, generateSeedComments } = require("../services/s
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
-const PLATFORMS = ["bilibili", "weibo", "tieba", "zhihu", "instagram", "generic"];
+// 从 model 取，别在这里再抄一份 —— 两处各写一份数组正是「插件认得 douyin、
+// 后端却把它降级成 generic」这类漂移的来源。
+const PLATFORMS = Scenario.SCENARIO_PLATFORMS;
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -24,6 +26,30 @@ function normalizePlatform(input) {
   return PLATFORMS.includes(value) ? value : "generic";
 }
 
+// URL 域名 → 平台。
+//
+// ★★ 两处必须同步改 ★★
+// 这里的域名规则与【插件仓库】 ideahub-arena-extension/src/content.js 的 detectPlatform()
+// 是【同一套判定的两份实现】：插件在页面上按 location.hostname 判平台并把 platform 随抓取结果
+// 提交过来，本函数则在用户直接贴 URL 时判平台。两边只要不一致，就会出现
+// 「插件说是 douyin、后端按 generic 存」这种静默错配 —— 用户看到的皮肤直接退化。
+// ⇒ 改任何一处，另一处必须跟着改。
+//
+// 与 detectPlatform 的【逐条对齐】现状：
+//   detectPlatform                              | 本函数
+//   ----------------------------------------------------------------
+//   /bilibili\.com|b23\.tv/        → bilibili    | ✅ 一致
+//   /weibo\.(com|cn)/             → weibo       | ✅ 一致
+//   /tieba\.baidu\.com/           → tieba       | ✅ 一致
+//   /zhihu\.com/                  → zhihu       | ✅ 一致
+//   /instagram\.com/              → instagram   | ✅ 一致
+//   /douyin\.com/                 → douyin      | ✅ 一致（本次补齐）
+//   /xiaohongshu\.com|xhslink\.com/ → xiaohongshu| ✅ 一致（本次补齐）
+//   /(^|\.)x\.com|twitter\.com/   → twitter     | ❌ 本次不接：没做皮肤，接了也只会 fallback 到 generic
+//   /youtube\.com|youtu\.be/      → youtube     | ❌ 同上
+//   /reddit\.com/                 → reddit      | ❌ 同上
+// 即：插件仍会把 twitter/youtube/reddit 报上来，本函数与 normalizePlatform 都把它们归入 generic。
+// 这是【有意为之】的取舍，不是遗漏；等为它们做了皮肤，再连同 SCENARIO_PLATFORMS 一起加。
 function platformFromHost(host) {
   const h = String(host || "").toLowerCase();
   if (h.includes("bilibili.com") || h.includes("b23.tv")) return "bilibili";
@@ -31,6 +57,8 @@ function platformFromHost(host) {
   if (h.includes("tieba.baidu.com")) return "tieba";
   if (h.includes("zhihu.com")) return "zhihu";
   if (h.includes("instagram.com")) return "instagram";
+  if (h.includes("douyin.com")) return "douyin";
+  if (h.includes("xiaohongshu.com") || h.includes("xhslink.com")) return "xiaohongshu";
   return "generic";
 }
 
@@ -575,10 +603,20 @@ async function captureScenario(req, res, next) {
   }
 }
 
+// 生成种子评论区。两条入口：topic（用户自拟话题）或 sourceText（真实评论素材）。
+//
+// ★★ sourceText 是【一次性入参】，只在本次请求的生命周期里存在：透传给 AI 当输入素材，
+// 拿到 AI 重新生成的评论就丢弃。它【绝不】写进 Scenario 或任何其它 model，也【绝不】
+// 出现在任何持久化字段里 —— 本函数不落库（只有 createScenario/updateScenario 落库，
+// 而它们从不读 req.body.sourceText）。
+// 理由（合规红线）：PIPL 第25条「不得公开其处理的个人信息」对「已合法公开的信息」没有豁免口；
+// 只换名字而正文逐字保留属【去标识化】（拿原文一搜即可复原），不是【匿名化】。
+// 故真实评论只作为 AI 的输入，发布出去的永远是 AI 重新生成的版本。
 async function generateScenario(req, res, next) {
   try {
     const topic = String(req.body.topic || "").trim();
-    if (!topic) badRequest("Topic is required");
+    const sourceText = String(req.body.sourceText || "").trim();
+    if (!topic && !sourceText) badRequest("请提供话题或素材");
 
     const platform = normalizePlatform(req.body.platform);
     const intensity = ["mild", "heated", "flame"].includes(String(req.body.intensity))
@@ -586,7 +624,8 @@ async function generateScenario(req, res, next) {
       : "heated";
     const count = clampInt(req.body.count, 12, 4, 20);
 
-    const { comments, model } = await generateSeedComments({ topic, platform, intensity, count });
+    // 无 AI key 时 generateSeedComments 内的 requireKey() 抛 501 → next(err)，行为不变。
+    const { comments, model } = await generateSeedComments({ topic, sourceText, platform, intensity, count });
     res.json({ ok: true, comments: normalizeComments(comments), model });
   } catch (err) {
     next(err);

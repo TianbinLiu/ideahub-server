@@ -9,6 +9,7 @@
     "postinstall": "node scripts/copyProjectDocs.js",
     "recompute:tag-leaderboards": "node src/workers/recomputeTagLeaderboards.js",
     "cleanup:empty-leaderboards": "node scripts/cleanupEmptyLeaderboards.js",
+    "backfill:points": "node scripts/backfillPoints.js",
     "test": "jest --runInBand"
   },
   "keywords": [],

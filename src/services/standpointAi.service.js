@@ -1,15 +1,7 @@
 // src/services/standpointAi.service.js
 // 立场展开 AI 服务：对一条来消息做「分类 + 按立场/人格/知识库生成回复」。
-// 有 OPENAI_API_KEY → 用 OpenAI；无 key → 本地启发式（reply.heuristic=true），绝不抛 501。
-const OpenAI = require("openai");
-
-function hasKey() {
-  return !!process.env.OPENAI_API_KEY;
-}
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
+// 有 AI key → 走 aiClient；无 key → 本地启发式（reply.heuristic=true），绝不抛 501。
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 function parseJsonObject(text) {
   const raw = String(text || "");
@@ -108,10 +100,8 @@ function heuristicClassifyAndReply({ incomingText, config }) {
   return { classification, reply: buildHeuristicReply({ classification, config }) };
 }
 
-// ── OpenAI 分类 + 生成 ────────────────────────────────────────────
+// ── AI 分类 + 生成 ────────────────────────────────────────────────
 async function openAiClassifyAndReply({ incomingText, kind, config }) {
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
   const stance = normalizeStance(config && config.stance);
   const stanceLabel = STANCE_LABEL[stance];
   const persona = String((config && config.personaText) || "").slice(0, 1000);
@@ -145,8 +135,7 @@ ${String(incomingText || "").slice(0, 1000)}
 不要输出 JSON 以外的任何内容。
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const payload = parseJsonObject(text);
 
   const classification =
@@ -172,7 +161,7 @@ ${String(incomingText || "").slice(0, 1000)}
 
 // ── 对外导出 ──────────────────────────────────────────────────────
 async function classifyAndReply({ incomingText, kind, config }) {
-  if (!hasKey()) {
+  if (!hasAiKey()) {
     return heuristicClassifyAndReply({ incomingText, config });
   }
   try {

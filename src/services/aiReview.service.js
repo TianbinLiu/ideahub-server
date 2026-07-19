@@ -1,19 +1,12 @@
 // src/services/aiReview.service.js
-const OpenAI = require("openai");
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 async function generateIdeaReview({ title, summary, content, tags }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
   }
-
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
   const prompt = `
 You are an evaluator for startup/product ideas.
@@ -29,12 +22,7 @@ Tags: ${(tags || []).join(", ")}
 Content: ${content || ""}
 `;
 
-  const resp = await client.responses.create({
-    model,
-    input: prompt,
-  });
-
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const jsonTextMatch = text.match(/\{[\s\S]*\}/);
   const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
 
@@ -75,14 +63,11 @@ async function runAiReview(ideaDoc) {
  * @returns {Promise<{isValid: boolean, feedbackType: string, summary: string, reason?: string}>}
  */
 async function validateFeedback({ title, summary, content }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
   }
-
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
   const prompt = `
 You are validating user feedback for a website called IdeaHub (an idea sharing platform).
@@ -100,12 +85,7 @@ Summary: ${summary || ""}
 Content: ${content || ""}
 `;
 
-  const resp = await client.responses.create({
-    model,
-    input: prompt,
-  });
-
-  const text = resp.output_text || "";
+  const { text } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const jsonTextMatch = text.match(/\{[\s\S]*\}/);
   const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
 
@@ -132,7 +112,7 @@ Content: ${content || ""}
 }
 
 async function generateIdeaDraftFromContent({ content, ideaType }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
@@ -146,8 +126,6 @@ async function generateIdeaDraftFromContent({ content, ideaType }) {
   }
 
   const mode = String(ideaType || "daily").trim().toLowerCase();
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
   const prompt = `
 You are helping users draft an idea post.
@@ -167,12 +145,7 @@ User content:
 ${normalizedContent}
 `;
 
-  const resp = await client.responses.create({
-    model,
-    input: prompt,
-  });
-
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const jsonTextMatch = text.match(/\{[\s\S]*\}/);
   const jsonText = jsonTextMatch ? jsonTextMatch[0] : "";
 

@@ -5,6 +5,7 @@ const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
+const { grantSignupBonus } = require("../services/points.service");
 
 function serializeAuthUser(user) {
   return {
@@ -82,6 +83,10 @@ async function register(req, res, next) {
       role: role === "company" ? "company" : "user", // Phase 2 先允许 user/company
       bio: "",
     });
+
+    // 注册赠送虚拟点数（唯一的印钱口）。余额本身来自 User schema 的 default，
+    // 这里只是把它记进账本；幂等，同一个 user 不会有第二条 signup 分录。
+    await grantSignupBonus(user._id);
 
     const token = signToken(user);
 

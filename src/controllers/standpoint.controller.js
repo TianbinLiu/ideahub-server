@@ -79,6 +79,7 @@ function serializeEvent(doc) {
     reply: serializeReply(doc.reply),
     status: doc.status || "drafted",
     autoSent: !!doc.autoSent,
+    threadUrl: doc.threadUrl || "",
     createdAt: doc.createdAt,
   };
 }
@@ -266,6 +267,47 @@ async function simulateEvent(req, res, next) {
   }
 }
 
+// 真实到消息 → AI 即时草稿（人在环内，绝不自动发送）。
+// 与 simulateEvent 的关键差别：无论 autoSendEnabled / status 如何，一律出草稿、
+// autoSent=false、drafted++，绝不 sent，也绝不代替用户在平台上点发送。
+async function ingestEvent(req, res, next) {
+  try {
+    const agent = await loadOrCreateAgent(req.user._id);
+    const { kind, platform, fromHandle, incomingText, threadUrl } = req.body;
+
+    const { classification, reply } = await classifyAndReply({
+      incomingText,
+      kind,
+      config: agent.config,
+    });
+
+    // 检测计数 +1
+    agent.stats.detected += 1;
+    // 真实到消息永远只出草稿，绝不自动发送
+    agent.stats.drafted += 1;
+
+    const event = await StandpointEvent.create({
+      agent: agent._id,
+      user: req.user._id,
+      kind,
+      platform,
+      fromHandle: fromHandle || "",
+      incomingText,
+      classification,
+      reply,
+      status: "drafted",
+      autoSent: false,
+      threadUrl: threadUrl || "",
+    });
+
+    await agent.save();
+
+    res.json({ ok: true, event: serializeEvent(event) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function regenerateReply(req, res, next) {
   try {
     const event = await loadOwnedEvent(req.params.id, req.user._id);
@@ -324,6 +366,7 @@ module.exports = {
   removeAccount,
   listEvents,
   simulateEvent,
+  ingestEvent,
   regenerateReply,
   sendReply,
   dismissEvent,

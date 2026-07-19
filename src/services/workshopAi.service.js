@@ -1,8 +1,4 @@
-const OpenAI = require("openai");
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 function parseJsonObject(text) {
   const raw = String(text || "");
@@ -16,14 +12,12 @@ function parseJsonObject(text) {
 }
 
 async function generateWorkshopEditPlan({ instruction, history = [], draft }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
   }
 
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.4";
   const conversation = history
     .filter((item) => item && (item.role === "user" || item.role === "assistant"))
     .slice(-6)
@@ -106,12 +100,9 @@ User instruction:
 ${String(instruction || "").slice(0, 600)}
 `;
 
-  const resp = await client.responses.create({
-    model,
-    input: prompt,
-  });
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.4" });
 
-  const payload = parseJsonObject(resp.output_text || "") || {};
+  const payload = parseJsonObject(text) || {};
   return {
     assistantMessage: String(payload.assistantMessage || "已根据安全规则生成一版草案。"),
     changes: payload.changes && typeof payload.changes === "object" ? payload.changes : {},
@@ -120,14 +111,12 @@ ${String(instruction || "").slice(0, 600)}
 }
 
 async function generateSiteDraftEditPlan({ instruction, history = [], pageKey, siteDraft, nodeCatalog = [] }) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!hasAiKey()) {
     const err = new Error("OPENAI_API_KEY is not set on server");
     err.status = 501;
     throw err;
   }
 
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.4";
   const conversation = history
     .filter((item) => item && (item.role === "user" || item.role === "assistant"))
     .slice(-8)
@@ -195,8 +184,8 @@ User instruction:
 ${String(instruction || "").slice(0, 800)}
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const payload = parseJsonObject(resp.output_text || "") || {};
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.4" });
+  const payload = parseJsonObject(text) || {};
   return {
     assistantMessage: String(payload.assistantMessage || "已生成全站改版操作草案。"),
     operations: payload.operations && typeof payload.operations === "object" ? payload.operations : {},

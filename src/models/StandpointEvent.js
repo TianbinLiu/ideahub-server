@@ -28,6 +28,7 @@ const standpointEventSchema = new mongoose.Schema(
     reply: { type: standpointReplySchema, default: null },
     status: { type: String, enum: EVENT_STATUSES, default: "drafted", index: true },
     autoSent: { type: Boolean, default: false },
+    threadUrl: { type: String, default: "", trim: true, maxlength: 2000 },
   },
   { timestamps: true }
 );

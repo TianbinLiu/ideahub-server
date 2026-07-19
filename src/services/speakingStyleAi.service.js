@@ -1,15 +1,7 @@
 // src/services/speakingStyleAi.service.js
-// 发言风格面板 AI 服务：把用户最近的发言文本汇总成一张“JOJO 替身”能力面板。
-// 有 OPENAI_API_KEY → 用 OpenAI 分析；无 key（或异常）→ 本地启发式（heuristic=true），绝不抛 501。
-const OpenAI = require("openai");
-
-function hasKey() {
-  return !!process.env.OPENAI_API_KEY;
-}
-
-function getClient() {
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-}
+// 发言风格面板 AI 服务：把用户最近的发言文本汇总成一张能力面板。
+// 有 AI key → 走 aiClient 分析；无 key（或异常）→ 本地启发式（heuristic=true），绝不抛 501。
+const { hasAiKey, aiComplete } = require("./aiClient");
 
 function parseJsonObject(text) {
   const raw = String(text || "");
@@ -59,36 +51,8 @@ function buildStats(valueMap = {}) {
   });
 }
 
-// ── 内置替身名/模板（无 key 或兜底用）────────────────────────────
-const STAND_NAMES = [
-  "《白金之嘴》",
-  "《黄金体验·杠精》",
-  "《绯红之辩》",
-  "《疯狂钻石·嘴替》",
-  "《败者食尘·阴阳》",
-  "《石之自由·嘴强王者》",
-  "《紫烟叠甲》",
-  "《狂热钢铁·键政》",
-  "《世界·终结讨论》",
-  "《隐者之紫·引经据典》",
-];
-
+// ── 内置模板（无 key 或兜底用）──────────────────────────────────
 const NEWCOMER_PHRASES = ["刚来，随便看看", "让我想想", "有道理", "先记一下"];
-
-// 从文本挑一个 standName（无 key 时按攻击力高低粗略映射，保持稳定又不呆板）
-function pickStandName(valueMap) {
-  const attack = Number(valueMap.attack) || 0;
-  const venom = Number(valueMap.venom) || 0;
-  const logic = Number(valueMap.logic) || 0;
-  const humor = Number(valueMap.humor) || 0;
-  let idx;
-  if (attack >= 70 && venom >= 60) idx = 0;
-  else if (logic >= 70) idx = 9;
-  else if (humor >= 65) idx = 5;
-  else if (venom >= 60) idx = 4;
-  else idx = (attack + venom + logic + humor) % STAND_NAMES.length;
-  return STAND_NAMES[idx] || STAND_NAMES[0];
-}
 
 // ── 启发式特征词表 ────────────────────────────────────────────────
 const ATTACK_WORDS = [
@@ -178,8 +142,7 @@ function heuristicProfile({ texts, styleTally }) {
     const valueMap = { attack: 20, venom: 15, logic: 25, armor: 20, resilience: 30, humor: 25 };
     const merged = applyTally(valueMap, styleTally);
     return {
-      standName: "《无名新星》",
-      summary: "还没留下多少发言样本，替身尚在孕育中。多在情景模拟、赏金和评论区发声，面板才会逐渐显形。",
+      summary: "还没留下多少发言样本，面板尚未成形。多在情景模拟、赏金和评论区发声，面板才会逐渐显形。",
       catchphrases: NEWCOMER_PHRASES.slice(),
       stats: buildStats(merged),
       heuristic: true,
@@ -196,10 +159,9 @@ function heuristicProfile({ texts, styleTally }) {
   const resilience = clamp100(35 + attack * 0.25 + venom * 0.2 - armor * 0.15);
 
   const valueMap = applyTally({ attack, venom, logic, armor, resilience, humor }, styleTally);
-  const standName = pickStandName(valueMap);
 
   const top = STAT_KEYS.reduce((a, b) => (valueMap[b] > valueMap[a] ? b : a), STAT_KEYS[0]);
-  const summary = `根据 ${list.length} 条发言，你的替身在「${STAT_LABEL[top]}」上格外突出。${
+  const summary = `根据 ${list.length} 条发言，你的发言在「${STAT_LABEL[top]}」上格外突出。${
     valueMap.armor >= 60 ? "习惯先叠甲再开火，攻守兼备。" : "说话相对直接，火力全开。"
   }${valueMap.humor >= 60 ? "还时不时整点幽默，气氛担当。" : ""}`;
 
@@ -217,7 +179,6 @@ function heuristicProfile({ texts, styleTally }) {
   }
 
   return {
-    standName,
     summary,
     catchphrases: catchphrases.slice(0, 6),
     stats: buildStats(valueMap),
@@ -225,10 +186,8 @@ function heuristicProfile({ texts, styleTally }) {
   };
 }
 
-// ── OpenAI 分析 ───────────────────────────────────────────────────
+// ── AI 分析 ───────────────────────────────────────────────────────
 async function openAiProfile({ texts, styleTally }) {
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL || "gpt-5.2";
   const list = Array.isArray(texts) ? texts.filter((t) => String(t || "").trim()) : [];
 
   const sampleBlock = list
@@ -242,7 +201,7 @@ async function openAiProfile({ texts, styleTally }) {
       : "";
 
   const prompt = `
-你是一个"发言风格分析师"。下面是某个用户在社区里（情景模拟辩论、赏金发言、评论区）留下的发言样本。请像给 JOJO 替身做能力面板那样，分析这个人的说话风格。
+你是一个"发言风格分析师"。下面是某个用户在社区里（情景模拟辩论、赏金发言、评论区）留下的发言样本。请做一张能力面板，分析这个人的说话风格。
 
 请评估以下 6 项固定能力，每项打 0-100 分：
 - attack（攻击力：主动进攻、直接开怼的强度）
@@ -252,14 +211,13 @@ async function openAiProfile({ texts, styleTally }) {
 - resilience（抗压能力：面对反驳与冲突时的稳定与不破防）
 - humor（幽默感：玩梗、搞笑、活跃气氛的能力）
 
-再给这个人起一个中二的"替身名"（standName，用书名号包裹，如《白金之嘴》《黄金体验·杠精》），写一段 2-3 句的中文点评（summary），并提炼 3-6 条这个用户的口头禅/风格短语（catchphrases）。
+再写一段 2-3 句的中文点评（summary），并提炼 3-6 条这个用户的口头禅/风格短语（catchphrases）。
 
 发言样本（共 ${list.length} 条）：
 ${sampleBlock || "（暂无样本）"}${tallyBlock}
 
 只返回 STRICT JSON，形如：
 {
-  "standName": "《……》",
   "summary": "……",
   "catchphrases": ["……", "……", "……"],
   "stats": { "attack": 0, "venom": 0, "logic": 0, "armor": 0, "resilience": 0, "humor": 0 }
@@ -267,8 +225,7 @@ ${sampleBlock || "（暂无样本）"}${tallyBlock}
 所有文本用中文。不要输出 JSON 以外的任何内容。
 `;
 
-  const resp = await client.responses.create({ model, input: prompt });
-  const text = resp.output_text || "";
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
   const payload = parseJsonObject(text);
 
   if (!payload || !payload.stats || typeof payload.stats !== "object") {
@@ -278,11 +235,6 @@ ${sampleBlock || "（暂无样本）"}${tallyBlock}
 
   const valueMap = {};
   for (const key of STAT_KEYS) valueMap[key] = clamp100(payload.stats[key]);
-
-  const standName =
-    typeof payload.standName === "string" && payload.standName.trim()
-      ? payload.standName.trim().slice(0, 120)
-      : pickStandName(valueMap);
 
   const summary =
     typeof payload.summary === "string" && payload.summary.trim()
@@ -297,7 +249,6 @@ ${sampleBlock || "（暂无样本）"}${tallyBlock}
     : [];
 
   return {
-    standName,
     summary,
     catchphrases,
     stats: buildStats(valueMap),
@@ -307,7 +258,7 @@ ${sampleBlock || "（暂无样本）"}${tallyBlock}
 
 // ── 对外导出 ──────────────────────────────────────────────────────
 async function generateStyleProfile({ texts, styleTally } = {}) {
-  if (!hasKey()) {
+  if (!hasAiKey()) {
     return heuristicProfile({ texts, styleTally });
   }
   try {

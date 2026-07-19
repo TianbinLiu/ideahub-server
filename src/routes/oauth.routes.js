@@ -7,6 +7,7 @@ const { requireAuth } = require("../middleware/auth");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { signToken, signOauthState, verifyOauthState } = require("../utils/jwt");
+const { grantSignupBonus } = require("../services/points.service");
 
 function safeUsername(base) {
   return String(base || "user")
@@ -317,6 +318,11 @@ router.get(
           avatarUrl,
           emailVerified: true,
         });
+
+        // 注册赠送虚拟点数（唯一的印钱口）。★只在这一支【新建用户】里调用：
+        // 上面 findOne 命中的是既有用户（他们的余额走 backfillPoints 补），
+        // st.mode === "link" 那一支是给已有账号绑第三方登录，都不能再赠送一次。
+        await grantSignupBonus(user._id);
       }
 
       const token = signToken(user);
@@ -409,6 +415,9 @@ router.get(
           avatarUrl,
           emailVerified: !!email,
         });
+
+        // 注册赠送虚拟点数（唯一的印钱口）。★只在这一支【新建用户】里调用，理由同 google callback。
+        await grantSignupBonus(user._id);
       }
 
       const token = signToken(user);

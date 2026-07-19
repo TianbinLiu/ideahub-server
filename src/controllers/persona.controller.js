@@ -95,7 +95,6 @@ function toPersonaPayload(doc, ctx = {}) {
       : doc.author,
     name: doc.name,
     description: doc.description || "",
-    standName: doc.standName || "",
     coverEmoji: doc.coverEmoji || "🎭",
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     style: serializeStyle(doc.style),
@@ -163,7 +162,7 @@ async function listPersonas(req, res, next) {
 
     if (q) {
       items = items.filter((item) => {
-        const hay = `${item.name || ""} ${item.description || ""} ${item.standName || ""} ${(item.tags || []).join(" ")}`.toLowerCase();
+        const hay = `${item.name || ""} ${item.description || ""} ${(item.tags || []).join(" ")}`.toLowerCase();
         return hay.includes(q);
       });
     }
@@ -249,7 +248,6 @@ async function createPersona(req, res, next) {
       author: req.user._id,
       name: name.slice(0, 120),
       description: String(req.body.description || "").trim().slice(0, 1000),
-      standName: String(req.body.standName || "").trim().slice(0, 120),
       coverEmoji: normalizeEmoji(req.body.coverEmoji),
       tags: toTags(req.body.tags),
       style: normalizeStyle(req.body.style),
@@ -274,7 +272,6 @@ async function updatePersona(req, res, next) {
 
     if (req.body.name !== undefined) doc.name = String(req.body.name || "").trim().slice(0, 120);
     if (req.body.description !== undefined) doc.description = String(req.body.description || "").trim().slice(0, 1000);
-    if (req.body.standName !== undefined) doc.standName = String(req.body.standName || "").trim().slice(0, 120);
     if (req.body.coverEmoji !== undefined) doc.coverEmoji = normalizeEmoji(req.body.coverEmoji);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
