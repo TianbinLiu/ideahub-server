@@ -3,7 +3,7 @@ const Scenario = require("../models/Scenario");
 const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
-const { generateRolePlayReplies, generateSeedComments } = require("../services/scenarioAi.service");
+const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
@@ -632,6 +632,29 @@ async function generateScenario(req, res, next) {
   }
 }
 
+// 按已有内容（话题 + 评论）分析并产出展示信息（标题/简介/标签）。
+//
+// ★ 与 /generate 一样【不落库】：这里只读入参、回一段建议文本，是否采用由前端决定，
+// 用户在「创建情景」向导第三步点了才会写进表单，真正持久化仍走 create/update。
+// comments 只作为 AI 的【分析输入】，本函数不写回任何 model。
+async function analyzeScenario(req, res, next) {
+  try {
+    const topic = String(req.body.topic || "").trim();
+    const platform = normalizePlatform(req.body.platform);
+    const comments = Array.isArray(req.body.comments) ? req.body.comments : [];
+    const hasComment = comments.some(
+      (c) => String(c?.text || "").trim() || String(c?.authorName || "").trim()
+    );
+    if (!topic && !hasComment) badRequest("请先提供话题或评论内容再让 AI 分析");
+
+    // 无 AI key 时 generateScenarioMeta 内的 requireKey() 抛 501 → next(err)，与 /generate 一致。
+    const { title, summary, tags, model } = await generateScenarioMeta({ topic, comments, platform });
+    res.json({ ok: true, title, summary, tags: toTags(tags), model });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listScenarios,
   listMyScenarios,
@@ -644,4 +667,5 @@ module.exports = {
   playScenario,
   captureScenario,
   generateScenario,
+  analyzeScenario,
 };

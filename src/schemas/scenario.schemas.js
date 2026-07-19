@@ -75,4 +75,22 @@ const generateBody = z.object({
   count: z.number().int().min(4).max(20).optional().default(12),
 });
 
-module.exports = { createBody, updateBody, playBody, captureBody, generateBody };
+// AI 分析并自动填写展示信息：入参是【正在编辑中的】评论，可能字段残缺（authorName 为空、
+// 正文为空皆合法），故这里用【宽松】的评论形状，绝不能套 createBody 里 authorName.min(1) 的
+// 严格校验 —— 否则用户填了一半点「AI 自动填写」会因某条评论没填名字而整个请求 400。
+// zod 默认 strip 未知字段（id/parentId/likeCount 等），透传进来也会被安静丢掉，只留下分析要用的。
+const analyzeCommentSchema = z.object({
+  authorName: z.string().trim().max(80).optional().default(""),
+  text: z.string().max(2000).optional().default(""),
+  stance: z.string().trim().max(200).optional().default(""),
+  isOP: z.boolean().optional(),
+});
+
+// topic 与 comments 至少有其一（交由控制器判定并给中文提示，与 generateBody 同一取舍）。
+const analyzeBody = z.object({
+  topic: z.string().trim().max(2000).optional().default(""),
+  platform: z.string().trim().max(40).optional().default("generic"),
+  comments: z.array(analyzeCommentSchema).max(200).optional().default([]),
+});
+
+module.exports = { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody };
