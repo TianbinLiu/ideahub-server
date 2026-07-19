@@ -2,6 +2,7 @@
 
 const bcrypt = require("bcryptjs");
 const geoip = require("geoip-lite");
+const { isRealSmsConfigured } = require("../services/sms.service");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
@@ -317,12 +318,18 @@ function getAuthCapabilities(req, res) {
       ? forceOauth
       : oauthEnabledByRegion;
 
+  // 手机短信登录是否可用：仅当【真实短信通道已配置】(aliyun-pnvs + AK/SK + 签名/模板)。
+  // 不依赖 NODE_ENV —— 生产若没设 NODE_ENV，也绝不会因 dev provider 而误显示一个发不出码的死按钮。
+  // 本地联调想预览手机 UI 用前端 ?phone=1 覆盖，不走这里。
+  const phoneEnabled = isRealSmsConfigured();
+
   res.json({
     ok: true,
     region,
     country,
     emailPasswordEnabled: true,
     oauthEnabled: oauthEnabled && providers.length > 0,
+    phoneEnabled,
     providers,
     fallback: {
       forceOauth,

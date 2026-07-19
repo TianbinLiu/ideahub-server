@@ -58,6 +58,13 @@ const userSchema = new mongoose.Schema(
     // ✅ 以后你做“邮箱必须验证码验证后才能登录”会用到
     emailVerified: { type: Boolean, default: false },
 
+    // ✅ 手机号登录（短信验证码）。
+    // ★ sparse+unique：既有用户【没有】这个字段，sparse 索引会跳过它们、不参与唯一性冲突；
+    //   只有手机登录/绑定过的用户才写入。故【绝不能】给 default（默认 "" 会让所有老用户都拿到 ""
+    //   而互相冲突）——保持 undefined，sparse 才生效。存归一化后的 11 位大陆手机号。
+    phone: { type: String, unique: true, sparse: true, trim: true },
+    phoneVerified: { type: Boolean, default: false },
+
     // ✅ 账号注销（软删除）：只打时间戳标记，不删任何内容数据，可恢复。
     // null = 正常账号；有值 = 已注销，auth 中间件一律视为未授权。
     deactivatedAt: { type: Date, default: null },
