@@ -224,6 +224,59 @@ async function generateSeedComments({ topic, sourceText, platform = "generic", i
   return { comments: mapSeedComments(rawComments), model };
 }
 
+// ── 按内容分析并补全展示信息（标题/简介/标签）────────────────────
+// 供「创建情景」向导第三步的「AI 分析并自动填写」使用：读取话题 + 已生成/编辑的评论，
+// 提炼出一套用于作品展示的标题、简介、标签。与 generateSeedComments 一样，无 key 抛 501。
+
+function buildMetaPrompt({ topic, platformLabel, seedComments }) {
+  return `
+你在为一个"情景模拟"作品补全用于展示的信息。下面是这个模拟评论区的内容：
+
+平台：${platformLabel}
+${topic ? `争论主题：${String(topic).slice(0, 800)}\n` : ""}评论区发言：
+"""
+${seedComments || "（暂无评论）"}
+"""
+
+请通读以上内容，提炼这场讨论的核心，产出用于作品展示的信息：
+- title：一个能概括争论焦点、有吸引力的中文标题（不超过 30 字，不要带书名号或引号）。
+- summary：一句话中文简介，说明这场讨论在争什么、有哪些对立观点（不超过 80 字）。
+- tags：3~6 个中文关键词标签（每个不超过 8 字，不带 # 号），概括话题领域与争论点。
+
+只返回 STRICT JSON，形如：
+{ "title": string, "summary": string, "tags": [string] }
+不要输出 JSON 以外的任何内容。`;
+}
+
+async function generateScenarioMeta({ topic, comments, platform = "generic" }) {
+  requireKey();
+
+  const platformLabel = PLATFORM_LABEL[platform] || PLATFORM_LABEL.generic;
+  const seedComments = (Array.isArray(comments) ? comments : [])
+    .slice(0, 30)
+    .map((c) => {
+      const name = String(c?.authorName || "网友").trim();
+      const text = String(c?.text || "").trim().slice(0, 200);
+      if (!text) return "";
+      return `${c?.isOP ? "【楼主】" : ""}${name}：${text}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  const prompt = buildMetaPrompt({ topic: String(topic || "").trim(), platformLabel, seedComments });
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
+  const payload = parseJsonObject(text) || {};
+
+  const title = String(payload.title || "").trim().replace(/^[《「"'']+|[》」"'']+$/g, "").slice(0, 120);
+  const summary = String(payload.summary || "").trim().slice(0, 500);
+  const tags = (Array.isArray(payload.tags) ? payload.tags : [])
+    .map((x) => String(x || "").trim().replace(/^#+/, "").slice(0, 20))
+    .filter(Boolean)
+    .slice(0, 6);
+
+  return { title, summary, tags, model };
+}
+
 // ── AI 扮演账号与用户对线 ─────────────────────────────────────────
 
 function buildFallbackReplies(accountList, userMessage) {
@@ -309,4 +362,4 @@ ${String(userMessage?.text || "").slice(0, 600)}
   return { replies: finalReplies, model };
 }
 
-module.exports = { generateRolePlayReplies, generateSeedComments };
+module.exports = { generateRolePlayReplies, generateSeedComments, generateScenarioMeta };
