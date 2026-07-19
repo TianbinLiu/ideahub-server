@@ -2,6 +2,7 @@
 
 const bcrypt = require("bcryptjs");
 const geoip = require("geoip-lite");
+const { isRealSmsConfigured, smsProvider } = require("../services/sms.service");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
@@ -317,12 +318,17 @@ function getAuthCapabilities(req, res) {
       ? forceOauth
       : oauthEnabledByRegion;
 
+  // 手机短信登录是否可用：真实短信通道已配 → 可用（生产）；或本地 dev（非生产）便于联调。
+  // 生产 + dev provider（只打日志不真发）→ 不可用，前端据此隐藏「手机登录」入口，避免给出发不出码的死按钮。
+  const phoneEnabled = isRealSmsConfigured() || (smsProvider() === "dev" && process.env.NODE_ENV !== "production");
+
   res.json({
     ok: true,
     region,
     country,
     emailPasswordEnabled: true,
     oauthEnabled: oauthEnabled && providers.length > 0,
+    phoneEnabled,
     providers,
     fallback: {
       forceOauth,
