@@ -1,6 +1,7 @@
 //auth.controller.js
 
 const bcrypt = require("bcryptjs");
+const geoip = require("geoip-lite");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
@@ -25,23 +26,46 @@ function parseBooleanEnv(value) {
   return null;
 }
 
+// 国家码 → region：CN→CN，其它非空→GLOBAL，空/占位(XX/T1)→UNKNOWN。
+function regionFromCountry(rawCountry) {
+  const country = String(rawCountry || "").trim().toUpperCase();
+  if (!country || country === "XX" || country === "T1") {
+    return { country: "", region: "UNKNOWN" };
+  }
+  if (country === "CN") return { country, region: "CN" };
+  return { country, region: "GLOBAL" };
+}
+
+// 判定请求方所在地区（用于登录界面按地区切换：CN→微信/QQ 套，其它→Google/GitHub 套）。
+//
+// 两级来源，可信度从高到低：
+// 1) 可信边缘/CDN 注入的国家头（Cloudflare cf-ipcountry / Vercel / GAE）—— 经可信代理设置，最权威；
+//    生产在阿里云直连、暂无这类头时它们都为空，落到第 2 步。
+// 2) geoip-lite 按【客户端 IP】自查国家 —— app.js 已 trust proxy=1，故 req.ip 是 nginx
+//    X-Forwarded-For 里的真实客户端 IP。私网/本地/库中查不到的 IP → UNKNOWN。
+//
+// ⚠️ 该判定只驱动【展示哪套登录按钮】这类 UX，不是安全边界（两套 UI 最终走的是同一批鉴权后端，
+// 微信/QQ 目前还是占位）。故不必对 IP 伪造做强校验；真要做地区合规限制须在可信边缘层校验。
 function detectRegion(req) {
   const countryHeader =
     req.headers["cf-ipcountry"] ||
     req.headers["x-vercel-ip-country"] ||
     req.headers["x-country-code"] ||
     req.headers["x-appengine-country"];
-
-  const country = String(countryHeader || "").trim().toUpperCase();
-  if (!country || country === "XX" || country === "T1") {
-    return { country: "", region: "UNKNOWN" };
+  const headerCountry = String(countryHeader || "").trim().toUpperCase();
+  if (headerCountry && headerCountry !== "XX" && headerCountry !== "T1") {
+    return regionFromCountry(headerCountry);
   }
 
-  if (country === "CN") {
-    return { country, region: "CN" };
+  try {
+    // 去掉 IPv4-mapped IPv6 前缀（::ffff:1.2.3.4 → 1.2.3.4），否则 geoip 查不到。
+    const ip = String(req.ip || "").trim().replace(/^::ffff:/i, "");
+    const geo = ip ? geoip.lookup(ip) : null;
+    if (geo && geo.country) return regionFromCountry(geo.country);
+  } catch {
+    // geoip 查询异常绝不能影响登录能力探测，静默回退 UNKNOWN。
   }
-
-  return { country, region: "GLOBAL" };
+  return { country: "", region: "UNKNOWN" };
 }
 
 function getAvailableOauthProviders() {
