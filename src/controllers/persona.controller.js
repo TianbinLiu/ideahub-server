@@ -152,7 +152,14 @@ async function listPersonas(req, res, next) {
       filter = { author: req.user._id };
     } else if (scope === "installed") {
       const installs = await PersonaInstall.find({ user: req.user._id }).select("persona").lean();
-      filter = { _id: { $in: installs.map((x) => x.persona) } };
+      // 只列【仍可用】的收藏（公开的，或自己发布的）。作者取消分享后 install 记录还在，
+      // 但收藏者连详情都打不开（getPersona 对 !shared && !owner 是 403）——列表里留着
+      // 只会产出「点不开的卡」，而情景编辑器的人格选择器也走这个接口：选了一个
+      // play 时永远不生效（resolveParticipantPersonas 判不可用）的人格 = 绑定即死链。
+      filter = {
+        _id: { $in: installs.map((x) => x.persona) },
+        $or: [{ shared: true }, { author: req.user._id }],
+      };
     } else {
       filter = { shared: true };
     }
@@ -483,4 +490,7 @@ module.exports = {
   togglePersonaLike,
   getEquipped,
   equipPersona,
+  // 供情景模拟复用：chat 场景 play 时按 participants.personaId 实时算人设文本喂 AI
+  // （见 scenario.controller.js 的 resolveParticipantPersonas）。
+  computeStyleDescriptor,
 };

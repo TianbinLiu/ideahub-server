@@ -23,6 +23,9 @@ const participantSchema = z.object({
   role: z.string().trim().max(80).optional().default(""),
   isSelf: z.boolean().optional(),
   goal: z.string().trim().max(400).optional().default(""),
+  // 绑定的人格（引用语义，play 时实时解析）；非法 ObjectId 由控制器归一置空
+  personaId: z.string().trim().max(64).optional().default(""),
+  personaName: z.string().trim().max(120).optional().default(""),
 });
 const chatMessageSchema = z.object({
   id: z.string().trim().max(120).optional(),

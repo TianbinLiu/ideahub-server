@@ -403,8 +403,14 @@ async function generateChatReplies({ scenario, history = [], userMessage }) {
   const participants = (Array.isArray(scenario?.participants) ? scenario.participants : []).slice(0, 5);
   const self = participants.find((p) => p.isSelf);
   const others = participants.filter((p) => !p.isSelf);
+  // personaStyle 由 scenario.controller 的 resolveParticipantPersonas 在 play 前注入：
+  // 绑定了人格广场人格的角色，说话要贴那个人格（风格/口头禅/倾向），goal 仍是本情景里的目标。
   const roster = participants
-    .map((p) => `- ${p.name}${p.isSelf ? "（＝用户本人）" : ""}（${p.role || "参与者"}）目标：${p.goal || "（即兴）"}`)
+    .map((p) => {
+      const base = `- ${p.name}${p.isSelf ? "（＝用户本人）" : ""}（${p.role || "参与者"}）目标：${p.goal || "（即兴）"}`;
+      const style = String(p.personaStyle || "").trim();
+      return style ? `${base}\n  人设（说话风格，必须贴合）：${style.slice(0, 400)}` : base;
+    })
     .join("\n");
 
   const seed = (Array.isArray(scenario?.messages) ? scenario.messages : [])
@@ -441,6 +447,7 @@ ${String(userMessage?.text || "").slice(0, 600)}
 要求：
 - 以最合适的【非用户本人】角色身份回复 1~2 条（通常就是对话对象本人；群聊里可 1~2 个不同角色接话）。
 - 严格贴合该角色的身份/关系/目标与既有语气，连贯人设，像真人在${platformLabel}里聊天：口语、简短、自然，情绪随情境（施压/劝说/敷衍/热络都行，不必然对抗）。
+- 带「人设」的角色必须按其人设的风格/口头禅/倾向说话（口头禅自然穿插，不要每句都堆）。
 - authorName 必须是上面参与者里【非本人】的某个 name。中文输出。
 
 只返回 STRICT JSON：{ "replies": [ { "authorName": string, "text": string } ] }
