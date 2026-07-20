@@ -3,6 +3,8 @@ const Scenario = require("../models/Scenario");
 const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
+const Persona = require("../models/Persona");
+const { computeStyleDescriptor } = require("./persona.controller");
 const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
@@ -178,6 +180,11 @@ function normalizeParticipants(raw) {
     // avatar 允许 emoji（短文本）或安全 http(s) url；其它一律截断防注入。
     const rawAvatar = String(p?.avatar || "").trim();
     const avatar = /^https?:\/\//i.test(rawAvatar) ? normalizeSafeUrl(rawAvatar) : rawAvatar.slice(0, 40);
+    // 绑定的人格：personaId 必须是合法 ObjectId，否则连同名字快照一起置空
+    // （防止把任意字符串塞进引用字段；快照名跟着清，避免「幽灵人格」chip）。
+    const personaId = mongoose.isValidObjectId(String(p?.personaId || "").trim())
+      ? String(p.personaId).trim()
+      : "";
     return {
       id,
       name: String(p?.name || "").trim().slice(0, 80),
@@ -185,6 +192,8 @@ function normalizeParticipants(raw) {
       role: String(p?.role || "").trim().slice(0, 80),
       isSelf: Boolean(p?.isSelf),
       goal: String(p?.goal || "").trim().slice(0, 400),
+      personaId,
+      personaName: personaId ? String(p?.personaName || "").trim().slice(0, 120) : "",
     };
   });
 }
@@ -211,6 +220,8 @@ function serializeParticipant(p) {
     role: p?.role || "",
     isSelf: !!p?.isSelf,
     goal: p?.goal || "",
+    personaId: p?.personaId || "",
+    personaName: p?.personaName || "",
   };
 }
 
@@ -567,14 +578,59 @@ async function toggleScenarioBookmark(req, res, next) {
   }
 }
 
+/**
+ * chat 场景 play 前：按 participants.personaId 实时解析绑定的人格，把最新
+ * styleDescriptor 注入 participant.personaStyle（只进 AI prompt，不落库、不出接口）。
+ *
+ * 【引用语义】（产品决策）：人格作者更新风格 → 所有绑定它的情景全网生效；
+ * 人格被删 / 取消分享 → 静默回退到角色卡自身的 goal（不报错、不挡 play）。
+ * 可用性判定：persona.shared，或人格作者就是【情景作者】—— 情景作者当初有权
+ * 选它（含自己的私有人格）；play 的是谁无关紧要，人设是情景的一部分。
+ */
+async function resolveParticipantPersonas(scenario) {
+  if (scenario.sceneKind !== "chat") return scenario;
+  const participants = Array.isArray(scenario.participants) ? scenario.participants : [];
+  // isSelf 的角色不解析：「我」由真实用户发言，人设对它无意义 —— 且编辑器把绑定
+  // 控件藏在 !isSelf 后面，若这里不挡，老数据/直连 API 塞进来的 self 绑定会
+  // 隐身进 AI prompt（评审实锤）。与 client 的 setSelfParticipant 清绑定互为双保险。
+  const ids = [...new Set(
+    participants
+      .filter((p) => !p?.isSelf)
+      .map((p) => String(p?.personaId || ""))
+      .filter((v) => mongoose.isValidObjectId(v))
+  )];
+  if (!ids.length) return scenario;
+
+  const personas = await Persona.find({ _id: { $in: ids } })
+    .select("name style shared author")
+    .lean();
+  const byId = new Map(personas.map((p) => [String(p._id), p]));
+  const scenarioAuthor = String(scenario.author?._id || scenario.author);
+
+  return {
+    ...scenario,
+    participants: participants.map((p) => {
+      if (p?.isSelf) return p;
+      const persona = p?.personaId ? byId.get(String(p.personaId)) : null;
+      const usable = persona && (persona.shared || String(persona.author) === scenarioAuthor);
+      return usable
+        ? { ...p, personaStyle: computeStyleDescriptor(persona.name, persona.style) }
+        : p;
+    }),
+  };
+}
+
 async function playScenario(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid scenario id");
 
-    const scenario = await Scenario.findById(id).lean();
+    let scenario = await Scenario.findById(id).lean();
     if (!scenario) notFound("Scenario not found");
     if (!scenario.shared && String(scenario.author) !== String(req.user._id)) forbidden("Forbidden");
+
+    // chat 场景：把绑定人格的最新风格注入 AI 上下文（人格不可用则静默回退 goal）
+    scenario = await resolveParticipantPersonas(scenario);
 
     const history = Array.isArray(req.body.history) ? req.body.history : [];
     const userMessage = req.body.userMessage || {};

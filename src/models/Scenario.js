@@ -70,6 +70,11 @@ const scenarioParticipantSchema = new mongoose.Schema(
     role: { type: String, default: "", trim: true, maxlength: 80 },       // 身份/关系：上司/HR/同事/我
     isSelf: { type: Boolean, default: false },                            // 是否代表「用户本人」（chat 我方气泡）
     goal: { type: String, default: "", trim: true, maxlength: 400 },      // 该角色目标/立场（供 AI 扮演）
+    // 绑定的「人格」（Persona 广场里的可分享人格）。【引用语义】：只存 id，play 时实时取
+    // 最新 styleDescriptor 喂 AI —— 人格作者更新风格会全网生效；人格被删/取消分享则回退到 goal。
+    // personaName 是绑定时的名字快照，仅供编辑器/详情展示（人格不可用时也有东西可显示）。
+    personaId: { type: String, default: "", trim: true },
+    personaName: { type: String, default: "", trim: true, maxlength: 120 },
   },
   { _id: false }
 );
