@@ -18,6 +18,7 @@ const {
   createPersona,
   updatePersona,
   removePersona,
+  purchasePersona,
   installPersona,
   uninstallPersona,
   togglePersonaLike,
@@ -40,6 +41,7 @@ router.post("/", requireAuth, validate({ body: createBody }), createPersona);
 router.get("/:id", optionalAuth, getPersona);
 router.put("/:id", requireAuth, validate({ body: updateBody }), updatePersona);
 router.delete("/:id", requireAuth, removePersona);
+router.post("/:id/purchase", requireAuth, purchasePersona);
 router.post("/:id/install", requireAuth, installPersona);
 router.delete("/:id/install", requireAuth, uninstallPersona);
 router.post("/:id/like", requireAuth, togglePersonaLike);
