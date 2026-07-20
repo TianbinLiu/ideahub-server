@@ -4,6 +4,7 @@ const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
 const Persona = require("../models/Persona");
+const PersonaInstall = require("../models/PersonaInstall");
 const { computeStyleDescriptor } = require("./persona.controller");
 const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
@@ -419,10 +420,58 @@ async function getScenarioDetail(req, res, next) {
     res.json({
       ok: true,
       scenario: toScenarioPayload(refreshed, { liked: !!liked, bookmarked: !!bookmarked, isOwner: !!isOwner }),
+      // chat 情景：角色绑定的人格卡片（供详情页展示 + 收藏）。可见性同 getPersona：
+      // 公开的对所有人可见；未公开的只有人格作者本人可见（标「未公开」，他人不可收藏）。
+      personas: await buildScenarioPersonaCards(refreshed, req.user),
     });
   } catch (err) {
     next(err);
   }
+}
+
+/**
+ * 情景详情页的「本情景中的人格」卡片：按 participants.personaId 汇总（去重），
+ * 只返回观看者可见的（shared，或自己发布的），并带 installed（观看者是否已收藏）、
+ * roles（哪些角色在用它 —— 一人格可绑多个角色）。返回 [] 表示无可展示人格。
+ */
+async function buildScenarioPersonaCards(scenario, user) {
+  if (scenario.sceneKind !== "chat") return [];
+  const participants = Array.isArray(scenario.participants) ? scenario.participants : [];
+  const bound = participants.filter((p) => !p.isSelf && p.personaId && mongoose.isValidObjectId(String(p.personaId)));
+  if (!bound.length) return [];
+
+  const ids = [...new Set(bound.map((p) => String(p.personaId)))];
+  const personas = await Persona.find({ _id: { $in: ids } })
+    .populate("author", "_id username")
+    .lean();
+
+  const installedSet = new Set();
+  if (user && personas.length) {
+    const installs = await PersonaInstall.find({
+      user: user._id,
+      persona: { $in: personas.map((p) => p._id) },
+    }).select("persona").lean();
+    installs.forEach((x) => installedSet.add(String(x.persona)));
+  }
+
+  return personas
+    .filter((p) => p.shared || (user && String(p.author?._id || p.author) === String(user._id)))
+    .map((p) => ({
+      _id: p._id,
+      name: p.name,
+      coverEmoji: p.coverEmoji || "🎭",
+      description: p.description || "",
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      shared: !!p.shared,
+      authorName: (p.author && p.author.username) || "",
+      installed: installedSet.has(String(p._id)),
+      isOwner: !!user && String(p.author?._id || p.author) === String(user._id),
+      stats: {
+        downloadCount: Number(p?.stats?.downloadCount || 0),
+        likeCount: Number(p?.stats?.likeCount || 0),
+      },
+      roles: bound.filter((b) => String(b.personaId) === String(p._id)).map((b) => b.name).filter(Boolean),
+    }));
 }
 
 async function createScenario(req, res, next) {
