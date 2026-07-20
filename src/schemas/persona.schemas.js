@@ -29,6 +29,13 @@ const createBody = z.object({
   shared: z.boolean().optional().default(false),
 });
 
+// 从聊天文本生成人格草稿（情景编辑器「✨从聊天记录生成」）。
+// chatText 下限 20：太短提炼不出风格，直接在校验层挡掉，省一次 AI 调用。
+const generateBody = z.object({
+  chatText: z.string().trim().min(20).max(20000),
+  hint: z.string().trim().max(200).optional().default(""),
+});
+
 const updateBody = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(1000).optional(),
@@ -42,4 +49,4 @@ const equipBody = z.object({
   personaId: z.string().trim().max(120).nullable().optional().default(null),
 });
 
-module.exports = { createBody, updateBody, equipBody, styleBody };
+module.exports = { createBody, updateBody, equipBody, styleBody, generateBody };

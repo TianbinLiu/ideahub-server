@@ -6,6 +6,7 @@ const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
+const { generatePersonaFromChat } = require("../services/personaAi.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
 function isValidId(id) {
@@ -40,8 +41,10 @@ function normalizeStyle(raw) {
   const style = raw && typeof raw === "object" ? raw : {};
   return {
     summary: String(style.summary || "").trim().slice(0, 2000),
+    // 每条 slice(0,120) 与 schemas 的 styleBody max(120) 对齐（zod 拒绝不截断；
+    // generate 草稿走这里归一后必须是合法的 create 入参，否则「创建并绑定」会 400）
     catchphrases: Array.isArray(style.catchphrases)
-      ? style.catchphrases.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 50)
+      ? style.catchphrases.map((x) => String(x || "").trim().slice(0, 120)).filter(Boolean).slice(0, 50)
       : [],
     stats: Array.isArray(style.stats)
       ? style.stats.slice(0, 30).map((s) => ({
@@ -240,6 +243,31 @@ async function getPersona(req, res, next) {
     res.json({
       ok: true,
       persona: toPersonaPayload(refreshed, { installed, liked, equipped, isOwner }),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/personas/generate —— 从聊天文本提炼人格【草稿】（不落库）。
+// 客户端预览草稿后走既有 POST /api/personas 创建（shared 由用户在预览时勾选），
+// 用户取消不会留孤儿人格。归一复用 create 同款 helper，保证草稿即创建合法入参。
+async function generatePersona(req, res, next) {
+  try {
+    const draft = await generatePersonaFromChat({
+      chatText: req.body.chatText,
+      hint: req.body.hint,
+    });
+    res.json({
+      ok: true,
+      draft: {
+        name: draft.name,
+        description: draft.description,
+        coverEmoji: normalizeEmoji(draft.coverEmoji),
+        tags: toTags(draft.tags),
+        style: normalizeStyle(draft.style),
+      },
+      model: draft.model,
     });
   } catch (err) {
     next(err);
@@ -482,6 +510,7 @@ async function equipPersona(req, res, next) {
 module.exports = {
   listPersonas,
   getPersona,
+  generatePersona,
   createPersona,
   updatePersona,
   removePersona,
