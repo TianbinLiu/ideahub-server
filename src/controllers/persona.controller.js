@@ -111,6 +111,9 @@ function toPersonaPayload(doc, ctx = {}) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     style: serializeStyle(doc.style),
     styleDescriptor: computeStyleDescriptor(doc.name, doc.style),
+    // shared 一直漏序列化（client Persona 类型早已声明）：编辑器回填 setShared(!!p.shared)
+    // 拿到 undefined → 勾选框永远显示未勾选 → 用户编辑公开人格随手保存就把它静默改私有。
+    shared: !!doc.shared,
     price: Number(doc.price || 0),
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
