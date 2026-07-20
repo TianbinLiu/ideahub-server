@@ -117,4 +117,12 @@ const analyzeBody = z.object({
   comments: z.array(analyzeCommentSchema).max(200).optional().default([]),
 });
 
-module.exports = { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody };
+// 生成聊天/IM 场景：按"场景描述"产出角色+对话（不落库）。
+const generateSceneBody = z.object({
+  sceneDesc: z.string().trim().max(1000).optional().default(""),
+  platform: z.string().trim().max(40).optional().default("wechat"),
+  category: z.string().trim().max(40).optional().default("workplace"),
+  count: z.number().int().min(4).max(30).optional().default(8),
+});
+
+module.exports = { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody, generateSceneBody };

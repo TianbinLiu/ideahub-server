@@ -39,6 +39,20 @@ const PLATFORM_LABEL = {
   douyin: "抖音短视频评论区",
   xiaohongshu: "小红书笔记评论区",
   generic: "通用社交平台评论区",
+  // 聊天/IM 平台（chat 场景）
+  wechat: "微信聊天",
+  qq: "QQ 聊天",
+};
+
+// category → 自然语言（喂 generateScene 的 prompt）
+const CATEGORY_LABEL = {
+  debate: "争论辩论",
+  workplace: "职场办公",
+  jobhunt: "求职应聘",
+  social: "社交情感",
+  service: "客服商家",
+  fun: "娱乐整活",
+  other: "其它",
 };
 
 const INTENSITY_LABEL = {
@@ -277,6 +291,185 @@ async function generateScenarioMeta({ topic, comments, platform = "generic" }) {
   return { title, summary, tags, model };
 }
 
+// ── 聊天/IM 场景：按"场景要求"生成一段可演练的对话（角色卡司 + 种子对话）────────
+// 与 generateSeedComments 同源思路：一段 prompt 让 AI 产出结构化 JSON，再 map 成模型形状。
+
+function sceneJsonShapeSpec(n) {
+  return `
+- participants：2~5 个参与者。其中【恰好一个】isSelf=true 代表"用户本人"（对话里的我方），其余是 AI 将扮演的角色。
+  每个给：name（该平台风格的中文名/昵称）、role（身份与关系，如"直属上司"/"HR"/"同组同事"/"用户本人"）、
+  goal（一句话说明该角色在这段对话里的目标/态度，供 AI 扮演）、avatar（一个贴切的 emoji）。
+- messages：${n} 条按时间先后的对话消息，形成一段有张力、贴近真实的对话；speaker 必须是上面某个 participant 的 name。
+  开场通常由非本人角色发起，中文口语化、符合该平台与该关系的语气。
+
+只返回 STRICT JSON，形如：
+{
+  "title": string,
+  "participants": [ { "name": string, "role": string, "isSelf": boolean, "goal": string, "avatar": string } ],
+  "messages": [ { "speaker": string, "text": string } ]
+}
+不要输出 JSON 以外的任何内容。`;
+}
+
+function buildScenePrompt({ sceneDesc, platformLabel, categoryLabel, n }) {
+  return `
+你在为一个"情景模拟"功能生成一段仿真的【${platformLabel}】对话场景。
+场景分类：${categoryLabel}
+场景要求/背景：${String(sceneDesc || "").slice(0, 1000)}
+
+据此生成一个可直接演练的对话场景：一小组固定参与者 + 一段种子对话。
+要求：${sceneJsonShapeSpec(n)}
+补充：
+- 让"用户本人（isSelf）"处在需要应对的一方（如被上司谈话、被 HR 面试），给后续用户接话留出空间。
+- 角色关系与 goal 要具体（是"因你提离职来挽留兼施压的直属上司"，不是泛泛的"一个上司"）。
+`;
+}
+
+function buildFallbackScene(sceneDesc) {
+  const d = String(sceneDesc || "这个场景").replace(/\s+/g, " ").trim().slice(0, 40) || "这个场景";
+  return {
+    title: `模拟：${d}`,
+    participants: [
+      { id: "sp_1", name: "我", avatar: "🙂", role: "用户本人", isSelf: true, goal: "" },
+      { id: "sp_2", name: "对方", avatar: "💬", role: "对话对象", isSelf: false, goal: `围绕「${d}」与用户对话` },
+    ],
+    messages: [{ id: "sm_1", senderId: "sp_2", text: `我们聊聊「${d}」吧。` }],
+  };
+}
+
+function mapScene(payload) {
+  const rawParts = Array.isArray(payload?.participants) ? payload.participants.slice(0, 5) : [];
+  const participants = rawParts.map((p, i) => ({
+    id: `sp_${i + 1}`,
+    name: String(p?.name || `角色${i + 1}`).trim().slice(0, 80) || `角色${i + 1}`,
+    avatar: String(p?.avatar || "").trim().slice(0, 40),
+    role: String(p?.role || "").trim().slice(0, 80),
+    isSelf: Boolean(p?.isSelf),
+    goal: String(p?.goal || "").trim().slice(0, 400),
+  }));
+
+  // 恰好一个 isSelf：多个/零个都修正（优先名字/角色含"我/本人/自己"的，否则第一个）。
+  let selfIdx = participants.findIndex((p) => p.isSelf);
+  if (selfIdx === -1) {
+    selfIdx = participants.findIndex((p) => /我|本人|自己|self/i.test(`${p.name}${p.role}`));
+    if (selfIdx === -1) selfIdx = 0;
+  }
+  participants.forEach((p, i) => { p.isSelf = i === selfIdx; });
+
+  const byName = new Map();
+  for (const p of participants) if (!byName.has(p.name)) byName.set(p.name, p.id);
+  const selfId = participants[selfIdx]?.id || participants[0]?.id || "";
+  const firstOtherId = participants.find((p) => !p.isSelf)?.id || participants[0]?.id || "";
+
+  const rawMsgs = Array.isArray(payload?.messages) ? payload.messages.slice(0, 60) : [];
+  const messages = rawMsgs
+    .map((m, i) => {
+      const speaker = String(m?.speaker || "").trim();
+      let senderId = byName.get(speaker) || "";
+      if (!senderId) senderId = /我|本人|自己|self/i.test(speaker) ? selfId : firstOtherId;
+      return { id: `sm_${i + 1}`, senderId, text: String(m?.text || "").trim().slice(0, 2000) };
+    })
+    .filter((m) => m.text);
+
+  const title = String(payload?.title || "").trim().replace(/^[《「"'']+|[》」"'']+$/g, "").slice(0, 120);
+  return { title, participants, messages };
+}
+
+async function generateScene({ sceneDesc, platform = "wechat", category = "workplace", count = 8 }) {
+  requireKey();
+  const n = clampInt(count, 8, 4, 30);
+  const platformLabel = PLATFORM_LABEL[platform] || "聊天";
+  const categoryLabel = CATEGORY_LABEL[category] || "其它";
+
+  const prompt = buildScenePrompt({ sceneDesc, platformLabel, categoryLabel, n });
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
+  const payload = parseJsonObject(text);
+
+  if (!payload || !Array.isArray(payload.participants) || !payload.participants.length) {
+    return { ...buildFallbackScene(sceneDesc), model };
+  }
+  const scene = mapScene(payload);
+  if (scene.participants.length < 2 || scene.messages.length === 0) {
+    return { ...buildFallbackScene(sceneDesc), model };
+  }
+  return { ...scene, model };
+}
+
+// ── 聊天场景的"扮演"：以固定角色继续与用户对话（非"多派对线"）─────────────────
+
+async function generateChatReplies({ scenario, history = [], userMessage }) {
+  requireKey();
+
+  const participants = (Array.isArray(scenario?.participants) ? scenario.participants : []).slice(0, 5);
+  const self = participants.find((p) => p.isSelf);
+  const others = participants.filter((p) => !p.isSelf);
+  const roster = participants
+    .map((p) => `- ${p.name}${p.isSelf ? "（＝用户本人）" : ""}（${p.role || "参与者"}）目标：${p.goal || "（即兴）"}`)
+    .join("\n");
+
+  const seed = (Array.isArray(scenario?.messages) ? scenario.messages : [])
+    .slice(0, 40)
+    .map((m) => {
+      const p = participants.find((x) => x.id === m.senderId);
+      return `${p ? p.name : "某人"}：${String(m?.text || "").slice(0, 300)}`;
+    })
+    .join("\n");
+
+  const convo = (Array.isArray(history) ? history : [])
+    .slice(-14)
+    .map((h) => `${h?.authorName || (h?.role === "user" ? self?.name || "我" : "对方")}：${String(h?.text || "").slice(0, 300)}`)
+    .join("\n");
+
+  const platformLabel = PLATFORM_LABEL[scenario?.platform] || "聊天";
+
+  const prompt = `
+你在一个"情景模拟"的【${platformLabel}】里，扮演【除用户本人之外】的角色，与真实用户继续对话。
+场景背景：${String(scenario?.topic || scenario?.title || "").slice(0, 400)}
+
+参与者及目标：
+${roster || "（无）"}
+
+种子对话：
+${seed || "（无）"}
+
+最近对话：
+${convo || "（无）"}
+
+真实用户（＝${self?.name || "我"}）刚发：
+${String(userMessage?.text || "").slice(0, 600)}
+
+要求：
+- 以最合适的【非用户本人】角色身份回复 1~2 条（通常就是对话对象本人；群聊里可 1~2 个不同角色接话）。
+- 严格贴合该角色的身份/关系/目标与既有语气，连贯人设，像真人在${platformLabel}里聊天：口语、简短、自然，情绪随情境（施压/劝说/敷衍/热络都行，不必然对抗）。
+- authorName 必须是上面参与者里【非本人】的某个 name。中文输出。
+
+只返回 STRICT JSON：{ "replies": [ { "authorName": string, "text": string } ] }
+不要输出 JSON 以外的任何内容。
+`;
+
+  const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
+  const payload = parseJsonObject(text);
+  const avatarByName = new Map(participants.map((p) => [p.name, p.avatar || ""]));
+
+  const fallbackOther = others[0] || { name: "对方", avatar: "💬", role: "对话对象" };
+  const rawReplies = payload && Array.isArray(payload.replies) && payload.replies.length
+    ? payload.replies
+    : [{ authorName: fallbackOther.name, text: "嗯……你说的我知道了。" }];
+
+  const replies = rawReplies
+    .slice(0, 2)
+    .map((r) => {
+      const name = String(r?.authorName || "").trim().slice(0, 80) || fallbackOther.name;
+      return { authorName: name, authorAvatar: avatarByName.get(name) || "", text: String(r?.text || "").trim().slice(0, 2000) };
+    })
+    .filter((r) => r.text);
+
+  const finalReplies = replies.length
+    ? replies
+    : [{ authorName: fallbackOther.name, authorAvatar: fallbackOther.avatar || "", text: "嗯。" }];
+  return { replies: finalReplies, model };
+}
+
 // ── AI 扮演账号与用户对线 ─────────────────────────────────────────
 
 function buildFallbackReplies(accountList, userMessage) {
@@ -292,6 +485,10 @@ function buildFallbackReplies(accountList, userMessage) {
 }
 
 async function generateRolePlayReplies({ scenario, history = [], userMessage }) {
+  // chat 场景 → 扮演固定角色继续对话（施压/劝说/敷衍…），不是评论区多派对线。
+  if (scenario?.sceneKind === "chat") {
+    return generateChatReplies({ scenario, history, userMessage });
+  }
   requireKey();
 
   const accountList = dedupeAccounts(scenario?.comments).slice(0, 20);
@@ -362,4 +559,4 @@ ${String(userMessage?.text || "").slice(0, 600)}
   return { replies: finalReplies, model };
 }
 
-module.exports = { generateRolePlayReplies, generateSeedComments, generateScenarioMeta };
+module.exports = { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene };

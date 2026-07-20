@@ -3,7 +3,7 @@ const Scenario = require("../models/Scenario");
 const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
-const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta } = require("../services/scenarioAi.service");
+const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
@@ -716,6 +716,34 @@ async function generateScenario(req, res, next) {
   }
 }
 
+// 生成【聊天/IM 场景】：按用户的"场景描述"产出 参与者花名册 + 种子对话。不落库（同 /generate，
+// 采用与否由前端定，用户在向导里编辑后才随 create 持久化）。返回的 participants/messages 已归一。
+async function generateSceneController(req, res, next) {
+  try {
+    const sceneDesc = String(req.body.sceneDesc || "").trim();
+    if (!sceneDesc) badRequest("请先描述你想模拟的场景");
+
+    const platform = normalizePlatform(req.body.platform || "wechat");
+    const category = normalizeCategory(req.body.category);
+    const count = clampInt(req.body.count, 8, 4, 30);
+
+    const { title, participants, messages, model } = await generateScene({ sceneDesc, platform, category, count });
+    // 复用 create 的归一（分配/校验 id、悬空 senderId 置空），保证前端拿到的形状与落库一致。
+    const normParticipants = normalizeParticipants(participants);
+    const pIds = new Set(normParticipants.map((p) => p.id));
+    res.json({
+      ok: true,
+      title,
+      sceneKind: "chat",
+      participants: normParticipants,
+      messages: normalizeChatMessages(messages, pIds),
+      model,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // 按已有内容（话题 + 评论）分析并产出展示信息（标题/简介/标签）。
 //
 // ★ 与 /generate 一样【不落库】：这里只读入参、回一段建议文本，是否采用由前端决定，
@@ -751,5 +779,6 @@ module.exports = {
   playScenario,
   captureScenario,
   generateScenario,
+  generateSceneController,
   analyzeScenario,
 };
