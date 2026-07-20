@@ -5,7 +5,7 @@
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody } = require("../schemas/scenario.schemas");
+const { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody, generateSceneBody } = require("../schemas/scenario.schemas");
 const { createBody: commentCreateBody } = require("../schemas/arenaComment.schemas");
 const { makeCommentHandlers } = require("../controllers/arenaComment.controller");
 const Scenario = require("../models/Scenario");
@@ -21,6 +21,7 @@ const {
   playScenario,
   captureScenario,
   generateScenario,
+  generateSceneController,
   analyzeScenario,
 } = require("../controllers/scenario.controller");
 
@@ -34,6 +35,7 @@ router.get("/mine", requireAuth, listMyScenarios);
 router.post("/", requireAuth, validate({ body: createBody }), createScenario);
 router.post("/capture", requireAuth, validate({ body: captureBody }), captureScenario);
 router.post("/generate", requireAuth, validate({ body: generateBody }), generateScenario);
+router.post("/generate-scene", requireAuth, validate({ body: generateSceneBody }), generateSceneController);
 router.post("/analyze", requireAuth, validate({ body: analyzeBody }), analyzeScenario);
 router.get("/:id", optionalAuth, getScenarioDetail);
 router.put("/:id", requireAuth, validate({ body: updateBody }), updateScenario);

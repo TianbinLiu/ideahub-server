@@ -3,13 +3,15 @@ const Scenario = require("../models/Scenario");
 const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
-const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta } = require("../services/scenarioAi.service");
+const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
 // 从 model 取，别在这里再抄一份 —— 两处各写一份数组正是「插件认得 douyin、
 // 后端却把它降级成 generic」这类漂移的来源。
 const PLATFORMS = Scenario.SCENARIO_PLATFORMS;
+const SCENE_KINDS = Scenario.SCENARIO_SCENE_KINDS;
+const CATEGORIES = Scenario.SCENARIO_CATEGORIES;
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -154,6 +156,68 @@ function serializeComment(c) {
   };
 }
 
+// ── 场景类型 / 分类 / 参与者 / 聊天消息（chat 场景）的归一与序列化 ──────────────
+
+function normalizeSceneKind(input) {
+  const v = String(input || "").trim().toLowerCase();
+  return SCENE_KINDS.includes(v) ? v : "comment";
+}
+
+function normalizeCategory(input) {
+  const v = String(input || "").trim().toLowerCase();
+  return CATEGORIES.includes(v) ? v : "other";
+}
+
+function normalizeParticipants(raw) {
+  if (!Array.isArray(raw)) return [];
+  const used = new Set();
+  return raw.slice(0, 30).map((p) => {
+    let id = String(p?.id || "").trim().slice(0, 120);
+    if (!id || used.has(id)) id = genId();
+    used.add(id);
+    // avatar 允许 emoji（短文本）或安全 http(s) url；其它一律截断防注入。
+    const rawAvatar = String(p?.avatar || "").trim();
+    const avatar = /^https?:\/\//i.test(rawAvatar) ? normalizeSafeUrl(rawAvatar) : rawAvatar.slice(0, 40);
+    return {
+      id,
+      name: String(p?.name || "").trim().slice(0, 80),
+      avatar,
+      role: String(p?.role || "").trim().slice(0, 80),
+      isSelf: Boolean(p?.isSelf),
+      goal: String(p?.goal || "").trim().slice(0, 400),
+    };
+  });
+}
+
+function normalizeChatMessages(raw, participantIds) {
+  if (!Array.isArray(raw)) return [];
+  const used = new Set();
+  const idSet = participantIds instanceof Set ? participantIds : new Set(participantIds || []);
+  return raw.slice(0, 300).map((m) => {
+    let id = String(m?.id || "").trim().slice(0, 120);
+    if (!id || used.has(id)) id = genId();
+    used.add(id);
+    let senderId = String(m?.senderId || "").trim().slice(0, 120);
+    if (senderId && idSet.size && !idSet.has(senderId)) senderId = ""; // 悬空发送者置空
+    return { id, senderId, text: String(m?.text || "").trim().slice(0, 2000) };
+  });
+}
+
+function serializeParticipant(p) {
+  return {
+    id: p?.id,
+    name: p?.name || "",
+    avatar: p?.avatar || "",
+    role: p?.role || "",
+    isSelf: !!p?.isSelf,
+    goal: p?.goal || "",
+  };
+}
+
+function serializeChatMessage(m) {
+  return { id: m?.id, senderId: m?.senderId || "", text: m?.text || "" };
+}
+
 function toScenarioPayload(doc, ctx = {}) {
   if (!doc) return null;
   return {
@@ -169,7 +233,11 @@ function toScenarioPayload(doc, ctx = {}) {
     shared: !!doc.shared,
     sourceUrl: doc.sourceUrl || "",
     topic: doc.topic || "",
+    sceneKind: doc.sceneKind || "comment",
+    category: doc.category || "other",
     comments: Array.isArray(doc.comments) ? doc.comments.map(serializeComment) : [],
+    participants: Array.isArray(doc.participants) ? doc.participants.map(serializeParticipant) : [],
+    messages: Array.isArray(doc.messages) ? doc.messages.map(serializeChatMessage) : [],
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
       likeCount: Number(doc?.stats?.likeCount || 0),
@@ -187,7 +255,8 @@ function toScenarioPayload(doc, ctx = {}) {
 function toScenarioCard(doc, ctx = {}) {
   const payload = toScenarioPayload(doc, ctx);
   if (!payload) return null;
-  const { comments, ...card } = payload;
+  // 列表卡去掉重的正文数组（comments/participants/messages），但保留轻量的 sceneKind/category 供广场按分类浏览。
+  const { comments, participants, messages, ...card } = payload;
   return card;
 }
 
@@ -350,17 +419,24 @@ async function createScenario(req, res, next) {
     const title = String(req.body.title || "").trim();
     if (!title) badRequest("Title is required");
 
+    const participants = normalizeParticipants(req.body.participants);
+    const participantIds = new Set(participants.map((p) => p.id));
+
     const doc = await Scenario.create({
       author: req.user._id,
       title: title.slice(0, 120),
       summary: String(req.body.summary || "").trim().slice(0, 500),
       coverImageUrl: normalizeSafeUrl(req.body.coverImageUrl),
       platform: normalizePlatform(req.body.platform),
+      sceneKind: normalizeSceneKind(req.body.sceneKind),
+      category: normalizeCategory(req.body.category),
       tags: toTags(req.body.tags),
       shared: Boolean(req.body.shared),
       sourceUrl: normalizeSafeUrl(req.body.sourceUrl),
       topic: String(req.body.topic || "").trim().slice(0, 2000),
       comments: normalizeComments(req.body.comments),
+      participants,
+      messages: normalizeChatMessages(req.body.messages, participantIds),
     });
 
     const populated = await Scenario.findById(doc._id).populate("author", "_id username").lean();
@@ -388,6 +464,14 @@ async function updateScenario(req, res, next) {
     if (req.body.sourceUrl !== undefined) doc.sourceUrl = normalizeSafeUrl(req.body.sourceUrl);
     if (req.body.topic !== undefined) doc.topic = String(req.body.topic || "").trim().slice(0, 2000);
     if (req.body.comments !== undefined) doc.comments = normalizeComments(req.body.comments);
+    if (req.body.sceneKind !== undefined) doc.sceneKind = normalizeSceneKind(req.body.sceneKind);
+    if (req.body.category !== undefined) doc.category = normalizeCategory(req.body.category);
+    if (req.body.participants !== undefined) doc.participants = normalizeParticipants(req.body.participants);
+    if (req.body.messages !== undefined) {
+      // messages 的 senderId 必须落在（更新后的）participants 里，否则悬空置空。
+      const pIds = new Set((doc.participants || []).map((p) => p.id));
+      doc.messages = normalizeChatMessages(req.body.messages, pIds);
+    }
 
     await doc.save();
     const populated = await Scenario.findById(doc._id).populate("author", "_id username").lean();
@@ -632,6 +716,34 @@ async function generateScenario(req, res, next) {
   }
 }
 
+// 生成【聊天/IM 场景】：按用户的"场景描述"产出 参与者花名册 + 种子对话。不落库（同 /generate，
+// 采用与否由前端定，用户在向导里编辑后才随 create 持久化）。返回的 participants/messages 已归一。
+async function generateSceneController(req, res, next) {
+  try {
+    const sceneDesc = String(req.body.sceneDesc || "").trim();
+    if (!sceneDesc) badRequest("请先描述你想模拟的场景");
+
+    const platform = normalizePlatform(req.body.platform || "wechat");
+    const category = normalizeCategory(req.body.category);
+    const count = clampInt(req.body.count, 8, 4, 30);
+
+    const { title, participants, messages, model } = await generateScene({ sceneDesc, platform, category, count });
+    // 复用 create 的归一（分配/校验 id、悬空 senderId 置空），保证前端拿到的形状与落库一致。
+    const normParticipants = normalizeParticipants(participants);
+    const pIds = new Set(normParticipants.map((p) => p.id));
+    res.json({
+      ok: true,
+      title,
+      sceneKind: "chat",
+      participants: normParticipants,
+      messages: normalizeChatMessages(messages, pIds),
+      model,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // 按已有内容（话题 + 评论）分析并产出展示信息（标题/简介/标签）。
 //
 // ★ 与 /generate 一样【不落库】：这里只读入参、回一段建议文本，是否采用由前端决定，
@@ -667,5 +779,6 @@ module.exports = {
   playScenario,
   captureScenario,
   generateScenario,
+  generateSceneController,
   analyzeScenario,
 };

@@ -24,6 +24,26 @@ const SCENARIO_PLATFORMS = [
   "douyin",
   "xiaohongshu",
   "generic",
+  // ↓ 聊天/IM 类平台（sceneKind==="chat" 用）。它们由【聊天壳的皮肤注册表】渲染，不是评论皮肤；
+  //   故 platformFromHost（贴 URL 抓评论）无需认它们，但 enum / 聊天皮肤 / 编辑器平台选项要有。
+  "wechat",
+  "qq",
+];
+
+// 场景类型 = 决定用哪个「壳/渲染器」。comment=评论区（默认，历史行为）；chat=聊天/私信/群聊（IM 时间线）。
+// 新增 sceneKind 要同步：这里 + client 的聊天壳与皮肤注册表 + 编辑器 + AI 生成/扮演分支。
+const SCENARIO_SCENE_KINDS = ["comment", "chat"];
+
+// 用户面向的「分类」= 浏览/搜索/发布时选（与 sceneKind 正交：分类是话题领域，sceneKind 是版式）。
+// 枚举外的值一律归 "other"。Phase 2 的模板市场按 category 浏览/筛选。
+const SCENARIO_CATEGORIES = [
+  "debate",    // 争论辩论（现有主场景）
+  "workplace", // 职场办公
+  "jobhunt",   // 求职应聘
+  "social",    // 社交情感
+  "service",   // 客服商家
+  "fun",       // 娱乐整活
+  "other",     // 其它
 ];
 
 const scenarioCommentSchema = new mongoose.Schema(
@@ -40,6 +60,31 @@ const scenarioCommentSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 一等公民「参与者」花名册（chat 场景用；comment 场景可留空，沿用评论内联作者）。
+// 让 AI 扮演有稳定身份/关系/目标的固定小卡司（你上司、HR、我…），比评论里那个 ≤200 字 stance 厚。
+const scenarioParticipantSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, trim: true },
+    name: { type: String, default: "", trim: true, maxlength: 80 },      // 显示名
+    avatar: { type: String, default: "" },                                // 头像 url 或 emoji
+    role: { type: String, default: "", trim: true, maxlength: 80 },       // 身份/关系：上司/HR/同事/我
+    isSelf: { type: Boolean, default: false },                            // 是否代表「用户本人」（chat 我方气泡）
+    goal: { type: String, default: "", trim: true, maxlength: 400 },      // 该角色目标/立场（供 AI 扮演）
+  },
+  { _id: false }
+);
+
+// chat 场景的种子对话消息序列（相当于 comment 场景的 comments[]，只是线性、带发送者）。
+// 注意：这与顶层 model ScenarioMessage（play 时真实用户的发言，做数据收集）不是一回事。
+const scenarioChatMessageSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, trim: true },
+    senderId: { type: String, default: "", trim: true },                 // 指向 participants[].id
+    text: { type: String, default: "", trim: true, maxlength: 2000 },
+  },
+  { _id: false }
+);
+
 const scenarioSchema = new mongoose.Schema(
   {
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
@@ -47,11 +92,17 @@ const scenarioSchema = new mongoose.Schema(
     summary: { type: String, default: "", trim: true, maxlength: 500 },
     coverImageUrl: { type: String, default: "" },
     platform: { type: String, enum: SCENARIO_PLATFORMS, default: "generic", index: true },
+    // 场景类型 + 分类（都向后兼容：老情景无此字段 → sceneKind 默认 comment、category 默认 other）。
+    sceneKind: { type: String, enum: SCENARIO_SCENE_KINDS, default: "comment", index: true },
+    category: { type: String, default: "other", index: true },
     tags: { type: [String], default: [] },
     shared: { type: Boolean, default: false, index: true },
     sourceUrl: { type: String, default: "" },
     topic: { type: String, default: "", trim: true, maxlength: 2000 },
     comments: { type: [scenarioCommentSchema], default: [] },
+    // chat 场景用（comment 场景留空）：固定卡司 + 种子对话。
+    participants: { type: [scenarioParticipantSchema], default: [] },
+    messages: { type: [scenarioChatMessageSchema], default: [] },
     stats: {
       viewCount: { type: Number, default: 0 },
       likeCount: { type: Number, default: 0 },
@@ -65,6 +116,11 @@ const scenarioSchema = new mongoose.Schema(
 
 scenarioSchema.index({ shared: 1, createdAt: -1 });
 scenarioSchema.index({ shared: 1, "stats.likeCount": -1 });
+// Phase 2 模板市场按 分类 / 场景类型 浏览用。
+scenarioSchema.index({ shared: 1, category: 1, createdAt: -1 });
+scenarioSchema.index({ shared: 1, sceneKind: 1 });
 
 module.exports = mongoose.model("Scenario", scenarioSchema);
 module.exports.SCENARIO_PLATFORMS = SCENARIO_PLATFORMS;
+module.exports.SCENARIO_SCENE_KINDS = SCENARIO_SCENE_KINDS;
+module.exports.SCENARIO_CATEGORIES = SCENARIO_CATEGORIES;

@@ -10,6 +10,7 @@
     "recompute:tag-leaderboards": "node src/workers/recomputeTagLeaderboards.js",
     "cleanup:empty-leaderboards": "node scripts/cleanupEmptyLeaderboards.js",
     "backfill:points": "node scripts/backfillPoints.js",
+    "seed:chat-scenarios": "node scripts/seedChatScenarioTemplates.js",
     "test": "jest --runInBand"
   },
   "keywords": [],

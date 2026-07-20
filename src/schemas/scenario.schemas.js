@@ -15,16 +15,36 @@ const commentSchema = z.object({
 
 const tagsSchema = z.union([z.array(z.string()), z.string()]);
 
+// chat 场景：参与者花名册 + 种子对话。宽松校验(控制器再 normalize)，未知键 zod 默认 strip。
+const participantSchema = z.object({
+  id: z.string().trim().max(120).optional(),
+  name: z.string().trim().max(80).optional().default(""),
+  avatar: z.string().trim().max(500).optional().default(""),
+  role: z.string().trim().max(80).optional().default(""),
+  isSelf: z.boolean().optional(),
+  goal: z.string().trim().max(400).optional().default(""),
+});
+const chatMessageSchema = z.object({
+  id: z.string().trim().max(120).optional(),
+  senderId: z.string().trim().max(120).optional().default(""),
+  text: z.string().max(2000).optional().default(""),
+});
+
+// sceneKind / category 在 schema 里只做长度守卫，真正的枚举归一交给控制器（越界→comment/other）。
 const createBody = z.object({
   title: z.string().trim().min(1).max(120),
   summary: z.string().trim().max(500).optional().default(""),
   coverImageUrl: z.string().trim().max(2000).optional().default(""),
   platform: z.string().trim().max(40).optional().default("generic"),
+  sceneKind: z.string().trim().max(20).optional(),
+  category: z.string().trim().max(40).optional(),
   tags: tagsSchema.optional().default([]),
   shared: z.boolean().optional().default(false),
   sourceUrl: z.string().trim().max(2000).optional().default(""),
   topic: z.string().trim().max(2000).optional().default(""),
   comments: z.array(commentSchema).max(200).optional().default([]),
+  participants: z.array(participantSchema).max(30).optional().default([]),
+  messages: z.array(chatMessageSchema).max(300).optional().default([]),
 });
 
 const updateBody = z.object({
@@ -32,11 +52,15 @@ const updateBody = z.object({
   summary: z.string().trim().max(500).optional(),
   coverImageUrl: z.string().trim().max(2000).optional(),
   platform: z.string().trim().max(40).optional(),
+  sceneKind: z.string().trim().max(20).optional(),
+  category: z.string().trim().max(40).optional(),
   tags: tagsSchema.optional(),
   shared: z.boolean().optional(),
   sourceUrl: z.string().trim().max(2000).optional(),
   topic: z.string().trim().max(2000).optional(),
   comments: z.array(commentSchema).max(200).optional(),
+  participants: z.array(participantSchema).max(30).optional(),
+  messages: z.array(chatMessageSchema).max(300).optional(),
 });
 
 const historyItem = z.object({
@@ -93,4 +117,12 @@ const analyzeBody = z.object({
   comments: z.array(analyzeCommentSchema).max(200).optional().default([]),
 });
 
-module.exports = { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody };
+// 生成聊天/IM 场景：按"场景描述"产出角色+对话（不落库）。
+const generateSceneBody = z.object({
+  sceneDesc: z.string().trim().max(1000).optional().default(""),
+  platform: z.string().trim().max(40).optional().default("wechat"),
+  category: z.string().trim().max(40).optional().default("workplace"),
+  count: z.number().int().min(4).max(30).optional().default(8),
+});
+
+module.exports = { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody, generateSceneBody };
