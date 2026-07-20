@@ -5,6 +5,7 @@ const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
+const PersonaPurchase = require("../models/PersonaPurchase");
 const { computeStyleDescriptor } = require("./persona.controller");
 const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
@@ -446,12 +447,15 @@ async function buildScenarioPersonaCards(scenario, user) {
     .lean();
 
   const installedSet = new Set();
+  const purchasedSet = new Set();
   if (user && personas.length) {
-    const installs = await PersonaInstall.find({
-      user: user._id,
-      persona: { $in: personas.map((p) => p._id) },
-    }).select("persona").lean();
+    const pids = personas.map((p) => p._id);
+    const [installs, purchases] = await Promise.all([
+      PersonaInstall.find({ user: user._id, persona: { $in: pids } }).select("persona").lean(),
+      PersonaPurchase.find({ user: user._id, persona: { $in: pids }, settledAt: { $ne: null } }).select("persona").lean(),
+    ]);
     installs.forEach((x) => installedSet.add(String(x.persona)));
+    purchases.forEach((x) => purchasedSet.add(String(x.persona)));
   }
 
   return personas
@@ -464,7 +468,9 @@ async function buildScenarioPersonaCards(scenario, user) {
       tags: Array.isArray(p.tags) ? p.tags : [],
       shared: !!p.shared,
       authorName: (p.author && p.author.username) || "",
+      price: Number(p.price || 0),
       installed: installedSet.has(String(p._id)),
+      purchased: purchasedSet.has(String(p._id)),
       isOwner: !!user && String(p.author?._id || p.author) === String(user._id),
       stats: {
         downloadCount: Number(p?.stats?.downloadCount || 0),
@@ -474,12 +480,48 @@ async function buildScenarioPersonaCards(scenario, user) {
     }));
 }
 
+/**
+ * 绑定付费人格的购买校验（防 API 直连白嫖）：participants 里绑了 price>0 的人格时，
+ * 情景作者必须是人格作者本人或已购买（PersonaPurchase 且已结算）。
+ * 免费/自有/未知 id（play 时自然解析失败回退 goal）不在此拦 —— 与既有宽松语义一致，
+ * 这里只挡「明码标价却没付钱」这一种。
+ *
+ * @param {Set<string>} exemptIds 存量豁免（评审实锤）：update 时情景里【已经绑定】的
+ *   personaId 集合。人格作者事后涨价不应把别人免费期合法绑定的情景锁死到无法编辑 ——
+ *   存量绑定不重验；play 侧的 paidOk 网仍会把未购的存量绑定判不可用回退 goal，白嫖不成立。
+ */
+async function assertPaidPersonasPurchased(participants, userId, exemptIds = new Set()) {
+  const ids = [...new Set(
+    (participants || [])
+      .filter((p) => !p.isSelf && p.personaId && mongoose.isValidObjectId(String(p.personaId)))
+      .map((p) => String(p.personaId))
+      .filter((pid) => !exemptIds.has(pid))
+  )];
+  if (!ids.length) return;
+
+  const personas = await Persona.find({ _id: { $in: ids } }).select("author price name").lean();
+  const paidOthers = personas.filter(
+    (p) => Number(p.price || 0) > 0 && String(p.author) !== String(userId)
+  );
+  if (!paidOthers.length) return;
+
+  const purchases = await PersonaPurchase.find({
+    user: userId,
+    persona: { $in: paidOthers.map((p) => p._id) },
+    settledAt: { $ne: null },
+  }).select("persona").lean();
+  const bought = new Set(purchases.map((x) => String(x.persona)));
+  const missing = paidOthers.find((p) => !bought.has(String(p._id)));
+  if (missing) badRequest(`人格「${missing.name}」为付费人格，需先购买才能绑定`);
+}
+
 async function createScenario(req, res, next) {
   try {
     const title = String(req.body.title || "").trim();
     if (!title) badRequest("Title is required");
 
     const participants = normalizeParticipants(req.body.participants);
+    await assertPaidPersonasPurchased(participants, req.user._id);
     const participantIds = new Set(participants.map((p) => p.id));
 
     const doc = await Scenario.create({
@@ -526,7 +568,15 @@ async function updateScenario(req, res, next) {
     if (req.body.comments !== undefined) doc.comments = normalizeComments(req.body.comments);
     if (req.body.sceneKind !== undefined) doc.sceneKind = normalizeSceneKind(req.body.sceneKind);
     if (req.body.category !== undefined) doc.category = normalizeCategory(req.body.category);
-    if (req.body.participants !== undefined) doc.participants = normalizeParticipants(req.body.participants);
+    if (req.body.participants !== undefined) {
+      const nextParticipants = normalizeParticipants(req.body.participants);
+      // 只校验本次【新增】的绑定：已在情景里的绑定豁免（人格涨价不锁死存量编辑）
+      const existingBound = new Set(
+        (doc.participants || []).map((p) => String(p.personaId || "")).filter(Boolean)
+      );
+      await assertPaidPersonasPurchased(nextParticipants, req.user._id, existingBound);
+      doc.participants = nextParticipants;
+    }
     if (req.body.messages !== undefined) {
       // messages 的 senderId 必须落在（更新后的）participants 里，否则悬空置空。
       const pIds = new Set((doc.participants || []).map((p) => p.id));
@@ -651,17 +701,32 @@ async function resolveParticipantPersonas(scenario) {
   if (!ids.length) return scenario;
 
   const personas = await Persona.find({ _id: { $in: ids } })
-    .select("name style shared author")
+    .select("name style shared author price")
     .lean();
   const byId = new Map(personas.map((p) => [String(p._id), p]));
   const scenarioAuthor = String(scenario.author?._id || scenario.author);
+
+  // 付费人格兜底校验（play 侧防白嫖）：情景作者必须已购（或是人格作者本人）。
+  // 购买义务在【情景作者】——玩家 play 别人的情景不需要为里面的人格付费。
+  const paidIds = personas
+    .filter((p) => Number(p.price || 0) > 0 && String(p.author) !== scenarioAuthor)
+    .map((p) => p._id);
+  const boughtSet = new Set(
+    paidIds.length
+      ? (await PersonaPurchase.find({ user: scenarioAuthor, persona: { $in: paidIds }, settledAt: { $ne: null } })
+          .select("persona").lean())
+          .map((x) => String(x.persona))
+      : []
+  );
 
   return {
     ...scenario,
     participants: participants.map((p) => {
       if (p?.isSelf) return p;
       const persona = p?.personaId ? byId.get(String(p.personaId)) : null;
-      const usable = persona && (persona.shared || String(persona.author) === scenarioAuthor);
+      const isAuthorOwn = persona && String(persona.author) === scenarioAuthor;
+      const paidOk = !persona || Number(persona.price || 0) <= 0 || isAuthorOwn || boughtSet.has(String(persona._id));
+      const usable = persona && (persona.shared || isAuthorOwn) && paidOk;
       return usable
         ? { ...p, personaStyle: computeStyleDescriptor(persona.name, persona.style) }
         : p;

@@ -29,7 +29,7 @@
 const User = require("../models/User");
 const Bounty = require("../models/Bounty");
 const PointsLedger = require("../models/PointsLedger");
-const { SIGNUP_GRANT_POINTS } = require("../config/points");
+const { SIGNUP_GRANT_POINTS, PERSONA_FEE_PERCENT } = require("../config/points");
 const { badRequest } = require("../utils/http");
 
 /** 点数上限：和 bounty.schemas 的 reward 上限一致，纯防呆 */
@@ -216,6 +216,45 @@ async function settleBountyEscrow(bountyId, memo) {
   return refundEscrowToPoster({ bountyId, posterId: claimed.author, amount, memo });
 }
 
+/** 人格购买的平台抽成（点数，整数，floor）。 */
+function personaFee(price) {
+  return Math.floor((price * PERSONA_FEE_PERCENT) / 100);
+}
+
+/**
+ * 人格购买转账：买家 -price → 创作者 +(price-fee)，平台抽成 fee 记到 user:null 分录。
+ * 三条分录和为零（fee=0 时省掉第三条），I1 对账式与「用户余额=个人流水和」都保持。
+ *
+ * ★只做「余额 + 账本」——购买记录（PersonaPurchase）的 claim/补偿由调用方
+ *   （persona.controller.purchasePersona）负责，与 holdEscrow 不碰 Bounty.escrowPoints 同款分工。
+ *
+ * @returns {Promise<{price:number, fee:number, buyerBalance:number}>}
+ * @throws badRequest 余额不足 / 创作者账号不存在（此时买家已退款，什么都没写进账本）
+ */
+async function purchasePersonaTransfer({ personaId, buyerId, creatorId, price, memo }) {
+  const fee = personaFee(price);
+  const creatorAmount = price - fee;
+
+  const buyerBalance = await debitUser(buyerId, price);
+  if (buyerBalance === null) badRequest("点数不足");
+
+  const creatorBalance = await creditUser(creatorId, creatorAmount);
+  // 创作者已被硬删：把买家的钱原样退回去，交易不成立、账本一个字不写。
+  if (creatorBalance === null) {
+    await creditUser(buyerId, price);
+    badRequest("创作者账号不存在，无法购买");
+  }
+
+  const entries = [
+    { user: buyerId, persona: personaId, delta: -price, reason: "persona_buy", balanceAfter: buyerBalance, memo },
+    { user: creatorId, persona: personaId, delta: creatorAmount, reason: "persona_income", balanceAfter: creatorBalance, memo },
+    { user: null, persona: personaId, delta: fee, reason: "persona_fee", balanceAfter: null, memo },
+  ].filter((e) => e.delta !== 0);
+  await writeTransferEntries(entries);
+
+  return { price, fee, buyerBalance };
+}
+
 module.exports = {
   SIGNUP_GRANT_POINTS,
   MAX_POINTS,
@@ -228,4 +267,6 @@ module.exports = {
   payEscrowToHunter,
   refundEscrowToPoster,
   settleBountyEscrow,
+  personaFee,
+  purchasePersonaTransfer,
 };

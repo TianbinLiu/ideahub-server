@@ -6,7 +6,9 @@ const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
+const PersonaPurchase = require("../models/PersonaPurchase");
 const { generatePersonaFromChat } = require("../services/personaAi.service");
+const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
 function isValidId(id) {
@@ -22,6 +24,13 @@ function clampNum(value, fallback, min, max) {
 function normalizeEmoji(raw) {
   const v = String(raw || "").trim().slice(0, 8);
   return v || "🎭";
+}
+
+/** 售价归一：非负整数点数，上限与模型一致；非法输入一律 0（免费） */
+function toPrice(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return 0;
+  return Math.min(n, 100000);
 }
 
 function toTags(raw) {
@@ -102,6 +111,7 @@ function toPersonaPayload(doc, ctx = {}) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     style: serializeStyle(doc.style),
     styleDescriptor: computeStyleDescriptor(doc.name, doc.style),
+    price: Number(doc.price || 0),
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
       downloadCount: Number(doc?.stats?.downloadCount || 0),
@@ -111,6 +121,8 @@ function toPersonaPayload(doc, ctx = {}) {
     liked: !!ctx.liked,
     equipped: !!ctx.equipped,
     isOwner: !!ctx.isOwner,
+    // 观看者是否已购买（永久解锁）。作者本人恒 false —— gate 处一律先判 isOwner。
+    purchased: !!ctx.purchased,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -121,17 +133,21 @@ function ownedBy(doc, user) {
 }
 
 async function loadUserContext(user, docs) {
-  if (!user || !docs.length) return { installedSet: new Set(), likedSet: new Set(), equippedId: null };
+  if (!user || !docs.length)
+    return { installedSet: new Set(), likedSet: new Set(), equippedId: null, purchasedSet: new Set() };
   const ids = docs.map((d) => d._id);
-  const [installs, likes, equip] = await Promise.all([
+  const [installs, likes, equip, purchases] = await Promise.all([
     PersonaInstall.find({ user: user._id, persona: { $in: ids } }).select("persona").lean(),
     PersonaLike.find({ user: user._id, persona: { $in: ids } }).select("persona").lean(),
     PersonaEquip.findOne({ user: user._id }).select("persona").lean(),
+    // settledAt 非空才算已购：pending claim 不具备解锁效力（见 PersonaPurchase 模型注释）
+    PersonaPurchase.find({ user: user._id, persona: { $in: ids }, settledAt: { $ne: null } }).select("persona").lean(),
   ]);
   return {
     installedSet: new Set(installs.map((x) => String(x.persona))),
     likedSet: new Set(likes.map((x) => String(x.persona))),
     equippedId: equip && equip.persona ? String(equip.persona) : null,
+    purchasedSet: new Set(purchases.map((x) => String(x.persona))),
   };
 }
 
@@ -192,7 +208,7 @@ async function listPersonas(req, res, next) {
     const totalPages = Math.max(Math.ceil(total / limit), 1);
     const paged = items.slice((page - 1) * limit, page * limit);
 
-    const { installedSet, likedSet, equippedId } = await loadUserContext(req.user, paged);
+    const { installedSet, likedSet, equippedId, purchasedSet } = await loadUserContext(req.user, paged);
 
     res.json({
       ok: true,
@@ -201,6 +217,7 @@ async function listPersonas(req, res, next) {
         liked: likedSet.has(String(item._id)),
         equipped: equippedId != null && String(item._id) === equippedId,
         isOwner: ownedBy(item, req.user),
+        purchased: purchasedSet.has(String(item._id)),
       })),
       total,
       page,
@@ -226,15 +243,18 @@ async function getPersona(req, res, next) {
     let installed = false;
     let liked = false;
     let equipped = false;
+    let purchased = false;
     if (req.user) {
-      const [inst, lk, eq] = await Promise.all([
+      const [inst, lk, eq, pur] = await Promise.all([
         PersonaInstall.exists({ user: req.user._id, persona: id }),
         PersonaLike.exists({ user: req.user._id, persona: id }),
         PersonaEquip.findOne({ user: req.user._id }).select("persona").lean(),
+        PersonaPurchase.exists({ user: req.user._id, persona: id, settledAt: { $ne: null } }),
       ]);
       installed = !!inst;
       liked = !!lk;
       equipped = !!(eq && eq.persona && String(eq.persona) === String(id));
+      purchased = !!pur;
     }
 
     await Persona.updateOne({ _id: id }, { $inc: { "stats.viewCount": 1 } });
@@ -242,7 +262,7 @@ async function getPersona(req, res, next) {
 
     res.json({
       ok: true,
-      persona: toPersonaPayload(refreshed, { installed, liked, equipped, isOwner }),
+      persona: toPersonaPayload(refreshed, { installed, liked, equipped, isOwner, purchased }),
     });
   } catch (err) {
     next(err);
@@ -287,6 +307,7 @@ async function createPersona(req, res, next) {
       tags: toTags(req.body.tags),
       style: normalizeStyle(req.body.style),
       shared: Boolean(req.body.shared),
+      price: toPrice(req.body.price),
     });
 
     const populated = await Persona.findById(doc._id).populate("author", "_id username").lean();
@@ -311,6 +332,8 @@ async function updatePersona(req, res, next) {
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
+    // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）
+    if (req.body.price !== undefined) doc.price = toPrice(req.body.price);
 
     await doc.save();
     const populated = await Persona.findById(doc._id).populate("author", "_id username").lean();
@@ -338,6 +361,113 @@ async function removePersona(req, res, next) {
     ]);
 
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/personas/:id/purchase —— 用赏金点数购买付费人格（永久解锁选用权）。
+ *
+ * 顺序是「先 claim 记录、转账失败再补偿删除」：
+ * - 幂等/并发：PersonaPurchase 的 {user,persona} 唯一索引保证并发双击只有一个 claim 成功，
+ *   另一个拿 duplicate key → 视作已购返回，不会扣两次款。
+ * - 失败补偿：claim 成功但转账失败（点数不足/创作者被删）→ 删掉 claim 再抛错，
+ *   不会出现「没花钱却解锁」的残留记录。
+ */
+async function purchasePersona(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid persona id");
+
+    const persona = await Persona.findById(id).select("_id author shared price name").lean();
+    if (!persona) notFound("Persona not found");
+    if (String(persona.author) === String(req.user._id)) badRequest("自己的人格无需购买");
+    if (!persona.shared) forbidden("Forbidden");
+
+    const price = Number(persona.price || 0);
+    if (price <= 0) badRequest("该人格是免费的，无需购买");
+
+    // 价格钉住（防 TOCTOU，评审实锤）：客户端确认弹层展示的是取列表时的价格，作者可能
+    // 在弹层打开期间调价 —— 带上 expectedPrice，不一致就拒绝，绝不按用户没见过的价格扣款。
+    if (req.body && req.body.expectedPrice !== undefined) {
+      const expected = Number(req.body.expectedPrice);
+      if (!Number.isInteger(expected) || expected !== price) {
+        badRequest("价格已更新，请刷新后按最新价格确认购买");
+      }
+    }
+
+    // 已有记录：settled = 真已购，幂等返回；pending = 另一请求正在支付（新鲜）
+    // 或上次进程崩溃的残留（陈旧，清掉重来）。pending 一律【不】当已购 —— 否则
+    // 「余额不足 + 并发双击」会给输家返回假成功（评审实锤）。
+    const PENDING_STALE_MS = 60 * 1000;
+    const existing = await PersonaPurchase.findOne({ user: req.user._id, persona: id })
+      .select("_id settledAt createdAt")
+      .lean();
+    if (existing) {
+      if (existing.settledAt) {
+        return res.json({ ok: true, purchased: true, alreadyOwned: true, price });
+      }
+      if (Date.now() - new Date(existing.createdAt).getTime() < PENDING_STALE_MS) {
+        badRequest("购买正在处理中，请稍后重试");
+      }
+      await PersonaPurchase.deleteOne({ _id: existing._id, settledAt: null });
+    }
+
+    // claim（唯一索引挡并发；pending 态，结算前不具备任何解锁效力）
+    let claim;
+    try {
+      claim = await PersonaPurchase.create({
+        user: req.user._id,
+        persona: id,
+        price,
+        fee: personaFee(price),
+      });
+    } catch (e) {
+      if (e && e.code === 11000) {
+        // 撞上并发对手的 claim：对手可能已结算（真已购）也可能还在支付中
+        const winner = await PersonaPurchase.findOne({ user: req.user._id, persona: id })
+          .select("settledAt")
+          .lean();
+        if (winner && winner.settledAt) {
+          return res.json({ ok: true, purchased: true, alreadyOwned: true, price });
+        }
+        badRequest("购买正在处理中，请稍后重试");
+      }
+      throw e;
+    }
+
+    try {
+      const { buyerBalance } = await purchasePersonaTransfer({
+        personaId: id,
+        buyerId: req.user._id,
+        creatorId: persona.author,
+        price,
+        memo: `购买人格「${persona.name}」`,
+      });
+      await PersonaPurchase.updateOne({ _id: claim._id }, { $set: { settledAt: new Date() } });
+      res.json({ ok: true, purchased: true, alreadyOwned: false, price, balance: buyerBalance });
+    } catch (err) {
+      // ★补偿方向要看「钱动没动」（评审实锤）：
+      // - badRequest（status 400：点数不足=原子扣款没成 / 创作者被删=已原样退款）
+      //   ⇒ 账本一个字没写、余额已复原 → 撤销 claim，交易干净地不存在。
+      // - 其它异常（DB/网络故障，比如扣款成功后写分录失败）⇒ 钱【可能已动】。
+      //   此时删 claim = 收走买家已付款的解锁，重试还会二次扣款 —— 方向反了。
+      //   改为：保留 claim 并置 settled（宁可平台送一次解锁，不能吞用户的钱），
+      //   打日志供人工对账（账本可能缺分录，「余额=流水和」的审计会指到这里）。
+      if (Number(err && err.status) === 400) {
+        await PersonaPurchase.deleteOne({ _id: claim._id });
+      } else {
+        console.error("[personaPurchase] 转账异常且钱可能已动，保留解锁待人工对账", {
+          claimId: String(claim._id),
+          persona: String(id),
+          buyer: String(req.user._id),
+          err: err && err.message,
+        });
+        await PersonaPurchase.updateOne({ _id: claim._id }, { $set: { settledAt: new Date() } });
+      }
+      throw err;
+    }
   } catch (err) {
     next(err);
   }
@@ -468,9 +598,16 @@ async function equipPersona(req, res, next) {
 
     if (!isValidId(personaId)) invalidId("Invalid persona id");
 
-    const persona = await Persona.findById(personaId).select("_id author shared").lean();
+    const persona = await Persona.findById(personaId).select("_id author shared price").lean();
     if (!persona) notFound("Persona not found");
-    if (!persona.shared && String(persona.author) !== String(req.user._id)) forbidden("Forbidden");
+    const isOwnPersona = String(persona.author) === String(req.user._id);
+    if (!persona.shared && !isOwnPersona) forbidden("Forbidden");
+
+    // 付费人格：装备也是「选用」，需先购买（作者自己免）
+    if (Number(persona.price || 0) > 0 && !isOwnPersona) {
+      const bought = await PersonaPurchase.exists({ user: req.user._id, persona: personaId, settledAt: { $ne: null } });
+      if (!bought) badRequest("该人格为付费人格，需先购买");
+    }
 
     // 装备时确保 install 存在（未收藏则自动收藏）
     const exists = await PersonaInstall.findOne({ user: req.user._id, persona: personaId }).select("_id").lean();
@@ -514,6 +651,7 @@ module.exports = {
   createPersona,
   updatePersona,
   removePersona,
+  purchasePersona,
   installPersona,
   uninstallPersona,
   togglePersonaLike,

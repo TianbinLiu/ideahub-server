@@ -34,6 +34,10 @@ const personaSchema = new mongoose.Schema(
     tags: { type: [String], default: [] },
     style: { type: personaStyleSchema, default: () => ({}) },
     shared: { type: Boolean, default: false, index: true },
+    // 售价（虚拟点数，整数；0=免费）。>0 时其他用户需购买（PersonaPurchase）才能
+    // 【选用】：绑进情景 / 装备。收藏（install）保持免费——那只是书签。
+    // 私有人格存价无意义但无害：只在 shared 时展示与生效。
+    price: { type: Number, default: 0, min: 0, max: 100000 },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },

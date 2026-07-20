@@ -17,14 +17,18 @@
 // ★托管分录【不得】出现在任何用户的流水接口里。
 const mongoose = require("mongoose");
 
-const LEDGER_REASONS = ["signup", "bounty_hold", "bounty_reward", "bounty_refund"];
+// persona_buy（买家出账）/ persona_income（创作者入账）/ persona_fee（平台抽成，user:null）
+// 三条同笔交易的分录和为零，I1 对账式不受影响。
+const LEDGER_REASONS = ["signup", "bounty_hold", "bounty_reward", "bounty_refund", "persona_buy", "persona_income", "persona_fee"];
 
 const pointsLedgerSchema = new mongoose.Schema(
   {
-    // null = 悬赏的托管账户（不是某个用户）
+    // null = 平台内部账（悬赏分录=该悬赏的托管账户；persona_fee 分录=平台抽成账户）
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     // signup 时为空
     bounty: { type: mongoose.Schema.Types.ObjectId, ref: "Bounty", default: null },
+    // 人格购买相关分录（persona_buy/persona_income/persona_fee）指向交易的人格
+    persona: { type: mongoose.Schema.Types.ObjectId, ref: "Persona", default: null },
     // 正 = 入账，负 = 出账
     delta: { type: Number, required: true },
     reason: { type: String, enum: LEDGER_REASONS, required: true },

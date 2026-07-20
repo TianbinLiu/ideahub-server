@@ -27,6 +27,8 @@ const createBody = z.object({
   tags: tagsSchema.optional().default([]),
   style: styleBody.optional().default({}),
   shared: z.boolean().optional().default(false),
+  // 售价（赏金点数，0=免费）。上限与 Persona 模型/controller toPrice 一致。
+  price: z.number().int().min(0).max(100000).optional().default(0),
 });
 
 // 从聊天文本生成人格草稿（情景编辑器「✨从聊天记录生成」）。
@@ -43,6 +45,7 @@ const updateBody = z.object({
   tags: tagsSchema.optional(),
   style: styleBody.optional(),
   shared: z.boolean().optional(),
+  price: z.number().int().min(0).max(100000).optional(),
 });
 
 const equipBody = z.object({
