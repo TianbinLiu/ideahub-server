@@ -21,11 +21,12 @@ const followSchema = new mongoose.Schema({
 followSchema.index({ follower: 1, following: 1 }, { unique: true });
 
 // Prevent self-following
-followSchema.pre('save', function (next) {
+// ★新版 mongoose 的 pre hook 不再传 next（"next is not a function"）——直接 throw。
+//   这个旧式签名曾让【所有关注操作】500（Follow.create 必炸），线上真机排查出来的存量 bug。
+followSchema.pre('save', function () {
   if (this.follower.equals(this.following)) {
-    return next(new Error('Cannot follow yourself'));
+    throw new Error('Cannot follow yourself');
   }
-  next();
 });
 
 module.exports = mongoose.model('Follow', followSchema);
