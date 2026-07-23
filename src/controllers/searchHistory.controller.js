@@ -91,9 +91,12 @@ async function suggestSearch(req, res, next) {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit || "8", 10) || 8, 1), 15);
     const prefixRegex = toPrefixRegex(req.query.prefix);
+    // board=1：热搜榜模式（🔥 热点面板用）——要完整的全站榜单，
+    // 【不】按个人历史剔重（联想 dropdown 才剔，避免和「搜索历史」段重复展示）。
+    const boardMode = String(req.query.board || "") === "1";
 
     const [personal, globalRows] = await Promise.all([
-      req.user
+      req.user && !boardMode
         ? SearchHistory.find({ user: req.user._id, ...(prefixRegex ? { query: prefixRegex } : {}) })
             .sort({ lastSearchedAt: -1 })
             .limit(limit)
@@ -106,7 +109,7 @@ async function suggestSearch(req, res, next) {
     ]);
 
     const personalSet = new Set(personal.map((e) => e.query));
-    const global = globalRows.filter((g) => !personalSet.has(g.query)).slice(0, limit);
+    const global = (boardMode ? globalRows : globalRows.filter((g) => !personalSet.has(g.query))).slice(0, limit);
 
     res.json({ ok: true, personal, global });
   } catch (err) {
