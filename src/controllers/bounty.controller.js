@@ -159,6 +159,7 @@ function toBountyPayload(doc, ctx = {}) {
     reward: Number(doc.reward || 0),
     platform: doc.platform || "other",
     targetUrl: doc.targetUrl || "",
+    coverImageUrl: doc.coverImageUrl || "",
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     slots: Number(doc.slots || 1),
     status: doc.status || "open",
@@ -333,6 +334,7 @@ async function createBounty(req, res, next) {
         reward,
         platform: normalizePlatform(req.body.platform),
         targetUrl: normalizeSafeUrl(req.body.targetUrl),
+        coverImageUrl: normalizeSafeUrl(req.body.coverImageUrl),
         tags: toTags(req.body.tags),
         slots,
         deadline: parseDeadline(req.body.deadline),
@@ -377,6 +379,7 @@ async function updateBounty(req, res, next) {
     if (req.body.description !== undefined) $set.description = String(req.body.description || "").trim().slice(0, 5000);
     if (req.body.platform !== undefined) $set.platform = normalizePlatform(req.body.platform);
     if (req.body.targetUrl !== undefined) $set.targetUrl = normalizeSafeUrl(req.body.targetUrl);
+    if (req.body.coverImageUrl !== undefined) $set.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) $set.tags = toTags(req.body.tags);
     if (req.body.deadline !== undefined) $set.deadline = parseDeadline(req.body.deadline);
 

@@ -464,6 +464,7 @@ async function buildScenarioPersonaCards(scenario, user) {
       _id: p._id,
       name: p.name,
       coverEmoji: p.coverEmoji || "🎭",
+      coverImageUrl: p.coverImageUrl || "",
       description: p.description || "",
       tags: Array.isArray(p.tags) ? p.tags : [],
       shared: !!p.shared,
