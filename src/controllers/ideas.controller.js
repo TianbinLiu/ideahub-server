@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const Idea = require("../models/Idea");
+const SearchHistory = require("../models/SearchHistory");
 const Group = require("../models/Group");
 const Like = require("../models/Like");
 const Bookmark = require("../models/Bookmark");
@@ -185,6 +186,8 @@ function getFeedbackPenalty(reason) {
 }
 
 const IDEA_TYPES = new Set(["business", "feedback", "external", "daily", "dynamic"]);
+// 类型分层混合（mixIdeaTypes=1）按此顺序轮转交错
+const IDEA_TYPE_LIST = ["daily", "dynamic", "business", "feedback", "external"];
 
 function normalizeIdeaType(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -507,6 +510,17 @@ async function listIdeas(req, res, next) {
 
     const q = (req.query.q || req.query.keyword || req.query.tag || "").toString().trim();
     const queryTokens = normalizeSearchTokens(q);
+
+    // 服务端搜索历史（账号维度）：fire-and-forget，绝不阻塞/影响搜索本身。
+    // 这份数据同时供搜索框的历史/联想（me/search-history、search/suggest）
+    // 与后续「按搜索兴趣推荐内容」使用。
+    if (q && req.user) {
+      SearchHistory.updateOne(
+        { user: req.user._id, query: q.toLowerCase().slice(0, 120) },
+        { $inc: { count: 1 }, $set: { lastSearchedAt: new Date() } },
+        { upsert: true }
+      ).catch(() => {});
+    }
     const recentSearchTokens = normalizeSearchTokens(req.query.recentTags || "");
     const useScoredRanking = queryTokens.length > 0 || sort === "recommended";
     const requestedIdeaType = normalizeIdeaType(req.query.ideaType);
@@ -594,7 +608,11 @@ async function listIdeas(req, res, next) {
 
           if (queryTokens.length > 0) {
             const relevance = scoreIdeaAgainstTokens(item, queryTokens);
-            if (relevance.matchedTagCount === 0) return null;
+            // 任意字段（tags/标题/摘要/正文/平台）命中即保留。
+            // ★以前这里是 matchedTagCount === 0 就丢——只有打了匹配标签的 idea 才搜得到，
+            //   标题正文里出现关键词但没打标签的（商业/反馈/引用类居多）被整体过滤，
+            //   呈现为「搜索只能搜到日常想法和动态」。
+            if (relevance.score <= 0) return null;
             return {
               ...item,
               recommendationFeedbackReason: feedbackReason,
@@ -628,6 +646,61 @@ async function listIdeas(req, res, next) {
       sortIdeasByScore(ranked);
       total = ranked.length;
       items = ranked.slice((page - 1) * limit, page * limit);
+    } else if (
+      String(req.query.mixIdeaTypes || "") === "1" &&
+      requestedIdeaTypeSet.size === 0 &&
+      !requestedIdeaType
+    ) {
+      // 类型分层混合（首页推荐板块用）：无筛选时按 5 种类型各取一桶再轮转交错，
+      // 保证商业/反馈/引用类也有机会被刷出来 —— 纯按时间排的话 feed 会被
+      // 数量占优的 daily/dynamic 淹没（用户点名的问题）。
+      // 分页语义（评审实锤修正）：每桶必须取满 page*limit 条 —— 类型分布倾斜时
+      // （比如全站只有 daily/dynamic）单桶要能独自填满切片窗口，否则窗口步进
+      // 快于 mixed 增速，会出现「第 2 页起永远空页 + 部分条目任何页都取不到」。
+      // 推荐板块只翻浅页，每桶 page*limit 的查询成本可控。
+      const takePerBucket = page * limit;
+      const buckets = await Promise.all(
+        IDEA_TYPE_LIST.map((ideaType) => {
+          let bucketFilter;
+          if (ideaType === "external") {
+            bucketFilter = {
+              ...filter,
+              $or: [
+                { ideaType: "external" },
+                { "externalSource.url": { $exists: true, $nin: [null, ""] } },
+                { "externalSource.platform": { $exists: true, $nin: [null, ""] } },
+              ],
+            };
+          } else if (ideaType === "daily") {
+            // 旧数据无 ideaType 的按 daily 归桶（与 inferIdeaType 的回退一致）
+            bucketFilter = { ...filter, $or: [{ ideaType: "daily" }, { ideaType: { $exists: false } }] };
+          } else {
+            bucketFilter = { ...filter, ideaType };
+          }
+          return Idea.find(bucketFilter)
+            .sort(sortSpec)
+            .limit(takePerBucket)
+            .populate("author", "_id username role")
+            .lean();
+        })
+      );
+
+      // 轮转交错 + 按 _id 去重（external 桶可能和别的桶重叠：老数据 ideaType 与 externalSource 并存）
+      const seen = new Set();
+      const mixed = [];
+      const maxLen = Math.max(...buckets.map((b) => b.length));
+      for (let i = 0; i < maxLen; i++) {
+        for (const bucket of buckets) {
+          const item = bucket[i];
+          if (!item) continue;
+          const key = String(item._id);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          mixed.push(item);
+        }
+      }
+      total = await Idea.countDocuments(filter);
+      items = mixed.slice((page - 1) * limit, page * limit);
     } else {
       let findFilter = filter;
       if (requestedIdeaTypeSet.size > 0) {
