@@ -31,6 +31,8 @@ const personaSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true, maxlength: 120 },
     description: { type: String, default: "", trim: true, maxlength: 1000 },
     coverEmoji: { type: String, default: "🎭", trim: true, maxlength: 8 },
+    // 可选图片封面（Cloudinary URL）：有值时优先于 coverEmoji 展示，空串 = 用 emoji
+    coverImageUrl: { type: String, default: "" },
     tags: { type: [String], default: [] },
     style: { type: personaStyleSchema, default: () => ({}) },
     shared: { type: Boolean, default: false, index: true },

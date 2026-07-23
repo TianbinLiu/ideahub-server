@@ -32,6 +32,8 @@ const bountySchema = new mongoose.Schema(
     reward: { type: Number, default: 0, min: 0 },
     platform: { type: String, enum: BOUNTY_PLATFORMS, default: "other", index: true },
     targetUrl: { type: String, default: "" },
+    // 可选封面图（Cloudinary URL，前端走 /api/uploads/image 拿）
+    coverImageUrl: { type: String, default: "" },
     tags: { type: [String], default: [] },
     slots: { type: Number, default: 1, min: 1 },
     status: { type: String, enum: BOUNTY_STATUSES, default: "open", index: true },

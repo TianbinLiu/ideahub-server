@@ -26,6 +26,20 @@ function normalizeEmoji(raw) {
   return v || "🎭";
 }
 
+/** 封面图 URL 归一：只收 http(s) 或站内相对路径，其余置空（与 bounty/scenario 同款防注入） */
+function normalizeSafeUrl(input) {
+  const raw = String(input || "").trim().slice(0, 2000);
+  if (!raw || /[\x00-\x1f\x7f]/.test(raw)) return "";
+  if (raw.startsWith("/") && !raw.startsWith("//")) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.toString();
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 /** 售价归一：非负整数点数，上限与模型一致；非法输入一律 0（免费） */
 function toPrice(raw) {
   const n = Number(raw);
@@ -108,6 +122,7 @@ function toPersonaPayload(doc, ctx = {}) {
     name: doc.name,
     description: doc.description || "",
     coverEmoji: doc.coverEmoji || "🎭",
+    coverImageUrl: doc.coverImageUrl || "",
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     style: serializeStyle(doc.style),
     styleDescriptor: computeStyleDescriptor(doc.name, doc.style),
@@ -307,6 +322,7 @@ async function createPersona(req, res, next) {
       name: name.slice(0, 120),
       description: String(req.body.description || "").trim().slice(0, 1000),
       coverEmoji: normalizeEmoji(req.body.coverEmoji),
+      coverImageUrl: normalizeSafeUrl(req.body.coverImageUrl),
       tags: toTags(req.body.tags),
       style: normalizeStyle(req.body.style),
       shared: Boolean(req.body.shared),
@@ -332,6 +348,7 @@ async function updatePersona(req, res, next) {
     if (req.body.name !== undefined) doc.name = String(req.body.name || "").trim().slice(0, 120);
     if (req.body.description !== undefined) doc.description = String(req.body.description || "").trim().slice(0, 1000);
     if (req.body.coverEmoji !== undefined) doc.coverEmoji = normalizeEmoji(req.body.coverEmoji);
+    if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
