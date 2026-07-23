@@ -81,4 +81,8 @@ const ideaSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// 关注流 / 用户主页的作者维度查询（{author, visibility} + createdAt 倒序分页）。
+// 没有它，/api/feed/following 的 find + countDocuments 都是全表扫描（评审实锤）。
+ideaSchema.index({ author: 1, visibility: 1, createdAt: -1 });
+
 module.exports = mongoose.model("Idea", ideaSchema);
