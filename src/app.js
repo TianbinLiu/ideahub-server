@@ -70,6 +70,7 @@ app.use(passport.initialize());
 
 app.use("/api", healthRoutes);
 app.use("/api/ideas", ideaRoutes);
+app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/auth", authRoutes);
 app.use("/api/auth", authOtpRoutes);
 

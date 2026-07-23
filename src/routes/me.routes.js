@@ -132,6 +132,16 @@ router.post("/deactivate", requireAuth, validate({ body: deactivateBody }), deac
 // ── 虚拟点数（★不是真钱：无现金价值，不可提现/兑换）──
 // GET /api/me/points        - 当前余额
 // GET /api/me/points/ledger - 我的点数流水（分页；只看自己的，托管分录不外露）
+// ── 我的搜索历史（记录侧在 ideas.controller.listIdeas）──
+const {
+  listMySearchHistory,
+  removeMySearchHistory,
+  clearMySearchHistory,
+} = require("../controllers/searchHistory.controller");
+router.get("/search-history", requireAuth, listMySearchHistory);
+router.delete("/search-history/:id", requireAuth, removeMySearchHistory);
+router.delete("/search-history", requireAuth, clearMySearchHistory);
+
 router.get("/points", requireAuth, getMyPoints);
 router.get("/points/ledger", requireAuth, listMyPointsLedger);
 
