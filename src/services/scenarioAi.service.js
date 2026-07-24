@@ -450,7 +450,17 @@ ${String(userMessage?.text || "").slice(0, 600)}
 - 带「人设」的角色必须按其人设的风格/口头禅/倾向说话（口头禅自然穿插，不要每句都堆）。
 - authorName 必须是上面参与者里【非本人】的某个 name。中文输出。
 
-只返回 STRICT JSON：{ "replies": [ { "authorName": string, "text": string } ] }
+同时你要对【这场对话的走向】下一个判定 verdict：
+- "continue"：对话正常，可以继续（绝大多数情况；用户偶尔跑题/开玩笑也算 continue）。
+- "derailed"：用户的发言已经胡言乱语/严重脱离情景/辱骂挑衅，到了【现实中对方会拒绝
+  继续沟通】的程度。此时你的回复必须体现这个态度——表达疑惑、觉得对方不对劲、
+  或礼貌但坚决地终止交流（贴合角色身份，上司/HR/同事各有各的终止方式）。
+- "completed"：本情景的核心目标已经演完、双方达成了结局（谈成/谈崩出结果/事情有了
+  明确结论），对话自然收尾。此时你的回复应是收尾性质的。
+判定要保守：拿不准就 "continue"，不要轻易结束用户的对局。
+
+只返回 STRICT JSON：
+{ "replies": [ { "authorName": string, "text": string } ], "verdict": "continue" | "derailed" | "completed" }
 不要输出 JSON 以外的任何内容。
 `;
 
@@ -474,7 +484,68 @@ ${String(userMessage?.text || "").slice(0, 600)}
   const finalReplies = replies.length
     ? replies
     : [{ authorName: fallbackOther.name, authorAvatar: fallbackOther.avatar || "", text: "嗯。" }];
-  return { replies: finalReplies, model };
+
+  // 对局走向判定：非法值一律回退 continue（判错不结束比误杀强）
+  const rawVerdict = String(payload?.verdict || "").trim().toLowerCase();
+  const verdict = rawVerdict === "derailed" || rawVerdict === "completed" ? rawVerdict : "continue";
+
+  return { replies: finalReplies, verdict, model };
+}
+
+/**
+ * 对局复盘评分：对一整场 chat 对局里【用户】的表现打分（0-100）+ 评语。
+ * endReason 会影响评语口吻：derailed（被拒续）如实指出；completed 侧重达成度。
+ * AI 失败时返回 null —— 调用方把 evaluation 留空，不阻塞结束流程。
+ */
+async function evaluateChatSession({ scenario, messages, endReason }) {
+  requireKey();
+
+  const participants = Array.isArray(scenario?.participants) ? scenario.participants : [];
+  const self = participants.find((p) => p.isSelf);
+  const transcript = (Array.isArray(messages) ? messages : [])
+    .slice(-60)
+    .map((m) => `${m.isUser ? `${m.senderName || "用户"}（用户）` : m.senderName || "对方"}：${String(m.text || "").slice(0, 300)}`)
+    .join("\n");
+
+  const reasonLabel =
+    endReason === "derailed"
+      ? "对话因用户发言脱离情景被对方终止"
+      : endReason === "completed"
+        ? "情景目标已演完自然收尾"
+        : "用户主动结束了对话";
+
+  const prompt = `
+你是"情景模拟"的复盘教练。下面是一场对话情景与完整对话记录，请对【用户本人】
+（＝${self?.name || "我"}）在这场情景里的表现做出复盘评分。
+
+场景背景：${String(scenario?.topic || scenario?.title || "").slice(0, 400)}
+用户角色目标：${String(self?.goal || "（未设定）").slice(0, 200)}
+结束方式：${reasonLabel}
+
+对话记录：
+${transcript || "（无对话）"}
+
+评分维度：表达清晰度、策略与应对（是否达成/接近自己的目标）、分寸与情商、贴合情景程度。
+- ${endReason === "derailed" ? "对话被对方终止：评分应显著偏低，评语如实指出问题所在，并给出改进建议。" : "评语 2~4 句：先说做得好的，再给 1~2 条具体改进建议。"}
+- 中文输出。score 是 0-100 整数。
+
+只返回 STRICT JSON：{ "score": number, "comment": string }
+不要输出 JSON 以外的任何内容。
+`;
+
+  try {
+    const { text, model } = await aiComplete(prompt, { fallbackModel: "gpt-5.2" });
+    const payload = parseJsonObject(text);
+    const rawScore = Number(payload?.score);
+    if (!payload || !Number.isFinite(rawScore)) return null;
+    return {
+      score: Math.max(0, Math.min(100, Math.round(rawScore))),
+      comment: String(payload.comment || "").trim().slice(0, 2000),
+      model,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ── AI 扮演账号与用户对线 ─────────────────────────────────────────
@@ -566,4 +637,4 @@ ${String(userMessage?.text || "").slice(0, 600)}
   return { replies: finalReplies, model };
 }
 
-module.exports = { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene };
+module.exports = { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene, evaluateChatSession };
