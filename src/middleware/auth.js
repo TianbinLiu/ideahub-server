@@ -28,7 +28,7 @@ async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const userId = payload.sub;
 
-    const user = await User.findById(userId).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs deactivatedAt");
+    const user = await User.findById(userId).select("_id username email role bio avatarUrl createdAt tokenVersion joinedGroupSlugs deactivatedAt");
     if (!user) {
       authDebug("User not found:", userId);
       throw new AppError({

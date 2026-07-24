@@ -15,6 +15,7 @@ function serializeAuthUser(user) {
     username: user.username,
     email: user.email,
     role: user.role,
+    avatarUrl: user.avatarUrl || "",
     hasPassword: Boolean(user.passwordHash),
   };
 }
@@ -172,7 +173,7 @@ async function login(req, res, next) {
 
 async function me(req, res, next) {
   try {
-    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
@@ -198,7 +199,7 @@ async function setPassword(req, res, next) {
       });
     }
 
-    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
@@ -245,7 +246,7 @@ async function changePassword(req, res, next) {
       });
     }
 
-    const user = await User.findById(req.user._id).select("_id username email role passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,

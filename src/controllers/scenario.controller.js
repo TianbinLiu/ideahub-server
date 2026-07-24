@@ -3,11 +3,13 @@ const Scenario = require("../models/Scenario");
 const ScenarioLike = require("../models/ScenarioLike");
 const ScenarioBookmark = require("../models/ScenarioBookmark");
 const ScenarioMessage = require("../models/ScenarioMessage");
+const ScenarioSession = require("../models/ScenarioSession");
+const ScenarioSessionLike = require("../models/ScenarioSessionLike");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
 const PersonaPurchase = require("../models/PersonaPurchase");
 const { computeStyleDescriptor } = require("./persona.controller");
-const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene } = require("../services/scenarioAi.service");
+const { generateRolePlayReplies, generateSeedComments, generateScenarioMeta, generateScene, evaluateChatSession } = require("../services/scenarioAi.service");
 const scraperController = require("./scraper.controller");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 
@@ -601,11 +603,16 @@ async function removeScenario(req, res, next) {
     if (!doc) notFound("Scenario not found");
     if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
 
+    // 对局及其点赞一并级联（评审实锤：否则删除情景后对局回放仍公开可达）。
+    // ScenarioSessionLike 无 scenario 字段，先取 session ids 再删。
+    const sessionIds = (await ScenarioSession.find({ scenario: id }).select("_id").lean()).map((s) => s._id);
     await Promise.all([
       Scenario.deleteOne({ _id: id }),
       ScenarioLike.deleteMany({ scenario: id }),
       ScenarioBookmark.deleteMany({ scenario: id }),
       ScenarioMessage.deleteMany({ scenario: id }),
+      ScenarioSession.deleteMany({ scenario: id }),
+      ...(sessionIds.length ? [ScenarioSessionLike.deleteMany({ session: { $in: sessionIds } })] : []),
     ]);
 
     res.json({ ok: true });
@@ -758,7 +765,8 @@ async function playScenario(req, res, next) {
 
     // 先调用 AI —— 若无 OPENAI_API_KEY(501) 或 AI 出错，直接进入 catch，
     // 不落库、不虚增 playCount（避免失败即污染数据 / 统计）。
-    const { replies, model } = await generateRolePlayReplies({
+    // chat 场景下 generateChatReplies 额外返回 verdict（对局走向判定）；comment 场景无
+    const { replies, verdict, model } = await generateRolePlayReplies({
       scenario,
       history,
       userMessage: { text: userText, parentId: userParentId },
@@ -788,7 +796,351 @@ async function playScenario(req, res, next) {
       isAi: true,
     }));
 
-    res.json({ ok: true, replies: outReplies, model });
+    // ── chat 场景：对局（session）记录 + 走向判定 ──────────────────────
+    // comment 场景保持原样（无 session 概念）。verdict 来自 generateChatReplies：
+    // derailed（用户发言脱离情景被拒续）/ completed（情景演完）→ 自动结束并评分。
+    let sessionInfo = null;
+    if (scenario.sceneKind === "chat") {
+      const participants = Array.isArray(scenario.participants) ? scenario.participants : [];
+      const selfP = participants.find((p) => p.isSelf);
+      const byName = new Map(participants.map((p) => [p.name, p]));
+
+      // get-or-create active 对局（partial unique index 挡并发双开）
+      let session;
+      try {
+        session = await ScenarioSession.findOneAndUpdate(
+          { scenario: id, user: req.user._id, status: "active" },
+          {
+            $setOnInsert: {
+              scenario: id,
+              user: req.user._id,
+              status: "active",
+              platform: scenario.platform || "generic",
+              messages: [],
+            },
+          },
+          { new: true, upsert: true, setDefaultsOnInsert: true }
+        );
+      } catch (e) {
+        if (e && e.code === 11000) {
+          session = await ScenarioSession.findOne({ scenario: id, user: req.user._id, status: "active" });
+        } else {
+          throw e;
+        }
+      }
+
+      if (session) {
+        const now = new Date();
+        const newMessages = [
+          {
+            mid: userMsgId || `u_${Date.now().toString(36)}`,
+            senderId: selfP?.id || "",
+            senderName: selfP?.name || req.user.username || "我",
+            senderAvatar: req.user.avatarUrl || selfP?.avatar || "",
+            isUser: true,
+            isAi: false,
+            text: userText.slice(0, 4000),
+            at: now,
+          },
+          ...outReplies.map((r) => ({
+            mid: r.id,
+            senderId: byName.get(r.authorName)?.id || "",
+            senderName: r.authorName,
+            senderAvatar: r.authorAvatar || byName.get(r.authorName)?.avatar || "",
+            isUser: false,
+            isAi: true,
+            text: String(r.text || "").slice(0, 4000),
+            at: now,
+          })),
+        ];
+
+        let conversationVerdict = verdict || "continue";
+        // 消息上限（评审实锤：单文档无界增长）：到 200 条强制按 completed 收尾评分，
+        // 对用户呈现为「情景演完了」而不是报错打断
+        if (session.messages.length + newMessages.length >= 200 && conversationVerdict === "continue") {
+          conversationVerdict = "completed";
+        }
+        const shouldEnd = conversationVerdict === "derailed" || conversationVerdict === "completed";
+
+        session.messages.push(...newMessages);
+        if (shouldEnd) {
+          session.status = "ended";
+          session.endReason = conversationVerdict;
+          session.endedAt = now;
+          const evaluation = await evaluateChatSession({
+            scenario,
+            messages: session.messages,
+            endReason: conversationVerdict,
+          }).catch(() => null);
+          if (evaluation) {
+            session.evaluation = { score: evaluation.score, comment: evaluation.comment };
+          }
+        }
+        await session.save();
+
+        sessionInfo = {
+          sessionId: session._id,
+          verdict: conversationVerdict,
+          ended: shouldEnd,
+          endReason: shouldEnd ? conversationVerdict : "",
+          evaluation: shouldEnd ? session.evaluation : null,
+        };
+      }
+    }
+
+    res.json({ ok: true, replies: outReplies, model, session: sessionInfo });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── 对局（session）：结束 / 列表 / 回放 / 分享 / 点赞 ─────────────────────
+
+/**
+ * session 端点共用的情景可见性门（评审 high 实锤）：与 getScenarioDetail/comments 同语义——
+ * 私有情景（shared=false）的一切对局内容只有情景作者可达；对局的 shared 只在情景本身
+ * 可见的前提下才有意义，否则对局全文（参与者/前提/对话）会把私有情景泄露出去。
+ */
+async function loadVisibleScenarioOrThrow(id, user) {
+  const scenario = await Scenario.findById(id).select("_id author shared sceneKind").lean();
+  if (!scenario) notFound("Scenario not found");
+  if (!scenario.shared && (!user || String(scenario.author) !== String(user._id))) {
+    forbidden("Forbidden");
+  }
+  return scenario;
+}
+
+function serializeSessionCard(doc, ctx = {}) {
+  return {
+    _id: doc._id,
+    user:
+      doc.user && typeof doc.user === "object"
+        ? { _id: doc.user._id, username: doc.user.username, avatarUrl: doc.user.avatarUrl || "" }
+        : doc.user,
+    status: doc.status,
+    endReason: doc.endReason || "",
+    messageCount: Array.isArray(doc.messages) ? doc.messages.length : 0,
+    evaluation: doc.evaluation && doc.evaluation.score !== null ? doc.evaluation : null,
+    shared: !!doc.shared,
+    likeCount: Number(doc.likeCount || 0),
+    liked: !!ctx.liked,
+    isOwner: !!ctx.isOwner,
+    endedAt: doc.endedAt || null,
+    createdAt: doc.createdAt,
+  };
+}
+
+/**
+ * GET /:id/sessions/active —— 我的进行中对局（恢复用）。
+ * play 页加载时调用：有 active 对局则把历史消息拼回时间线继续玩（评审实锤：
+ * 否则刷新/隔天回来会出现「看不见却存在」的幽灵对局——结束时评的是看不见的对话）。
+ */
+async function getActiveScenarioSession(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid scenario id");
+    await loadVisibleScenarioOrThrow(id, req.user);
+
+    const session = await ScenarioSession.findOne({ scenario: id, user: req.user._id, status: "active" }).lean();
+    if (!session) return res.json({ ok: true, session: null });
+
+    res.json({
+      ok: true,
+      session: {
+        ...serializeSessionCard(session, { isOwner: true }),
+        messages: (session.messages || []).map((m) => ({
+          mid: m.mid,
+          senderId: m.senderId || "",
+          senderName: m.senderName || "",
+          senderAvatar: m.senderAvatar || "",
+          isUser: !!m.isUser,
+          isAi: !!m.isAi,
+          text: m.text || "",
+          at: m.at,
+        })),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /:id/sessions/end —— 手动结束当前 active 对局并评分 */
+async function endScenarioSession(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid scenario id");
+
+    const session = await ScenarioSession.findOne({ scenario: id, user: req.user._id, status: "active" });
+    if (!session) notFound("没有进行中的对局");
+
+    const scenario = await Scenario.findById(id).lean();
+    session.status = "ended";
+    session.endReason = "manual";
+    session.endedAt = new Date();
+    if (session.messages.length > 0 && scenario) {
+      const evaluation = await evaluateChatSession({
+        scenario,
+        messages: session.messages,
+        endReason: "manual",
+      }).catch(() => null);
+      if (evaluation) {
+        session.evaluation = { score: evaluation.score, comment: evaluation.comment };
+      }
+    }
+    await session.save();
+
+    res.json({
+      ok: true,
+      session: serializeSessionCard(session, { isOwner: true }),
+      evaluation: session.evaluation && session.evaluation.score !== null ? session.evaluation : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /:id/sessions —— 该情景已分享的对局列表（大家的对话） */
+async function listScenarioSessions(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid scenario id");
+    const page = Math.max(parseInt(req.query.page || "1", 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10) || 10, 1), 30);
+    const sort = String(req.query.sort || "hot") === "new" ? { endedAt: -1 } : { likeCount: -1, endedAt: -1 };
+
+    await loadVisibleScenarioOrThrow(id, req.user);
+    const filter = { scenario: id, shared: true, status: "ended" };
+    const [rows, total] = await Promise.all([
+      ScenarioSession.find(filter)
+        .sort(sort)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate("user", "_id username avatarUrl")
+        .select("-messages")
+        .lean(),
+      ScenarioSession.countDocuments(filter),
+    ]);
+
+    let likedSet = new Set();
+    if (req.user && rows.length) {
+      const likes = await ScenarioSessionLike.find({
+        user: req.user._id,
+        session: { $in: rows.map((r) => r._id) },
+      }).select("session").lean();
+      likedSet = new Set(likes.map((x) => String(x.session)));
+    }
+
+    res.json({
+      ok: true,
+      sessions: rows.map((r) =>
+        serializeSessionCard(r, {
+          liked: likedSet.has(String(r._id)),
+          isOwner: !!req.user && String(r.user?._id || r.user) === String(req.user._id),
+        })
+      ),
+      total,
+      page,
+      limit,
+      totalPages: Math.max(Math.ceil(total / limit), 1),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /:id/sessions/:sessionId —— 对局回放（已分享的对所有人开放；未分享仅本人） */
+async function getScenarioSession(req, res, next) {
+  try {
+    const { id, sessionId } = req.params;
+    if (!isValidId(id) || !isValidId(sessionId)) invalidId("Invalid id");
+
+    await loadVisibleScenarioOrThrow(id, req.user);
+    const session = await ScenarioSession.findOne({ _id: sessionId, scenario: id })
+      .populate("user", "_id username avatarUrl")
+      .lean();
+    if (!session) notFound("对局不存在");
+
+    const isOwner = !!req.user && String(session.user?._id || session.user) === String(req.user._id);
+    if (!session.shared && !isOwner) forbidden("该对局未公开");
+
+    const liked = req.user
+      ? !!(await ScenarioSessionLike.exists({ user: req.user._id, session: sessionId }))
+      : false;
+
+    res.json({
+      ok: true,
+      session: {
+        ...serializeSessionCard(session, { liked, isOwner }),
+        messages: (session.messages || []).map((m) => ({
+          mid: m.mid,
+          senderId: m.senderId || "",
+          senderName: m.senderName || "",
+          senderAvatar: m.senderAvatar || "",
+          isUser: !!m.isUser,
+          isAi: !!m.isAi,
+          text: m.text || "",
+          at: m.at,
+        })),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /:id/sessions/:sessionId/share —— 公开自己的对局（进入「大家的对话」+ 可被点赞） */
+async function shareScenarioSession(req, res, next) {
+  try {
+    const { id, sessionId } = req.params;
+    if (!isValidId(id) || !isValidId(sessionId)) invalidId("Invalid id");
+
+    // 私有情景的对局不允许公开分享：对局全文会泄露私有情景内容（评审实锤）
+    const scenario = await loadVisibleScenarioOrThrow(id, req.user);
+    if (!scenario.shared) badRequest("私有情景的对局不能公开分享");
+
+    const session = await ScenarioSession.findOne({ _id: sessionId, scenario: id });
+    if (!session) notFound("对局不存在");
+    if (String(session.user) !== String(req.user._id)) forbidden("Forbidden");
+    if (session.status !== "ended") badRequest("对局结束后才能分享");
+
+    session.shared = true;
+    await session.save();
+    res.json({ ok: true, shared: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /:id/sessions/:sessionId/like —— 点赞 toggle（仅对已分享对局） */
+async function toggleScenarioSessionLike(req, res, next) {
+  try {
+    const { id, sessionId } = req.params;
+    if (!isValidId(id) || !isValidId(sessionId)) invalidId("Invalid id");
+
+    await loadVisibleScenarioOrThrow(id, req.user);
+    const session = await ScenarioSession.findOne({ _id: sessionId, scenario: id }).select("_id user shared").lean();
+    if (!session) notFound("对局不存在");
+    if (!session.shared && String(session.user) !== String(req.user._id)) forbidden("该对局未公开");
+
+    const existing = await ScenarioSessionLike.findOne({ user: req.user._id, session: sessionId });
+    let liked;
+    if (existing) {
+      await ScenarioSessionLike.deleteOne({ _id: existing._id });
+      liked = false;
+    } else {
+      try {
+        await ScenarioSessionLike.create({ user: req.user._id, session: sessionId });
+      } catch (e) {
+        if (!(e && e.code === 11000)) throw e; // 并发重复：幂等
+      }
+      liked = true;
+    }
+
+    const likeCount = await ScenarioSessionLike.countDocuments({ session: sessionId });
+    await ScenarioSession.updateOne({ _id: sessionId }, { $set: { likeCount } });
+
+    res.json({ ok: true, liked, likeCount });
   } catch (err) {
     next(err);
   }
@@ -952,4 +1304,10 @@ module.exports = {
   generateScenario,
   generateSceneController,
   analyzeScenario,
+  endScenarioSession,
+  getActiveScenarioSession,
+  listScenarioSessions,
+  getScenarioSession,
+  shareScenarioSession,
+  toggleScenarioSessionLike,
 };

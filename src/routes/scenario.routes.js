@@ -23,6 +23,12 @@ const {
   generateScenario,
   generateSceneController,
   analyzeScenario,
+  endScenarioSession,
+  getActiveScenarioSession,
+  listScenarioSessions,
+  getScenarioSession,
+  shareScenarioSession,
+  toggleScenarioSessionLike,
 } = require("../controllers/scenario.controller");
 
 const comments = makeCommentHandlers({
@@ -43,6 +49,15 @@ router.delete("/:id", requireAuth, removeScenario);
 router.post("/:id/like", requireAuth, toggleScenarioLike);
 router.post("/:id/bookmark", requireAuth, toggleScenarioBookmark);
 router.post("/:id/play", requireAuth, validate({ body: playBody }), playScenario);
+
+// ── 对局（session）：记录 / 结束 / 回放 / 分享 / 点赞 ──
+// /sessions/end、/sessions/active 是三段静态路径，与 /sessions/:sessionId 顺序敏感：静态在前防被 :sessionId 捕获
+router.post("/:id/sessions/end", requireAuth, endScenarioSession);
+router.get("/:id/sessions/active", requireAuth, getActiveScenarioSession);
+router.get("/:id/sessions", optionalAuth, listScenarioSessions);
+router.get("/:id/sessions/:sessionId", optionalAuth, getScenarioSession);
+router.post("/:id/sessions/:sessionId/share", requireAuth, shareScenarioSession);
+router.post("/:id/sessions/:sessionId/like", requireAuth, toggleScenarioSessionLike);
 
 // ── 情景详情页讨论区（与模拟页的仿真评论 ScenarioMessage 无关）──────────
 router.get("/:id/comments", optionalAuth, comments.list);
