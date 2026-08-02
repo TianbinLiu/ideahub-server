@@ -11,6 +11,22 @@
  */
 
 require("dotenv").config();
+
+// 可选：覆盖 Node 的 DNS 服务器（逗号分隔）。不设就完全按系统走，生产不受影响。
+//
+// 为什么需要：Node 的 dns.resolve*（c-ares）用的是它自己那份服务器列表，和 Windows
+// 解析器不是一回事。某些机器上（开了 WSL/Hyper-V 的 ICS DNS 代理时）c-ares 会选中
+// 127.0.0.1，而那个代理对本机查询一律 REFUSED —— 表现就是浏览器一切正常、Node 却
+// `querySrv ECONNREFUSED`，mongodb+srv:// 连不上。设一下这个变量即可绕过，
+// 不用改连接串、也不用动系统网络设置。
+if (process.env.DNS_SERVERS) {
+  const servers = process.env.DNS_SERVERS.split(",").map((s) => s.trim()).filter(Boolean);
+  if (servers.length) {
+    require("dns").setServers(servers);
+    console.log("🌐 DNS servers overridden:", servers.join(", "));
+  }
+}
+
 const fs = require("fs").promises;
 const path = require("path");
 const app = require("./app");
