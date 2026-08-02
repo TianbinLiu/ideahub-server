@@ -52,8 +52,31 @@ function toDeckPayload(doc) {
     id: String(doc._id),
     name: doc.name || "",
     cardIds: Array.isArray(doc.cardIds) ? doc.cardIds : [],
+    published: !!doc.published,
+    publishedAt: doc.publishedAt,
+    description: doc.description || "",
+    installs: Number(doc.installs || 0),
+    sourceDeck: doc.sourceDeck ? String(doc.sourceDeck) : undefined,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
+  };
+}
+
+/** 广场里的一条：不返回完整 cards 快照（列表会很大），只给张数和前几张封面 */
+function toSharedDeckPayload(doc) {
+  if (!doc) return null;
+  const cards = Array.isArray(doc.cards) ? doc.cards : [];
+  return {
+    _id: doc._id,
+    id: String(doc._id),
+    name: doc.name || "",
+    description: doc.description || "",
+    cardCount: cards.length,
+    covers: cards.slice(0, 4).map((c) => c.cover).filter(Boolean),
+    types: [...new Set(cards.map((c) => c.type))],
+    installs: Number(doc.installs || 0),
+    author: doc.owner && typeof doc.owner === "object" ? doc.owner : undefined,
+    publishedAt: doc.publishedAt,
   };
 }
 
@@ -327,6 +350,202 @@ async function deleteDeck(req, res, next) {
   }
 }
 
+// ── 卡组分享到创意工坊 ────────────────────────────────────────────
+
+const DECK_AUTHOR_FIELDS = "_id username displayName avatarUrl";
+
+// POST /decks/:id/publish —— { description? }
+// 发布时把卡片内容快照进卡组：卡片是 { owner, cardId } 私有的，
+// 别人装这套卡组时要给他自己建一份。快照让「装」这件事自包含，
+// 也让发布者事后删卡不会把已分享的卡组变成空壳。
+async function publishDeck(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid deck id");
+
+    const doc = await BranchDeck.findById(id);
+    if (!doc) notFound("Deck not found");
+    if (String(doc.owner) !== String(req.user._id)) forbidden("Forbidden");
+    if (!doc.cardIds.length) {
+      res.status(400);
+      throw new Error("空卡组不能分享");
+    }
+
+    const owned = await BranchCard.find({ owner: req.user._id, cardId: { $in: doc.cardIds } }).lean();
+    if (!owned.length) {
+      res.status(400);
+      throw new Error("这套卡组里的卡片都不在了");
+    }
+
+    // 按卡组里的顺序快照
+    const byId = new Map(owned.map((c) => [c.cardId, c]));
+    doc.cards = doc.cardIds
+      .map((cid) => byId.get(cid))
+      .filter(Boolean)
+      .map((c) => ({
+        cardId: c.cardId,
+        type: c.type,
+        name: c.name || "",
+        summary: c.summary || "",
+        cover: c.cover || "",
+        tags: Array.isArray(c.tags) ? c.tags : [],
+        hot: Number(c.hot || 0),
+      }));
+    doc.description = String((req.body && req.body.description) || "").trim().slice(0, 200);
+    doc.published = true;
+    doc.publishedAt = new Date();
+    await doc.save();
+
+    res.json({ ok: true, deck: toDeckPayload(doc.toObject()) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /decks/:id/publish —— 取消分享（快照一并清掉，别白占空间）
+async function unpublishDeck(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid deck id");
+
+    const doc = await BranchDeck.findById(id);
+    if (!doc) notFound("Deck not found");
+    if (String(doc.owner) !== String(req.user._id)) forbidden("Forbidden");
+
+    doc.published = false;
+    doc.publishedAt = undefined;
+    doc.cards = [];
+    await doc.save();
+
+    res.json({ ok: true, deck: toDeckPayload(doc.toObject()) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /decks/shared?q=&limit= —— 广场（optionalAuth：不登录也能逛）
+// Express 5 的 req.query 是只读 getter，validate({query}) 会静默失效，
+// 所以这里显式解析（与 branchVideo 的列表同一处理）。
+async function listSharedDecks(req, res, next) {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 60);
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+
+    const filter = { published: true };
+    if (q) {
+      // 用户输入直接进正则会被当成模式（比如搜 "a+b" 会炸），先转义
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ name: rx }, { description: rx }, { "cards.name": rx }, { "cards.tags": rx }];
+    }
+
+    const docs = await BranchDeck.find(filter)
+      .sort({ publishedAt: -1 })
+      .limit(limit)
+      .populate("owner", DECK_AUTHOR_FIELDS)
+      // 装来的卡组再分享出去时把出处带上，否则广场会被无署名的转发副本填满
+      .populate({ path: "sourceDeck", select: "owner", populate: { path: "owner", select: DECK_AUTHOR_FIELDS } })
+      .lean();
+
+    // 已登录时标出「我装过了」和「这是我自己发的」
+    let installedSet = new Set();
+    if (req.user) {
+      const mine = await BranchDeck.find({ owner: req.user._id, sourceDeck: { $ne: null } })
+        .select("sourceDeck")
+        .lean();
+      installedSet = new Set(mine.map((d) => String(d.sourceDeck)));
+    }
+
+    res.json({
+      ok: true,
+      decks: docs.map((d) => ({
+        ...toSharedDeckPayload(d),
+        remixOf: d.sourceDeck && d.sourceDeck.owner ? d.sourceDeck.owner : undefined,
+        installed: installedSet.has(String(d._id)),
+        isOwner: req.user ? String((d.owner && d.owner._id) || d.owner) === String(req.user._id) : false,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /decks/:id/install —— 把别人分享的卡组装进我的库。
+// 幂等：同一个人对同一套源卡组只装一次（{owner, sourceDeck} 唯一索引兜底）。
+async function installDeck(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid deck id");
+
+    const src = await BranchDeck.findById(id).lean();
+    if (!src || !src.published) notFound("Deck not found");
+    if (String(src.owner) === String(req.user._id)) {
+      res.status(400);
+      throw new Error("这是你自己分享的卡组");
+    }
+
+    const owner = req.user._id;
+    const existing = await BranchDeck.findOne({ owner, sourceDeck: src._id }).lean();
+    if (existing) {
+      return res.json({ ok: true, deck: toDeckPayload(existing), cards: [], alreadyInstalled: true });
+    }
+
+    // 1) 快照里的卡 upsert 进我的卡库（已有的同 cardId 不覆盖）
+    const snap = Array.isArray(src.cards) ? src.cards : [];
+    if (snap.length) {
+      await BranchCard.bulkWrite(
+        snap.map((c) => ({
+          updateOne: {
+            filter: { owner, cardId: c.cardId },
+            update: {
+              $setOnInsert: {
+                owner,
+                cardId: c.cardId,
+                type: c.type,
+                name: c.name,
+                summary: c.summary,
+                cover: c.cover,
+                tags: c.tags,
+                hot: c.hot,
+                createdAt: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false }
+      );
+    }
+
+    // 2) 建我自己的卡组
+    let deck;
+    try {
+      deck = await BranchDeck.create({
+        owner,
+        name: src.name,
+        cardIds: snap.map((c) => c.cardId),
+        sourceDeck: src._id,
+      });
+    } catch (e) {
+      if (e && e.code === 11000) {
+        const dup = await BranchDeck.findOne({ owner, sourceDeck: src._id }).lean();
+        if (dup) return res.json({ ok: true, deck: toDeckPayload(dup), cards: [], alreadyInstalled: true });
+      }
+      throw e;
+    }
+
+    await BranchDeck.updateOne({ _id: src._id }, { $inc: { installs: 1 } });
+
+    const cards = await BranchCard.find({ owner, cardId: { $in: snap.map((c) => c.cardId) } }).lean();
+    res.status(201).json({
+      ok: true,
+      deck: toDeckPayload(deck.toObject()),
+      cards: cards.map(toCardPayload),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listCards,
   addCards,
@@ -335,4 +554,8 @@ module.exports = {
   createDeck,
   updateDeck,
   deleteDeck,
+  publishDeck,
+  unpublishDeck,
+  listSharedDecks,
+  installDeck,
 };
