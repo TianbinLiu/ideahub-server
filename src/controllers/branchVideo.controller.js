@@ -1,0 +1,654 @@
+// src/controllers/branchVideo.controller.js
+// 分支视频控制器：列表（recommend/following + category + q + cursor 分页）、发布（含资源转存）、
+// 详情、删除、播放计数、点赞/取消（BranchLike 去重）、评论列表/发表。
+//
+// ★ 资源转存（契约 docs/api-contract.md「资源转存」）：
+//   1) dataURL   → Buffer → uploadToCloudinary(buffer, "branch-frames", key)
+//   2) 方舟 TOS videoUrl（约 24h 过期）→ 服务端 fetch 下载 → cloudinary upload_stream({resource_type:"video"})
+//   3) 其它 http(s) 外链 → 原样保留
+//   单个资源失败只 console.warn 并降级为原值，不阻断整条发布。
+const mongoose = require("mongoose");
+const BranchVideo = require("../models/BranchVideo");
+const BranchLike = require("../models/BranchLike");
+const BranchComment = require("../models/BranchComment");
+const Follow = require("../models/Follow");
+const { uploadToCloudinary } = require("../middleware/upload");
+const { cloudinary } = require("../config/cloudinary");
+const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
+const { listQuery, commentListQuery } = require("../schemas/branchVideo.schemas");
+
+const AUTHOR_FIELDS = "_id username displayName avatarUrl";
+
+// 下载方舟视频的上限与超时（可用环境变量覆盖）
+const MAX_VIDEO_BYTES = Number(process.env.BRANCH_VIDEO_MAX_BYTES || 80 * 1024 * 1024);
+const VIDEO_FETCH_TIMEOUT_MS = Number(process.env.BRANCH_VIDEO_FETCH_TIMEOUT_MS || 60_000);
+// 转存失败时，超过该长度的 dataURL 不再内联落库（否则一条作品的 base64 会撑爆 16MB BSON 上限）
+const MAX_INLINE_FALLBACK = Number(process.env.BRANCH_INLINE_FALLBACK_MAX || 512 * 1024);
+
+// 火山方舟 / TOS 视频域名特征：命中则必须转存，否则 24h 后链接失效
+const ARK_HOST_PATTERNS = [
+  /(^|\.)volces\.com$/i,
+  /(^|\.)volccdn\.com$/i,
+  /(^|\.)byteimg\.com$/i,
+  /(^|\.)bytedance\.com$/i,
+  /(^|\.)ivolces\.com$/i,
+  /tos-[a-z0-9-]+\./i,
+];
+
+function isValidId(id) {
+  return mongoose.isValidObjectId(id);
+}
+
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isDataUrl(value) {
+  return typeof value === "string" && /^data:[\w.+-]*\/?[\w.+-]*;base64,/i.test(value.trim());
+}
+
+function isHttpUrl(value) {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
+}
+
+function isArkVideoUrl(value) {
+  if (!isHttpUrl(value)) return false;
+  try {
+    const host = new URL(value.trim()).hostname;
+    return ARK_HOST_PATTERNS.some((re) => re.test(host));
+  } catch {
+    return false;
+  }
+}
+
+// ── 资源转存 ─────────────────────────────────────────────────────
+
+function dataUrlToBuffer(value) {
+  const raw = String(value).trim();
+  const commaAt = raw.indexOf(",");
+  if (commaAt < 0) return null;
+  const buf = Buffer.from(raw.slice(commaAt + 1), "base64");
+  return buf.length ? buf : null;
+}
+
+/** 转存失败的降级值：过大的 dataURL 不内联落库，避免撑爆单文档 16MB */
+function fallbackValue(original, label) {
+  const raw = String(original || "");
+  if (isDataUrl(raw) && raw.length > MAX_INLINE_FALLBACK) {
+    console.warn(`[branch] ${label} 转存失败且 dataURL 过大(${raw.length}B)，已丢弃内联数据`);
+    return "";
+  }
+  return raw;
+}
+
+async function uploadVideoBuffer(buffer, key) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "ideahub/branch-videos",
+        public_id: `${key}`,
+        resource_type: "video",
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result?.secure_url || "");
+      }
+    );
+    stream.end(buffer);
+  });
+}
+
+async function downloadToBuffer(url) {
+  if (typeof fetch !== "function") throw new Error("global fetch unavailable (Node >= 18 required)");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VIDEO_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { redirect: "follow", signal: controller.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const declared = Number(resp.headers.get("content-length") || 0);
+    if (declared && declared > MAX_VIDEO_BYTES) {
+      throw new Error(`video too large: ${declared} > ${MAX_VIDEO_BYTES}`);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length) throw new Error("empty body");
+    if (buf.length > MAX_VIDEO_BYTES) {
+      throw new Error(`video too large: ${buf.length} > ${MAX_VIDEO_BYTES}`);
+    }
+    return buf;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 转存上下文：同一次发布内按「原始值」缓存结果，
+ * 让 segments 与 branchTree 里重复出现的同一帧只上传一次。
+ */
+function createTransferContext(userId) {
+  return { userId, cache: new Map(), seq: 0, uploaded: 0, failed: 0, kept: 0 };
+}
+
+function nextKey(ctx, label) {
+  ctx.seq += 1;
+  const slug = String(label).replace(/[^a-zA-Z0-9]+/g, "-").slice(0, 24);
+  return `${ctx.userId}-${Date.now()}-${ctx.seq}-${slug}`;
+}
+
+/** 图片类资源（cover / firstFrame / lastFrame）：dataURL 才转存，http(s) 原样保留 */
+async function transferImage(ctx, value, label) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (!isDataUrl(raw)) {
+    ctx.kept += 1;
+    return raw; // 已是 http(s) 或其它形式，原样保留
+  }
+  if (ctx.cache.has(raw)) return ctx.cache.get(raw);
+
+  let out;
+  try {
+    const buffer = dataUrlToBuffer(raw);
+    if (!buffer) throw new Error("invalid dataURL payload");
+    out = await uploadToCloudinary(buffer, "branch-frames", nextKey(ctx, label));
+    ctx.uploaded += 1;
+  } catch (err) {
+    ctx.failed += 1;
+    console.warn(`[branch] 图片转存失败(${label}):`, err?.message || err);
+    out = fallbackValue(raw, label);
+  }
+  ctx.cache.set(raw, out);
+  return out;
+}
+
+/** 视频资源：dataURL 或方舟 TOS 链接才转存，其它 http(s) 原样保留 */
+async function transferVideo(ctx, value, label) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const needsTransfer = isDataUrl(raw) || isArkVideoUrl(raw);
+  if (!needsTransfer) {
+    ctx.kept += 1;
+    return raw;
+  }
+  if (ctx.cache.has(raw)) return ctx.cache.get(raw);
+
+  let out;
+  try {
+    const buffer = isDataUrl(raw) ? dataUrlToBuffer(raw) : await downloadToBuffer(raw);
+    if (!buffer) throw new Error("empty video payload");
+    out = await uploadVideoBuffer(buffer, nextKey(ctx, label));
+    if (!out) throw new Error("cloudinary returned no url");
+    ctx.uploaded += 1;
+  } catch (err) {
+    ctx.failed += 1;
+    console.warn(`[branch] 视频转存失败(${label}):`, err?.message || err);
+    out = fallbackValue(raw, label); // 降级保留原值（方舟链接约 24h 后失效）
+  }
+  ctx.cache.set(raw, out);
+  return out;
+}
+
+async function transferSegment(ctx, segment, label) {
+  return {
+    title: segment.title || "",
+    plot: segment.plot || "",
+    firstFrame: await transferImage(ctx, segment.firstFrame, `${label}.firstFrame`),
+    lastFrame: await transferImage(ctx, segment.lastFrame, `${label}.lastFrame`),
+    durationSec: Number(segment.durationSec || 0),
+    videoUrl: await transferVideo(ctx, segment.videoUrl, `${label}.videoUrl`),
+  };
+}
+
+/**
+ * 把整份草稿里的外链资源转存到 Cloudinary。
+ * 串行执行：Cloudinary 有并发/速率限制，且缓存命中依赖前一次结果。
+ */
+async function transferDraftAssets(draft, userId) {
+  const ctx = createTransferContext(userId);
+
+  const cover = await transferImage(ctx, draft.cover, "cover");
+
+  const segments = [];
+  for (let i = 0; i < draft.segments.length; i += 1) {
+    segments.push(await transferSegment(ctx, draft.segments[i], `segments[${i}]`));
+  }
+
+  let branchTree;
+  if (draft.branchTree && draft.branchTree.nodes) {
+    const nodes = {};
+    for (const [nodeId, node] of Object.entries(draft.branchTree.nodes)) {
+      nodes[nodeId] = {
+        id: node.id || nodeId,
+        segment: await transferSegment(ctx, node.segment, `branchTree.${nodeId}`),
+        choices: Array.isArray(node.choices) ? node.choices : [],
+      };
+    }
+    branchTree = {
+      rootId: draft.branchTree.rootId,
+      ...(draft.branchTree.startChoices ? { startChoices: draft.branchTree.startChoices } : {}),
+      nodes,
+    };
+  }
+
+  console.log(
+    `[branch] 资源转存完成 user=${userId} uploaded=${ctx.uploaded} kept=${ctx.kept} failed=${ctx.failed}`
+  );
+
+  return { cover, segments, branchTree };
+}
+
+// ── 序列化 ───────────────────────────────────────────────────────
+
+function toAuthorPayload(author) {
+  if (!author) return null;
+  if (typeof author === "object" && author._id) {
+    return {
+      _id: author._id,
+      username: author.username || "",
+      displayName: author.displayName || "",
+      avatarUrl: author.avatarUrl || "",
+    };
+  }
+  return author; // 未 populate 时是裸 ObjectId
+}
+
+function toBranchTreePayload(tree) {
+  if (!tree) return undefined;
+  // lean() 出来的 Map 字段是普通对象；非 lean 时是 Map
+  const nodes = tree.nodes instanceof Map ? Object.fromEntries(tree.nodes) : tree.nodes;
+  if (!nodes) return undefined;
+  return {
+    rootId: tree.rootId || "",
+    ...(Array.isArray(tree.startChoices) && tree.startChoices.length
+      ? { startChoices: tree.startChoices }
+      : {}),
+    nodes,
+  };
+}
+
+function toVideoPayload(doc, ctx = {}) {
+  if (!doc) return null;
+  const payload = {
+    _id: doc._id,
+    title: doc.title || "",
+    category: doc.category || "",
+    description: doc.description || "",
+    cover: doc.cover || "",
+    segments: Array.isArray(doc.segments) ? doc.segments : [],
+    author: toAuthorPayload(doc.author),
+    plays: Number(doc.plays || 0),
+    likes: Number(doc.likes || 0),
+    commentCount: Number(doc.commentCount || 0),
+    liked: !!ctx.liked,
+    isOwner: !!ctx.isOwner,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+  const tree = toBranchTreePayload(doc.branchTree);
+  if (tree) payload.branchTree = tree;
+  if (ctx.comments) payload.comments = ctx.comments;
+  return payload;
+}
+
+function toCommentPayload(doc) {
+  if (!doc) return null;
+  return {
+    _id: doc._id,
+    author: toAuthorPayload(doc.author),
+    text: doc.text || "",
+    createdAt: doc.createdAt,
+  };
+}
+
+function ownedBy(doc, user) {
+  return !!user && !!doc?.author && String(user._id) === String(doc.author?._id || doc.author);
+}
+
+/** 当前用户在这批视频里点过赞的集合 */
+async function loadLikedSet(user, docs) {
+  if (!user || !docs.length) return new Set();
+  const likes = await BranchLike.find({
+    user: user._id,
+    video: { $in: docs.map((d) => d._id) },
+  })
+    .select("video")
+    .lean();
+  return new Set(likes.map((x) => String(x.video)));
+}
+
+// ── cursor 分页（createdAt 降序 + _id 兜底，避免同毫秒丢条目）────
+
+function encodeCursor(doc) {
+  const at = doc.createdAt instanceof Date ? doc.createdAt : new Date(doc.createdAt);
+  return `${at.toISOString()}_${doc._id}`;
+}
+
+function cursorFilter(cursor) {
+  if (!cursor) return null;
+  const sep = cursor.lastIndexOf("_");
+  if (sep < 0) return null;
+  const at = new Date(cursor.slice(0, sep));
+  const id = cursor.slice(sep + 1);
+  if (Number.isNaN(at.getTime()) || !isValidId(id)) return null;
+  return {
+    $or: [{ createdAt: { $lt: at } }, { createdAt: at, _id: { $lt: new mongoose.Types.ObjectId(id) } }],
+  };
+}
+
+// ── 端点 ─────────────────────────────────────────────────────────
+
+// GET /api/branch/videos
+async function listVideos(req, res, next) {
+  try {
+    const { feed, category, q, cursor, limit } = listQuery.parse(req.query);
+
+    const filter = {};
+
+    if (feed === "following") {
+      if (!req.user) return res.json({ ok: true, items: [], nextCursor: null });
+      const follows = await Follow.find({ follower: req.user._id }).select("following").lean();
+      const authorIds = follows.map((f) => f.following);
+      if (!authorIds.length) return res.json({ ok: true, items: [], nextCursor: null });
+      filter.author = { $in: authorIds };
+    }
+
+    if (category && category !== "全部" && category.toLowerCase() !== "all") {
+      filter.category = category;
+    }
+
+    if (q) {
+      const re = new RegExp(escapeRegExp(q), "i");
+      filter.$or = [{ title: re }, { description: re }];
+    }
+
+    const range = cursorFilter(cursor);
+    const query = range ? { $and: [filter, range] } : filter;
+
+    const docs = await BranchVideo.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1) // 多取一条判断是否还有下一页
+      .populate("author", AUTHOR_FIELDS)
+      .lean();
+
+    const hasMore = docs.length > limit;
+    const page = hasMore ? docs.slice(0, limit) : docs;
+    const likedSet = await loadLikedSet(req.user, page);
+
+    res.json({
+      ok: true,
+      items: page.map((doc) =>
+        toVideoPayload(doc, {
+          liked: likedSet.has(String(doc._id)),
+          isOwner: ownedBy(doc, req.user),
+        })
+      ),
+      nextCursor: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/branch/videos
+async function createVideo(req, res, next) {
+  try {
+    const draft = req.body;
+    if (!Array.isArray(draft.segments) || draft.segments.length === 0) {
+      badRequest("segments is required");
+    }
+
+    // 幂等：转存几段方舟视频要几十秒，客户端很容易先超时再重发，而第一次其实已经落库了。
+    // 先按 {author, clientId} 查一次，命中就直接把首次那条还回去（连转存都不用重做）。
+    const clientId = typeof draft.clientId === "string" ? draft.clientId.trim() : "";
+    if (clientId) {
+      const dup = await BranchVideo.findOne({ author: req.user._id, clientId })
+        .populate("author", AUTHOR_FIELDS)
+        .lean();
+      if (dup) {
+        return res.status(200).json({
+          ok: true,
+          video: toVideoPayload(dup, { liked: false, isOwner: true, comments: [] }),
+        });
+      }
+    }
+
+    // 关键步骤：dataURL / 方舟 TOS 链接转存为 Cloudinary 永久地址
+    const { cover, segments, branchTree } = await transferDraftAssets(draft, String(req.user._id));
+
+    let doc;
+    try {
+      doc = await BranchVideo.create({
+        title: draft.title,
+        category: draft.category || "",
+        description: draft.description || "",
+        cover: cover || segments[0]?.firstFrame || "",
+        segments,
+        ...(branchTree ? { branchTree } : {}),
+        author: req.user._id,
+        ...(clientId ? { clientId } : {}),
+        plays: 0,
+        likes: 0,
+        commentCount: 0,
+      });
+    } catch (err) {
+      // 两次重发几乎同时到达：上面的查重都扑空，唯一索引在这里兜底
+      if (err && err.code === 11000 && clientId) {
+        const dup = await BranchVideo.findOne({ author: req.user._id, clientId })
+          .populate("author", AUTHOR_FIELDS)
+          .lean();
+        if (dup) {
+          return res.status(200).json({
+            ok: true,
+            video: toVideoPayload(dup, { liked: false, isOwner: true, comments: [] }),
+          });
+        }
+      }
+      throw err;
+    }
+
+    const populated = await BranchVideo.findById(doc._id).populate("author", AUTHOR_FIELDS).lean();
+    res.status(201).json({
+      ok: true,
+      video: toVideoPayload(populated, { liked: false, isOwner: true, comments: [] }),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/branch/videos/:id
+async function getVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const doc = await BranchVideo.findById(id).populate("author", AUTHOR_FIELDS).lean();
+    if (!doc) notFound("Video not found");
+
+    const [comments, liked] = await Promise.all([
+      BranchComment.find({ video: id })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .populate("author", AUTHOR_FIELDS)
+        .lean(),
+      req.user ? BranchLike.exists({ user: req.user._id, video: id }) : Promise.resolve(null),
+    ]);
+
+    res.json({
+      ok: true,
+      video: toVideoPayload(doc, {
+        liked: !!liked,
+        isOwner: ownedBy(doc, req.user),
+        comments: comments.map(toCommentPayload),
+      }),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/branch/videos/:id
+async function removeVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const doc = await BranchVideo.findById(id).select("_id author").lean();
+    if (!doc) notFound("Video not found");
+    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+
+    await Promise.all([
+      BranchVideo.deleteOne({ _id: id }),
+      BranchLike.deleteMany({ video: id }),
+      BranchComment.deleteMany({ video: id }),
+    ]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/branch/videos/:id/play
+async function addPlay(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const updated = await BranchVideo.findByIdAndUpdate(
+      id,
+      { $inc: { plays: 1 } },
+      { new: true, select: "plays" }
+    ).lean();
+    if (!updated) notFound("Video not found");
+
+    res.json({ ok: true, plays: Number(updated.plays || 0) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** 用 BranchLike 重算并回写 likes，返回最新计数 */
+async function syncLikes(videoId) {
+  const likes = await BranchLike.countDocuments({ video: videoId });
+  await BranchVideo.updateOne({ _id: videoId }, { $set: { likes } });
+  return likes;
+}
+
+// POST /api/branch/videos/:id/like
+async function likeVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const exists = await BranchVideo.exists({ _id: id });
+    if (!exists) notFound("Video not found");
+
+    // 唯一索引 + upsert：重复点赞幂等，不会把计数刷高
+    await BranchLike.updateOne(
+      { user: req.user._id, video: id },
+      { $setOnInsert: { user: req.user._id, video: id } },
+      { upsert: true }
+    );
+
+    res.json({ ok: true, likes: await syncLikes(id), liked: true });
+  } catch (err) {
+    // 并发下 upsert 可能撞唯一索引，视作已点赞
+    if (err && err.code === 11000) {
+      try {
+        return res.json({ ok: true, likes: await syncLikes(req.params.id), liked: true });
+      } catch (inner) {
+        return next(inner);
+      }
+    }
+    next(err);
+  }
+}
+
+// DELETE /api/branch/videos/:id/like
+async function unlikeVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const exists = await BranchVideo.exists({ _id: id });
+    if (!exists) notFound("Video not found");
+
+    await BranchLike.deleteOne({ user: req.user._id, video: id });
+
+    res.json({ ok: true, likes: await syncLikes(id), liked: false });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/branch/videos/:id/comments
+async function listComments(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const { cursor, limit } = commentListQuery.parse(req.query);
+
+    const exists = await BranchVideo.exists({ _id: id });
+    if (!exists) notFound("Video not found");
+
+    const range = cursorFilter(cursor);
+    const query = range ? { $and: [{ video: id }, range] } : { video: id };
+
+    const docs = await BranchComment.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .populate("author", AUTHOR_FIELDS)
+      .lean();
+
+    const hasMore = docs.length > limit;
+    const page = hasMore ? docs.slice(0, limit) : docs;
+
+    res.json({
+      ok: true,
+      items: page.map(toCommentPayload),
+      nextCursor: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/branch/videos/:id/comments
+async function addComment(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const exists = await BranchVideo.exists({ _id: id });
+    if (!exists) notFound("Video not found");
+
+    const doc = await BranchComment.create({
+      video: id,
+      author: req.user._id,
+      text: req.body.text,
+    });
+
+    const commentCount = await BranchComment.countDocuments({ video: id });
+    await BranchVideo.updateOne({ _id: id }, { $set: { commentCount } });
+
+    const populated = await BranchComment.findById(doc._id).populate("author", AUTHOR_FIELDS).lean();
+    res.status(201).json({ ok: true, comment: toCommentPayload(populated), commentCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  listVideos,
+  createVideo,
+  getVideo,
+  removeVideo,
+  addPlay,
+  likeVideo,
+  unlikeVideo,
+  listComments,
+  addComment,
+  // 导出给测试/其它模块复用
+  transferDraftAssets,
+  isArkVideoUrl,
+};

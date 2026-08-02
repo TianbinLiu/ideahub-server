@@ -103,6 +103,25 @@ router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, ne
   }
 });
 
+// GET /api/me/profile - 读回完整资料
+// /api/auth/me 的 serializeAuthUser 不含 displayName/bio（它只服务于登录态校验），
+// 客户端重新装载账号时要拿昵称、简介、头像，得有这条对称的读接口，
+// 否则换设备登录后昵称会退回 username。
+router.get("/profile", requireAuth, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user._id).select(
+      "username displayName bio avatarUrl role createdAt"
+    );
+    if (!user) {
+      res.status(404);
+      throw new Error("User not found");
+    }
+    res.json({ ok: true, user });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // PUT /api/me/profile - Update user profile
 router.put("/profile", requireAuth, async (req, res, next) => {
   try {

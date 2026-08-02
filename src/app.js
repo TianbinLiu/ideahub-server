@@ -47,6 +47,9 @@ const app = express();
 app.set("trust proxy", 1);
 
 app.use(cors());
+// 分支视频发布体里带 dataURL 首尾帧（MB 级），默认 100kb 会 413。
+// 只给 /api/branch 放宽，必须排在全局 express.json() 之前（body-parser 解析过就不会重复解析）。
+app.use("/api/branch", express.json({ limit: process.env.BRANCH_JSON_LIMIT || "50mb" }));
 app.use(express.json());
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
@@ -97,6 +100,7 @@ app.use("/api/bounties", bountyRoutes);
 app.use("/api/speaking-style", speakingStyleRoutes);
 app.use("/api/personas", personaRoutes);
 app.use("/api/memes", memeRoutes);
+app.use("/api/branch", require("./routes/branchVideo.routes"));
 
 app.use(notFound);
 app.use(errorHandler);
