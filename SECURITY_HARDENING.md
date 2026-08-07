@@ -166,8 +166,34 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
   仍建议后续在 nginx 配 `real_ip` 模块 + `set_real_ip_from <Cloudflare IP 段>`
   并拒绝非 Cloudflare 来源的连接（需 sudo），以封死直连源站伪造头的残余路径。
 
-- ⚠️ **nginx 访问日志的客户端 IP 现在是 Cloudflare 边缘 IP**（同一根因）。
-  排查问题时看到的不是真实用户 IP，配 `real_ip` 模块可一并解决。
+- ✅ ~~nginx 访问日志的客户端 IP 是 Cloudflare 边缘 IP~~ **已修复（2026-08-07）**。
+  已配置 `ngx_http_realip_module`：22 条 `set_real_ip_from`（15 个 IPv4 + 7 个 IPv6
+  官方网段）+ `real_ip_header CF-Connecting-IP` + `real_ip_recursive off`。
+  实测确认：日志中记录的是真实访问者 IP，无任何 Cloudflare 段的 IP。
+  脚本见 `client/deploy/apply-nginx-realip.sh`（幂等、失败自动清理、IP 段实时拉取）。
+
+  **实现要点**：配置作为新文件放进 `/etc/nginx/conf.d/`，由 nginx.conf 既有的
+  `include /etc/nginx/conf.d/*.conf;` 自动加载 —— 不修改任何现有配置文件，
+  回退就是删一个文件。放 http 层而非逐个 server 块，因为
+  `server_name api.ideahubs.org;` 在 80 端口跳转块与 443 块各出现一次，
+  按名字锚定会改错位置（脚本的断言在预演时拦下了这个）。
+
+  **维护**：Cloudflare 网段会变，重跑脚本即可刷新（幂等）。建议纳入月度巡检 ——
+  网段过期不会报错，只会让 real_ip 静默失效、日志与限流悄悄退回错误状态。
+
+### ⚠️ 本轮踩到的三次「验证方法假阴性」（值得记住）
+
+三次都表现为「改动看起来失败了」，但实际配置从头到尾正确。若当时贸然回滚，
+就会撤掉一个本来正确的改动：
+
+1. **`systemctl reload nginx` 是异步的** —— reload 返回后旧 worker 仍在服务，
+   紧接着 curl 会打到旧 worker，报「未看到安全头」。→ 验证要带重试。
+2. **`/proc/<pid>/environ` 看不到 dotenv 设的变量** —— 那是进程 exec 时的环境快照，
+   而 dotenv 在运行时设置 `process.env`。→ 要在应用的加载路径里查。
+3. **非 root 跑 `nginx -T` 输出为空** —— 读不了 Let's Encrypt 证书文件直接中止，
+   `grep -c set_real_ip_from` 得到 0。→ 要么用 sudo，要么直接看配置文件本身。
+
+**通用教训**：验证失败时先怀疑验证方法，再怀疑改动本身。
 - ✅ **DMARC 已加报告地址**：`v=DMARC1; p=none; rua=mailto:...; fo=1; adkim=r; aspf=r`。
   仍保持 `p=none` 不拦截 —— 同时用了 SES 与 Resend 两个发信通道，
   在拿到聚合报告确认 SPF/DKIM 对齐之前收紧到 `p=quarantine` 有可能把自己的正常邮件
