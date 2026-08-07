@@ -85,6 +85,50 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
 
 ---
 
+## A5. 线上核查结果（2026-08-07 实际登录 ECS 核对）
+
+对着生产环境逐项验证，结果与纸面推测有出入，以下为**实情**：
+
+### 已当场修复
+
+- 🔴 **`JWT_SECRET` 是 `.env.example` 里的占位符**（33 字符，以 `replace` 开头）。
+  这个字符串就写在公开仓库里 —— 任何人都能据此签发任意用户（含 admin）的 JWT，
+  是完全的认证绕过，比代码里那几个漏洞更致命，且当时正在线上。
+  **已轮换为 64 字符随机值**（服务器上 `secrets.token_urlsafe(48)` 生成并直接写入
+  `.env`，值未经过屏幕也未进任何记录），`pm2 restart --update-env` 后
+  `check:config` 通过、`/api/health` 200、旧 token 已返回 401。
+  副作用：全员需重新登录（已知并接受）。
+  原 `.env` 备份在服务器 `/var/www/ideahub-server/.env.bak.2026-08-07-131207`。
+
+### 与纸面推测不符、需修正的认知
+
+- **前端不在 Vercel 上**：GitHub Actions 构建后 rsync 到 ECS 的
+  `/var/www/ideahub-client-dist`，由 nginx 提供服务。`vercel.json` 对生产不生效，
+  安全响应头必须走 nginx（见 `client/deploy/`）。
+- **缓存策略服务器上已配好**（index.html no-cache、/assets/ immutable），无需再加。
+- **`api.ideahubs.org` 已被 helmet 完整覆盖**（CSP/HSTS/nosniff/XFO/Referrer-Policy
+  实测均在），nginx 层无需重复。只有前端域名缺安全头。
+- **`.env` 权限是 600、属主 deploy**，且 `OTP_PEPPER`、`SMS_PROVIDER`、
+  `CLIENT_BASE_URL` 均已正确配置 —— 这几项原先担心的问题实际不存在。
+
+### 新发现、尚未处理
+
+- ⚠️ **生产环境没有设置 `NODE_ENV`**。后果：① 我加的启动自检只告警不拦截；
+  ② `middleware/error.js` 对 500 的消息脱敏不生效，内部错误详情会回给客户端；
+  ③ Express 跑在 development 模式（性能与日志行为都不同）。
+  修法是在 `.env` 加 `NODE_ENV=production` 后重启 —— 但**改完启动自检会转为强制**，
+  配置有任何问题会拒绝启动，所以要在能立刻处理的时间窗口做。
+- ⚠️ **`deploy` 用户无免密 sudo**，nginx 配置改不了。安全响应头需要有 sudo 权限的人
+  执行 `sudo bash /tmp/apply-nginx-headers.sh`（脚本已上传到服务器 `/tmp`，
+  幂等、失败自动回滚）。
+- ⚠️ **`ideahubs.org` 与 `api.ideahubs.org` 均未走 Cloudflare 代理**（响应无 `cf-ray`），
+  源站 IP `8.217.8.225` 直接暴露，无 WAF/DDoS 防护。
+- ⚠️ **`ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` 明文存在 `.env`**。
+  应确认该 AK 是按最小权限授权的 RAM 子账号（只给短信发送所需权限），而非主账号 AK。
+- GitHub 三仓的 Dependabot（alerts + security updates + dependency graph）**已开启**，
+  Secret scanning 与 Push protection 原本就是开的。当前 2 条告警均为 `uuid` 的
+  moderate 问题，来自测试/构建工具链，不进生产运行时。
+
 ## B. 待人工执行（需控制台/服务器权限）
 
 以下按 Xerofocus 清单的章节顺序组织，映射到我们的实际栈。**代码层做不到，必须人工操作。**
