@@ -100,8 +100,18 @@ async function start() {
     } catch (cleanupErr) {
       console.warn("Cleanup empty leaderboards failed:", cleanupErr.message || cleanupErr);
     }
-    const server = app.listen(PORT, () => {
-      console.log(`Server listening on http://localhost:${PORT}`);
+    // ★ 显式绑定监听地址，默认只听 127.0.0.1。
+    //
+    // 原先是 app.listen(PORT)，等于监听 0.0.0.0（所有网卡）—— 4000 端口对公网
+    // 是否可达，就全靠云安全组那一条规则。规则被改错、或换台机器忘了配，API 就
+    // 直接裸露在公网上，且【绕过 nginx 的全部安全响应头、也绕过 Cloudflare 的
+    // WAF 与源站隐藏】。本进程只由同机 nginx 反代（proxy_pass http://127.0.0.1:4000），
+    // 绑本地不影响任何调用方，却把"单靠安全组"变成了两层防护。
+    //
+    // 容器化部署（需要跨容器访问）时用 BIND_HOST=0.0.0.0 覆盖。
+    const HOST = process.env.BIND_HOST || "127.0.0.1";
+    const server = app.listen(PORT, HOST, () => {
+      console.log(`Server listening on http://${HOST}:${PORT}`);
     });
 
     // ★ AI worker 移到这里：原来它在 start() 之外被调用，不等 connectDB() 完成，
