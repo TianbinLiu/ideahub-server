@@ -7,6 +7,7 @@
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "postinstall": "node scripts/copyProjectDocs.js",
+    "check:config": "node scripts/checkConfig.js",
     "recompute:tag-leaderboards": "node src/workers/recomputeTagLeaderboards.js",
     "cleanup:empty-leaderboards": "node scripts/cleanupEmptyLeaderboards.js",
     "backfill:points": "node scripts/backfillPoints.js",

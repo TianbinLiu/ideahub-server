@@ -73,43 +73,9 @@ async function syncProjectDocs() {
   }
 }
 
-/**
- * 启动自检：把「配错了但能跑起来」变成「配错了就起不来」。
- *
- * 这些值以前是缺了也照常启动、等到第一个请求进来才炸（JWT_SECRET），
- * 或者更糟——静默降级成开发模式（SMS provider=dev 会把验证码打进日志，
- * 谁能看日志谁就能登录任意手机账号）。生产环境宁可拒绝启动。
- */
-function assertProductionConfig() {
-  const isProd = process.env.NODE_ENV === "production";
-  const problems = [];
-
-  const secret = process.env.JWT_SECRET || "";
-  if (!secret) problems.push("JWT_SECRET 未设置");
-  else if (secret.length < 32) problems.push(`JWT_SECRET 过短（${secret.length} 字符，至少 32）`);
-  else if (/^(replace|change|example|test|secret|dev)/i.test(secret)) problems.push("JWT_SECRET 仍是示例值");
-
-  if (isProd) {
-    if (!process.env.OTP_PEPPER || process.env.OTP_PEPPER === "dev_pepper_change_me") {
-      problems.push("OTP_PEPPER 未设置或仍是默认值（6 位验证码的 sha256 可离线暴破）");
-    }
-    if (!process.env.SMS_PROVIDER || process.env.SMS_PROVIDER === "dev") {
-      problems.push("SMS_PROVIDER 未配置真实短信通道（dev 通道会把验证码写进日志）");
-    }
-    if (!process.env.CORS_ORIGINS && !process.env.CLIENT_BASE_URL) {
-      problems.push("CORS_ORIGINS / CLIENT_BASE_URL 均未设置，CORS 将对所有来源开放");
-    }
-  }
-
-  if (problems.length) {
-    const msg = problems.map((p) => `  - ${p}`).join("\n");
-    if (isProd) {
-      console.error(`❌ 生产配置自检未通过：\n${msg}`);
-      process.exit(1);
-    }
-    console.warn(`⚠️  配置自检提示（非生产环境，仅告警）：\n${msg}`);
-  }
-}
+// 启动自检的实现在 config/preflight.js —— 抽出去是为了能用
+// `npm run check:config` 在【部署之前】单独跑一次，而不是等部署失败才发现缺什么。
+const { assertProductionConfig } = require("./config/preflight");
 
 async function start() {
   try {
