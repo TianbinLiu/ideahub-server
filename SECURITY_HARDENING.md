@@ -131,9 +131,16 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
   **注意验证方法**：`/proc/<pid>/environ` 看不到这个值 —— 那是进程 exec 时的环境快照，
   而 dotenv 是在 Node 运行时设置 `process.env`。要验证得在应用的加载路径里查
   （`node -e 'require("dotenv").config(); console.log(process.env.NODE_ENV)'`）。
-- ⚠️ **`deploy` 用户无免密 sudo**，nginx 配置改不了。安全响应头需要有 sudo 权限的人
-  执行 `sudo bash /tmp/apply-nginx-headers.sh`（脚本已上传到服务器 `/tmp`，
-  幂等、失败自动回滚）。
+- ✅ ~~`deploy` 用户无免密 sudo，nginx 安全头待应用~~ **已完成（2026-08-07）**。
+  前端 `ideahubs.org` 现返回 CSP / HSTS / X-Content-Type-Options / X-Frame-Options:DENY /
+  Referrer-Policy / Permissions-Policy / COOP / X-DNS-Prefetch-Control。
+  关键验证：`/assets/*.js` **同时**带 `Cache-Control: immutable` 与全套安全头 ——
+  证明 nginx「子 location 有 add_header 就丢弃父块全部 add_header」的坑已绕过
+  （include 插在了 server 块 + `location = /index.html` + `location /assets/` 三处）。
+  浏览器实测首页与 `/tag-rank`：全部请求 200、零 CSP 违规、跨域调 `api.ideahubs.org` 正常。
+  ⚠️ 脚本首次运行时验证步骤误报「未看到安全头」——`systemctl reload nginx` 是异步的，
+  紧接着 curl 会打到旧 worker。脚本已改为重试 5 次，但**若日后再见到这条提示，
+  先手动 `curl -I` 确认，不要贸然回滚一个可能本来就正确的改动**。
 - ⚠️ **`ideahubs.org` 与 `api.ideahubs.org` 均未走 Cloudflare 代理**（响应无 `cf-ray`），
   源站 IP `8.217.8.225` 直接暴露，无 WAF/DDoS 防护。
 - ⚠️ **`ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` 明文存在 `.env`**。
