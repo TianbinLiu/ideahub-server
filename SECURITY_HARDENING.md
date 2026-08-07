@@ -111,13 +111,26 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
 - **`.env` 权限是 600、属主 deploy**，且 `OTP_PEPPER`、`SMS_PROVIDER`、
   `CLIENT_BASE_URL` 均已正确配置 —— 这几项原先担心的问题实际不存在。
 
+### 生产环境实测证据（代码确实在跑，不只是部署了）
+
+- **限流生效**：连续 25 次 `POST /api/auth/login` → 第 25 次返回 `HTTP 429`。
+- **优雅退出生效**：pm2 重启时日志出现 `SIGINT 收到，开始优雅退出… 已断开数据库连接，退出`，
+  说明在途请求会被 drain 而不是硬切。
+- **启动自检生效**：`npm run check:config` 在 production 模式下通过；
+  轮换 JWT_SECRET 前它准确报出了「JWT_SECRET 仍是示例值」。
+- **鉴权正常**：无 token 访问 `/api/auth/me` → 401；旧 token（轮换前签发）→ 401；
+  不存在的路由 → 404；`/api/health` → 200。
+
 ### 新发现、尚未处理
 
-- ⚠️ **生产环境没有设置 `NODE_ENV`**。后果：① 我加的启动自检只告警不拦截；
-  ② `middleware/error.js` 对 500 的消息脱敏不生效，内部错误详情会回给客户端；
-  ③ Express 跑在 development 模式（性能与日志行为都不同）。
-  修法是在 `.env` 加 `NODE_ENV=production` 后重启 —— 但**改完启动自检会转为强制**，
-  配置有任何问题会拒绝启动，所以要在能立刻处理的时间窗口做。
+- ✅ ~~生产环境没有设置 `NODE_ENV`~~ **已修复（2026-08-07）**。原先的后果是：
+  启动自检只告警不拦截、500 错误的内部细节原样回给客户端、Express 跑 development 模式。
+  已在 `.env` 首行加入 `NODE_ENV=production` 并重启，验证：应用读到的
+  `process.env.NODE_ENV === "production"`、500 消息脱敏为 `"Server error"`、
+  启动自检转为强制且通过。
+  **注意验证方法**：`/proc/<pid>/environ` 看不到这个值 —— 那是进程 exec 时的环境快照，
+  而 dotenv 是在 Node 运行时设置 `process.env`。要验证得在应用的加载路径里查
+  （`node -e 'require("dotenv").config(); console.log(process.env.NODE_ENV)'`）。
 - ⚠️ **`deploy` 用户无免密 sudo**，nginx 配置改不了。安全响应头需要有 sudo 权限的人
   执行 `sudo bash /tmp/apply-nginx-headers.sh`（脚本已上传到服务器 `/tmp`，
   幂等、失败自动回滚）。
