@@ -7,6 +7,7 @@ const AppError = require("../utils/AppError");
 const Idea = require("../models/Idea");
 const ScraperJob = require("../models/ScraperJob");
 const { uploadToCloudinary } = require("../middleware/upload");
+const { assertPublicUrl, safeGet } = require("../utils/ssrfGuard");
 
 const PLATFORM_CATALOG = [
   {
@@ -84,17 +85,20 @@ async function saveRemoteImageToCloudinary(sourceUrl) {
   if (!["http:", "https:"].includes(parsed.protocol)) return "";
 
   const axios = (await import("axios")).default;
-  const response = await axios.get(normalizedSourceUrl, {
+  // safeGet：解析 DNS 后拒绝私网/回环/云元数据地址，并逐跳校验重定向。
+  // 原来的 maxRedirects:5 意味着"第一跳公网、第二跳 169.254.169.254"照样能打通。
+  const response = await safeGet(axios, normalizedSourceUrl, {
     responseType: "arraybuffer",
     timeout: 20000,
-    maxRedirects: 5,
+    maxContentLength: 5 * 1024 * 1024,
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
       Referer: `${parsed.protocol}//${parsed.host}/`,
     },
-    validateStatus: (status) => status >= 200 && status < 400,
   });
+
+  if (response.status < 200 || response.status >= 300) return "";
 
   const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
   if (!contentType.startsWith("image/")) return "";
@@ -522,14 +526,10 @@ async function fetchExternalContent(req, res, next) {
       });
     }
 
-    // Security: only allow http/https protocols
-    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
-      throw new AppError({
-        code: "INVALID_URL",
-        status: 400,
-        message: "Only HTTP/HTTPS URLs are allowed",
-      });
-    }
+    // Security: 协议白名单 + 目标 IP 必须是公网地址。
+    // 只判协议是不够的 —— https://169.254.169.254/latest/meta-data/ 完全合法，
+    // 而下面的 parseHtml 结果会原样回传给调用方，构成可读型 SSRF（云凭证外泄）。
+    await assertPublicUrl(url);
 
     let title = "";
     let content = "";
@@ -704,11 +704,11 @@ async function fetchExternalContent(req, res, next) {
 
     for (const headers of requestStrategies) {
       try {
-        const response = await axios.get(url, {
+        // safeGet 内部逐跳校验重定向目标（maxRedirects 交给它管），并限制响应体大小
+        const response = await safeGet(axios, url, {
           timeout: 15000,
-          maxRedirects: 5,
+          maxContentLength: 5 * 1024 * 1024,
           headers,
-          validateStatus: (status) => status >= 200 && status < 500,
         });
 
         const contentType = String(response.headers?.["content-type"] || "").toLowerCase();

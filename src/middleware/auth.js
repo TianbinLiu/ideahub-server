@@ -25,7 +25,9 @@ async function requireAuth(req, res, next) {
       });
     }
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    // ★ 固定算法：不写 algorithms 时 jsonwebtoken 会按 token 头部的 alg 字段来验，
+    //   这正是 alg 混淆攻击的入口（如把 HS256 换成别的对称算法试探）。我们只签 HS256。
+    const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
     const userId = payload.sub;
 
     const user = await User.findById(userId).select("_id username email role bio avatarUrl createdAt tokenVersion joinedGroupSlugs deactivatedAt");
@@ -113,7 +115,9 @@ async function optionalAuth(req, res, next) {
       return next(); // 没 token 就当匿名
     }
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    // ★ 固定算法：不写 algorithms 时 jsonwebtoken 会按 token 头部的 alg 字段来验，
+    //   这正是 alg 混淆攻击的入口（如把 HS256 换成别的对称算法试探）。我们只签 HS256。
+    const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
     const user = await User.findById(payload.sub).select("_id username email role bio createdAt tokenVersion joinedGroupSlugs deactivatedAt");
     // 已注销账号当匿名处理：不挂 req.user，也不阻塞公开接口
     if (user && !user.deactivatedAt && Number(payload.tokenVersion || 0) === Number(user.tokenVersion || 0)) {

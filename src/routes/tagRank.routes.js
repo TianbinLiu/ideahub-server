@@ -13,7 +13,10 @@ router.get("/search", optionalAuth, searchLeaderboards);
 router.get("/suggest", optionalAuth, require("../controllers/tagRank.controller").suggestTags || ((req,res)=>res.json({ok:true, tags:[] }))); 
 
 // POST /api/tag-rank/leaderboard { tags }
-router.post("/leaderboard", optionalAuth, createLeaderboard);
+// ★ requireAuth（原为 optionalAuth）：这是全仓唯一一个"写操作只挂 optionalAuth"的端点，
+//   而 createLeaderboard 是带 upsert 的 findOneAndUpdate —— 匿名请求即可用同一 tagsKey
+//   覆盖他人榜单的全部 entries，或批量 upsert 灌库。
+router.post("/leaderboard", requireAuth, createLeaderboard);
 
 // GET /api/tag-rank/leaderboards?sort=recent|hottest
 router.get("/leaderboards", optionalAuth, listLeaderboards);

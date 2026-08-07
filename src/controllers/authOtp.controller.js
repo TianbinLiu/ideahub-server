@@ -129,6 +129,11 @@ async function emailResetVerify(req, res, next) {
 
     const passwordHash = await bcrypt.hash(String(newPassword), 10);
     user.passwordHash = passwordHash;
+    // ★ 必须递增 tokenVersion —— 这是"忘记密码"的重置入口，用户走到这里
+    //   十有八九正是因为账号已被盗。只改密码而不作废已发出的 token，
+    //   攻击者手里那张 7 天有效期的 JWT 会继续有效，重置形同虚设。
+    //   （auth.controller 的改密/设密两条路径都递增了，唯独这里漏了。）
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1;
     await user.save();
 
     const token = signToken(user);

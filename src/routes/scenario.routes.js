@@ -4,6 +4,7 @@
 // 讨论区 /:id/comments 是两段路径，与上述单段静态路径不会互相遮蔽，挂在末尾即可。
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
+const { aiRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const { createBody, updateBody, playBody, captureBody, generateBody, analyzeBody, generateSceneBody } = require("../schemas/scenario.schemas");
 const { createBody: commentCreateBody } = require("../schemas/arenaComment.schemas");
@@ -39,16 +40,16 @@ const comments = makeCommentHandlers({
 router.get("/", optionalAuth, listScenarios);
 router.get("/mine", requireAuth, listMyScenarios);
 router.post("/", requireAuth, validate({ body: createBody }), createScenario);
-router.post("/capture", requireAuth, validate({ body: captureBody }), captureScenario);
-router.post("/generate", requireAuth, validate({ body: generateBody }), generateScenario);
-router.post("/generate-scene", requireAuth, validate({ body: generateSceneBody }), generateSceneController);
-router.post("/analyze", requireAuth, validate({ body: analyzeBody }), analyzeScenario);
+router.post("/capture", requireAuth, aiRateLimit({ max: 10, scope: "ai:scenario-capture" }), validate({ body: captureBody }), captureScenario);
+router.post("/generate", requireAuth, aiRateLimit({ max: 10, scope: "ai:scenario-generate" }), validate({ body: generateBody }), generateScenario);
+router.post("/generate-scene", requireAuth, aiRateLimit({ max: 10, scope: "ai:scenario-scene" }), validate({ body: generateSceneBody }), generateSceneController);
+router.post("/analyze", requireAuth, aiRateLimit({ max: 10, scope: "ai:scenario-analyze" }), validate({ body: analyzeBody }), analyzeScenario);
 router.get("/:id", optionalAuth, getScenarioDetail);
 router.put("/:id", requireAuth, validate({ body: updateBody }), updateScenario);
 router.delete("/:id", requireAuth, removeScenario);
 router.post("/:id/like", requireAuth, toggleScenarioLike);
 router.post("/:id/bookmark", requireAuth, toggleScenarioBookmark);
-router.post("/:id/play", requireAuth, validate({ body: playBody }), playScenario);
+router.post("/:id/play", requireAuth, aiRateLimit({ max: 20, scope: "ai:scenario-play" }), validate({ body: playBody }), playScenario);
 
 // ── 对局（session）：记录 / 结束 / 回放 / 分享 / 点赞 ──
 // /sessions/end、/sessions/active 是三段静态路径，与 /sessions/:sessionId 顺序敏感：静态在前防被 :sessionId 捕获

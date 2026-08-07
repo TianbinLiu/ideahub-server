@@ -14,7 +14,12 @@ function notFound(req, res, next) {
 }
 
 function errorHandler(err, req, res, next) {
-  let status = err.status || 500;
+  // 仓里有两套写法：AppError 把状态码带在 err.status 上，而 auth/ideas/interest 等
+  // controller 用的是 Express 惯例的 `res.status(400); throw new Error(...)`。
+  // 后者的普通 Error 没有 .status，只认 err.status 的话这 15 处全部退化成 500
+  // （表现：注册撞用户名返回的是"服务器错误"而不是 409）。两套都认。
+  const preset = res.statusCode >= 400 ? res.statusCode : 0;
+  let status = err.status || preset || 500;
   let code = err.code || CODES.SERVER_ERROR;
   let message = err.message || "Server error";
   let details = err.details;

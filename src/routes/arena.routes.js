@@ -13,10 +13,11 @@
 
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
+const { aiRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const { suggestBody } = require("../schemas/arena.schemas");
 const { suggestReplies } = require("../controllers/arena.controller");
 
-router.post("/suggest", requireAuth, validate({ body: suggestBody }), suggestReplies);
+router.post("/suggest", requireAuth, aiRateLimit({ max: 20, scope: "ai:arena-suggest" }), validate({ body: suggestBody }), suggestReplies);
 
 module.exports = router;

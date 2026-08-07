@@ -11,6 +11,7 @@ const Notification = require("../models/Notification");
 const { canReadIdea, canWriteIdea, canModerateIdea } = require("../utils/permissions");
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
+const { searchRegex } = require("../utils/regex");
 const { validateFeedback, generateIdeaDraftFromContent } = require("../services/aiReview.service");
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
@@ -1094,7 +1095,7 @@ async function suggestTitles(req, res, next) {
   try {
     const q = (req.query.q || "").toString().trim();
     if (!q) return res.json({ ok: true, ideas: [] });
-    const re = new RegExp(q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), "i");
+    const re = searchRegex(q);
     const accessibleGroupSlugs = getAccessibleGroupSlugs(req.user);
     const publicGroupSlugs = (await Group.find({ visibility: "public" }).select("slug").lean()).map((group) => group.slug);
     const items = await Idea.find({

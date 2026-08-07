@@ -44,6 +44,7 @@
 
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
+const { aiRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 
 const { requestAiReview } = require("../controllers/aiReview.controller");
@@ -83,7 +84,7 @@ router.get("/suggest", optionalAuth, require("../controllers/ideas.controller").
 
 router.get("/mine", requireAuth, listMyIdeas);
 
-router.post("/draft", requireAuth, generateIdeaDraft);
+router.post("/draft", requireAuth, aiRateLimit({ max: 10, scope: "ai:idea-draft" }), generateIdeaDraft);
 
 // 详情：公开/未列出任何人可看；私密仅作者
 router.get("/:id", optionalAuth, getIdeaById);

@@ -174,6 +174,33 @@ function findModelEntryFile(files) {
   return "";
 }
 
+// Live2D 运行时真正需要的文件类型。★这是白名单，不是黑名单 —— 新格式宁可报错也别放行。
+//
+// 为什么必须限制：解压产物落在 uploads/ 下，由 express.static 按【扩展名】推导 Content-Type
+// 对外提供，且该目录显式设了 Access-Control-Allow-Origin: *。zip 里塞一个 evil.html +
+// payload.js，就得到一个同源、可执行的页面 —— helmet 的 script-src 'self' 拦不住它，
+// 因为它确实就在 self 上。API 与前端同域时即为完整的存储型 XSS（可直接读走 localStorage 里的 JWT）。
+// .svg 同样危险：直接导航时以 image/svg+xml 渲染，内嵌 <script> 会执行。
+const LIVE2D_ALLOWED_EXTENSIONS = new Set([
+  ".json", ".moc", ".moc3", ".mtn", ".motion3", ".exp", ".exp3",
+  ".png", ".jpg", ".jpeg", ".webp",
+  ".physics3", ".cdi3", ".pose3", ".userdata3", ".txt",
+]);
+
+/** 解压总字节上限：25MB 的 zip 可以膨胀到几十 GB（zip bomb），必须按解压后体积记账 */
+const MAX_EXTRACTED_BYTES = 60 * 1024 * 1024;
+/** 条目数上限：几十万个空文件同样能把 inode 和目录遍历打死 */
+const MAX_ENTRIES = 500;
+
+function isAllowedLive2DFile(name) {
+  const base = path.basename(name).toLowerCase();
+  if (base.startsWith(".")) return false; // .htaccess 之类
+  // 复合扩展名（model3.json / motion3.json）取最后一段判断即可，
+  // 但要挡住 "evil.png.html" 这种——所以判的是【最后】一个扩展名。
+  const ext = path.extname(base);
+  return LIVE2D_ALLOWED_EXTENSIONS.has(ext);
+}
+
 async function extractZipToDirectory(buffer, targetDir) {
   const zip = new AdmZip(buffer);
   const entries = zip.getEntries();
@@ -186,7 +213,18 @@ async function extractZipToDirectory(buffer, targetDir) {
     });
   }
 
+  if (entries.length > MAX_ENTRIES) {
+    throw new AppError({
+      code: CODES.VALIDATION_ERROR,
+      status: 400,
+      message: `The bundle contains too many files (max ${MAX_ENTRIES})`,
+    });
+  }
+
   await fs.mkdir(targetDir, { recursive: true });
+
+  let written = 0;
+  let accepted = 0;
 
   for (const entry of entries) {
     const normalizedName = path.normalize(entry.entryName).replace(/^([.][.][/\\])+/, "");
@@ -205,8 +243,33 @@ async function extractZipToDirectory(buffer, targetDir) {
       continue;
     }
 
+    // 不在白名单的条目直接跳过（而不是报错）：真实的 Live2D 包常夹带
+    // readme/psd/授权文件，为这些整包拒绝对用户太粗暴。危险的那些不落盘即可。
+    if (!isAllowedLive2DFile(normalizedName)) {
+      continue;
+    }
+
+    const data = entry.getData();
+    written += data.length;
+    if (written > MAX_EXTRACTED_BYTES) {
+      throw new AppError({
+        code: CODES.VALIDATION_ERROR,
+        status: 400,
+        message: "The bundle expands to too much data",
+      });
+    }
+
     await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.writeFile(destination, entry.getData());
+    await fs.writeFile(destination, data);
+    accepted += 1;
+  }
+
+  if (!accepted) {
+    throw new AppError({
+      code: CODES.VALIDATION_ERROR,
+      status: 400,
+      message: "The bundle contains no usable Live2D files",
+    });
   }
 }
 

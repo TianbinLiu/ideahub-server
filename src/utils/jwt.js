@@ -44,7 +44,7 @@ function signOauthState(payload) {
 }
 
 function verifyOauthState(token) {
-  const payload = jwt.verify(token, process.env.JWT_SECRET);
+  const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
   if (payload?.purpose !== "oauth-state") {
     throw new Error("Invalid OAuth state");
   }
