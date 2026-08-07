@@ -88,10 +88,19 @@ function getClient() {
 async function aiComplete(prompt, opts = {}) {
   const model = resolveModel(opts.fallbackModel || "gpt-5.2");
 
-  const resp = await getClient().chat.completions.create({
-    model,
-    messages: [{ role: "user", content: String(prompt || "") }],
-  });
+  // ★ timeout / max_tokens 是必须的，不是可选优化：
+  //   - 没有 timeout：上游挂起时这条请求会一直占着 Node 的连接与内存，
+  //     几十个并发就能把服务拖垮（我们这边先崩，上游还没回）。
+  //   - 没有 max_tokens：单次响应长度无上限，成本不可预测，
+  //     且超长输出会连带把下游的解析/存储撑爆。
+  const resp = await getClient().chat.completions.create(
+    {
+      model,
+      messages: [{ role: "user", content: String(prompt || "") }],
+      max_tokens: Number(process.env.AI_MAX_TOKENS || 2048),
+    },
+    { timeout: Number(process.env.AI_TIMEOUT_MS || 60_000) },
+  );
 
   const text =
     (resp &&

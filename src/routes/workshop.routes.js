@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
+const { aiRateLimit } = require("../middleware/rateLimit");
 const {
   listTemplates,
   listMyTemplates,
@@ -17,8 +18,8 @@ const {
   getActiveTemplate,
 } = require("../controllers/workshop.controller");
 
-router.post("/ai/edit", requireAuth, previewAiEdit);
-router.post("/ai/site-edit", requireAuth, previewAiSiteEdit);
+router.post("/ai/edit", requireAuth, aiRateLimit({ max: 15, scope: "ai:workshop-edit" }), previewAiEdit);
+router.post("/ai/site-edit", requireAuth, aiRateLimit({ max: 15, scope: "ai:workshop-site-edit" }), previewAiSiteEdit);
 router.get("/templates", optionalAuth, listTemplates);
 router.get("/templates/mine", requireAuth, listMyTemplates);
 router.get("/tag-insights", optionalAuth, listTemplateTagInsights);

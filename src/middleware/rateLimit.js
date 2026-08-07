@@ -1,41 +1,132 @@
-// Simple in-memory rate limiter for abuse protection.
-// Note: in-memory is per-process; for production consider Redis-backed limiter.
+// 进程内限流。
+//
+// ★ 边界声明（部署前必读）：这是【单进程】计数器。PM2 cluster / 多实例部署时，
+//   每个进程各有一份 buckets，实际放行量 = 配置值 × 进程数。真正要挡住撞库，
+//   得换 Redis 后端（见 docs/security-hardening.md 的"待办"）。此处的目标是
+//   把"完全无节流"提升到"有成本"，不是密码学意义上的严格配额。
+//
+// 相比初版的三处改动：
+//   1. 惰性清理过期桶 —— 初版的 Map 永不删除条目，每个来访 IP 一条永久驻留，
+//      被慢速扫描打一遍就是几十万条常驻内存（内存泄漏即 DoS 面）。
+//   2. 支持自定义 key —— 只按 IP 限流挡不住"一个 IP 池撞一个账号"，
+//      登录接口需要按【账号】再限一道。
+//   3. 返回 Retry-After 头 —— 正常客户端能据此退避，而不是盲目重试放大压力。
 
 const buckets = new Map();
 
-function rateLimit({ windowMs = 60 * 1000, max = 10 } = {}) {
+// 测试环境整体关闭：单元/集成测试会在几秒内跑出成百上千次请求，
+// 限流一开，测的就不再是业务逻辑而是限流器本身（且失败信息极具误导性——
+// 你会看到"创建悬赏返回 429"，完全看不出跟限流有关）。
+// 限流器自身的行为由 tests/rateLimit.spec.js 单独覆盖。
+const DISABLED = process.env.NODE_ENV === "test";
+
+/** 每这么多次请求做一轮过期清理（惰性 GC，避免常驻 setInterval） */
+const SWEEP_EVERY = 500;
+let sinceSweep = 0;
+
+function sweep(now) {
+  for (const [key, entry] of buckets) {
+    if (now - entry.start > entry.windowMs) buckets.delete(key);
+  }
+}
+
+/**
+ * @param {object}   [opts]
+ * @param {number}   [opts.windowMs] 窗口长度，默认 60s
+ * @param {number}   [opts.max]      窗口内最大请求数，默认 10
+ * @param {string}   [opts.scope]    桶名前缀。不同接口必须给不同 scope，
+ *                                   否则会共用同一个计数器互相干扰
+ * @param {Function} [opts.keyFor]   (req) => string|null，返回附加维度（如账号名）。
+ *                                   返回 null 表示这一维度不适用，跳过。
+ */
+function rateLimit({ windowMs = 60 * 1000, max = 10, scope = "default", keyFor = null } = {}) {
+  if (DISABLED) return (req, res, next) => next();
   return (req, res, next) => {
     try {
-      const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress || 'anon';
       const now = Date.now();
-      const key = ip;
-      let entry = buckets.get(key);
-      if (!entry) {
-        entry = { count: 1, start: now };
-        buckets.set(key, entry);
-        return next();
+      if (++sinceSweep >= SWEEP_EVERY) {
+        sinceSweep = 0;
+        sweep(now);
       }
 
-      if (now - entry.start > windowMs) {
-        // reset window
-        entry.count = 1;
-        entry.start = now;
-        buckets.set(key, entry);
+      // trust proxy 已在 app.js 设为 1，req.ip 即 nginx 透传的真实客户端 IP。
+      // 不再自己读 x-forwarded-for：那个头客户端可任意伪造，读它等于让限流可被绕过。
+      const dimension = keyFor ? keyFor(req) : null;
+      if (keyFor && dimension == null) return next();
+      const key = `${scope}:${dimension ?? req.ip ?? "anon"}`;
+
+      let entry = buckets.get(key);
+      if (!entry || now - entry.start > windowMs) {
+        buckets.set(key, { count: 1, start: now, windowMs });
         return next();
       }
 
       if (entry.count >= max) {
-        res.status(429).json({ ok: false, code: 'RATE_LIMIT_EXCEEDED', message: 'Too many requests, slow down' });
-        return;
+        const retryAfter = Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000));
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+          ok: false,
+          code: "RATE_LIMIT_EXCEEDED",
+          message: "Too many requests, slow down",
+          details: { retryAfter },
+        });
       }
 
       entry.count += 1;
-      buckets.set(key, entry);
       return next();
-    } catch (e) {
+    } catch {
+      // fail-open：限流器自身出错不该把正常业务打挂
       return next();
     }
   };
 }
 
-module.exports = { rateLimit };
+/**
+ * 登录类接口的双维度限流：IP 一道 + 账号一道。
+ *
+ * ★ 两个维度的松紧【必须】不一样，这是本文件最容易改错的地方：
+ *   - 按账号要【严】：同一个账号 15 分钟内被试 10 次密码，正常用户不可能，
+ *     撞库则必然触发。这一道才是真正挡住撞库的。
+ *   - 按 IP 要【松】：运营商 CGNAT、校园网、办公室出口后面是成千上万真实用户，
+ *     共用一个公网 IP。按 IP 卡死等于"一个网吧有人失败几次，整栋楼都登不上"。
+ *     这一道只用来削掉最粗暴的单机洪水。
+ *   把 IP 那道调紧看起来"更安全"，实际是拿可用性换一个撞库者随便换 IP 就能绕开的限制。
+ */
+function loginRateLimit(accountField) {
+  const byIp = rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.LOGIN_RATE_IP_MAX || 60),
+    scope: `${accountField}:ip`,
+  });
+  const byAccount = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: Number(process.env.LOGIN_RATE_ACCOUNT_MAX || 10),
+    scope: `${accountField}:acct`,
+    keyFor: (req) => {
+      const v = req.body?.[accountField];
+      return typeof v === "string" && v ? v.toLowerCase().slice(0, 128) : null;
+    },
+  });
+  return [byIp, byAccount];
+}
+
+/**
+ * AI 端点限流：按【用户】而不是按 IP 计。
+ *
+ * 这类端点每次调用都要花真金白银（LLM token），且响应慢（占着连接）。
+ * 不限流的话，一个账号写个循环就能把当月预算刷光 —— 这不是"被攻击"，
+ * 是"账单被放大"，而且攻击者不需要任何漏洞，只要一个合法账号。
+ *
+ * 默认 20 次/分钟：正常用户手速远达不到，脚本刷会立刻撞墙。
+ * 更贵的端点（一次请求触发多轮 LLM）应显式调小 max。
+ */
+function aiRateLimit({ max = 20, windowMs = 60 * 1000, scope = "ai" } = {}) {
+  return rateLimit({
+    windowMs,
+    max,
+    scope,
+    keyFor: (req) => (req.user?._id ? String(req.user._id) : null),
+  });
+}
+
+module.exports = { rateLimit, loginRateLimit, aiRateLimit };

@@ -115,8 +115,14 @@ async function vote(req, res, next) {
 
     // invalidate cache for this tagKey
     CACHE.delete(tagsKey);
-    // remove persisted leaderboard so it will be recomputed next time (or we could incrementally update)
-    try { await TagLeaderboard.deleteOne({ tagsKey }); } catch (e) {}
+    // ★ 只清空计算结果，【不能】删掉整个文档。
+    //   原实现是 deleteOne({ tagsKey })：投一票就把他人榜单连同 author 字段一起抹掉，
+    //   任何人随后用同一 tagsKey 重建即成为新 author，进而有权 deleteLeaderboard
+    //   级联删除该 tag 下所有用户的 LeaderboardPost —— 一条从"投票"到"删他人内容"的完整链路。
+    //   清空 entries 同样能触发下次重算，而 author/创建时间等归属信息得以保留。
+    try {
+      await TagLeaderboard.updateOne({ tagsKey }, { $set: { entries: [], computedAt: null } });
+    } catch (e) {}
 
     res.json({ ok: true, ideaId, tags: normalized, tagsKey, score, votes: votesCount });
   } catch (err) {
@@ -398,10 +404,14 @@ async function deleteLeaderboard(req, res, next) {
 
     // Delete the leaderboard
     await TagLeaderboard.deleteOne({ _id: id });
-    
+
     // Also delete related bookmarks and posts
+    // ★ LeaderboardPost 的删除必须 scope 到本人：帖子是各用户自己发的，
+    //   榜单作者只有权删自己的。原实现按 tagsKey 全量删，等于榜单作者可以
+    //   一键抹掉该 tag 下所有其他用户的帖子。Bookmark 按 leaderboard id 删是对的
+    //   （榜单没了，指向它的收藏就是悬空引用）。
     await Bookmark.deleteMany({ leaderboard: id, type: "leaderboard" });
-    await LeaderboardPost.deleteMany({ tagsKey: board.tagsKey });
+    await LeaderboardPost.deleteMany({ tagsKey: board.tagsKey, author: userId });
 
     res.json({ ok: true, message: "Leaderboard deleted" });
   } catch (err) {

@@ -6,6 +6,7 @@ const LeaderboardPost = require("../models/LeaderboardPost");
 const Idea = require("../models/Idea");
 const GroupJoinReferral = require("../models/GroupJoinReferral");
 const AppError = require("../utils/AppError");
+const { searchRegex } = require("../utils/regex");
 const { canReadIdea } = require("../utils/permissions");
 const {
   ensureNoBlockForInteraction,
@@ -30,7 +31,7 @@ async function searchUsers(req, res, next) {
     }
 
     // Search by username pattern
-    const re = new RegExp(`^${q.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}`, "i");
+    const re = searchRegex(q, { anchored: true });
     const users = await User.find({ username: re })
       .select("_id username")
       .limit(limit)

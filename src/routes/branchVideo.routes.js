@@ -3,6 +3,7 @@
 // 本文件只负责 /videos 相关端点；/cards 与 /decks 由 branchAsset.routes.js 提供，挂在同一 base 下。
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
+const { rateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const { publishBody, commentBody } = require("../schemas/branchVideo.schemas");
 const {
@@ -23,7 +24,9 @@ router.post("/videos", requireAuth, validate({ body: publishBody }), createVideo
 router.get("/videos/:id", optionalAuth, getVideo);
 router.delete("/videos/:id", requireAuth, removeVideo);
 
-router.post("/videos/:id/play", optionalAuth, addPlay);
+// 播放计数保持匿名可调（未登录也要能看视频），但必须限频：
+// 这是个无鉴权的 $inc，不限的话一个循环就能把任意视频刷到榜首。
+router.post("/videos/:id/play", optionalAuth, rateLimit({ windowMs: 60 * 1000, max: 60, scope: "branch:play" }), addPlay);
 router.post("/videos/:id/like", requireAuth, likeVideo);
 router.delete("/videos/:id/like", requireAuth, unlikeVideo);
 
