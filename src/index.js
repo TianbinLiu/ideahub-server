@@ -126,33 +126,60 @@ async function start() {
 }
 
 /**
- * 优雅退出。没有这段时，每次部署（PM2 reload / 容器滚动更新）都会硬切在途请求：
- * 用户看到的是随机的 502，而正在跑的 AiJob 会永远停留在 running 状态没人回收。
+ * 优雅退出：让在途请求跑完，同时尽快把监听端口让给新进程。
+ *
+ * ★ 关于 pm2 restart 期间的 502（务必知情）：
+ *   `pm2 restart` 在 fork 模式下就是「停旧进程 → 起新进程」，中间必然有空档，
+ *   nginx 在空档里只能返回 502。这是重启方式本身决定的，不是本函数的缺陷 ——
+ *   要做到零停机需要 cluster 模式 + `pm2 reload`（见 SECURITY_HARDENING.md 的待办）。
+ *   本函数只能把空档【尽量缩短】，不能消除它。
+ *
+ * ★ 为什么加 closeIdleConnections()：
+ *   `server.close()` 只停止接受新连接，已建立的连接要等对端断开才释放。
+ *   nginx 用长连接反代，理论上可能拖长退出时间。
+ *   （诚实说明：本地用「客户端持有 keep-alive 连接」的场景复现过，两种写法都
+ *    毫秒级关闭，【没有】复现出卡住 —— 所以这不是已证实的故障原因，
+ *    加上它是防御性的标准做法，不是针对某个已确诊问题的修复。）
+ *   closeIdleConnections() 立刻掐掉空闲连接，在途请求留 DRAIN_MS 跑完，
+ *   到点由 closeAllConnections() 兜底。两个 API 需 Node ≥ 18.2（生产 v20.20.2）。
  */
 function setupGracefulShutdown(server) {
   let shuttingDown = false;
+
+  /** 留给在途请求跑完的时间；超过就强断，不能让部署一直卡着 */
+  const DRAIN_MS = Number(process.env.SHUTDOWN_DRAIN_MS || 5000);
 
   async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n${signal} 收到，开始优雅退出…`);
 
-    // 强制超时：极端情况下（长连接不断开）不能无限等
-    const force = setTimeout(() => {
-      console.error("优雅退出超时（15s），强制结束");
-      process.exit(1);
-    }, 15000);
-    force.unref();
-
-    server.close(async () => {
+    let exited = false;
+    const finish = async (code, why) => {
+      if (exited) return;
+      exited = true;
       try {
         await require("mongoose").disconnect();
-        console.log("已断开数据库连接，退出");
+        console.log(`已断开数据库连接，退出（${why}）`);
       } catch (e) {
         console.warn("断开数据库连接失败:", e.message || e);
       }
-      process.exit(0);
-    });
+      process.exit(code);
+    };
+
+    // 1. 停止接受新连接
+    server.close(() => finish(0, "连接已排空"));
+
+    // 2. 立刻掐掉空闲的 keep-alive —— 这一步是关键，没有它 close() 可能永远不回调
+    server.closeIdleConnections?.();
+
+    // 3. 在途请求的宽限期，到点强断剩余连接
+    const force = setTimeout(() => {
+      console.warn(`优雅退出：${DRAIN_MS}ms 内仍有连接未结束，强制关闭`);
+      server.closeAllConnections?.();
+      finish(0, "超时强断");
+    }, DRAIN_MS);
+    force.unref();
   }
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
