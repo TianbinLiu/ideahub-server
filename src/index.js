@@ -77,6 +77,27 @@ async function syncProjectDocs() {
 // `npm run check:config` 在【部署之前】单独跑一次，而不是等部署失败才发现缺什么。
 const { assertProductionConfig } = require("./config/preflight");
 
+/**
+ * 清理没有任何提名的排行榜。纯维护性工作，不影响对外服务能力，
+ * 因此在 listen 之后异步执行 —— 挡在 listen 前面只会拉长部署的停机窗口。
+ * 失败只告警：清理不成功不该让服务起不来。
+ */
+async function cleanupEmptyLeaderboards() {
+  try {
+    await Promise.all([
+      LeaderboardPost.deleteMany({ tagsKey: "" }),
+      TagVote.deleteMany({ tagsKey: "" }),
+    ]);
+    const activeTagsKeys = (await LeaderboardPost.distinct("tagsKey")).filter(Boolean);
+    const result = await TagLeaderboard.deleteMany({ tagsKey: { $nin: activeTagsKeys } });
+    if (result?.deletedCount) {
+      console.log(`Cleaned leaderboards with no nominations: ${result.deletedCount}`);
+    }
+  } catch (cleanupErr) {
+    console.warn("Cleanup empty leaderboards failed:", cleanupErr.message || cleanupErr);
+  }
+}
+
 async function start() {
   try {
     assertProductionConfig();
@@ -86,20 +107,7 @@ async function start() {
     validateCloudinaryConfig();
 
     await connectDB();
-    // Cleanup leaderboards with no nominations on startup
-    try {
-      await Promise.all([
-        LeaderboardPost.deleteMany({ tagsKey: "" }),
-        TagVote.deleteMany({ tagsKey: "" }),
-      ]);
-      const activeTagsKeys = (await LeaderboardPost.distinct("tagsKey")).filter(Boolean);
-      const result = await TagLeaderboard.deleteMany({ tagsKey: { $nin: activeTagsKeys } });
-      if (result?.deletedCount) {
-        console.log(`Cleaned leaderboards with no nominations: ${result.deletedCount}`);
-      }
-    } catch (cleanupErr) {
-      console.warn("Cleanup empty leaderboards failed:", cleanupErr.message || cleanupErr);
-    }
+
     // ★ 显式绑定监听地址，默认只听 127.0.0.1。
     //
     // 原先是 app.listen(PORT)，等于监听 0.0.0.0（所有网卡）—— 4000 端口对公网
@@ -119,6 +127,15 @@ async function start() {
     startAiWorker();
 
     setupGracefulShutdown(server);
+
+    // ★ 排行榜清理挪到 listen 【之后】异步跑。
+    //
+    // 它原先挡在 app.listen() 前面：一次 distinct + 两次 deleteMany，
+    // 而 pm2 restart 是「停旧进程 → 起新进程」，端口没打开之前 nginx 只能返回 502。
+    // 实测（服务器本地 50ms 采样）：重启期间不可用约 9.9 秒，全是连接被拒。
+    // 这是纯维护性清理，晚几秒执行没有任何影响，却让每次部署都多停机好几秒。
+    // 放到监听之后，端口一就绪就能接客，清理在后台自己跑完。
+    cleanupEmptyLeaderboards();
   } catch (err) {
     console.error("❌ Failed to start server:", err.message);
     process.exit(1);
