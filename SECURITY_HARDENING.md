@@ -141,8 +141,38 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
   ⚠️ 脚本首次运行时验证步骤误报「未看到安全头」——`systemctl reload nginx` 是异步的，
   紧接着 curl 会打到旧 worker。脚本已改为重试 5 次，但**若日后再见到这条提示，
   先手动 `curl -I` 确认，不要贸然回滚一个可能本来就正确的改动**。
-- ⚠️ **`ideahubs.org` 与 `api.ideahubs.org` 均未走 Cloudflare 代理**（响应无 `cf-ray`），
-  源站 IP `8.217.8.225` 直接暴露，无 WAF/DDoS 防护。
+- ✅ ~~两个域名均未走 Cloudflare 代理，源站 IP 暴露~~ **已完成（2026-08-07）**。
+  三条 A 记录（`ideahubs.org` / `www` / `api`）全部改为 Proxied，源站 IP 已从 DNS 消失。
+  Bot Fight Mode 已开启。
+
+  **为什么必须三条全开**：三条记录指向同一 IP，只代理前端的话，攻击者
+  `nslookup api.ideahubs.org` 即得源站 IP，再用 `curl -H "Host: ideahubs.org" https://<IP>/`
+  就绕过了 WAF —— 只代理前端等于承担改动风险却拿不到保护。改完 www 之后 Cloudflare
+  自己也弹出了 "Your origin IP address is partially exposed" 的告警，独立印证了这点。
+
+  **没有复现历史上的 525**：SSL/TLS 模式早已是 `Full (strict)` 且源站有有效
+  Let's Encrypt 证书，当初踩坑的条件已不存在。
+
+  实测：主域 200（8/8 安全头完整穿透 Cloudflare）、www 301 跳转正常、
+  API 200 且 `cf-cache-status: DYNAMIC`（未被缓存）、POST 写操作正常、鉴权仍 401。
+  Bot Fight Mode 开启后用 okhttp UA（安卓 App 的典型客户端）实测 API 仍 200，
+  未影响非浏览器客户端。浏览器加载全站零 CSP 违规。
+
+- ⚠️ **接入代理后引入并已修复的回归**：nginx 会把 Cloudflare 边缘 IP 追加进
+  `X-Forwarded-For`，`trust proxy=1` 于是让 `req.ip` 取到边缘 IP，
+  **同一边缘后的所有用户共用一个限流桶**（登录限流从「按用户」退化成「按全站」）。
+  已改为优先取 `CF-Connecting-IP`。
+  实测发现 **Cloudflare 会拦截伪造该头的请求（返回 403）**，故经代理来的该头可信。
+  仍建议后续在 nginx 配 `real_ip` 模块 + `set_real_ip_from <Cloudflare IP 段>`
+  并拒绝非 Cloudflare 来源的连接（需 sudo），以封死直连源站伪造头的残余路径。
+
+- ⚠️ **nginx 访问日志的客户端 IP 现在是 Cloudflare 边缘 IP**（同一根因）。
+  排查问题时看到的不是真实用户 IP，配 `real_ip` 模块可一并解决。
+- ✅ **DMARC 已加报告地址**：`v=DMARC1; p=none; rua=mailto:...; fo=1; adkim=r; aspf=r`。
+  仍保持 `p=none` 不拦截 —— 同时用了 SES 与 Resend 两个发信通道，
+  在拿到聚合报告确认 SPF/DKIM 对齐之前收紧到 `p=quarantine` 有可能把自己的正常邮件
+  打进垃圾箱。收几天报告后再决定。
+
 - ⚠️ **`ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` 明文存在 `.env`**。
   应确认该 AK 是按最小权限授权的 RAM 子账号（只给短信发送所需权限），而非主账号 AK。
 - GitHub 三仓的 Dependabot（alerts + security updates + dependency graph）**已开启**，
