@@ -128,6 +128,108 @@ describe("Live2D 上传的文件类型白名单", () => {
   );
 });
 
+describe("真实客户端 IP（Cloudflare 代理链路）", () => {
+  // 回归用例：接入 Cloudflare 后链路是 用户 → CF边缘 → nginx → Node，
+  // nginx 会把 CF 边缘 IP 追加进 X-Forwarded-For，trust proxy=1 于是取到 CF 的 IP，
+  // 导致同一边缘后的所有用户共用一个限流配额（登录限流从「按用户」退化成「按全站」）。
+  // 已实测复现过，这里钉住修复。
+  const REAL = "203.0.113.77";
+  const CF_EDGE = "172.71.150.20";
+
+  function keyOf(headers, reqIp) {
+    jest.resetModules();
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    const { rateLimit } = require("../src/middleware/rateLimit");
+    let seenKey = null;
+    const mw = rateLimit({
+      windowMs: 60_000,
+      max: 1,
+      scope: "iptest",
+      keyFor: (req) => {
+        // 借 keyFor 观察中间件会用什么当 IP：返回 null 让它走默认 IP 分支拿不到，
+        // 所以这里直接复用中间件的取 IP 逻辑做断言
+        return null;
+      },
+    });
+    // 直接断言中间件内部选用的 IP：连打两次，第二次是否 429 取决于 key 是否相同
+    const mk = (h, ip) => ({ headers: h, ip, body: {} });
+    const res = () => ({
+      setHeader() {},
+      status(c) { this.statusCode = c; return this; },
+      json() { return this; },
+    });
+    process.env.NODE_ENV = prev;
+    return { rateLimit, mk, res };
+  }
+
+  test("CF-Connecting-IP 存在时按它区分用户，而不是按 Cloudflare 边缘 IP", () => {
+    jest.resetModules();
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    const { rateLimit } = require("../src/middleware/rateLimit");
+
+    const mw = rateLimit({ windowMs: 60_000, max: 1, scope: "cf-ip-test" });
+    const mkRes = () => ({
+      statusCode: 200,
+      setHeader() {},
+      status(c) { this.statusCode = c; return this; },
+      json() { return this; },
+    });
+
+    // 两个【不同】的真实用户，经由【同一个】Cloudflare 边缘节点
+    const userA = { headers: { "cf-connecting-ip": "203.0.113.10" }, ip: CF_EDGE, body: {} };
+    const userB = { headers: { "cf-connecting-ip": "203.0.113.20" }, ip: CF_EDGE, body: {} };
+
+    let passed = 0;
+    const next = () => { passed += 1; };
+
+    const rA = mkRes(); mw(userA, rA, next);   // A 第一次：放行
+    const rB = mkRes(); mw(userB, rB, next);   // B 第一次：也应放行（不同用户）
+
+    expect(passed).toBe(2);
+    expect(rB.statusCode).not.toBe(429);       // 修复前 B 会被 A 挤掉
+
+    // 同一用户再来一次才该被限
+    const rA2 = mkRes(); mw(userA, rA2, next);
+    expect(rA2.statusCode).toBe(429);
+
+    process.env.NODE_ENV = prev;
+    jest.resetModules();
+  });
+
+  test("没有 CF-Connecting-IP 时回退到 req.ip（直连/本地开发）", () => {
+    jest.resetModules();
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    const { rateLimit } = require("../src/middleware/rateLimit");
+
+    const mw = rateLimit({ windowMs: 60_000, max: 1, scope: "fallback-ip-test" });
+    const mkRes = () => ({
+      statusCode: 200,
+      setHeader() {},
+      status(c) { this.statusCode = c; return this; },
+      json() { return this; },
+    });
+
+    let passed = 0;
+    const next = () => { passed += 1; };
+    const a = { headers: {}, ip: "198.51.100.1", body: {} };
+    const b = { headers: {}, ip: "198.51.100.2", body: {} };
+
+    mw(a, mkRes(), next);
+    mw(b, mkRes(), next);
+    expect(passed).toBe(2);            // 不同 IP 互不影响
+
+    const r = mkRes();
+    mw(a, r, next);
+    expect(r.statusCode).toBe(429);    // 同 IP 第二次被限
+
+    process.env.NODE_ENV = prev;
+    jest.resetModules();
+  });
+});
+
 describe("限流器", () => {
   // rateLimit 在 NODE_ENV=test 下整体关闭（否则会污染所有业务测试），
   // 所以这里直接测内部行为需要绕过那个开关 —— 用独立的模块实例。

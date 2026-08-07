@@ -31,6 +31,39 @@ function sweep(now) {
 }
 
 /**
+ * 取真实客户端 IP。
+ *
+ * ★ 为什么不能只用 req.ip：接入 Cloudflare 代理后链路变成
+ *       用户 → Cloudflare 边缘 → nginx → Node
+ *   nginx 的 $proxy_add_x_forwarded_for 会把它自己看到的 $remote_addr
+ *   （= Cloudflare 边缘 IP）追加到 X-Forwarded-For 末尾，于是 Node 收到的是
+ *       X-Forwarded-For: "<真实用户IP>, <Cloudflare边缘IP>"
+ *   而 app.js 的 trust proxy=1 只信任 1 跳，req.ip 取到的就是 Cloudflare 边缘 IP。
+ *   后果：同一边缘节点后的【所有用户共用一个限流配额】—— 登录限流从
+ *   「60 次/分/用户」退化成「60 次/分/全站」，正常用户会被互相挤下线。
+ *   （已实测复现，不是推测。）
+ *
+ * CF-Connecting-IP 是 Cloudflare 单独设置的头，值恒为真实客户端 IP，不受跳数影响。
+ *
+ * 伪造风险：客户端可以自己伪造 CF-Connecting-IP 来绕过限流 —— 但前提是能【绕过
+ * Cloudflare 直连源站】。Cloudflare 会覆盖客户端自带的这个头，所以经代理来的请求
+ * 无法伪造。源站 IP 已从 DNS 移除，直连需要先猜到 IP。
+ * 要彻底封死，应在 nginx 层用 real_ip 模块 + set_real_ip_from <Cloudflare IP 段>
+ * 恢复真实 IP，并拒绝非 Cloudflare 来源的连接（需要 sudo，见 SECURITY_HARDENING.md）。
+ * 在那之前，这里的取舍是：宁可让极少数能猜到源站 IP 的人绕过限流，
+ * 也不能让全体正常用户共用一个配额。
+ */
+function clientIp(req) {
+  // ★ 用可选链而不是直接下标：req.headers 缺失时直接下标会抛异常，
+  //   而本中间件的 catch 是 fail-open —— 那意味着限流会【静默失效并放行】，
+  //   这是限流器最不该有的失效方向。（单元测试构造的假 req 没有 headers，正好暴露了这点。）
+  const cf = req?.headers?.["cf-connecting-ip"];
+  // 长度上限 45 = IPv6 最长表示；顺带挡住超长头被当成 Map 的 key 撑内存
+  if (typeof cf === "string" && cf.length > 0 && cf.length <= 45) return cf;
+  return req?.ip ?? "anon";
+}
+
+/**
  * @param {object}   [opts]
  * @param {number}   [opts.windowMs] 窗口长度，默认 60s
  * @param {number}   [opts.max]      窗口内最大请求数，默认 10
@@ -49,11 +82,9 @@ function rateLimit({ windowMs = 60 * 1000, max = 10, scope = "default", keyFor =
         sweep(now);
       }
 
-      // trust proxy 已在 app.js 设为 1，req.ip 即 nginx 透传的真实客户端 IP。
-      // 不再自己读 x-forwarded-for：那个头客户端可任意伪造，读它等于让限流可被绕过。
       const dimension = keyFor ? keyFor(req) : null;
       if (keyFor && dimension == null) return next();
-      const key = `${scope}:${dimension ?? req.ip ?? "anon"}`;
+      const key = `${scope}:${dimension ?? clientIp(req)}`;
 
       let entry = buckets.get(key);
       if (!entry || now - entry.start > windowMs) {
