@@ -1,16 +1,23 @@
-// 进程内限流。
+// 限流中间件。
 //
-// ★ 边界声明（部署前必读）：这是【单进程】计数器。PM2 cluster / 多实例部署时，
-//   每个进程各有一份 buckets，实际放行量 = 配置值 × 进程数。真正要挡住撞库，
-//   得换 Redis 后端（见 docs/security-hardening.md 的"待办"）。此处的目标是
-//   把"完全无节流"提升到"有成本"，不是密码学意义上的严格配额。
+// ★ 计数后端有两层：
+//   1. Redis（配了 REDIS_URL 时）—— 跨进程共享，pm2 cluster 多实例下配额准确。
+//   2. 进程内 Map —— Redis 未配置或不可用时的回退。
 //
-// 相比初版的三处改动：
-//   1. 惰性清理过期桶 —— 初版的 Map 永不删除条目，每个来访 IP 一条永久驻留，
-//      被慢速扫描打一遍就是几十万条常驻内存（内存泄漏即 DoS 面）。
-//   2. 支持自定义 key —— 只按 IP 限流挡不住"一个 IP 池撞一个账号"，
-//      登录接口需要按【账号】再限一道。
-//   3. 返回 Retry-After 头 —— 正常客户端能据此退避，而不是盲目重试放大压力。
+//   为什么必须有回退：限流是【保护性】功能，不是业务功能。Redis 挂了就让 API 全挂，
+//   是拿可用性换一个本来就只是"提高攻击成本"的机制，本末倒置。
+//   降级的代价是配额在多实例下被稀释（放行量 = 配置值 × 实例数），
+//   这比整站不可用好得多。降级会打日志，便于发现。
+//
+// 演进记录（每条都对应踩过的坑）：
+//   1. 惰性清理过期桶 —— 初版 Map 永不删除，每个来访 IP 一条永久驻留，
+//      慢速扫描一遍就是几十万条常驻内存（内存泄漏本身就是 DoS 面）。
+//   2. 双维度 key —— 只按 IP 挡不住"IP 池撞单账号"，登录需按账号再限一道。
+//   3. 返回 Retry-After —— 正常客户端据此退避，而不是盲目重试放大压力。
+//   4. 取 IP 改用 X-Real-IP —— 见 clientIp() 的说明，接 Cloudflare 后 req.ip 会取到边缘 IP。
+//   5. Redis 后端 —— 为 pm2 cluster 铺路，见上。
+
+const redis = require("../config/redis");
 
 const buckets = new Map();
 
@@ -78,37 +85,54 @@ function clientIp(req) {
  */
 function rateLimit({ windowMs = 60 * 1000, max = 10, scope = "default", keyFor = null } = {}) {
   if (DISABLED) return (req, res, next) => next();
-  return (req, res, next) => {
-    try {
-      const now = Date.now();
-      if (++sinceSweep >= SWEEP_EVERY) {
-        sinceSweep = 0;
-        sweep(now);
-      }
 
+  /** 超限时的统一响应 */
+  function reject(res, retryAfterSec) {
+    res.setHeader("Retry-After", String(retryAfterSec));
+    return res.status(429).json({
+      ok: false,
+      code: "RATE_LIMIT_EXCEEDED",
+      message: "Too many requests, slow down",
+      details: { retryAfter: retryAfterSec },
+    });
+  }
+
+  /** 进程内计数（Redis 不可用时的回退），返回 true=放行 */
+  function allowLocally(key, res) {
+    const now = Date.now();
+    if (++sinceSweep >= SWEEP_EVERY) {
+      sinceSweep = 0;
+      sweep(now);
+    }
+    let entry = buckets.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      buckets.set(key, { count: 1, start: now, windowMs });
+      return true;
+    }
+    if (entry.count >= max) {
+      reject(res, Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000)));
+      return false;
+    }
+    entry.count += 1;
+    return true;
+  }
+
+  return async (req, res, next) => {
+    try {
       const dimension = keyFor ? keyFor(req) : null;
       if (keyFor && dimension == null) return next();
-      const key = `${scope}:${dimension ?? clientIp(req)}`;
+      const key = `rl:${scope}:${dimension ?? clientIp(req)}`;
 
-      let entry = buckets.get(key);
-      if (!entry || now - entry.start > windowMs) {
-        buckets.set(key, { count: 1, start: now, windowMs });
+      // Redis 优先；返回 null 表示不可用，静默回退到本地计数
+      const hit = await redis.incr(key, windowMs);
+      if (hit) {
+        if (hit.count > max) {
+          return reject(res, Math.max(1, Math.ceil(hit.ttlMs / 1000)));
+        }
         return next();
       }
 
-      if (entry.count >= max) {
-        const retryAfter = Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000));
-        res.setHeader("Retry-After", String(retryAfter));
-        return res.status(429).json({
-          ok: false,
-          code: "RATE_LIMIT_EXCEEDED",
-          message: "Too many requests, slow down",
-          details: { retryAfter },
-        });
-      }
-
-      entry.count += 1;
-      return next();
+      if (allowLocally(key, res)) return next();
     } catch {
       // fail-open：限流器自身出错不该把正常业务打挂
       return next();

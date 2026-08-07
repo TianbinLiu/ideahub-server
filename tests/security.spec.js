@@ -163,7 +163,7 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
     return { rateLimit, mk, res };
   }
 
-  test("CF-Connecting-IP 存在时按它区分用户，而不是按 Cloudflare 边缘 IP", () => {
+  test("CF-Connecting-IP 存在时按它区分用户，而不是按 Cloudflare 边缘 IP", async () => {
     jest.resetModules();
     const prev = process.env.NODE_ENV;
     process.env.NODE_ENV = "development";
@@ -184,21 +184,21 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
     let passed = 0;
     const next = () => { passed += 1; };
 
-    const rA = mkRes(); mw(userA, rA, next);   // A 第一次：放行
-    const rB = mkRes(); mw(userB, rB, next);   // B 第一次：也应放行（不同用户）
+    const rA = mkRes(); await mw(userA, rA, next);   // A 第一次：放行
+    const rB = mkRes(); await mw(userB, rB, next);   // B 第一次：也应放行（不同用户）
 
     expect(passed).toBe(2);
     expect(rB.statusCode).not.toBe(429);       // 修复前 B 会被 A 挤掉
 
     // 同一用户再来一次才该被限
-    const rA2 = mkRes(); mw(userA, rA2, next);
+    const rA2 = mkRes(); await mw(userA, rA2, next);
     expect(rA2.statusCode).toBe(429);
 
     process.env.NODE_ENV = prev;
     jest.resetModules();
   });
 
-  test("X-Real-IP 优先于 CF-Connecting-IP —— 直连源站时伪造后者不能绕过限流", () => {
+  test("X-Real-IP 优先于 CF-Connecting-IP —— 直连源站时伪造后者不能绕过限流", async () => {
     // 直连源站（不经 Cloudflare）时，客户端可以自己塞任意 CF-Connecting-IP：
     // 每次换一个就能拿到一个全新的限流桶，限流被无成本绕过。
     // 而 X-Real-IP 由 nginx 用 $remote_addr 设置并【覆盖】客户端自带值，伪造不了。
@@ -226,9 +226,9 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
       body: {},
     });
 
-    mw(attack("1.1.1.1"), mkRes(), next);       // 第一次放行
+    await mw(attack("1.1.1.1"), mkRes(), next);       // 第一次放行
     const r2 = mkRes();
-    mw(attack("2.2.2.2"), r2, next);            // 换了伪造值，但仍应被同一个桶拦下
+    await mw(attack("2.2.2.2"), r2, next);            // 换了伪造值，但仍应被同一个桶拦下
 
     expect(passed).toBe(1);
     expect(r2.statusCode).toBe(429);
@@ -237,7 +237,7 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
     jest.resetModules();
   });
 
-  test("没有 CF-Connecting-IP 时回退到 req.ip（直连/本地开发）", () => {
+  test("没有 CF-Connecting-IP 时回退到 req.ip（直连/本地开发）", async () => {
     jest.resetModules();
     const prev = process.env.NODE_ENV;
     process.env.NODE_ENV = "development";
@@ -256,12 +256,12 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
     const a = { headers: {}, ip: "198.51.100.1", body: {} };
     const b = { headers: {}, ip: "198.51.100.2", body: {} };
 
-    mw(a, mkRes(), next);
-    mw(b, mkRes(), next);
+    await mw(a, mkRes(), next);
+    await mw(b, mkRes(), next);
     expect(passed).toBe(2);            // 不同 IP 互不影响
 
     const r = mkRes();
-    mw(a, r, next);
+    await mw(a, r, next);
     expect(r.statusCode).toBe(429);    // 同 IP 第二次被限
 
     process.env.NODE_ENV = prev;
@@ -272,7 +272,7 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
 describe("限流器", () => {
   // rateLimit 在 NODE_ENV=test 下整体关闭（否则会污染所有业务测试），
   // 所以这里直接测内部行为需要绕过那个开关 —— 用独立的模块实例。
-  test("超过阈值后返回 429 且带 Retry-After", () => {
+  test("超过阈值后返回 429 且带 Retry-After", async () => {
     jest.resetModules();
     const prev = process.env.NODE_ENV;
     process.env.NODE_ENV = "development";
@@ -290,11 +290,11 @@ describe("限流器", () => {
     let passed = 0;
     const next = () => { passed += 1; };
 
-    mw(req, res, next);
-    mw(req, res, next);
+    await mw(req, res, next);
+    await mw(req, res, next);
     expect(passed).toBe(2);
 
-    mw(req, res, next);
+    await mw(req, res, next);
     expect(passed).toBe(2);              // 第三次没有放行
     expect(res.statusCode).toBe(429);
     expect(headers["Retry-After"]).toBeDefined();

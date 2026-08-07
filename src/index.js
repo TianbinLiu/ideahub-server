@@ -120,11 +120,31 @@ async function start() {
     const HOST = process.env.BIND_HOST || "127.0.0.1";
     const server = app.listen(PORT, HOST, () => {
       console.log(`Server listening on http://${HOST}:${PORT}`);
+
+      // ★ 告诉 pm2「这个实例真的能服务了」。
+      //   ecosystem.config.js 里设了 wait_ready:true —— pm2 会等这条消息再把流量切过来，
+      //   而不是「进程起来了」就算就绪（那时 MongoDB 可能还没连上、端口还没监听）。
+      //   零停机 reload 完全依赖这一句：没有它，pm2 会干等到 listen_timeout(15s) 才继续，
+      //   每次 reload 反而比 restart 更慢。
+      //   process.send 只在 pm2 托管时存在，裸跑 node 时为 undefined，故要判空。
+      process.send?.("ready");
     });
 
     // ★ AI worker 移到这里：原来它在 start() 之外被调用，不等 connectDB() 完成，
     //   数据库连不上时照样开始轮询 AiJob，产生一串连接错误噪音。
-    startAiWorker();
+    //
+    // ★ cluster 模式下只在 0 号实例跑。任务抢占本身是原子的
+    //   （findOneAndUpdate 把 pending 改成 running），多实例并跑【不会】重复处理任务，
+    //   但会让轮询频率乘以实例数 —— 2 实例 = 每 4 秒查两次库，纯属浪费，
+    //   而且 AI 并发数会隐性翻倍（每个实例各跑各的）。
+    //   pm2 在 cluster 模式下会给每个实例注入 NODE_APP_INSTANCE（"0"、"1"…）；
+    //   fork 模式下该变量不存在，条件为真，行为与之前一致。
+    const instanceId = process.env.NODE_APP_INSTANCE;
+    if (instanceId === undefined || instanceId === "0") {
+      startAiWorker();
+    } else {
+      console.log(`实例 ${instanceId}：跳过 AI worker（只在 0 号实例运行）`);
+    }
 
     setupGracefulShutdown(server);
 
@@ -176,10 +196,13 @@ function setupGracefulShutdown(server) {
       if (exited) return;
       exited = true;
       try {
-        await require("mongoose").disconnect();
-        console.log(`已断开数据库连接，退出（${why}）`);
+        await Promise.all([
+          require("mongoose").disconnect(),
+          require("./config/redis").quit(),
+        ]);
+        console.log(`已断开数据库与 Redis 连接，退出（${why}）`);
       } catch (e) {
-        console.warn("断开数据库连接失败:", e.message || e);
+        console.warn("断开连接失败:", e.message || e);
       }
       process.exit(code);
     };
