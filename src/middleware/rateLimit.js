@@ -33,34 +33,38 @@ function sweep(now) {
 /**
  * 取真实客户端 IP。
  *
- * ★ 为什么不能只用 req.ip：接入 Cloudflare 代理后链路变成
+ * ★ 为什么不能用 req.ip：接入 Cloudflare 代理后链路是
  *       用户 → Cloudflare 边缘 → nginx → Node
- *   nginx 的 $proxy_add_x_forwarded_for 会把它自己看到的 $remote_addr
- *   （= Cloudflare 边缘 IP）追加到 X-Forwarded-For 末尾，于是 Node 收到的是
- *       X-Forwarded-For: "<真实用户IP>, <Cloudflare边缘IP>"
- *   而 app.js 的 trust proxy=1 只信任 1 跳，req.ip 取到的就是 Cloudflare 边缘 IP。
- *   后果：同一边缘节点后的【所有用户共用一个限流配额】—— 登录限流从
- *   「60 次/分/用户」退化成「60 次/分/全站」，正常用户会被互相挤下线。
+ *   nginx 的 $proxy_add_x_forwarded_for 会把它看到的 $remote_addr 追加到
+ *   X-Forwarded-For 末尾，而 app.js 的 trust proxy=1 只信任 1 跳，
+ *   req.ip 于是取到上一跳而非真实用户。后果：同一 Cloudflare 边缘后的
+ *   【所有用户共用一个限流桶】—— 登录限流从「按用户」退化成「按全站」。
  *   （已实测复现，不是推测。）
  *
- * CF-Connecting-IP 是 Cloudflare 单独设置的头，值恒为真实客户端 IP，不受跳数影响。
+ * ★ 为什么优先 X-Real-IP 而不是 CF-Connecting-IP：
+ *   两者在「经 Cloudflare 来」的请求上等价，但对【直连源站】的请求不同 ——
+ *     - CF-Connecting-IP 是 Cloudflare 加的头。直连源站时 Cloudflare 不在链路上，
+ *       客户端可以自己塞一个假值，每次换一个就拿到一个全新的限流桶，
+ *       等于限流可被无成本绕过。
+ *     - X-Real-IP 由 nginx 以 `proxy_set_header X-Real-IP $remote_addr` 设置，
+ *       【覆盖】客户端自带的同名值，伪造不了；且 nginx 已配 real_ip 模块
+ *       （set_real_ip_from = Cloudflare 官方网段 + real_ip_header CF-Connecting-IP），
+ *       $remote_addr 在两种链路下都已是真实客户端 IP：
+ *         · 经 Cloudflare：real_ip 用 CF-Connecting-IP 把它换成了真实用户 IP
+ *         · 直连源站：本来就是对方的真实 IP
+ *   所以 X-Real-IP 是唯一一个「两种链路都正确、且不可伪造」的来源。
  *
- * 伪造风险：客户端可以自己伪造 CF-Connecting-IP 来绕过限流 —— 但前提是能【绕过
- * Cloudflare 直连源站】。Cloudflare 会覆盖客户端自带的这个头，所以经代理来的请求
- * 无法伪造。源站 IP 已从 DNS 移除，直连需要先猜到 IP。
- * 要彻底封死，应在 nginx 层用 real_ip 模块 + set_real_ip_from <Cloudflare IP 段>
- * 恢复真实 IP，并拒绝非 Cloudflare 来源的连接（需要 sudo，见 SECURITY_HARDENING.md）。
- * 在那之前，这里的取舍是：宁可让极少数能猜到源站 IP 的人绕过限流，
- * 也不能让全体正常用户共用一个配额。
+ * 回退顺序：X-Real-IP（nginx 设，首选）→ CF-Connecting-IP（无 nginx 的部署形态）
+ *          → req.ip（本地开发直连 Node）。
  */
 function clientIp(req) {
-  // ★ 用可选链而不是直接下标：req.headers 缺失时直接下标会抛异常，
-  //   而本中间件的 catch 是 fail-open —— 那意味着限流会【静默失效并放行】，
-  //   这是限流器最不该有的失效方向。（单元测试构造的假 req 没有 headers，正好暴露了这点。）
-  const cf = req?.headers?.["cf-connecting-ip"];
+  // 用可选链而不是直接下标：req.headers 缺失时直接下标会抛异常，
+  // 而本中间件的 catch 是 fail-open —— 那意味着限流会【静默失效并放行】，
+  // 这是限流器最不该有的失效方向。（单元测试构造的假 req 没有 headers，正好暴露过这点。）
+  const h = req?.headers;
   // 长度上限 45 = IPv6 最长表示；顺带挡住超长头被当成 Map 的 key 撑内存
-  if (typeof cf === "string" && cf.length > 0 && cf.length <= 45) return cf;
-  return req?.ip ?? "anon";
+  const pick = (v) => (typeof v === "string" && v.length > 0 && v.length <= 45 ? v : null);
+  return pick(h?.["x-real-ip"]) ?? pick(h?.["cf-connecting-ip"]) ?? req?.ip ?? "anon";
 }
 
 /**

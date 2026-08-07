@@ -198,6 +198,45 @@ describe("真实客户端 IP（Cloudflare 代理链路）", () => {
     jest.resetModules();
   });
 
+  test("X-Real-IP 优先于 CF-Connecting-IP —— 直连源站时伪造后者不能绕过限流", () => {
+    // 直连源站（不经 Cloudflare）时，客户端可以自己塞任意 CF-Connecting-IP：
+    // 每次换一个就能拿到一个全新的限流桶，限流被无成本绕过。
+    // 而 X-Real-IP 由 nginx 用 $remote_addr 设置并【覆盖】客户端自带值，伪造不了。
+    // 故必须优先取 X-Real-IP。
+    jest.resetModules();
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    const { rateLimit } = require("../src/middleware/rateLimit");
+
+    const mw = rateLimit({ windowMs: 60_000, max: 1, scope: "xrealip-priority" });
+    const mkRes = () => ({
+      statusCode: 200,
+      setHeader() {},
+      status(c) { this.statusCode = c; return this; },
+      json() { return this; },
+    });
+
+    let passed = 0;
+    const next = () => { passed += 1; };
+
+    // 同一个攻击者（X-Real-IP 恒为 198.51.100.9），每次伪造不同的 CF-Connecting-IP
+    const attack = (fakeCf) => ({
+      headers: { "x-real-ip": "198.51.100.9", "cf-connecting-ip": fakeCf },
+      ip: "198.51.100.9",
+      body: {},
+    });
+
+    mw(attack("1.1.1.1"), mkRes(), next);       // 第一次放行
+    const r2 = mkRes();
+    mw(attack("2.2.2.2"), r2, next);            // 换了伪造值，但仍应被同一个桶拦下
+
+    expect(passed).toBe(1);
+    expect(r2.statusCode).toBe(429);
+
+    process.env.NODE_ENV = prev;
+    jest.resetModules();
+  });
+
   test("没有 CF-Connecting-IP 时回退到 req.ip（直连/本地开发）", () => {
     jest.resetModules();
     const prev = process.env.NODE_ENV;
