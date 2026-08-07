@@ -254,6 +254,24 @@ nginx 只能返回 502。**这是重启方式本身决定的，不是 bug**，�
 资源：2 实例各约 215MB + Redis，1.6G 内存机器剩余约 739MB。
 运维：`pm2 reload ecosystem.config.js` 部署；`pm2 save` 已持久化，重启机器自动恢复。
 
+### 部署脚本（deploy.sh）同步加固
+
+切完 cluster 后发现 `deploy.sh` 会把这项工作悄悄还原，已修：
+
+- 原来是 `pm2 restart` —— 停旧起新、约 3 秒 502，cluster 的意义只剩多一个实例。
+  改为 `pm2 reload ecosystem.config.js --update-env`。
+- **更危险的是兜底分支**：原本是 `pm2 start npm --name ideahub-server -- start`。
+  进程一旦丢失（如机器重启后 pm2 resurrect 失败），部署会把它重建成
+  **fork 模式 + npm 入口** —— cluster 配置、多实例、零停机全部回退，**且不报任何错**。
+  这类「静默回退到旧行为」比直接失败危险得多。两个分支现在都走 ecosystem.config.js。
+- 新增 reload 前的 `npm run check:config`：在重启【之前】发现配置问题，
+  而不是等新实例起不来时才发现。已实测：`JWT_SECRET` 坏掉时返回退出码 1，部署中止且不重启。
+- 新增 reload 后健康检查（重试 10 次）：reload 报成功不等于服务真能用，
+  探不通就以非零码退出让 CI 标红，而不是「部署成功但站点是挂的」。
+- 补 `--update-env`：不加则 pm2 沿用进程创建时的环境变量，`.env` 改动读不到。
+
+**实测**：跑完整的 `bash deploy.sh`，400 个采样点全部 200，退出码 0，零停机。
+
 ### Redis 安装踩的坑（同一类错误犯了两次）
 
 首次安装把 Redis 打挂了，两个原因：
