@@ -2,3 +2,9 @@ node_modules
 .env
 dist
 uploads/
+
+# ── Claude Code ─────────────────────────────────────────────────────────
+# .claude/skills/ 是【团队共享】配置，必须入库——新成员克隆后就带着工程规则 skill。
+# 只挡本机工作区与可能含个人 token 的本地设置覆盖。
+.claude/worktrees/
+.claude/settings.local.json

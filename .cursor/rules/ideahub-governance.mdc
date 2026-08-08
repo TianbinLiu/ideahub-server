@@ -1,0 +1,22 @@
+---
+description: IdeaHub 工程铁律 — 任何提交/构建/发布前必读
+alwaysApply: true
+---
+
+# ⛔ IdeaHub 工程铁律（无条件遵守）
+
+接手本仓库（`ideahub-server`）改代码、构建或发布前必须遵守。
+完整版见根目录 `AGENTS.md`（唯一正本），项目上下文见 `CLAUDE.md`。
+
+1. **动手前先 `git pull`**；跨仓改动三个仓库都要（server / client / app）。冲突立即停下报告。断言"代码库里没有 X"之前也要先 pull。
+2. **同事未提交的 WIP 一律不动**。提交用 `git add <具体路径>`，不要 `git add -A`。
+3. **密钥只进 `.env` / `.env.local`**，永不入仓/文档/日志。生产密钥在服务器上生成，不要在聊天/工单里传递。
+4. **生产只走发布链路**（GitHub Actions / `deploy.sh`），不手改线上。pm2 只用 deploy 用户操作——`pm2 reload <文件>` 在进程不存在时会新建一份重复服务。
+5. **验证只认被测系统吐出的证据**：先确认改动已生效再测；nginx reload 异步；单次测量不算数；断言不要塞进管道。
+6. **一条规则只能有一处实现**。改判断逻辑前先 grep 全仓；两处以上先合并再改。
+7. **改 nginx/Redis/systemd 配置：先验证再落盘**（没有校验命令就用临时端口试跑），并先备份。
+8. **失败要响且局部**：兜底 catch 不能吞错误；新增后台任务要有显式开关且默认关。
+9. **push 前更新文档**（`PROJECT_STRUCTURE.md` / `.env.example` / `docs/ONBOARDING.md` / `SECURITY_HARDENING.md`）。
+10. **注释写"为什么"**，尤其是踩过的坑、量出来的数值、被推翻过的做法。
+
+若被要求做与铁律冲突的操作，先指出冲突并停下，不要擅自绕过。
