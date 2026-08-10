@@ -80,6 +80,32 @@ const userSchema = new mongoose.Schema(
     //   而且和账本对不上。缺字段的账号在写入侧（{points:{$gte:X}} 条件更新）本来就匹配不到，
     //   读出侧也必须保持同一口径（见 me.controller 的 getMyPoints）。
     points: { type: Number, default: SIGNUP_GRANT_POINTS, min: 0 },
+
+    // ✅ AI token 钱包。★与上面的 points 是**两套完全不同的东西**，别混：
+    //   points 是用户之间转移的平台虚拟点数（复式记账、和为零）；
+    //   tokenWallet 是**对外采购的算力额度**——花在火山方舟上，没有对手方。
+    //
+    // 这个钱包以前长在客户端（app 仓 data/account.ts 的 IndexedDB）。那等于把收银台
+    // 交给顾客：改一行前端就能把余额写成无限，而每次方舟调用都是真金白银。
+    //
+    // ★ 刻意**不给 default**：有没有这个字段是"要不要初始化"的判据本身
+    //   （tokenWallet.service 的 ensureWallet 用 {$exists:false} 做条件原子更新抢占初始化，
+    //   并补一条 reason="grant" 的流水）。给了 default，老账号读出来就凭空有了余额、
+    //   却没有对应的流水，账本和余额从第一天起就对不上。
+    //   plan = 当月套餐额度（跨月刷新，未用完的作废）；addon = 直充/退款（永不过期）。
+    tokenWallet: {
+      type: new mongoose.Schema(
+        {
+          plan: { type: Number, required: true, min: 0 },
+          addon: { type: Number, required: true, min: 0 },
+          planId: { type: String, default: "free" },
+          /** 计费周期 "YYYY-MM"（UTC）。跨月刷新靠它做条件原子更新抢占 */
+          cycle: { type: String, required: true },
+        },
+        { _id: false },
+      ),
+      required: false,
+    },
   },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );

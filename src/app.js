@@ -63,6 +63,11 @@ app.use(cors({
     return cb(null, allowedOrigins.includes(origin.replace(/\/+$/, "")));
   },
   credentials: false,
+  // ★ 跨域下自定义响应头默认对 JS **不可见**（只能读到那几个 CORS 安全头）。
+  //   APK 里 WebView 的源是 https://localhost，打 api.ideahubs.org 是跨域的，
+  //   不放行这两个头的话 /api/ark 回来的余额读不到，App 的钱包镜像就只能靠
+  //   每次调用后再 GET 一次 —— 多一趟往返，还会在两次请求之间显示旧余额。
+  exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon"],
 }));
 
 // 两处需要放宽 body 上限（默认 100kb 会 413），且必须排在全局 express.json() 之前
@@ -143,6 +148,9 @@ app.use("/api/tts", require("./routes/tts.routes"));
 // 原来是 app 仓 vite dev 的代理，APK 里不存在，而 Capacitor 对未命中路径回 200+index.html，
 // 表现成"第 1 段生成失败：Unexpected token '<'"。白名单转发，不是通用反向代理。
 app.use("/api/ark", require("./routes/ark.routes"));
+// AI token 钱包。★ 必须在服务端：它以前长在 app 的 IndexedDB 里，等于把收银台交给顾客，
+// 而每次方舟调用都是真金白银。扣费发生在 /api/ark 转发之前（见 ark.routes 的 billedForward）
+app.use("/api/me/wallet", require("./routes/wallet.routes"));
 
 app.use(notFound);
 app.use(errorHandler);
