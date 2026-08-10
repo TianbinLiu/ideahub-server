@@ -152,6 +152,9 @@ app.use("/api/speaking-style", speakingStyleRoutes);
 app.use("/api/personas", personaRoutes);
 app.use("/api/memes", memeRoutes);
 app.use("/api/branch", require("./routes/branchVideo.routes"));
+// 工坊 NPC 的语音合成。原来只是 app 仓 vite dev 的一个中间件，打成 APK 后无人应答
+// （真机上 NPC 全程哑巴），且密钥不能进前端包，所以收到服务端
+app.use("/api/tts", require("./routes/tts.routes"));
 
 app.use(notFound);
 app.use(errorHandler);
