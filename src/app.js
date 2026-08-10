@@ -65,31 +65,15 @@ app.use(cors({
   credentials: false,
 }));
 
-// 分支视频发布体里带 dataURL 首尾帧（MB 级），默认 100kb 会 413。
-// 只给 /api/branch 放宽，必须排在全局 express.json() 之前（body-parser 解析过就不会重复解析）。
-//
-// ★ 大 body 只对【持有效签名 token】的请求开放。
-//   body 解析发生在路由鉴权之前，所以原来的写法等于"任何匿名者 POST /api/branch/xxx
-//   都能让服务端缓冲并解析 50MB" —— 几个并发就能把进程内存打爆。
-//   这里先做一次纯签名校验（jwt.verify，不查库，微秒级）作为闸门：
-//   验不过的请求走 1mb 的常规上限，验得过的才放宽。真正的鉴权仍由路由的
-//   requireAuth 负责（它还要查 tokenVersion / deactivatedAt），此处只管"值不值得为你分配内存"。
-const jwt = require("jsonwebtoken");
-const bigJson = express.json({ limit: process.env.BRANCH_JSON_LIMIT || "50mb" });
-const smallJson = express.json({ limit: "1mb" });
-
-app.use("/api/branch", (req, res, next) => {
-  const [type, token] = String(req.headers.authorization || "").split(" ");
-  if (type === "Bearer" && token) {
-    try {
-      jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
-      return bigJson(req, res, next);
-    } catch {
-      /* 签名无效：按匿名处理，走小上限 */
-    }
-  }
-  return smallJson(req, res, next);
-});
+// 两处需要放宽 body 上限（默认 100kb 会 413），且必须排在全局 express.json() 之前
+// ——body-parser 解析过一次就不会重复解析，排在后面等于没挂：
+//   /api/branch  发布体里带 dataURL 首尾帧（MB 级）
+//   /api/ark     Seedance 任务创建请求带 base64 首尾帧（压到 720p 后仍有 2-3MB）
+// 「大 body 只对持有效签名 token 的请求开放」这条闸门的实现见 middleware/bigJson.js
+// （两处共用一份：改了阈值或判据要两边同时生效）。
+const { jsonGate } = require("./middleware/bigJson");
+app.use("/api/branch", jsonGate);
+app.use("/api/ark", jsonGate);
 
 app.use(express.json({ limit: "1mb" }));
 app.use(helmet({
@@ -155,6 +139,10 @@ app.use("/api/branch", require("./routes/branchVideo.routes"));
 // 工坊 NPC 的语音合成。原来只是 app 仓 vite dev 的一个中间件，打成 APK 后无人应答
 // （真机上 NPC 全程哑巴），且密钥不能进前端包，所以收到服务端
 app.use("/api/tts", require("./routes/tts.routes"));
+// 火山方舟（出图/出视频/对话）代理。与 /api/tts 同一个理由、同一个事故：
+// 原来是 app 仓 vite dev 的代理，APK 里不存在，而 Capacitor 对未命中路径回 200+index.html，
+// 表现成"第 1 段生成失败：Unexpected token '<'"。白名单转发，不是通用反向代理。
+app.use("/api/ark", require("./routes/ark.routes"));
 
 app.use(notFound);
 app.use(errorHandler);
