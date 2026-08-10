@@ -152,7 +152,9 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
     } catch {
       continue;
     }
-    if (j.code && j.code !== 0) {
+    // ★ 20000000 是**结束帧**（message "OK"），不是错误。每次成功合成的最后一帧都是它，
+    //   当成错误记下来的话，一旦真出问题、日志里报的就是这个无辜的码——线上自检时踩过。
+    if (j.code && j.code !== 0 && j.code !== 20000000) {
       errCode = j.code;
       errMsg = j.message || "";
     }
