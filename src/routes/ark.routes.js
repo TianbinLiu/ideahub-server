@@ -16,16 +16,22 @@
  *   开成通用代理的话，任何登录用户都能拿我们的 key 调方舟的任意模型
  *   （包括 seedance-2.5 这种 70 元/M 的），账单直接爆。
  *
- * ⚠ 现状说明（不是本次遗漏，是已知边界）：花钱的闸门目前只有
- *   requireAuth + 按账号限流。App 里那套 token 钱包（data/economy.ts）是**客户端**
- *   记账，服务端并不校验余额——改客户端就能绕过。真要收费上线，得把钱包搬到服务端
- *   并在这里做扣费。限流的上限就是按"最坏情况一分钟能烧多少钱"定的。
+ * ★ 花钱的闸门有三道，缺一不可：
+ *     ① requireAuth —— 不许裸奔；
+ *     ② 按账号限流 —— 挡住"合法账号写个循环刷"；
+ *     ③ **服务端钱包扣费** —— 见 services/tokenWallet.service.js。
+ *   ③ 是 2026-08 补上的：在那之前钱包长在客户端（app 的 IndexedDB 记账），
+ *   改一行前端就能把余额写成无限，①②只能限速、限不住总量。
+ *   现在的顺序是「条件原子扣减成功 = 拿到这次调用的许可」，扣不动就 402，
+ *   上游没受理再原路退回（见 billedForward）。
  */
 const express = require("express");
 const { Readable } = require("node:stream");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
+const wallet = require("../services/tokenWallet.service");
+const { priceOf } = require("../config/tokens");
 
 const router = express.Router();
 
@@ -68,10 +74,11 @@ router.get("/health", (_req, res) => {
   res.json({ ok: true, ark: Boolean(process.env.ARK_API_KEY) });
 });
 
-/** 转发一条已经过白名单的请求。key 只在这里出现，永远不回给客户端。 */
-async function forward(req, res, path, timeoutMs) {
+/** 转发一条已经过白名单的请求，返回上游的 { status, text }。
+ *  key 只在这里出现，永远不回给客户端。 */
+async function callArk(req, path, timeoutMs) {
   const apiKey = process.env.ARK_API_KEY;
-  if (!apiKey) return res.status(501).json({ message: "ark not configured" });
+  if (!apiKey) return { status: 501, text: JSON.stringify({ message: "ark not configured" }) };
 
   let up;
   try {
@@ -85,24 +92,73 @@ async function forward(req, res, path, timeoutMs) {
     // ★ 超时/连接失败要**说出来**，不能吞（铁律八）。App 那边靠这条消息区分
     //   "方舟慢"和"这台服务器没有代理"，两者的处置完全不同。
     console.error(`[ark] upstream ${path} ${String((e && e.name) || e)}`);
-    return res.status(504).json({ message: `ark upstream ${String((e && e.name) || "error")}` });
+    return { status: 504, text: JSON.stringify({ message: `ark upstream ${String((e && e.name) || "error")}` }) };
   }
-
-  const text = await up.text();
-  // 原样透传状态码与 JSON：App 侧对 429（限流退避）与 400（敏感词，不该重试）
-  // 有不同的处理，聚合成 502 会把这个区分抹掉。
-  res.status(up.status).type("application/json").send(text || "{}");
+  return { status: up.status, text: await up.text() };
 }
 
-/** 创建类请求的公共校验：model 必须在册 */
-function checkModel(req, res) {
-  const model = req.body && req.body.model;
-  if (!ALLOWED_MODELS.has(String(model))) {
-    console.warn(`[ark] 拒绝未在册的模型: ${String(model).slice(0, 64)}`);
-    res.status(400).json({ message: "model not allowed" });
-    return false;
-  }
-  return true;
+/** 把最新余额挂在响应头上，App 的钱包镜像据此同步（省掉一次 GET /api/me/wallet）。
+ *  ★ 跨域可见需要 CORS 的 exposedHeaders 放行，见 app.js。 */
+function setWalletHeaders(res, w) {
+  if (!w) return;
+  res.setHeader("X-Wallet-Plan", String(w.plan));
+  res.setHeader("X-Wallet-Addon", String(w.addon));
+}
+
+/**
+ * 计费转发：**先扣钱，再转发；上游没受理就退回来**（W2）。
+ *
+ * ★ 顺序不能反。先转发再扣钱的话，余额不足的请求已经花掉了钱，扣不扣都晚了；
+ *   而"先查余额、转发、再扣"更糟——查和扣之间的窗口正是并发双花的入口。
+ *   所以这里是"条件原子扣减成功 = 拿到了这次调用的许可"。
+ *
+ * ★ 只有**创建类**请求计费。轮询任务状态与取产物不计费：它们既不产生算力消耗，
+ *   又高频（一段视频轮询上百次），按次收会把一段片的价格翻好几倍。
+ */
+function billedForward(kind, path, timeoutMs) {
+  return async (req, res, next) => {
+    try {
+      const model = String(req.body?.model ?? "");
+      if (!ALLOWED_MODELS.has(model)) {
+        console.warn(`[ark] 拒绝未在册的模型: ${model.slice(0, 64)}`);
+        return res.status(400).json({ ok: false, message: "model not allowed" });
+      }
+
+      const cost = priceOf(kind, req.body);
+      const memo = `${kind} ${model}`;
+      let w = await wallet.debit(req.user._id, cost, memo);
+      if (!w) {
+        // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
+        const cur = await wallet.getWallet(req.user._id);
+        setWalletHeaders(res, cur);
+        return res.status(402).json({
+          ok: false,
+          code: "INSUFFICIENT_TOKENS",
+          message: "token 余额不足",
+          need: cost,
+          balance: cur ? cur.plan + cur.addon : 0,
+        });
+      }
+
+      const { status, text } = await callArk(req, path, timeoutMs);
+
+      // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
+      // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
+      //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
+      if (status < 200 || status >= 300) {
+        const back = await wallet.credit(req.user._id, cost, "ark_refund", `${memo} 上游 ${status}`);
+        w = back ?? w;
+        console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
+      }
+
+      setWalletHeaders(res, w);
+      // 原样透传状态码与 JSON：App 侧对 429（限流退避）与 400（敏感词，不该重试）
+      // 有不同的处理，聚合成 502 会把这个区分抹掉。
+      return res.status(status).type("application/json").send(text || "{}");
+    } catch (err) {
+      return next(err);
+    }
+  };
 }
 
 // ── 白名单端点 ──────────────────────────────────────────────────────────
@@ -113,29 +169,32 @@ const genLimit = aiRateLimit({ max: 30, scope: "ark-gen" });
 const pollLimit = aiRateLimit({ max: 90, scope: "ark-poll" });
 
 /** Seedream 出图 */
-router.post("/images/generations", requireAuth, genLimit, (req, res) => {
-  if (!checkModel(req, res)) return;
-  return forward(req, res, "/images/generations", T_CREATE);
-});
+router.post("/images/generations", requireAuth, genLimit, billedForward("image", "/images/generations", T_CREATE));
 
-/** Seedance 出视频 / Seed3D 建模（同一个异步任务端点） */
-router.post("/contents/generations/tasks", requireAuth, genLimit, (req, res) => {
-  if (!checkModel(req, res)) return;
-  return forward(req, res, "/contents/generations/tasks", T_CREATE);
-});
+/** Seedance 出视频 / Seed3D 建模（同一个异步任务端点）。
+ *  两者单价差一个数量级（一段 720p 视频约 216k，一次建模 160k），按 body.model 分别定价 */
+router.post(
+  "/contents/generations/tasks",
+  requireAuth,
+  genLimit,
+  billedForward("task", "/contents/generations/tasks", T_CREATE),
+);
 
-/** 轮询任务状态。单独一个限流桶：它便宜且高频（每 5s 一次，一段视频最多 120 次），
- *  和"创建"共用一个桶的话，正常出片会被自己的轮询挤爆。 */
-router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, (req, res) => {
-  if (!TASK_ID_RE.test(req.params.id)) return res.status(400).json({ message: "bad task id" });
-  return forward(req, res, `/contents/generations/tasks/${req.params.id}`, T_POLL);
+/** 轮询任务状态。**不计费**（见 billedForward 的注释），单独一个限流桶：
+ *  它便宜且高频（每 5s 一次，一段视频最多 120 次），和"创建"共用一个桶的话，
+ *  正常出片会被自己的轮询挤爆。 */
+router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    if (!TASK_ID_RE.test(req.params.id)) return res.status(400).json({ ok: false, message: "bad task id" });
+    const { status, text } = await callArk(req, `/contents/generations/tasks/${req.params.id}`, T_POLL);
+    return res.status(status).type("application/json").send(text || "{}");
+  } catch (err) {
+    return next(err);
+  }
 });
 
 /** 豆包对话（剧情推演 / 卡片文案 / 工坊 NPC 闲聊 / 看图说话） */
-router.post("/chat/completions", requireAuth, genLimit, (req, res) => {
-  if (!checkModel(req, res)) return;
-  return forward(req, res, "/chat/completions", T_CREATE);
-});
+router.post("/chat/completions", requireAuth, genLimit, billedForward("chat", "/chat/completions", T_CREATE));
 
 /**
  * GET /api/ark/asset?url=… —— 取方舟产物（图片 / 视频 / 3D zip）。
