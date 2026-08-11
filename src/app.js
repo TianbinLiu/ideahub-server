@@ -151,6 +151,10 @@ app.use("/api/ark", require("./routes/ark.routes"));
 // AI token 钱包。★ 必须在服务端：它以前长在 app 的 IndexedDB 里，等于把收银台交给顾客，
 // 而每次方舟调用都是真金白银。扣费发生在 /api/ark 转发之前（见 ark.routes 的 billedForward）
 app.use("/api/me/wallet", require("./routes/wallet.routes"));
+// 充值订单与支付回调。★ 发币的唯一入口是这里的回调结算，钱包路由已经不发币了。
+// 回调端点无鉴权（渠道服务器不带 token），安全全压在渠道 adapter 的验签上，
+// 所以未注册的渠道一律拒绝——见 services/payment/channels.js 的文件头。
+app.use("/api/pay", require("./routes/pay.routes"));
 
 app.use(notFound);
 app.use(errorHandler);

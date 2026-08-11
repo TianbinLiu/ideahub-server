@@ -78,16 +78,13 @@ function priceOf(kind, body) {
   return 0;
 }
 
-// ── 模拟支付的防滥用上限 ────────────────────────────────────────────────
-// ⚠ 充值与购套餐目前是**模拟支付**（没有接真实支付网关）。也就是说，只要有一个有效
-//   登录态，就能免费给自己发 token。把它们搬到服务端**并没有堵上这个洞**，
-//   堵上它需要真实支付回调。搬过来的意义是：口径唯一、可审计、可限量，
-//   接支付网关时只要改这一处。
-//   在那之前，用下面两个上限做兜底，让脚本刷不出天量额度。
-/** 单账号每日直充上限（最大充值包是 5M，给两次的余量） */
-const DAILY_RECHARGE_CAP = 10_000_000;
-/** 单账号每日购套餐次数上限 */
-const DAILY_PLAN_BUYS = 5;
+// ★ 这里原来有 DAILY_RECHARGE_CAP / DAILY_PLAN_BUYS 两个「模拟支付的防滥用上限」。
+//   那时 /api/me/wallet/recharge 调一下就到账，任何有登录态的人都能给自己发 token，
+//   这两个数是唯一的兜底。2026-08 发币口搬到了支付回调（services/payment/），
+//   下单不再发币，每日上限也就没有意义了——不给币，刷多少次都是 0。
+//   现在挡刷单靠的是 routes/pay.routes.js 上的 aiRateLimit（下单本身也不该被刷爆）。
+//   `tokenWallet.service.mintedToday` 还留着：它是查"今天发了多少币"的现成工具，
+//   对账时用得上，只是没有调用方在拿它做闸门了。
 
 module.exports = {
   PLANS,
@@ -100,6 +97,4 @@ module.exports = {
   VIDEO_MULT,
   segTokens,
   priceOf,
-  DAILY_RECHARGE_CAP,
-  DAILY_PLAN_BUYS,
 };

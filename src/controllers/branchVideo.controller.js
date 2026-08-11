@@ -211,6 +211,26 @@ async function transferDraftAssets(draft, userId) {
     segments.push(await transferSegment(ctx, draft.segments[i], `segments[${i}]`));
   }
 
+  // 卡组快照的卡面同样可能是 dataURL。
+  // ★ app 端 publishAssets.materializeDraft 现在会先把它们传成 URL 再发，
+  //   但这条路必须留着：老版本 app、以及别的客户端仍会直接发 base64。
+  let deck;
+  if (draft.deck && Array.isArray(draft.deck.cards)) {
+    const cards = [];
+    for (let i = 0; i < draft.deck.cards.length; i += 1) {
+      const c = draft.deck.cards[i];
+      cards.push({
+        cardId: String(c.cardId || c.id || ""),
+        type: c.type || "prop",
+        name: c.name || "",
+        summary: c.summary || "",
+        cover: await transferImage(ctx, c.cover, `deck.cards[${i}]`),
+        tags: Array.isArray(c.tags) ? c.tags : [],
+      });
+    }
+    deck = { name: draft.deck.name || "", cards };
+  }
+
   let branchTree;
   if (draft.branchTree && draft.branchTree.nodes) {
     const nodes = {};
@@ -232,7 +252,7 @@ async function transferDraftAssets(draft, userId) {
     `[branch] 资源转存完成 user=${userId} uploaded=${ctx.uploaded} kept=${ctx.kept} failed=${ctx.failed}`
   );
 
-  return { cover, segments, branchTree };
+  return { cover, segments, branchTree, deck };
 }
 
 // ── 序列化 ───────────────────────────────────────────────────────
@@ -277,6 +297,8 @@ function toVideoPayload(doc, ctx = {}) {
     plays: Number(doc.plays || 0),
     likes: Number(doc.likes || 0),
     commentCount: Number(doc.commentCount || 0),
+    // 老数据没这个字段，对外一律归一成 "public"（客户端就不用再判 undefined）
+    visibility: doc.visibility === "private" ? "private" : "public",
     liked: !!ctx.liked,
     isOwner: !!ctx.isOwner,
     createdAt: doc.createdAt,
@@ -284,6 +306,7 @@ function toVideoPayload(doc, ctx = {}) {
   };
   const tree = toBranchTreePayload(doc.branchTree);
   if (tree) payload.branchTree = tree;
+  if (doc.deck && Array.isArray(doc.deck.cards) && doc.deck.cards.length) payload.deck = doc.deck;
   if (ctx.comments) payload.comments = ctx.comments;
   return payload;
 }
@@ -300,6 +323,24 @@ function toCommentPayload(doc) {
 
 function ownedBy(doc, user) {
   return !!user && !!doc?.author && String(user._id) === String(doc.author?._id || doc.author);
+}
+
+/**
+ * 仅自己可见的作品：除作者本人外谁都不该看到。
+ *
+ * ★ 用 `!== "private"` 判而不是 `=== "public"`：字段是后加的，**存量作品这一项是
+ *   undefined**，按等值判会把库里所有老作品判成不可见（表现是首页突然空了）。
+ *   同一条规则在 listVideos 的 Mongo 查询里是 `{ visibility: { $ne: "private" } }`
+ *   ——改一处必须改另一处（铁律六）。
+ */
+function visibleTo(doc, user) {
+  return doc?.visibility !== "private" || ownedBy(doc, user);
+}
+
+/** 列表用的可见性条件：公开的 + 自己的（未登录就只有公开的） */
+function visibilityFilter(user) {
+  const open = { visibility: { $ne: "private" } };
+  return user ? { $or: [open, { author: user._id }] } : open;
 }
 
 /** 当前用户在这批视频里点过赞的集合 */
@@ -359,8 +400,13 @@ async function listVideos(req, res, next) {
       filter.$or = [{ title: re }, { description: re }];
     }
 
+    // ★ 可见性条件用 $and 拼，不能往 filter 上直接挂 $or ——
+    //   搜索（q）已经占用了顶层 $or，两个 $or 合并会互相覆盖，
+    //   结果是「搜索时 private 泄漏」或「不搜索时什么都查不到」，取决于谁后写。
     const range = cursorFilter(cursor);
-    const query = range ? { $and: [filter, range] } : filter;
+    const parts = [filter, visibilityFilter(req.user)];
+    if (range) parts.push(range);
+    const query = { $and: parts };
 
     const docs = await BranchVideo.find(query)
       .sort({ createdAt: -1, _id: -1 })
@@ -411,7 +457,7 @@ async function createVideo(req, res, next) {
     }
 
     // 关键步骤：dataURL / 方舟 TOS 链接转存为 Cloudinary 永久地址
-    const { cover, segments, branchTree } = await transferDraftAssets(draft, String(req.user._id));
+    const { cover, segments, branchTree, deck } = await transferDraftAssets(draft, String(req.user._id));
 
     let doc;
     try {
@@ -422,6 +468,8 @@ async function createVideo(req, res, next) {
         cover: cover || segments[0]?.firstFrame || "",
         segments,
         ...(branchTree ? { branchTree } : {}),
+        ...(deck && deck.cards.length ? { deck } : {}),
+        visibility: draft.visibility === "private" ? "private" : "public",
         author: req.user._id,
         ...(clientId ? { clientId } : {}),
         plays: 0,
@@ -462,6 +510,9 @@ async function getVideo(req, res, next) {
 
     const doc = await BranchVideo.findById(id).populate("author", AUTHOR_FIELDS).lean();
     if (!doc) notFound("Video not found");
+    // 仅自己可见的作品对别人一律 404 而不是 403：403 等于确认「这个 id 上有东西」，
+    // 拿着链接的人照样能数出作者发了多少条私密作品。
+    if (!visibleTo(doc, req.user)) notFound("Video not found");
 
     const [comments, liked] = await Promise.all([
       BranchComment.find({ video: id })
@@ -479,6 +530,38 @@ async function getVideo(req, res, next) {
         isOwner: ownedBy(doc, req.user),
         comments: comments.map(toCommentPayload),
       }),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /api/branch/videos/:id —— 作品编辑（仅作者）。
+ *
+ * ★ 只改**元信息**：标题 / 简介 / 分区 / 可见性。
+ *   片段、分支树、卡组一概不收 —— 那些是「发布那一刻的样子」，改了就意味着
+ *   已经看过、已经收藏过这条作品的人看到的东西会变。要换内容请重新发一条。
+ *   （产品上也已经定了：作品一经发布不能回炉。）
+ */
+async function updateVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const doc = await BranchVideo.findById(id).select("_id author").lean();
+    if (!doc) notFound("Video not found");
+    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+
+    // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那四个键
+    const patch = req.body;
+    const updated = await BranchVideo.findByIdAndUpdate(id, { $set: patch }, { returnDocument: "after" })
+      .populate("author", AUTHOR_FIELDS)
+      .lean();
+
+    res.json({
+      ok: true,
+      video: toVideoPayload(updated, { isOwner: true }),
     });
   } catch (err) {
     next(err);
@@ -513,10 +596,12 @@ async function addPlay(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    const updated = await BranchVideo.findByIdAndUpdate(
-      id,
+    // 可见性条件写进**更新的查询条件**里，而不是先查再改：
+    // 拆成两步就多一个竞态窗口，而且白白多一次往返。
+    const updated = await BranchVideo.findOneAndUpdate(
+      { $and: [{ _id: id }, visibilityFilter(req.user)] },
       { $inc: { plays: 1 } },
-      { new: true, select: "plays" }
+      { returnDocument: "after", select: "plays" }
     ).lean();
     if (!updated) notFound("Video not found");
 
@@ -539,7 +624,9 @@ async function likeVideo(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    const exists = await BranchVideo.exists({ _id: id });
+    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
+    // 就成了探测私密作品是否存在的旁路。
+    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
     if (!exists) notFound("Video not found");
 
     // 唯一索引 + upsert：重复点赞幂等，不会把计数刷高
@@ -569,7 +656,9 @@ async function unlikeVideo(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    const exists = await BranchVideo.exists({ _id: id });
+    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
+    // 就成了探测私密作品是否存在的旁路。
+    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
     if (!exists) notFound("Video not found");
 
     await BranchLike.deleteOne({ user: req.user._id, video: id });
@@ -588,7 +677,9 @@ async function listComments(req, res, next) {
 
     const { cursor, limit } = commentListQuery.parse(req.query);
 
-    const exists = await BranchVideo.exists({ _id: id });
+    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
+    // 就成了探测私密作品是否存在的旁路。
+    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
     if (!exists) notFound("Video not found");
 
     const range = cursorFilter(cursor);
@@ -619,7 +710,9 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    const exists = await BranchVideo.exists({ _id: id });
+    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
+    // 就成了探测私密作品是否存在的旁路。
+    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
     if (!exists) notFound("Video not found");
 
     const doc = await BranchComment.create({
@@ -642,6 +735,7 @@ module.exports = {
   listVideos,
   createVideo,
   getVideo,
+  updateVideo,
   removeVideo,
   addPlay,
   likeVideo,

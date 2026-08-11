@@ -16,6 +16,9 @@ function collectConfigProblems(env = process.env) {
   const isProd = env.NODE_ENV === "production";
   const problems = [];
 
+  // 支付：假渠道没有验签，生产环境开着等于任何人都能给自己发 token
+  problems.push(...require("./payment").collectPaymentProblems(env));
+
   const secret = env.JWT_SECRET || "";
   if (!secret) problems.push("JWT_SECRET 未设置");
   else if (secret.length < 32) problems.push(`JWT_SECRET 过短（${secret.length} 字符，至少 32）`);

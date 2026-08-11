@@ -242,27 +242,43 @@ describe("/api/ark 的扣费闸门", () => {
   });
 });
 
-describe("模拟支付的防滥用上限", () => {
-  test("只收在册面额（不许充任意数字）", async () => {
-    const { token } = await registerUser();
-    await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 999_999_999 }).expect(400);
-    await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 1_000_000 }).expect(200);
-  });
-
-  test("未知套餐挡掉；买了套餐额度立刻到账并记住档位", async () => {
+// ★ 这里原来是「模拟支付的防滥用上限」：那时 /recharge 与 /plan 调一下就到账，
+//   靠 DAILY_RECHARGE_CAP / DAILY_PLAN_BUYS 兜底不让脚本刷出天量额度。
+//   2026-08 发币口搬到了支付回调（见 tests/payOrder.spec.js），这两条路径只剩下单，
+//   每日上限也就没有存在意义了——不给币，刷多少次都是 0。
+//   保留下面这组用例是为了钉住「它们真的不发币了」这件事本身。
+describe("老的钱包路径只下单、不发币", () => {
+  test("直充：只收在册面额，且返回 202 而不是 200", async () => {
     const { token, userId } = await registerUser();
-    await request(app).post("/api/me/wallet/plan").set(auth(token)).send({ planId: "hacker" }).expect(400);
-    const res = await request(app).post("/api/me/wallet/plan").set(auth(token)).send({ planId: "pro" }).expect(200);
-    expect(res.body.wallet.planId).toBe("pro");
-    expect(await balanceOf(userId)).toBe(FREE + 8_000_000);
+    await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
+    await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 999_999_999 }).expect(400);
+    // ★ 202 = 请求收下了，但余额还没变。用 200 的话老客户端会当成充值成功
+    const res = await request(app)
+      .post("/api/me/wallet/recharge")
+      .set(auth(token))
+      .send({ tokens: 1_000_000 })
+      .expect(202);
+    expect(res.body.order.status).toBe("created");
+    expect(await balanceOf(userId)).toBe(FREE);
   });
 
-  test("每日直充有上限，刷不出天量额度", async () => {
-    const { token } = await registerUser();
-    for (let i = 0; i < 2; i++) {
-      await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 5_000_000 }).expect(200);
+  test("套餐：未知档位挡掉；合法档位只下单，额度不到账", async () => {
+    const { token, userId } = await registerUser();
+    await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
+    await request(app).post("/api/me/wallet/plan").set(auth(token)).send({ planId: "hacker" }).expect(400);
+    const res = await request(app).post("/api/me/wallet/plan").set(auth(token)).send({ planId: "pro" }).expect(202);
+    expect(res.body.order.planId).toBe("pro");
+    expect(res.body.wallet.planId).not.toBe("pro"); // 没付款就不该生效
+    expect(await balanceOf(userId)).toBe(FREE);
+  });
+
+  test("刷多少次都刷不出额度（这正是改成订单要堵的洞）", async () => {
+    const { token, userId } = await registerUser();
+    await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
+    for (let i = 0; i < 10; i++) {
+      await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 5_000_000 });
     }
-    await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 5_000_000 }).expect(429);
+    expect(await balanceOf(userId)).toBe(FREE);
   });
 });
 
@@ -271,7 +287,8 @@ describe("流水与余额对得上", () => {
     const { token, userId } = await registerUser();
     mockArk(200, { data: [{ url: "u" }] });
     await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
-    await request(app).post("/api/me/wallet/recharge").set(auth(token)).send({ tokens: 200_000 }).expect(200);
+    // ★ 这里原来先充 200k 再花：充值已经不发币了，留着它这条断言就恒等于"只有 grant + spend"。
+    //   对账要验的是"每一笔变动都有流水"，用 grant + 三次 ark_spend 一样能验到。
     for (let i = 0; i < 3; i++) {
       await request(app)
         .post("/api/ark/images/generations")
