@@ -186,6 +186,13 @@ async function transferVideo(ctx, value, label) {
   return out;
 }
 
+/**
+ * ★ 这里是逐字段重建，不是展开原对象 —— 所以它是**第二个会悄悄丢字段的地方**
+ *   （第一个是 schemas/branchVideo.schemas.js 的 z.object strip）。
+ *   给 segment 加字段时**两处都要加**，只加一处的表现完全一样：201 成功、读回来没有。
+ *   故意不写成 `{ ...segment, firstFrame: ... }`：那样会把客户端塞的任意字段
+ *   一并落库，模型里没有的会被 mongoose 丢掉、有的又绕过了校验。
+ */
 async function transferSegment(ctx, segment, label) {
   return {
     title: segment.title || "",
@@ -194,6 +201,8 @@ async function transferSegment(ctx, segment, label) {
     lastFrame: await transferImage(ctx, segment.lastFrame, `${label}.lastFrame`),
     durationSec: Number(segment.durationSec || 0),
     videoUrl: await transferVideo(ctx, segment.videoUrl, `${label}.videoUrl`),
+    ...(segment.videoTier ? { videoTier: segment.videoTier } : {}),
+    ...(segment.aspect ? { aspect: segment.aspect } : {}),
   };
 }
 

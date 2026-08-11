@@ -286,3 +286,55 @@ describe("作品编辑（PATCH）", () => {
       .expect(400);
   });
 });
+
+describe("段字段不会被悄悄 strip 掉", () => {
+  // ★ 这条盯的是「加了字段但服务端存不下」这个**反复出现**的坑。
+  //   丢字段有两个地方，加字段时两处都要动，只动一处症状完全一样（201 成功、读回来没有）：
+  //     1. schemas/branchVideo.schemas.js 的 z.object —— 默认 strip 未声明字段
+  //     2. controllers/branchVideo.controller.js 的 transferSegment —— 逐字段重建
+  //   deck 丢过一次，aspect/videoTier 丢过一次（同事的画幅功能，2026-08-11 发现）。
+  test("画幅与档位随作品落库，读得回来", async () => {
+    const author = await registerUser();
+    const created = await request(app)
+      .post("/api/branch/videos")
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({
+        title: "横屏作品",
+        segments: [
+          {
+            title: "第一段",
+            firstFrame: "https://cdn.example.com/a.jpg",
+            durationSec: 5,
+            aspect: "landscape",
+            videoTier: "doubao-seedance-1-0-pro-250528",
+          },
+        ],
+      })
+      .expect(201);
+
+    expect(created.body.video.segments[0].aspect).toBe("landscape");
+    expect(created.body.video.segments[0].videoTier).toBe("doubao-seedance-1-0-pro-250528");
+
+    const detail = await request(app).get(`/api/branch/videos/${created.body.video._id}`).expect(200);
+    expect(detail.body.video.segments[0].aspect).toBe("landscape");
+    expect(detail.body.video.segments[0].videoTier).toBe("doubao-seedance-1-0-pro-250528");
+  });
+
+  test("不带画幅的老客户端不会被塞一个默认值", async () => {
+    // ★ "没有这个字段"和"明确是横屏"必须分得开：app 的 aspectOf() 把缺省当横屏，
+    //   给了 default 等于替老数据做了一个它没做过的声明
+    const author = await registerUser();
+    const created = await publish(author.token, { title: "老客户端发的" }).expect(201);
+    expect(created.body.video.segments[0].aspect).toBeUndefined();
+    expect(created.body.video.segments[0].videoTier).toBeUndefined();
+  });
+
+  test("非法画幅值挡在门口（400），不落库", async () => {
+    const author = await registerUser();
+    await request(app)
+      .post("/api/branch/videos")
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ title: "歪的", segments: [{ firstFrame: "https://cdn.example.com/a.jpg", aspect: "square" }] })
+      .expect(400);
+  });
+});
