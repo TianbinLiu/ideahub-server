@@ -5,11 +5,12 @@ const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
-const { publishBody, commentBody } = require("../schemas/branchVideo.schemas");
+const { publishBody, updateBody, commentBody } = require("../schemas/branchVideo.schemas");
 const {
   listVideos,
   createVideo,
   getVideo,
+  updateVideo,
   removeVideo,
   addPlay,
   likeVideo,
@@ -22,6 +23,8 @@ const {
 router.get("/videos", optionalAuth, listVideos);
 router.post("/videos", requireAuth, validate({ body: publishBody }), createVideo);
 router.get("/videos/:id", optionalAuth, getVideo);
+// 作品编辑：只改标题/简介/分区/可见性。片段与卡组不可改（发布即定稿）
+router.patch("/videos/:id", requireAuth, validate({ body: updateBody }), updateVideo);
 router.delete("/videos/:id", requireAuth, removeVideo);
 
 // 播放计数保持匿名可调（未登录也要能看视频），但必须限频：

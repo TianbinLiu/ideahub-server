@@ -212,13 +212,17 @@ async function listMessageRequests(req, res, next) {
     let statusFilter = {};
     if (status) statusFilter.status = status;
 
+    // ★ 排序一律带 `_id` 兜底，不能只按 createdAt：
+    //   同一毫秒内落库的两条（申请 + 秒回的那条回复，测试里天天出现，真机上手速快也会）
+    //   在只按 createdAt 排时顺序是**不确定的** —— 表现是会话里两句话偶尔前后颠倒，
+    //   而且概率随机器快慢变。branchVideo 的游标分页早就踩过并注掉了同一条坑。
     // 获取收到的申请
     const receivedRequests = await MessageRequest.find({
       toUserId: userId,
       ...statusFilter,
     })
       .populate("fromUserId", "username displayName avatarUrl role")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1, _id: -1 });
 
     // 获取发出的申请
     const sentRequests = await MessageRequest.find({
@@ -226,7 +230,7 @@ async function listMessageRequests(req, res, next) {
       ...statusFilter,
     })
       .populate("toUserId", "username displayName avatarUrl role")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1, _id: -1 });
 
     res.json({
       ok: true,
@@ -460,7 +464,7 @@ async function getConversationMessages(req, res, next) {
 
     const [messages, total] = await Promise.all([
       DirectMessage.find({ conversationId, deletedFor: { $ne: userId } })
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .populate("fromUserId", "username displayName avatarUrl role")
@@ -683,7 +687,7 @@ async function listDmBlacklist(req, res, next) {
 
     const items = await DmRequestBlock.find({ blockerUserId })
       .populate("blockedUserId", "username displayName avatarUrl role")
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1, _id: -1 })
       .lean();
 
     res.json({ ok: true, items });

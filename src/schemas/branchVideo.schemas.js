@@ -34,6 +34,28 @@ const branchTreeBody = z.object({
   nodes: z.record(z.string().min(1).max(120), branchNodeBody),
 });
 
+// 随作品发布的卡组快照（app 的 VideoDeck）。
+// ★ id 字段客户端叫 `id`（本地 Card.id），落库统一叫 `cardId`（与 BranchCard 一致）；
+//   两个名字都收，映射在 controller 里做一次。
+const deckCardBody = z
+  .object({
+    id: z.string().trim().max(120).optional(),
+    cardId: z.string().trim().max(120).optional(),
+    type: z.string().trim().max(40).optional().default("prop"),
+    name: z.string().trim().max(120).optional().default(""),
+    summary: z.string().trim().max(2000).optional().default(""),
+    cover: assetUrl,
+    tags: z.array(z.string().trim().max(40)).max(20).optional().default([]),
+  })
+  .loose(); // 卡上还有 modelUrl/genPrompt 等本地字段，收下但不入库
+
+const deckBody = z.object({
+  name: z.string().trim().max(120).optional().default(""),
+  cards: z.array(deckCardBody).max(60).optional().default([]),
+});
+
+const visibility = z.enum(["public", "private"]);
+
 // POST /api/branch/videos —— DraftVideo
 const publishBody = z.object({
   title: z.string().trim().min(1).max(120),
@@ -42,9 +64,25 @@ const publishBody = z.object({
   cover: assetUrl,
   segments: z.array(segmentBody).min(1).max(60),
   branchTree: branchTreeBody.optional(),
+  // ★ 这两个字段**必须显式声明**：z.object 默认 strip 未声明字段，
+  //   deck 之前就是因为没写这行被静默丢掉的——客户端发了、服务端存了个空。
+  deck: deckBody.optional(),
+  visibility: visibility.optional().default("public"),
   // 幂等键（客户端生成，重试沿用）。z.object 默认 strip 未声明字段，不写这行就到不了 controller
   clientId: z.string().trim().min(1).max(120).optional(),
 });
+
+// PATCH /api/branch/videos/:id —— 作品编辑（仅作者）
+// ★ 全部 optional，且**不给 default**：给了 default 的字段会凭空出现在 patch 里，
+//   于是「只改可见性」的请求会顺手把标题清成空串。
+const updateBody = z
+  .object({
+    title: z.string().trim().min(1).max(120).optional(),
+    category: z.string().trim().max(40).optional(),
+    description: z.string().trim().max(4000).optional(),
+    visibility: visibility.optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 
 // POST /api/branch/videos/:id/comments
 const commentBody = z.object({
@@ -73,9 +111,11 @@ const commentListQuery = z
 
 module.exports = {
   publishBody,
+  updateBody,
   commentBody,
   listQuery,
   commentListQuery,
   segmentBody,
   branchTreeBody,
+  deckBody,
 };

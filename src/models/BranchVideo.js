@@ -45,6 +45,30 @@ const branchTreeSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 随作品发布的卡组：**内嵌快照**，不是对 BranchCard 的引用。
+// 作者事后删掉自己库里的卡，已发布作品里的卡组也不能跟着少几张——观众看到的
+// 必须是发布那一刻的样子。字段与 BranchCard 对齐（cardId 同为客户端稳定 id）。
+const deckCardSchema = new mongoose.Schema(
+  {
+    cardId: { type: String, default: "", trim: true, maxlength: 120 },
+    type: { type: String, default: "prop", trim: true, maxlength: 40 },
+    name: { type: String, default: "", trim: true, maxlength: 120 },
+    summary: { type: String, default: "", trim: true, maxlength: 2000 },
+    // 转存失败时可能残留 dataURL，同 segment 的帧字段，不设 maxlength
+    cover: { type: String, default: "" },
+    tags: { type: [String], default: [] },
+  },
+  { _id: false }
+);
+
+const deckSchema = new mongoose.Schema(
+  {
+    name: { type: String, default: "", trim: true, maxlength: 120 },
+    cards: { type: [deckCardSchema], default: [] },
+  },
+  { _id: false }
+);
+
 const branchVideoSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -53,6 +77,10 @@ const branchVideoSchema = new mongoose.Schema(
     cover: { type: String, default: "" },
     segments: { type: [segmentSchema], default: [] },
     branchTree: { type: branchTreeSchema, default: undefined },
+    deck: { type: deckSchema, default: undefined },
+    // 可见性。★ 查询一律用 { visibility: { $ne: "private" } } 而不是 { visibility: "public" }：
+    // 这个字段是后加的，**存量作品没有它**，按等值查会把所有老作品从首页上抹掉。
+    visibility: { type: String, enum: ["public", "private"], default: "public" },
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     plays: { type: Number, default: 0, min: 0 },
     likes: { type: Number, default: 0, min: 0 },
@@ -74,5 +102,7 @@ branchVideoSchema.index(
 branchVideoSchema.index({ author: 1, createdAt: -1 });
 branchVideoSchema.index({ category: 1, createdAt: -1 });
 branchVideoSchema.index({ createdAt: -1 });
+// 公开流现在每条查询都带 visibility 条件，给它一条能整条走索引的复合索引
+branchVideoSchema.index({ visibility: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model("BranchVideo", branchVideoSchema);
