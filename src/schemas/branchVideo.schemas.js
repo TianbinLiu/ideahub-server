@@ -64,6 +64,14 @@ const deckBody = z.object({
 
 const visibility = z.enum(["public", "private"]);
 
+// 作品付费设置（app 的 VideoPricing）。★ 同样是"发得出、存不下"过的字段：
+// 没声明就被 z.object strip 掉，作者在发布页设了价、看到"你到手 3500"，
+// 发布后重启一看变成免费——收益永远是 0，而且全程零报错。
+const pricingBody = z.object({
+  mode: z.enum(["free", "paid"]),
+  partPrices: z.array(z.coerce.number().int().min(0).max(10_000_000)).max(60).optional().default([]),
+});
+
 // POST /api/branch/videos —— DraftVideo
 const publishBody = z.object({
   title: z.string().trim().min(1).max(120),
@@ -76,6 +84,7 @@ const publishBody = z.object({
   //   deck 之前就是因为没写这行被静默丢掉的——客户端发了、服务端存了个空。
   deck: deckBody.optional(),
   visibility: visibility.optional().default("public"),
+  pricing: pricingBody.optional(),
   // 幂等键（客户端生成，重试沿用）。z.object 默认 strip 未声明字段，不写这行就到不了 controller
   clientId: z.string().trim().min(1).max(120).optional(),
 });
@@ -89,6 +98,19 @@ const updateBody = z
     category: z.string().trim().max(40).optional(),
     description: z.string().trim().max(4000).optional(),
     visibility: visibility.optional(),
+    // 封面可改（成片不可改，但"用哪一帧当封面"属于壳）。
+    // ★ 只收 http(s) URL，**不收 dataURL**：客户端先把它传成永久 URL 再 PATCH
+    //   （app 的 EditPage 走 publishAssets.imageToUrl，与发布路径同一条）。
+    //   收 dataURL 的话请求体是 MB 级的，会撞上网关 1MB 的 client_max_body_size，
+    //   而且撞了只表现成 fetch failed，看不出是因为太大。
+    //   ⚠ 不能用 z.url()：`data:image/...;base64,xxx` 也是**合法 URI**，zod 会放行
+    //     （用例实测：期望 400，实得 200）。必须显式钉住 http/https 协议。
+    cover: z
+      .string()
+      .trim()
+      .max(2000)
+      .regex(/^https?:\/\//i, "cover must be an http(s) URL")
+      .optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 

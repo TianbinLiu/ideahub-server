@@ -75,6 +75,17 @@ const deckSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 付费设置。partPrices 与分集对齐；单 P 作品长度为 1。
+// ★ 不给 default：没有这个字段 = 免费，和"明确设成免费"在语义上没有区别，
+//   但给了 default 会让每条老作品都凭空多出一个 pricing 对象。
+const pricingSchema = new mongoose.Schema(
+  {
+    mode: { type: String, enum: ["free", "paid"], default: "free" },
+    partPrices: { type: [Number], default: [] },
+  },
+  { _id: false }
+);
+
 const branchVideoSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -84,6 +95,7 @@ const branchVideoSchema = new mongoose.Schema(
     segments: { type: [segmentSchema], default: [] },
     branchTree: { type: branchTreeSchema, default: undefined },
     deck: { type: deckSchema, default: undefined },
+    pricing: { type: pricingSchema, default: undefined },
     // 可见性。★ 查询一律用 { visibility: { $ne: "private" } } 而不是 { visibility: "public" }：
     // 这个字段是后加的，**存量作品没有它**，按等值查会把所有老作品从首页上抹掉。
     visibility: { type: String, enum: ["public", "private"], default: "public" },

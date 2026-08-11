@@ -316,6 +316,7 @@ function toVideoPayload(doc, ctx = {}) {
   const tree = toBranchTreePayload(doc.branchTree);
   if (tree) payload.branchTree = tree;
   if (doc.deck && Array.isArray(doc.deck.cards) && doc.deck.cards.length) payload.deck = doc.deck;
+  if (doc.pricing && doc.pricing.mode === "paid") payload.pricing = doc.pricing;
   if (ctx.comments) payload.comments = ctx.comments;
   return payload;
 }
@@ -478,6 +479,7 @@ async function createVideo(req, res, next) {
         segments,
         ...(branchTree ? { branchTree } : {}),
         ...(deck && deck.cards.length ? { deck } : {}),
+        ...(draft.pricing && draft.pricing.mode === "paid" ? { pricing: draft.pricing } : {}),
         visibility: draft.visibility === "private" ? "private" : "public",
         author: req.user._id,
         ...(clientId ? { clientId } : {}),
@@ -562,7 +564,9 @@ async function updateVideo(req, res, next) {
     if (!doc) notFound("Video not found");
     if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
 
-    // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那四个键
+    // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那五个键。
+    // ★ cover 的 schema 已经把它限成 http(s) URL（不收 dataURL，见 schemas 里的说明），
+    //   所以这里不需要再走 transferImage —— 客户端传上来的就已经是永久地址了。
     const patch = req.body;
     const updated = await BranchVideo.findByIdAndUpdate(id, { $set: patch }, { returnDocument: "after" })
       .populate("author", AUTHOR_FIELDS)
