@@ -119,6 +119,35 @@ const commentBody = z.object({
   text: z.string().trim().min(1).max(1000),
 });
 
+/** 一条弹幕的字数上限。★ 这是**契约值**（docs/api-contract.md「弹幕」），
+ *  客户端的 DANMAKU_MAX_LEN 必须与它相等 —— 客户端松了会收到一串 400，
+ *  客户端紧了则是"服务端明明收得下，用户却打不完一句话"。 */
+const DANMAKU_MAX_LEN = 40;
+
+// POST /api/branch/videos/:id/danmaku
+const danmakuBody = z.object({
+  text: z.string().trim().min(1).max(DANMAKU_MAX_LEN),
+  // 全片累计秒。上限 86400（一天）纯粹是防呆：作品再长也不可能到这个量级，
+  // 但不设上限的话一个 1e300 就能让播放端的轨道调度算出 Infinity
+  at: z.coerce.number().min(0).max(86400),
+  // ★ 必须钉成 #rrggbb 再入库。这个值最后会原样进客户端的 style.color ——
+  //   收任意字符串等于把一段用户可控的文本喂进 CSS。空串 = 用默认色
+  color: z
+    .string()
+    .trim()
+    .regex(/^#[0-9a-f]{6}$/i, "color must be #rrggbb")
+    .optional(),
+});
+
+// GET /api/branch/videos/:id/danmaku
+const danmakuListQuery = z
+  .object({
+    // 播放端要的是**一整条时间轴**，不是一页 —— 所以这里不做 cursor 分页，
+    // 只给一个"最多取多少条"的天花板（采样口径见 controller）
+    limit: z.coerce.number().int().min(1).max(500).default(200),
+  })
+  .loose();
+
 // GET /api/branch/videos —— 列表 query
 const listQuery = z
   .object({
@@ -143,9 +172,12 @@ module.exports = {
   publishBody,
   updateBody,
   commentBody,
+  danmakuBody,
   listQuery,
   commentListQuery,
+  danmakuListQuery,
   segmentBody,
   branchTreeBody,
   deckBody,
+  DANMAKU_MAX_LEN,
 };

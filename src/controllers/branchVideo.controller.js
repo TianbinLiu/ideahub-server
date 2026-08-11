@@ -11,11 +11,12 @@ const mongoose = require("mongoose");
 const BranchVideo = require("../models/BranchVideo");
 const BranchLike = require("../models/BranchLike");
 const BranchComment = require("../models/BranchComment");
+const BranchDanmaku = require("../models/BranchDanmaku");
 const Follow = require("../models/Follow");
 const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
-const { listQuery, commentListQuery } = require("../schemas/branchVideo.schemas");
+const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 
 const AUTHOR_FIELDS = "_id username displayName avatarUrl";
 
@@ -637,10 +638,7 @@ async function likeVideo(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
-    // 就成了探测私密作品是否存在的旁路。
-    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
-    if (!exists) notFound("Video not found");
+    await assertVisible(id, req.user);
 
     // 唯一索引 + upsert：重复点赞幂等，不会把计数刷高
     await BranchLike.updateOne(
@@ -669,10 +667,7 @@ async function unlikeVideo(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
-    // 就成了探测私密作品是否存在的旁路。
-    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
-    if (!exists) notFound("Video not found");
+    await assertVisible(id, req.user);
 
     await BranchLike.deleteOne({ user: req.user._id, video: id });
 
@@ -690,10 +685,7 @@ async function listComments(req, res, next) {
 
     const { cursor, limit } = commentListQuery.parse(req.query);
 
-    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
-    // 就成了探测私密作品是否存在的旁路。
-    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
-    if (!exists) notFound("Video not found");
+    await assertVisible(id, req.user);
 
     const range = cursorFilter(cursor);
     const query = range ? { $and: [{ video: id }, range] } : { video: id };
@@ -723,10 +715,7 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    // 看不见的作品在这几条子端点上也必须是「不存在」，否则点赞/评论接口
-    // 就成了探测私密作品是否存在的旁路。
-    const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(req.user)] });
-    if (!exists) notFound("Video not found");
+    await assertVisible(id, req.user);
 
     const doc = await BranchComment.create({
       video: id,
@@ -744,6 +733,81 @@ async function addComment(req, res, next) {
   }
 }
 
+/**
+ * 看不见的作品在子端点上也必须是「不存在」。
+ * 否则点赞/评论/弹幕这几条就成了探测私密作品是否存在的旁路（403 与 404 是两种信息）。
+ * ★ 原来这段在三个函数里各写了一遍，加弹幕就是第四遍 —— 收成一处（铁律六）。
+ */
+async function assertVisible(id, user) {
+  const exists = await BranchVideo.exists({ $and: [{ _id: id }, visibilityFilter(user)] });
+  if (!exists) notFound("Video not found");
+}
+
+/**
+ * 弹幕**不透出作者**，只告诉你"这条是不是你自己发的"。
+ *
+ * ★ 这是刻意的，不是偷懒：弹幕在 B 站那套心智里是匿名的，把 username 挂上去，
+ *   一条作品的弹幕墙就成了"谁在什么时间看了这个视频"的公开记录。
+ *   客户端需要作者信息的唯一用途是给自己发的那条描个边，`mine` 一个布尔够了。
+ */
+function toDanmakuPayload(doc, user) {
+  return {
+    _id: doc._id,
+    at: doc.at,
+    text: doc.text || "",
+    color: doc.color || "",
+    mine: !!user && String(doc.author) === String(user._id),
+    createdAt: doc.createdAt,
+  };
+}
+
+// GET /api/branch/videos/:id/danmaku
+async function listDanmaku(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    const { limit } = danmakuListQuery.parse(req.query);
+    await assertVisible(id, req.user);
+
+    // ★ 采样口径：**先按发布时间取最新的 limit 条，再按时间轴排序返回**。
+    //   不是"按 at 取前 N 条" —— 那样一条爆火作品的前 10 秒会被塞满，
+    //   后面永远是空的，新弹幕发出去也看不见。
+    //   客户端拿到的必须是 at 升序：播放端是按游标扫时间轴的，乱序会漏放。
+    const docs = await BranchDanmaku.find({ video: id })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .select("at text color author createdAt")
+      .lean();
+
+    const items = docs.map((d) => toDanmakuPayload(d, req.user)).sort((a, b) => a.at - b.at);
+    // truncated：明确告诉客户端"这不是全部"。不给这个标记的话，
+    // 客户端没法区分"这条作品就这么多弹幕"和"被我们截断了"
+    res.json({ ok: true, items, truncated: docs.length >= limit });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/branch/videos/:id/danmaku
+async function addDanmaku(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    await assertVisible(id, req.user);
+
+    const doc = await BranchDanmaku.create({
+      video: id,
+      author: req.user._id,
+      at: req.body.at,
+      text: req.body.text,
+      color: req.body.color || "",
+    });
+    res.status(201).json({ ok: true, danmaku: toDanmakuPayload(doc, req.user) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listVideos,
   createVideo,
@@ -755,6 +819,8 @@ module.exports = {
   unlikeVideo,
   listComments,
   addComment,
+  listDanmaku,
+  addDanmaku,
   // 导出给测试/其它模块复用
   transferDraftAssets,
   isArkVideoUrl,
