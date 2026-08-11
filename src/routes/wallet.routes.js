@@ -3,23 +3,21 @@
  *
  * 钱包本体与三条不变量见 services/tokenWallet.service.js。这一层只做参数校验与限流。
  *
- * ⚠ **充值与购套餐目前是模拟支付**（没有接真实支付网关）。把它们从客户端搬到服务端
- *   **并没有堵上"自己给自己发 token"这个洞** —— 有一个有效登录态就能调。
- *   搬过来的意义是：口径唯一、有流水可审计、有上限可兜底，接支付网关时只改这一处。
- *   在那之前靠 config/tokens.js 的 DAILY_RECHARGE_CAP / DAILY_PLAN_BUYS 挡住脚本刷量。
- *   ★ 这段话是给未来的人看的：别看到"已经在服务端了"就以为可以开门收钱。
+ * ★ 发币的口子**已经不在这里了**。/recharge 与 /plan 曾经是「调一下就到账」的
+ *   模拟支付，也就是说有个有效登录态就能给自己发 token。现在两条都改成
+ *   **下单**（转 /api/pay/orders），真正发币只发生在渠道回调结算时
+ *   —— services/payment/order.service.js 的 applyCallback，那里有幂等与金额校验。
+ *   保留这两条路径是为了老客户端不至于直接 404，它们只是转发。
  */
 const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const wallet = require("../services/tokenWallet.service");
-const { PLANS, planOf, DAILY_RECHARGE_CAP, DAILY_PLAN_BUYS } = require("../config/tokens");
+const orders = require("../services/payment/order.service");
+const { availableChannels } = require("../services/payment/channels");
+const { PLANS } = require("../config/tokens");
 
 const router = express.Router();
-
-/** 直充包面额白名单（与 app 的 RECHARGE_PACKS 一致）。只收在册面额，
- *  不收任意数字——否则"充 999999999"就是一句话的事 */
-const RECHARGE_PACKS = [200_000, 1_000_000, 5_000_000];
 
 /** GET /api/me/wallet —— 余额快照。顺带完成初始化与跨月刷新 */
 router.get("/", requireAuth, async (req, res, next) => {
@@ -41,39 +39,43 @@ router.get("/ledger", requireAuth, async (req, res, next) => {
   }
 });
 
-/** POST /api/me/wallet/recharge —— 直充进 addon（模拟支付，见文件头警告） */
-router.post("/recharge", requireAuth, aiRateLimit({ max: 10, scope: "wallet-mint" }), async (req, res, next) => {
+/**
+ * 老路径转下单。
+ *
+ * ★ 它们**不再发币**了。原来的行为是"调一下就到账"，那是个洞：任何有登录态的人
+ *   都能给自己发 token。现在返回一张订单，付款与发币交给 /api/pay。
+ * ★ 状态码用 **202 Accepted** 而不是 200：请求收下了、但你要的事（余额变多）
+ *   还没发生。老客户端拿 200 会以为充值成功、把余额刷成新的，然后下一次同步又掉回去
+ *   —— 静默且全局的错（铁律八）。202 + 明确的 message 至少能让人看出发生了什么。
+ */
+async function toOrder(req, res, next, make) {
   try {
-    const tokens = Number(req.body?.tokens);
-    if (!RECHARGE_PACKS.includes(tokens)) {
-      return res.status(400).json({ ok: false, message: "unknown recharge pack" });
-    }
-    const { rechargeTokens } = await wallet.mintedToday(req.user._id);
-    if (rechargeTokens + tokens > DAILY_RECHARGE_CAP) {
-      return res.status(429).json({ ok: false, message: "daily recharge cap reached" });
-    }
-    const w = await wallet.credit(req.user._id, tokens, "recharge", `直充 ${tokens}`);
-    res.json({ ok: true, wallet: w });
+    const r = await make();
+    if (r.error) return res.status(400).json({ ok: false, message: r.error });
+    const payable = availableChannels().length > 0;
+    res.status(202).json({
+      ok: true,
+      order: orders.toOrderPayload(r.order),
+      payable,
+      message: payable
+        ? "订单已创建，请完成支付；付款成功后额度会自动到账"
+        : "订单已创建，但本服务尚未接入任何支付渠道，暂时无法完成付款",
+      // 余额没变，把当前值一并回去，省得客户端为了刷新再打一次
+      wallet: await wallet.getWallet(req.user._id),
+    });
   } catch (err) {
     next(err);
   }
-});
+}
 
-/** POST /api/me/wallet/plan —— 购/续套餐（模拟支付，见文件头警告） */
-router.post("/plan", requireAuth, aiRateLimit({ max: 10, scope: "wallet-mint" }), async (req, res, next) => {
-  try {
-    const planId = String(req.body?.planId ?? "");
-    if (planOf(planId).id !== planId) return res.status(400).json({ ok: false, message: "unknown plan" });
-    const { planBuys } = await wallet.mintedToday(req.user._id);
-    if (planBuys >= DAILY_PLAN_BUYS) {
-      return res.status(429).json({ ok: false, message: "daily plan purchase cap reached" });
-    }
-    const w = await wallet.buyPlan(req.user._id, planId);
-    if (!w) return res.status(404).json({ ok: false, message: "wallet not found" });
-    res.json({ ok: true, wallet: w });
-  } catch (err) {
-    next(err);
-  }
-});
+/** POST /api/me/wallet/recharge —— 【已改为下单】直充包 */
+router.post("/recharge", requireAuth, aiRateLimit({ max: 20, scope: "pay-order" }), (req, res, next) =>
+  toOrder(req, res, next, () => orders.createRechargeOrder(req.user._id, req.body?.tokens))
+);
+
+/** POST /api/me/wallet/plan —— 【已改为下单】购/续套餐 */
+router.post("/plan", requireAuth, aiRateLimit({ max: 20, scope: "pay-order" }), (req, res, next) =>
+  toOrder(req, res, next, () => orders.createPlanOrder(req.user._id, String(req.body?.planId ?? "")))
+);
 
 module.exports = router;
