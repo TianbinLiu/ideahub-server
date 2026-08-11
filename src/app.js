@@ -112,6 +112,8 @@ initPassport();
 app.use(passport.initialize());
 
 app.use("/api", healthRoutes);
+// 安卓 App 的版本清单（无需登录，检查更新发生在登录之前）
+app.use("/api/app", require("./routes/appRelease.routes"));
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/feed", require("./routes/feed.routes"));
