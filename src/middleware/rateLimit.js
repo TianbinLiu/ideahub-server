@@ -170,7 +170,25 @@ function loginRateLimit(accountField) {
 }
 
 /**
- * AI 端点限流：按【用户】而不是按 IP 计。
+ * 已登录端点的限流：按【账号】而不是按 IP 计。
+ *
+ * ★ 为什么必须按账号：requireAuth 后面的端点，攻击者手上已经有一个合法账号了，
+ *   按 IP 计等于"换个出口就重新开一桶"（家宽拨号、代理池、手机切流量，成本近乎零）。
+ *   反过来按账号计还顺带解决了 CGNAT 误伤：同一出口后面的一千个真人各有各的桶。
+ *   ⚠ keyFor 返回 null 时 rateLimit 会**直接放行**，所以这个限流器只能挂在
+ *     requireAuth 后面；挂到 optionalAuth 端点上等于对游客完全不限。
+ */
+function userRateLimit({ max = 20, windowMs = 60 * 1000, scope = "user" } = {}) {
+  return rateLimit({
+    windowMs,
+    max,
+    scope,
+    keyFor: (req) => (req.user?._id ? String(req.user._id) : null),
+  });
+}
+
+/**
+ * AI 端点限流：按【用户】而不是按 IP 计（就是 userRateLimit，换个默认 scope）。
  *
  * 这类端点每次调用都要花真金白银（LLM token），且响应慢（占着连接）。
  * 不限流的话，一个账号写个循环就能把当月预算刷光 —— 这不是"被攻击"，
@@ -180,12 +198,10 @@ function loginRateLimit(accountField) {
  * 更贵的端点（一次请求触发多轮 LLM）应显式调小 max。
  */
 function aiRateLimit({ max = 20, windowMs = 60 * 1000, scope = "ai" } = {}) {
-  return rateLimit({
-    windowMs,
-    max,
-    scope,
-    keyFor: (req) => (req.user?._id ? String(req.user._id) : null),
-  });
+  return userRateLimit({ max, windowMs, scope });
 }
 
-module.exports = { rateLimit, loginRateLimit, aiRateLimit };
+// ★ clientIp 对外导出：仓里凡是要"这个请求从哪儿来"的地方都必须用它，别再手写一份。
+//   上面那段注释解释了为什么 req.ip / CF-Connecting-IP 都是错的答案，
+//   抄第二遍的代价是「限流看着生效、实际所有人共用一个桶」这种查不出来的故障。
+module.exports = { rateLimit, loginRateLimit, aiRateLimit, userRateLimit, clientIp };

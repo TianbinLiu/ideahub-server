@@ -12,6 +12,9 @@ const { canReadIdea, canWriteIdea, canModerateIdea } = require("../utils/permiss
 const { invalidId, notFound, unauthorized, forbidden } = require("../utils/http");
 const { parseMentions } = require("../utils/mentionParser");
 const { searchRegex } = require("../utils/regex");
+// 热度公式收在 utils/hotScore.js 一处：卡片/卡组的热度用的是同一份权重，
+// 抄第二遍必然出现「想法榜和卡片榜按两套标准排」（铁律六）。
+const { hotScore } = require("../utils/hotScore");
 const { validateFeedback, generateIdeaDraftFromContent } = require("../services/aiReview.service");
 const AppError = require("../utils/AppError");
 const errorCodes = require("../utils/errorCodes");
@@ -82,12 +85,8 @@ function normalizeSearchTokens(raw) {
 }
 
 function getIdeaHotScore(idea) {
-  const stats = idea?.stats || {};
-  const likeCount = Number(stats.likeCount || 0);
-  const commentCount = Number(stats.commentCount || 0);
-  const bookmarkCount = Number(stats.bookmarkCount || 0);
-  const viewCount = Number(stats.viewCount || 0);
-  return likeCount * 6 + commentCount * 4 + bookmarkCount * 3 + Math.min(viewCount, 5000) * 0.04;
+  // 权重本体已搬到 utils/hotScore.js（原封不动），这里只负责把 idea.stats 的字段名喂进去
+  return hotScore(idea?.stats || {});
 }
 
 function getIdeaRecencyScore(idea) {

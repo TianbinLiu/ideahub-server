@@ -7,6 +7,7 @@ const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
+const { normalizeNewUsername } = require("../utils/username");
 const { grantSignupBonus } = require("../services/points.service");
 
 function serializeAuthUser(user) {
@@ -83,9 +84,9 @@ function getAvailableOauthProviders() {
 
 async function register(req, res, next) {
   try {
-    const { username, email, password, role } = req.body;
+    const { username: rawUsername, email, password, role } = req.body;
 
-    if (!username || !email || !password) {
+    if (!rawUsername || !email || !password) {
       res.status(400);
       throw new Error("username, email, password are required");
     }
@@ -93,6 +94,10 @@ async function register(req, res, next) {
       res.status(400);
       throw new Error("password must be at least 6 characters");
     }
+    // ★ 长度上限在这里挡住，理由与"存量超长用户名怎么办"一起写在 utils/username.js：
+    //   不挡的话，注册出来的账号在两条产品线上都**永远 @ 不到**（令牌只切前 32 个字符），
+    //   而且表现是"打了 @ 没反应"，一个错都不报。
+    const username = normalizeNewUsername(rawUsername);
 
     const exists = await User.findOne({ $or: [{ username }, { email }] });
     if (exists) {

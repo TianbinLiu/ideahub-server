@@ -381,3 +381,80 @@ describe("付费设置与封面编辑", () => {
       .expect(400);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 按作者列作品（GET /api/branch/videos?author=<userId>）
+//
+// ★ 这组盯的是**新能力最容易做错的那一处**：author 是个筛选条件，不是可见性的替代品。
+//   忘了跟 visibilityFilter 求交集，一行代码就能把全站的私密作品倒出来 —— 而且
+//   接口 200、字段齐全，看起来完全正常，只有作者本人某天刷到自己没发出去的东西才会发现。
+// ─────────────────────────────────────────────────────────────────────
+describe("按作者列作品", () => {
+  const listByAuthor = (authorId, token) => {
+    const req = request(app).get(`/api/branch/videos?author=${authorId}`);
+    return token ? req.set("Authorization", `Bearer ${token}`) : req;
+  };
+
+  test("A1 陌生人的主页：只给公开作品，私密的一条都不给", async () => {
+    const author = await registerUser();
+    const stranger = await registerUser();
+
+    const open = String((await publish(author.token, { title: "作者的公开作品" }).expect(201)).body.video._id);
+    const secret = String(
+      (await publish(author.token, { title: "作者的私密作品", visibility: "private" }).expect(201)).body.video._id
+    );
+    // 别人的作品：不该出现在这一页里（证明 author 真的在筛，不是把全站原样返回）
+    const other = String((await publish(stranger.token, { title: "别人的作品" }).expect(201)).body.video._id);
+
+    // 未登录看
+    const anon = await listByAuthor(author.userId).expect(200);
+    expect(idsOf(anon.body)).toContain(open);
+    expect(idsOf(anon.body)).not.toContain(secret);
+    expect(idsOf(anon.body)).not.toContain(other);
+
+    // 登录成另一个人看 —— 同样看不到私密的
+    const byStranger = await listByAuthor(author.userId, stranger.token).expect(200);
+    expect(idsOf(byStranger.body)).toContain(open);
+    expect(idsOf(byStranger.body)).not.toContain(secret);
+  });
+
+  test("A2 问自己要：私密作品必须在里面（否则作者看不见自己的草稿箱）", async () => {
+    const author = await registerUser();
+    const open = String((await publish(author.token, { title: "自己的公开" }).expect(201)).body.video._id);
+    const secret = String(
+      (await publish(author.token, { title: "自己的私密", visibility: "private" }).expect(201)).body.video._id
+    );
+
+    const mine = await listByAuthor(author.userId, author.token).expect(200);
+    expect(idsOf(mine.body)).toEqual(expect.arrayContaining([open, secret]));
+  });
+
+  test("A3 author 与其它筛选条件求交集，不是互相覆盖", async () => {
+    const author = await registerUser();
+    const other = await registerUser();
+    const tag = `搜${Date.now().toString(36)}`;
+
+    const hit = String((await publish(author.token, { title: `${tag} 命中` }).expect(201)).body.video._id);
+    const wrongAuthor = String((await publish(other.token, { title: `${tag} 别人的` }).expect(201)).body.video._id);
+    const wrongTitle = String((await publish(author.token, { title: "同一个人但标题不含关键词" }).expect(201)).body.video._id);
+
+    const res = await request(app)
+      .get(`/api/branch/videos?author=${author.userId}&q=${encodeURIComponent(tag)}`)
+      .expect(200);
+    expect(idsOf(res.body)).toEqual([hit]);
+    expect(idsOf(res.body)).not.toContain(wrongAuthor);
+    expect(idsOf(res.body)).not.toContain(wrongTitle);
+  });
+
+  test("A4 id 拼错是 400，不是 500，也不是一个骗人的空列表", async () => {
+    // ★ 放任非法 id 进 Mongo 会抛 CastError → 被兜成 500，
+    //   让人去查一个根本不存在的服务器故障；而静默返回空列表则等于告诉调用方
+    //   "这个人没有作品"，两件事在界面上必须分得开。
+    await request(app).get("/api/branch/videos?author=not-an-object-id").expect(400);
+
+    // 合法但不存在的 id：空列表才是对的（这个人确实没有作品）
+    const ghost = new mongoose.Types.ObjectId().toString();
+    const res = await request(app).get(`/api/branch/videos?author=${ghost}`).expect(200);
+    expect(res.body.items).toEqual([]);
+  });
+});

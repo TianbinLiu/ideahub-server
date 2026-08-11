@@ -117,6 +117,18 @@ const updateBody = z
 // POST /api/branch/videos/:id/comments
 const commentBody = z.object({
   text: z.string().trim().min(1).max(1000),
+  // 楼中楼：被回复的那条**顶层**评论的 _id。
+  // ★ 必须显式声明：z.object 默认 strip 未声明字段，漏了这一行的表现是
+  //   「每一条回复都静默变成顶层评论」—— 客户端发了 parentId、服务端 201 了、
+  //   读回来是一条挂在评论区最外层的孤儿。deck / pricing 已经栽过两次同一个坑。
+  //   24 位十六进制是 ObjectId 的长度，非法值在 controller 里再判一次 400。
+  parentId: z.string().trim().length(24).optional(),
+  // ★★ 这里**故意没有 `mentions`**，而且以后也不许加：@提及的收件人由服务端自己
+  //   从 text 里解析（utils/mentionParser）。收客户端传上来的名单等于开一个
+  //   "给任意用户发推送"的接口——正文里一个 @ 都没有也能点名一百个人。
+  //   z.object 默认 strip 未声明字段，所以客户端就算发了也到不了 controller；
+  //   这条注释是为了让下一个"顺手补一下 schema"的人先看见理由（否则它看起来像漏声明，
+  //   而漏声明恰好是本文件里 deck / pricing / parentId 栽过三次的那个坑）。
 });
 
 /** 一条弹幕的字数上限。★ 这是**契约值**（docs/api-contract.md「弹幕」），
@@ -154,6 +166,13 @@ const listQuery = z
     feed: z.enum(["recommend", "following"]).optional().default("recommend"),
     category: z.string().trim().max(40).optional().default(""),
     q: z.string().trim().max(120).optional().default(""),
+    // ★ 按作者筛（用户 id）。没有它，app 点开一个陌生人就只能画一个凭空空着的主页 ——
+    //   界面上看不出是"这个人没发过作品"还是"我们根本没去查"。
+    //   这里只管形状（24 位十六进制 = ObjectId），合法性在 controller 里再判一次：
+    //   不判的话 Mongo 会把 CastError 抛成 500，而这是个用户输入错误，该是 400。
+    //   ⚠ 它**不是**可见性的替代品：拿到别人的 id 也只能看到对方的公开作品，
+    //     私密作品由 visibilityFilter 那一条挡（见 controller 里的 $and 拼法）。
+    author: z.string().trim().max(64).optional().default(""),
     // cursor 形如 "<ISO时间>_<ObjectId>"，由上一页 nextCursor 原样回传
     cursor: z.string().trim().max(80).optional().default(""),
     limit: z.coerce.number().int().min(1).max(50).default(12),

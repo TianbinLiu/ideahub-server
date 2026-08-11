@@ -1,7 +1,18 @@
 const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
 
-async function createNotification({ userId, actorId, ideaId, type, payload = {} }) {
+/**
+ * 全站唯一的通知入口。
+ *
+ * ★ 关联对象有**两个**字段，不是一个：
+ *   - ideaId  → ref:"Idea"，ideas 产品线用
+ *   - videoId → ref:"BranchVideo"，分支视频（ideahub-app 的作品）用
+ *   两者不能互相顶替：把 BranchVideo 的 _id 塞进 ideaId，populate 会去 ideas 集合里
+ *   找一个永远不存在的文档 → 出来是 null。表现是"通知列表能看，但点进去哪儿都去不了"，
+ *   而且**一个错都不报**（populate 找不到就是 null，不是异常）。
+ *   两个都不传是合法的（ideas 的邀请、消息请求、榜单通知本来就没有关联对象）。
+ */
+async function createNotification({ userId, actorId, ideaId, videoId, type, payload = {} }) {
   // 确保 userId 和 actorId 都是有效的 ObjectId
   if (!userId) {
     throw new Error("userId is required for notification");
@@ -21,6 +32,7 @@ async function createNotification({ userId, actorId, ideaId, type, payload = {} 
       userId: userObjId,
       actorId: actorObjId,
       ideaId,
+      videoId,
       type,
       payload,
     });

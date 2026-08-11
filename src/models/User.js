@@ -2,6 +2,8 @@
 
 const mongoose = require("mongoose");
 const { SIGNUP_GRANT_POINTS } = require("../config/points");
+// 大小写不敏感索引的 collation 与查询侧同源，别再手抄字面量（见 utils/username.js）
+const { CI_COLLATION } = require("../utils/username");
 
 const live2dComponentSettingsSchema = new mongoose.Schema(
   {
@@ -109,5 +111,22 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );
+
+// ★ @提及查询专用的**大小写不敏感**索引，与 utils/username.js 的 CI_COLLATION
+//   必须逐字相等 —— MongoDB 只在查询 collation 与索引 collation 完全一致时才用得上它，
+//   对不上不会报错，只是默默退化成全表扫（users 表迟早会大到让每条评论都拖一下）。
+//   所以这里直接引那个常量，不再手抄一份 `{locale:"en",strength:2}`。
+//
+//   为什么不直接把 `username` 那条 unique 索引改成 ci：那会顺带改变**唯一性语义**
+//   （从此 "Bob" 和 "bob" 不能共存），而库里可能已经存在这样两个账号，
+//   改索引会当场建不出来、启动即失败。这里只加一条独立的非唯一次级索引，零语义变更。
+userSchema.index({ username: 1 }, { name: "username_ci", collation: CI_COLLATION });
+
+// ★ displayName 的同款索引，服务的是**找人搜索里的"精确档"**
+//   （users.controller 的 searchUsers 单独发的那条等值查询）。
+//   没有它的话，那条查询的 $or 里有一个分支用不上索引 —— 而 MongoDB 的 $or
+//   是"任一分支无索引则整条退化成集合扫"，等于为了修排序问题白白多加一次全表扫。
+//   非唯一：displayName 本来就允许重名（它不是身份，username 才是）。
+userSchema.index({ displayName: 1 }, { name: "displayName_ci", collation: CI_COLLATION });
 
 module.exports = mongoose.model("User", userSchema);

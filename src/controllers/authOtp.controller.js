@@ -9,6 +9,10 @@ const { normEmail, createOtp, verifyOtp } = require("../services/otp.service");
 const { sendEmailOtp } = require("../services/email.service");
 const { sendPhoneOtp, checkPhoneOtp } = require("../services/sms.service");
 const { grantSignupBonus } = require("../services/points.service");
+// 用户名长度上限：与 @提及的令牌上限同源（utils/username.js）。
+// ★ 这条注册路径**也要**挡 —— 只挡 auth.controller 那条的话，超长用户名换个入口照样进得来，
+//   而它带来的故障（那个账号永远 @ 不到）是静默的，谁也不会想到去查邮箱验证码注册这条路。
+const { normalizeNewUsername } = require("../utils/username");
 
 // 归一手机号：去空格/连字符，去掉 +86 / 86 前缀，只留 11 位。
 function normPhone(p) {
@@ -30,11 +34,14 @@ async function makeUniquePhoneUsername() {
 // POST /api/auth/email/register/start
 async function emailRegisterStart(req, res, next) {
   try {
-    const { email, username, password } = req.body;
+    const { email, username: rawUsername, password } = req.body;
     const e = normEmail(email);
 
-    if (!e || !username || !password) badRequest("email, username, password are required");
+    if (!e || !rawUsername || !password) badRequest("email, username, password are required");
     if (String(password).length < 6) badRequest("password must be at least 6 characters");
+
+    // 在 start 这一步就拒掉，别等用户收完验证码、填完再说"名字太长"
+    const username = normalizeNewUsername(rawUsername);
 
     const exists = await User.findOne({ $or: [{ email: e }, { username }] }).lean();
     if (exists) badRequest("username or email already in use");
@@ -53,10 +60,14 @@ async function emailRegisterStart(req, res, next) {
 // POST /api/auth/email/register/verify
 async function emailRegisterVerify(req, res, next) {
   try {
-    const { email, username, password, code, role } = req.body;
+    const { email, username: rawUsername, password, code, role } = req.body;
     const e = normEmail(email);
 
-    if (!e || !username || !password || !code) badRequest("email, username, password, code are required");
+    if (!e || !rawUsername || !password || !code) badRequest("email, username, password, code are required");
+
+    // verify 这一步**也要**再挡一次：start 与 verify 是两个独立请求，
+    // 中间那个 username 完全可以被换掉（start 传合法的、verify 传超长的）。
+    const username = normalizeNewUsername(rawUsername);
 
     await verifyOtp({ target: e, purpose: "email_register", code });
 

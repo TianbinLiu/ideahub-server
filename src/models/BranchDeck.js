@@ -17,6 +17,11 @@ const snapshotCardSchema = new mongoose.Schema(
     cover: { type: String, default: "" }, // 已是 Cloudinary URL（入库时转存过）
     tags: { type: [String], default: [] },
     hot: { type: Number, default: 0, min: 0 },
+    // ★ 与 BranchCard 一起补的两个字段。快照里漏声明的后果最隐蔽：
+    //   卡片本身有建模和生成蓝图，装走之后变成没有——用户会以为是自己装错了。
+    //   modelUrl 只可能是 http(s)（发布时 shareableModelUrl 已经剥过本地指针）。
+    modelUrl: { type: String, default: "" },
+    genPrompt: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -26,6 +31,10 @@ const branchDeckSchema = new mongoose.Schema(
     owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     name: { type: String, required: true, trim: true, maxlength: 60 },
     cardIds: { type: [String], default: [] },
+    /** 封面卡（客户端 cardId）。★ 客户端一直在发这个字段，但 schema/model 都没声明，
+     *  于是被 z.object strip 掉 —— 表现是「设了封面，换台设备打开又变回第一张」。
+     *  缺省/指向已被移出的卡时由客户端回退成组内第一张（deckCoverOf）。 */
+    coverCardId: { type: String, default: "", trim: true, maxlength: 120 },
 
     // ── 分享到创意工坊 ──
     published: { type: Boolean, default: false },

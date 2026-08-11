@@ -17,8 +17,22 @@ const branchCardSchema = new mongoose.Schema(
     name: { type: String, default: "", trim: true, maxlength: 120 },
     summary: { type: String, default: "", trim: true, maxlength: 2000 },
     cover: { type: String, default: "" },
+    // ⚠ hot 是**客户端发来的**种子热度，只做展示兜底，不再是「热度」的判据。
+    //   真热度按 { kind:"card", key:cardId } 存在 BranchAssetStat 里，由服务端算。
+    //   留着这个字段是为了兼容老客户端（它还在发），不接受它会整批加卡 400。
     hot: { type: Number, default: 0, min: 0 },
     tags: { type: [String], default: [] },
+    /** 3D 建模指针。可能是 `idb:model3d:*` 这种**只在卡主那台设备上有意义**的本地指针，
+     *  所以发布/安装时会被剥掉（见 controller 的 shareableModelUrl） */
+    modelUrl: { type: String, default: "" },
+    /** 铸卡时的完整生成提示词（卡片详情页的「生成蓝图」） */
+    genPrompt: { type: String, default: "" },
+
+    // ── 发布到创意工坊（与 BranchDeck 同一套语义）──
+    published: { type: Boolean, default: false },
+    publishedAt: { type: Date, default: undefined },
+    description: { type: String, default: "", trim: true, maxlength: 200 },
+
     createdAt: { type: Date, default: Date.now },
   },
   { versionKey: false }
@@ -28,5 +42,7 @@ const branchCardSchema = new mongoose.Schema(
 branchCardSchema.index({ owner: 1, cardId: 1 }, { unique: true });
 // 「我的卡片」按时间倒序列出
 branchCardSchema.index({ owner: 1, createdAt: -1 });
+// 卡片广场：只查已发布的，按发布时间倒序（与 BranchDeck 的广场索引同形）
+branchCardSchema.index({ published: 1, publishedAt: -1 });
 
 module.exports = mongoose.model("BranchCard", branchCardSchema);

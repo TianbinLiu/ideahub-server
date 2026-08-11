@@ -1,0 +1,493 @@
+// tests/branchAssetPublish.spec.js
+// 覆盖：卡片/卡组「发布到创意工坊」+ 真实热度（GET /cards/shared、POST /assets/:kind/:key/*）。
+//
+// ★ 这套用例盯的是六类【做错了不报错】的问题：
+//   A1 字段被 z.object 静默 strip —— modelUrl / genPrompt / coverCardId / description
+//      四个都曾经是「客户端发了、服务端 201 了、读回来是空的」。只有回读才发现得了。
+//   A2 路由顺序 —— /cards/shared 排在 /cards/:cardId 后面时，"shared" 会被当成 cardId，
+//      返回的是 200 + 空广场，看起来只是"还没人分享"。
+//   A3 卡片热度必须按 **cardId 全局**聚合，不是按 BranchCard 文档 —— 同一张市场卡在库里
+//      是每个装过的人各一份，挂在文档上的话每个人看到的都是自己那份的 0，像丢了数据。
+//   A4 点赞/收藏必须幂等且计数不漂移 —— 计数是从去重表 countDocuments 重算的，
+//      连点两次 likes 必须还是 1。$inc 写法在这条上会涨到 2 而且校不回去。
+//   A5 第三方版权模型不能被分享出去，设备本地指针（idb:）不能跟着卡走给别人 ——
+//      前者是法律问题，后者是"答应了全息预览、别人打开什么都没有"。
+//   A6 非法 kind/key 一律 400 —— 这两个值会进 Mongo 查询和计数表主键。
+const mongoose = require("mongoose");
+const { MongoMemoryServer } = require("mongodb-memory-server");
+const request = require("supertest");
+
+let mongod;
+let app;
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  process.env.MONGO_URI = mongod.getUri();
+  process.env.JWT_SECRET = process.env.JWT_SECRET || "test-secret";
+  const { connectDB } = require("../src/config/db");
+  await connectDB();
+  app = require("../src/app");
+});
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  if (mongod) await mongod.stop();
+});
+
+let seq = 0;
+async function registerUser() {
+  seq += 1;
+  const name = `ap${seq}_${Date.now().toString(36)}`;
+  const res = await request(app)
+    .post("/api/auth/register")
+    .send({ username: name, email: `${name}@test.local`, password: "secret123" })
+    .expect(201);
+  return { token: res.body.token, userId: String(res.body.user._id) };
+}
+
+let cardSeq = 0;
+function cardOf(extra = {}) {
+  cardSeq += 1;
+  return {
+    cardId: extra.cardId || `mkt_test_${cardSeq}_${Date.now().toString(36)}`,
+    type: "character",
+    name: "测试角色",
+    summary: "用于回归测试的卡",
+    cover: "https://cdn.example.com/c.jpg",
+    tags: ["测试"],
+    ...extra,
+  };
+}
+
+function addCards(token, cards) {
+  return request(app).post("/api/branch/cards").set("Authorization", `Bearer ${token}`).send({ cards });
+}
+
+function auth(req, token) {
+  return token ? req.set("Authorization", `Bearer ${token}`) : req;
+}
+
+describe("卡片/卡组发布到创意工坊", () => {
+  test("A1 modelUrl / genPrompt 必须能存下来（曾被 z.object 静默 strip）", async () => {
+    const me = await registerUser();
+    const card = cardOf({ modelUrl: "https://cdn.example.com/hero.glb", genPrompt: "厚涂插画风的剑客立绘" });
+    const created = await addCards(me.token, [card]).expect(201);
+    expect(created.body.cards[0].modelUrl).toBe("https://cdn.example.com/hero.glb");
+    expect(created.body.cards[0].genPrompt).toBe("厚涂插画风的剑客立绘");
+
+    // 回读一次：201 的回包可能是内存里的对象，真正的判据是从库里查出来还在
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const back = listed.body.cards.find((c) => c.cardId === card.cardId);
+    expect(back.modelUrl).toBe("https://cdn.example.com/hero.glb");
+    expect(back.genPrompt).toBe("厚涂插画风的剑客立绘");
+  });
+
+  test("A1b 卡组的 coverCardId 与 description（客户端的 intro）必须能存下来", async () => {
+    const me = await registerUser();
+    const c1 = cardOf();
+    const c2 = cardOf();
+    await addCards(me.token, [c1, c2]).expect(201);
+
+    const deck = (
+      await request(app)
+        .post("/api/branch/decks")
+        .set("Authorization", `Bearer ${me.token}`)
+        .send({ name: "我的卡组", cardIds: [c1.cardId, c2.cardId] })
+        .expect(201)
+    ).body.deck;
+
+    await request(app)
+      .patch(`/api/branch/decks/${deck._id}`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .send({ coverCardId: c2.cardId, description: "这套卡适合生成赛博朋克短片" })
+      .expect(200);
+
+    const listed = await request(app)
+      .get("/api/branch/decks")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const back = listed.body.decks.find((d) => d._id === deck._id);
+    expect(back.coverCardId).toBe(c2.cardId);
+    expect(back.description).toBe("这套卡适合生成赛博朋克短片");
+
+    // ★ 分享时不带 description 不能把已经写好的简介清空
+    await request(app)
+      .post(`/api/branch/decks/${deck._id}/publish`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const shared = await request(app).get("/api/branch/decks/shared").expect(200);
+    const row = shared.body.decks.find((d) => d._id === deck._id);
+    expect(row.description).toBe("这套卡适合生成赛博朋克短片");
+  });
+
+  test("A2 /cards/shared 不会被 /cards/:cardId 吃掉；发布 → 出现，取消 → 消失", async () => {
+    const author = await registerUser();
+    const card = cardOf({ name: "广场测试卡" });
+    await addCards(author.token, [card]).expect(201);
+
+    // 未发布时不在广场（游客也能读这条端点）
+    let shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.some((c) => c.cardId === card.cardId)).toBe(false);
+
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ description: "随便拿去用" })
+      .expect(200);
+
+    shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    const row = shared.body.cards.find((c) => c.cardId === card.cardId);
+    expect(row).toBeTruthy();
+    expect(row.description).toBe("随便拿去用");
+    expect(row.author.username).toBeTruthy();
+
+    // 搜得到，且正则元字符不会把 mongod 打挂（转义收口在 utils/regex.js）
+    const hit = await request(app)
+      .get(`/api/branch/cards/shared?q=${encodeURIComponent("广场测试卡")}`)
+      .expect(200);
+    expect(hit.body.cards.some((c) => c.cardId === card.cardId)).toBe(true);
+    const evil = await request(app)
+      .get(`/api/branch/cards/shared?q=${encodeURIComponent("(a+)+$")}`)
+      .expect(200);
+    expect(evil.body.cards).toHaveLength(0);
+
+    await request(app)
+      .delete(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.some((c) => c.cardId === card.cardId)).toBe(false);
+  });
+
+  test("A2b 只有卡主能发布自己的卡；别人发同名 cardId 只影响他自己那份", async () => {
+    const author = await registerUser();
+    const stranger = await registerUser();
+    const card = cardOf();
+    await addCards(author.token, [card]).expect(201);
+
+    // 陌生人库里没有这张卡 → 404（不是 403：不该让人探出别人有哪些卡）
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${stranger.token}`)
+      .expect(404);
+    // 未登录 401
+    await request(app).post(`/api/branch/cards/${card.cardId}/publish`).expect(401);
+  });
+
+  test("A3 卡片热度按 cardId 全局聚合：换个装过同一张卡的人读到的是同一个数", async () => {
+    const a = await registerUser();
+    const b = await registerUser();
+    const card = cardOf();
+    await addCards(a.token, [card]).expect(201);
+    await addCards(b.token, [card]).expect(201); // 同一个 cardId，库里两份文档
+
+    await auth(request(app).post(`/api/branch/assets/card/${card.cardId}/like`), a.token).expect(200);
+
+    const asA = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${a.token}`)
+      .expect(200);
+    const asB = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${b.token}`)
+      .expect(200);
+    const heatA = asA.body.cards.find((c) => c.cardId === card.cardId).stats.heat;
+    const heatB = asB.body.cards.find((c) => c.cardId === card.cardId).stats.heat;
+    expect(heatA).toBe(6); // 一个赞 = 6
+    expect(heatB).toBe(heatA); // ★ 挂在文档上的话 B 会读到 0
+  });
+
+  test("A4 点赞/收藏幂等，计数不漂移；热度用的是仓库里唯一那条公式", async () => {
+    const me = await registerUser();
+    const card = cardOf();
+    await addCards(me.token, [card]).expect(201);
+    const base = `/api/branch/assets/card/${card.cardId}`;
+
+    // 连点两次赞：计数必须还是 1（$inc 写法这里会变成 2）
+    await auth(request(app).post(`${base}/like`), me.token).expect(200);
+    const twice = await auth(request(app).post(`${base}/like`), me.token).expect(200);
+    expect(twice.body.stats.likes).toBe(1);
+    expect(twice.body.stats.liked).toBe(true);
+
+    await auth(request(app).post(`${base}/bookmark`), me.token).expect(200);
+    await request(app).post(`${base}/view`).expect(200); // 浏览允许匿名
+    const stats = (await request(app).get(`${base}/stats`).expect(200)).body.stats;
+
+    expect(stats).toMatchObject({ views: 1, likes: 1, bookmarks: 1 });
+    // likes*6 + comments*4 + bookmarks*3 + min(views,5000)*0.04
+    expect(stats.heat).toBeCloseTo(6 + 3 + 0.04, 5);
+    // 未登录读同一条：数一样，但 liked/bookmarked 是 false
+    expect(stats.liked).toBe(false);
+
+    // 取消点赞回到 0，且 liked 立刻转 false
+    const off = await auth(request(app).delete(`${base}/like`), me.token).expect(200);
+    expect(off.body.stats.likes).toBe(0);
+    expect(off.body.stats.liked).toBe(false);
+  });
+
+  test("A4b 点赞/收藏必须登录；未登录只能浏览和读数", async () => {
+    const me = await registerUser();
+    const card = cardOf();
+    await addCards(me.token, [card]).expect(201);
+    const base = `/api/branch/assets/card/${card.cardId}`;
+    await request(app).post(`${base}/like`).expect(401);
+    await request(app).post(`${base}/bookmark`).expect(401);
+    await request(app).get(`${base}/stats`).expect(200);
+  });
+
+  test("A5 第三方版权模型不能分享；idb: 本地指针不跟着卡走", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+
+    // ① 第三方素材（/models/protected/ 下、非自有的 milltina）→ 400，不是"悄悄剥掉"
+    const rin = cardOf({ modelUrl: "https://cdn.example.com/models/protected/rin-player-opt.glbx" });
+    await addCards(author.token, [rin]).expect(201);
+    await request(app)
+      .post(`/api/branch/cards/${rin.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(400);
+
+    // ② 设备本地指针：卡主自己那份留着，但别人装走的那份必须是空的
+    const local = cardOf({ modelUrl: `idb:model3d:${Date.now()}` });
+    await addCards(author.token, [local]).expect(201);
+    await request(app)
+      .post(`/api/branch/cards/${local.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    const shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.find((c) => c.cardId === local.cardId).modelUrl).toBe("");
+
+    const installed = await request(app)
+      .post(`/api/branch/cards/${local.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    expect(installed.body.card.modelUrl).toBe("");
+    // 卡主自己那份没被动
+    const mine = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(mine.body.cards.find((c) => c.cardId === local.cardId).modelUrl).toMatch(/^idb:/);
+  });
+
+  test("A5b 装卡是幂等的：装两次只有一张，第二次说 alreadyInstalled", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const card = cardOf({ genPrompt: "会跟着卡一起走的蓝图" });
+    await addCards(author.token, [card]).expect(201);
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    const first = await request(app)
+      .post(`/api/branch/cards/${card.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    expect(first.body.card.genPrompt).toBe("会跟着卡一起走的蓝图");
+
+    const again = await request(app)
+      .post(`/api/branch/cards/${card.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(200);
+    expect(again.body.alreadyInstalled).toBe(true);
+
+    const mine = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(200);
+    expect(mine.body.cards.filter((c) => c.cardId === card.cardId)).toHaveLength(1);
+
+    // 没发布的卡装不到
+    const secret = cardOf();
+    await addCards(author.token, [secret]).expect(201);
+    await request(app)
+      .post(`/api/branch/cards/${secret.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(404);
+  });
+
+  test("A6 非法 kind / key 一律 400（这两个值会进 Mongo 查询与计数表主键）", async () => {
+    const me = await registerUser();
+    await request(app).get("/api/branch/assets/video/abc/stats").expect(400);
+    await request(app)
+      .get(`/api/branch/assets/card/${encodeURIComponent("带空格 的key")}/stats`)
+      .expect(400);
+    await auth(
+      request(app).post(`/api/branch/assets/card/${encodeURIComponent("$ne")}/like`),
+      me.token
+    ).expect(400);
+  });
+
+  test("A8 编出来的 key 一律 404，而且不能在库里留下任何一行", async () => {
+    const me = await registerUser();
+    const BranchAssetStat = require("../src/models/BranchAssetStat");
+    const BranchAssetLike = require("../src/models/BranchAssetLike");
+    const BranchAssetView = require("../src/models/BranchAssetView");
+
+    // 字符集合法、但世上没有这张卡 —— parseAssetRef 只管前者
+    const ghostCard = `mkt_nobody_has_this_${Date.now().toString(36)}`;
+    const ghostDeck = new mongoose.Types.ObjectId().toString();
+
+    await auth(request(app).post(`/api/branch/assets/card/${ghostCard}/like`), me.token).expect(404);
+    await auth(request(app).post(`/api/branch/assets/card/${ghostCard}/bookmark`), me.token).expect(404);
+    await auth(request(app).delete(`/api/branch/assets/card/${ghostCard}/like`), me.token).expect(404);
+    await request(app).post(`/api/branch/assets/card/${ghostCard}/view`).expect(404);
+    await auth(request(app).post(`/api/branch/assets/deck/${ghostDeck}/like`), me.token).expect(404);
+    // 卡组的 key 必须是 ObjectId 串；不是的话直接丢给 Mongo 会 CastError 变 500
+    await auth(request(app).post("/api/branch/assets/deck/not-an-objectid/like"), me.token).expect(404);
+
+    // ★ 真正的判据：一行都没造出来。这几张表全是 upsert:true，
+    //   放行的话一个循环就能灌出**任何 API 都读不到、也删不掉**的文档
+    for (const Model of [BranchAssetStat, BranchAssetLike, BranchAssetView]) {
+      expect(await Model.countDocuments({ key: { $in: [ghostCard, ghostDeck, "not-an-objectid"] } })).toBe(0);
+    }
+  });
+
+  test("A9 浏览量去重：同一个访客同一天只算一次，换个人才 +1", async () => {
+    const me = await registerUser();
+    const other = await registerUser();
+    const card = cardOf();
+    await addCards(me.token, [card]).expect(201);
+    const base = `/api/branch/assets/card/${card.cardId}`;
+
+    // 匿名连打三次：客户端那份 sessionStorage 去重任何 HTTP 客户端都绕得过去，
+    // 服务端不自己数就是没数
+    const first = await request(app).post(`${base}/view`).expect(200);
+    expect(first.body.stats.views).toBe(1);
+    await request(app).post(`${base}/view`).expect(200);
+    const third = await request(app).post(`${base}/view`).expect(200);
+    // ★ 已经数过时照样 200：再打开一次详情页对用户来说本来就该是成功的
+    expect(third.body.stats.views).toBe(1);
+
+    // 换个访客（登录的算另一个人）才 +1，而且他自己重复打也只算一次
+    const logged = await auth(request(app).post(`${base}/view`), me.token).expect(200);
+    expect(logged.body.stats.views).toBe(2);
+    const again = await auth(request(app).post(`${base}/view`), me.token).expect(200);
+    expect(again.body.stats.views).toBe(2);
+    const byOther = await auth(request(app).post(`${base}/view`), other.token).expect(200);
+    expect(byOther.body.stats.views).toBe(3);
+
+    // 去重表里存的不能是原始 IP（那是可直接识别到人的数据，而我们只需要"数过没有"）
+    const BranchAssetView = require("../src/models/BranchAssetView");
+    const rows = await BranchAssetView.find({ kind: "card", key: card.cardId }).lean();
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row.viewer).not.toMatch(/127\.0\.0\.1|::1|::ffff:/);
+      expect(row.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    }
+  });
+
+  test("A10 广场展示的那份和装到手的那份必须是同一个文档（最早发布的那份）", async () => {
+    const firstPublisher = await registerUser();
+    const secondPublisher = await registerUser();
+    const taker = await registerUser();
+
+    // 同一个 cardId 在库里是每人一份，各份的名字/封面/建模可以完全不一样
+    const cardId = `mkt_same_card_${Date.now().toString(36)}`;
+    await addCards(firstPublisher.token, [
+      cardOf({ cardId, name: "先分享的那份", genPrompt: "原作者的蓝图" }),
+    ]).expect(201);
+    await addCards(secondPublisher.token, [
+      cardOf({ cardId, name: "后分享的那份", genPrompt: "改过的蓝图" }),
+    ]).expect(201);
+
+    await request(app)
+      .post(`/api/branch/cards/${cardId}/publish`)
+      .set("Authorization", `Bearer ${firstPublisher.token}`)
+      .expect(200);
+    await new Promise((r) => setTimeout(r, 20)); // 让两条的 publishedAt 真的分得开
+    await request(app)
+      .post(`/api/branch/cards/${cardId}/publish`)
+      .set("Authorization", `Bearer ${secondPublisher.token}`)
+      .expect(200);
+
+    // 广场：只出现一条，且是**最早**分享的那份（谁先分享算谁的）
+    const shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    const rows = shared.body.cards.filter((c) => c.cardId === cardId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].name).toBe("先分享的那份");
+    expect(rows[0].author.username).toBeTruthy();
+
+    // ★ 装到手的必须是同一份文档 —— 不然用户点开看的和装进库的是两张卡，且两次都 200
+    const installed = await request(app)
+      .post(`/api/branch/cards/${cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    expect(installed.body.card.name).toBe(rows[0].name);
+    expect(installed.body.card.genPrompt).toBe(rows[0].genPrompt);
+    expect(String(installed.body.card._id)).not.toBe(String(rows[0]._id)); // 是我自己那份副本
+    expect(rows[0].name).toBe("先分享的那份");
+  });
+
+  test("A11 卡组里有第三方版权模型：整个发布 400 并点名是哪张卡，不是悄悄剥掉", async () => {
+    const author = await registerUser();
+    const clean = cardOf({ name: "干净的卡" });
+    const rin = cardOf({
+      name: "凛",
+      modelUrl: "https://cdn.example.com/models/protected/rin-player-opt.glbx",
+    });
+    await addCards(author.token, [clean, rin]).expect(201);
+
+    const deck = (
+      await request(app)
+        .post("/api/branch/decks")
+        .set("Authorization", `Bearer ${author.token}`)
+        .send({ name: "混了版权素材的卡组", cardIds: [clean.cardId, rin.cardId] })
+        .expect(201)
+    ).body.deck;
+
+    const res = await request(app)
+      .post(`/api/branch/decks/${deck._id}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(400);
+    // 一套卡十几张，不点名等于让用户挨个猜
+    expect(res.body.message).toContain("凛");
+
+    // 没有半发布状态：广场上不该出现它
+    const shared = await request(app).get("/api/branch/decks/shared").expect(200);
+    expect(shared.body.decks.some((d) => d._id === deck._id)).toBe(false);
+
+    // 自有资产（委托定制的 milltina）住在同一个加密目录里，但不受此限
+    const own = cardOf({ modelUrl: "https://cdn.example.com/models/protected/milltina-opt.glbx" });
+    await addCards(author.token, [own]).expect(201);
+    await request(app)
+      .patch(`/api/branch/decks/${deck._id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ cardIds: [clean.cardId, own.cardId] })
+      .expect(200);
+    await request(app)
+      .post(`/api/branch/decks/${deck._id}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+  });
+
+  test("A7 卡组也有热度，且与卡片各算各的（key 不共用一个命名空间）", async () => {
+    const me = await registerUser();
+    const card = cardOf({ cardId: `shared_key_${Date.now().toString(36)}` });
+    await addCards(me.token, [card]).expect(201);
+    const deck = (
+      await request(app)
+        .post("/api/branch/decks")
+        .set("Authorization", `Bearer ${me.token}`)
+        .send({ name: "热度卡组", cardIds: [card.cardId] })
+        .expect(201)
+    ).body.deck;
+
+    await auth(request(app).post(`/api/branch/assets/deck/${deck._id}/like`), me.token).expect(200);
+
+    const decks = await request(app)
+      .get("/api/branch/decks")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(decks.body.decks.find((d) => d._id === deck._id).stats.heat).toBe(6);
+
+    // 同名 key 在 card 命名空间下仍然是 0
+    const cardStats = await request(app).get(`/api/branch/assets/card/${deck._id}/stats`).expect(200);
+    expect(cardStats.body.stats.heat).toBe(0);
+  });
+});
