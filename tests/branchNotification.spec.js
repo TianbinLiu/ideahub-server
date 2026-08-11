@@ -560,6 +560,219 @@ describe("分支视频 @提及", () => {
     expect((await inbox(bob.token)).filter((n) => n.type === "BRANCH_MENTION")).toHaveLength(2);
   });
 
+  // ── span 这条路（客户端补全面板报范围、服务端核对）────────────────────
+  //
+  // ★ 这一组盯的是 span 特有的四类【做错了不报错】的问题：
+  //   M9  中文昵称根本不可能被正则切出来 —— 没有 span 就是"打了 @ 没反应"；
+  //       而 span 存的必须是 userId + 位置，名字现查，否则改名后就对不上。
+  //   M10 **不核对**客户端报的名单 = 一个"给任意用户发推送"的接口：正文里一个 @
+  //       都没有也能点名一百个人。而且它一切 200，只有去数别人的收件箱才发现得了。
+  //   M11 两条路（span / ASCII 自动解析）合并时不去重 → 同一个人收两条通知。
+  //   M12 span 不受合并后的上限约束的话，封顶就形同虚设（报 20 个 span 即可绕过）。
+  const setDisplayName = (token, displayName) =>
+    request(app)
+      .put("/api/me/profile")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ displayName })
+      .expect(200);
+
+  test("M9 @中文昵称：正则切不出来，靠 span 才成立；改名后已发出的那条跟着显示新名字", async () => {
+    const author = await registerUser();
+    const wang = await registerUser();
+    await setDisplayName(wang.token, "我是王桑");
+    const fan = await registerUser();
+    const id = await publish(author.token, { title: "中文昵称也要 @ 得到" });
+
+    // ★ 中日韩没有词边界：`@我是王桑你看看这个` 贪婪匹配会把整句吃进去。
+    //   补全面板知道用户选了谁，于是把这一段的范围报上来。
+    const text = "@我是王桑你看看这个";
+    const res = await comment(fan.token, id, {
+      text,
+      mentions: [{ userId: wang.userId, offset: 0, length: 4 }],
+    }).expect(201);
+
+    expect(mentionsOf(res)).toHaveLength(1);
+    expect(mentionsOf(res)[0]).toMatchObject({
+      token: "@我是王桑",
+      displayName: "我是王桑",
+      offset: 0,
+      length: 4,
+    });
+    expect(String(mentionsOf(res)[0].userId)).toBe(wang.userId);
+    expect((await inbox(wang.token)).map((n) => n.type)).toEqual(["BRANCH_MENTION"]);
+
+    // ★★ 改名之后，**已经发出去的**那条 @ 读回来必须是新名字 —— 这是产品要的
+    //   「改名同步」。它成立的前提正是"落库的是 userId + 位置，名字读的时候现查"。
+    await setDisplayName(wang.token, "王桑桑");
+    const list = await request(app).get(`/api/branch/videos/${id}/comments`).expect(200);
+    const got = list.body.items.find((c) => c._id === res.body.comment._id);
+    expect(got.mentions[0].displayName).toBe("王桑桑");
+    // 正文一个字都没动（它是当时打出来的字面），渲染端据 span 把这一段换成新名字
+    expect(got.text).toBe(text);
+    expect(got.mentions[0]).toMatchObject({ offset: 0, length: 4 });
+    expect(got.text.slice(0, 1 + 4)).toBe("@我是王桑");
+  });
+
+  test("M10 客户端报的名单要**逐条核对**：正文里没写着这个人的名字就丢掉（评论照发）", async () => {
+    const author = await registerUser();
+    const victim = await registerUser();
+    await setDisplayName(victim.token, "受害者");
+    const attacker = await registerUser();
+    const id = await publish(author.token);
+    const ghostId = new mongoose.Types.ObjectId().toString();
+
+    // ① 正文里一个 @ 都没有 —— 不核对的话这就是"点名任意用户"
+    const a = await comment(attacker.token, id, {
+      text: "什么都没有的一句话",
+      mentions: [{ userId: victim.userId, offset: 0, length: 3 }],
+    }).expect(201);
+    expect(a.body.comment.mentions).toHaveLength(0);
+
+    // ② 有 @，但那一段写的是别人的名字
+    const b = await comment(attacker.token, id, {
+      text: "@张三 你好",
+      mentions: [{ userId: victim.userId, offset: 0, length: 2 }],
+    }).expect(201);
+    expect(b.body.comment.mentions).toHaveLength(0);
+
+    // ③ 名字对但 offset 没指着那个 `@`（差一位）
+    const c = await comment(attacker.token, id, {
+      text: "喂 @受害者 在吗",
+      mentions: [{ userId: victim.userId, offset: 0, length: 3 }],
+    }).expect(201);
+    expect(c.body.comment.mentions).toHaveLength(0);
+
+    // ④ 越界（offset+1+length 超出正文）与 ⑤ 幽灵 userId
+    const d = await comment(attacker.token, id, {
+      text: "@受害者",
+      mentions: [
+        { userId: victim.userId, offset: 0, length: 999 },
+        { userId: ghostId, offset: 0, length: 3 },
+      ],
+    }).expect(201);
+    expect(d.body.comment.mentions).toHaveLength(0);
+
+    // ★ 以上全部 201（一条 @ 没生效不该把用户写好的一段话打回去），
+    //   但受害者的收件箱必须一条都没有
+    expect(await inbox(victim.token)).toHaveLength(0);
+
+    // ⑥ 形状本身非法 → 这才是 400（zod 挡在 controller 之前）
+    await comment(attacker.token, id, {
+      text: "@受害者",
+      mentions: [{ userId: "not-an-object-id", offset: 0, length: 3 }],
+    }).expect(400);
+    await comment(attacker.token, id, {
+      text: "@受害者",
+      mentions: [{ userId: victim.userId, offset: -1, length: 3 }],
+    }).expect(400);
+
+    // ⑦ 报对了就照常生效（证明上面挡住的是核对，不是"span 整条路没接上"）
+    const ok = await comment(attacker.token, id, {
+      text: "@受害者 你好",
+      mentions: [{ userId: victim.userId, offset: 0, length: 3 }],
+    }).expect(201);
+    expect(ok.body.comment.mentions).toHaveLength(1);
+    expect((await inbox(victim.token)).map((n) => n.type)).toEqual(["BRANCH_MENTION"]);
+  });
+
+  test("M11 两条路合并后去重：同一个人既被 span 报到又被 ASCII 解析到，只算一次", async () => {
+    const author = await registerUser();
+    const bob = await registerUser(); // 没设昵称 → App 里显示的就是 username
+    const fan = await registerUser();
+    const id = await publish(author.token);
+
+    const text = `@${bob.username} 你好`;
+    const res = await comment(fan.token, id, {
+      text,
+      // 补全面板选的也是这个人、这一段（昵称为空时报的自然是 username）
+      mentions: [{ userId: bob.userId, offset: 0, length: bob.username.length }],
+    }).expect(201);
+
+    expect(mentionsOf(res)).toHaveLength(1);
+    expect(String(mentionsOf(res)[0].userId)).toBe(bob.userId);
+    expect(mentionsOf(res)[0]).toMatchObject({ offset: 0, length: bob.username.length });
+    expect((await inbox(bob.token)).filter((n) => n.type === "BRANCH_MENTION")).toHaveLength(1);
+
+    // ★ 老版本 App 压根不发 spans —— 那条路必须还能用（三仓各自独立部署）
+    const legacy = await comment(fan.token, id, { text: `@${bob.username} 再叫一次` }).expect(201);
+    expect(mentionsOf(legacy)).toHaveLength(1);
+    expect(mentionsOf(legacy)[0]).toMatchObject({ offset: 0, length: bob.username.length });
+  });
+
+  test("M12 重叠的 span 只留一个；span 也不能绕过合并后的 10 个上限", async () => {
+    const author = await registerUser();
+    const fan = await registerUser();
+    const id = await publish(author.token);
+
+    // ① 重叠：`@王桑` 里 A 叫「王桑」、B 叫「王」，两条各自都核得过。
+    //   渲染端是**从后往前**替换 span 的，重叠没有正确解 —— 必须只留靠前更长的那个。
+    const userA = await registerUser();
+    await setDisplayName(userA.token, "王桑");
+    const userB = await registerUser();
+    await setDisplayName(userB.token, "王");
+
+    const overlap = await comment(fan.token, id, {
+      text: "@王桑 在吗",
+      mentions: [
+        { userId: userB.userId, offset: 0, length: 1 },
+        { userId: userA.userId, offset: 0, length: 2 },
+      ],
+    }).expect(201);
+    expect(overlap.body.comment.mentions).toHaveLength(1);
+    expect(String(overlap.body.comment.mentions[0].userId)).toBe(userA.userId);
+    expect(await inbox(userB.token)).toHaveLength(0);
+
+    // ② 上限作用在**合并之后**：10 个 ASCII 提及已经占满，末尾再报一个 span 也进不来。
+    //   （否则"多报几个 span"就是绕过收件箱封顶的口子）
+    const targets = [];
+    for (let i = 0; i < 10; i += 1) targets.push(await registerUser());
+    const extra = await registerUser();
+    await setDisplayName(extra.token, "桑桑");
+
+    const prefix = `${targets.map((t) => `@${t.username}`).join(" ")} `;
+    const res = await comment(fan.token, id, {
+      text: `${prefix}@桑桑`,
+      mentions: [{ userId: extra.userId, offset: prefix.length, length: 2 }],
+    }).expect(201);
+
+    expect(res.body.comment.mentions).toHaveLength(10);
+    expect(res.body.comment.mentions.map((m) => m.username)).toEqual(targets.map((t) => t.username));
+    expect(await inbox(extra.token)).toHaveLength(0);
+  });
+
+  test("M13 存量提及行没有 offset/length：用 token 反查补出来，不是回一个 undefined", async () => {
+    // ★ offset/length 是这次新加的字段，**库里已有的提及行没有它们**。
+    //   直接回 undefined 的话，客户端拿不到范围 → 那些老评论里的 @ 全部退回纯文本，
+    //   看起来就是"升级了一版，以前的 @ 全没了"，而且一个错都不报。
+    //   评论正文是不可编辑的，所以当年存进去的 token 一定还原样躺在 text 里，反查是确定性的。
+    const BranchComment = require("../src/models/BranchComment");
+
+    const author = await registerUser();
+    const bob = await registerUser();
+    await setDisplayName(bob.token, "老数据里的 Bob");
+    const id = await publish(author.token);
+
+    // 手写一条"老形状"的评论：只有 {user, token}
+    const legacy = await BranchComment.create({
+      video: id,
+      author: author.userId,
+      text: `喂 @${bob.username} 还在吗`,
+      mentions: [{ user: bob.userId, token: `@${bob.username}` }],
+    });
+
+    const list = await request(app).get(`/api/branch/videos/${id}/comments`).expect(200);
+    const got = list.body.items.find((c) => c._id === String(legacy._id));
+    expect(got.mentions).toHaveLength(1);
+    // 反查出来的范围要真的框住正文里那一段
+    expect(got.mentions[0].offset).toBe(2);
+    expect(got.mentions[0].length).toBe(bob.username.length);
+    expect(got.text.slice(got.mentions[0].offset, got.mentions[0].offset + 1 + got.mentions[0].length)).toBe(
+      `@${bob.username}`
+    );
+    // 名字仍然是现查的（老行里压根没存过名字）
+    expect(got.mentions[0].displayName).toBe("老数据里的 Bob");
+  });
+
   test("M6 邮箱地址里的 @ 不算提及", async () => {
     const author = await registerUser();
     const bob = await registerUser();

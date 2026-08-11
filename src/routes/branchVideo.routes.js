@@ -17,10 +17,12 @@ const {
   unlikeVideo,
   listComments,
   addComment,
+  removeComment,
   likeComment,
   unlikeComment,
   listDanmaku,
   addDanmaku,
+  removeDanmaku,
 } = require("../controllers/branchVideo.controller");
 
 // 列表 query 的校验放在 controller 里（Express 5 的 req.query 只读，validate({query}) 会静默失效）
@@ -72,6 +74,17 @@ const commentLikeLimit = userRateLimit({ windowMs: 60 * 1000, max: 60, scope: "b
 router.post("/videos/:id/comments/:commentId/like", requireAuth, commentLikeLimit, likeComment);
 router.delete("/videos/:id/comments/:commentId/like", requireAuth, commentLikeLimit, unlikeComment);
 
+// 删评论：评论作者本人 或 作品作者。
+// ★ **单开一个桶**，不与 branch:comment（发评论）共用：删是不可逆的，共用的话
+//   "清理自己作品下的一片刷屏评论"会把自己接下来发言的额度一起吃掉。
+// ★ 也不与点赞那样把 POST/DELETE 合桶：点赞合桶是因为要刷的是"取消→再点"这个**来回**，
+//   而删除没有来回（删掉就没了），合桶只会平白误伤。
+// ★ 按【账号】计（userRateLimit）：这条在 requireAuth 后面，按 IP 计等于换个出口就重开一桶，
+//   同时又会让同一个 NAT 后面的真人互相抢额度（理由与发评论那条逐字相同）。
+// 30/分钟：作品作者手动清理一片刷屏够用，脚本批量删会撞墙。
+const commentDeleteLimit = userRateLimit({ windowMs: 60 * 1000, max: 30, scope: "branch:commentDelete" });
+router.delete("/videos/:id/comments/:commentId", requireAuth, commentDeleteLimit, removeComment);
+
 // 弹幕。读匿名可调（不登录也要看得到别人的弹幕），发必须登录。
 // ★ 发弹幕**必须限频**，而且比评论严得多：它是一句话的成本、能盖在别人的画面上，
 //   是这套 API 里最适合拿来刷屏的一条。30 条/分钟 ≈ 两秒一条 —— 正常人边看边发
@@ -88,6 +101,15 @@ router.post(
   userRateLimit({ windowMs: 60 * 1000, max: 30, scope: "branch:danmaku" }),
   validate({ body: danmakuBody }),
   addDanmaku
+);
+// 删弹幕：弹幕作者本人 或 作品作者。桶与"发弹幕"分开，理由同上面删评论那条。
+// ⚠ 这条端点的回包与错误文案**绝不能透出作者是谁**（见 controller 的说明）：
+//   弹幕对外只有一个 mine 布尔，一句"这条属于 xxx"就等于给整面弹幕墙开了逐条查作者的接口。
+router.delete(
+  "/videos/:id/danmaku/:danmakuId",
+  requireAuth,
+  userRateLimit({ windowMs: 60 * 1000, max: 30, scope: "branch:danmakuDelete" }),
+  removeDanmaku
 );
 
 // 卡片 / 卡组（/cards、/decks）由另一个模块提供。

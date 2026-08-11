@@ -114,21 +114,50 @@ const updateBody = z
   })
   .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 
+/** 评论正文上限。★ span 的 offset/length 都被正文长度天然约束住，所以两处同一个数（铁律六）。 */
+const MAX_COMMENT_LEN = 1000;
+
+/**
+ * 客户端补全面板报上来的一段提及。
+ *
+ * ★★ 这里收客户端的名单，但**不盲信**它 —— 差别全在 controller 调的
+ *   `parseMentionsWithSpans`：它逐条核对
+ *   `text.slice(offset, offset+1+length) === '@' + 该用户当下的名字`，
+ *   核不过就丢掉这一条（不是整条评论 400）。所以伪造不出一个正文里根本没出现的提及。
+ *   ⚠ 只声明形状**不等于**安全：把下面的核对去掉，这个字段立刻退化成
+ *     "给任意用户发推送"的接口（正文里一个 @ 都没有也能点名一百个人）。
+ *
+ * ★ 为什么需要它：中日韩没有词边界，`@我是王桑你看看这个` 用正则切不出「我是王桑」。
+ *   而选人本来就是在补全面板里完成的，面板知道用户选了谁 —— 让它把范围报上来，
+ *   比在服务端猜靠谱得多。ASCII 的 `@username` 自动解析仍然保留（手打 / 老客户端）。
+ *
+ * ★ offset/length 的单位是 **UTF-16 码元**（JS 字符串下标），两端都是 JS，天然同口径。
+ */
+const mentionSpanBody = z.object({
+  userId: z
+    .string()
+    .trim()
+    .regex(/^[a-f0-9]{24}$/i, "userId must be a 24-hex ObjectId"),
+  // 正文里那个 `@` 的下标
+  offset: z.coerce.number().int().min(0).max(MAX_COMMENT_LEN),
+  // 名字的长度（不含 `@`）
+  length: z.coerce.number().int().min(1).max(MAX_COMMENT_LEN),
+});
+
 // POST /api/branch/videos/:id/comments
 const commentBody = z.object({
-  text: z.string().trim().min(1).max(1000),
+  text: z.string().trim().min(1).max(MAX_COMMENT_LEN),
   // 楼中楼：被回复的那条**顶层**评论的 _id。
   // ★ 必须显式声明：z.object 默认 strip 未声明字段，漏了这一行的表现是
   //   「每一条回复都静默变成顶层评论」—— 客户端发了 parentId、服务端 201 了、
   //   读回来是一条挂在评论区最外层的孤儿。deck / pricing 已经栽过两次同一个坑。
   //   24 位十六进制是 ObjectId 的长度，非法值在 controller 里再判一次 400。
   parentId: z.string().trim().length(24).optional(),
-  // ★★ 这里**故意没有 `mentions`**，而且以后也不许加：@提及的收件人由服务端自己
-  //   从 text 里解析（utils/mentionParser）。收客户端传上来的名单等于开一个
-  //   "给任意用户发推送"的接口——正文里一个 @ 都没有也能点名一百个人。
-  //   z.object 默认 strip 未声明字段，所以客户端就算发了也到不了 controller；
-  //   这条注释是为了让下一个"顺手补一下 schema"的人先看见理由（否则它看起来像漏声明，
-  //   而漏声明恰好是本文件里 deck / pricing / parentId 栽过三次的那个坑）。
+  // ★ 可选：老版本 App 不发这个字段，那时只有 ASCII 自动解析这条路（行为与从前一模一样）。
+  //   上限 20 与 mentionParser 的 MAX_MENTION_CANDIDATES 同源：挡的是数据库开销
+  //   （一条报 500 个 span 的评论会变成一个 500 元素的 $in）。真正生效的上限是
+  //   合并后的 MAX_RESOLVED_MENTIONS（10），在 mentionParser 里。
+  mentions: z.array(mentionSpanBody).max(20).optional(),
 });
 
 /** 一条弹幕的字数上限。★ 这是**契约值**（docs/api-contract.md「弹幕」），
@@ -198,5 +227,7 @@ module.exports = {
   segmentBody,
   branchTreeBody,
   deckBody,
+  mentionSpanBody,
   DANMAKU_MAX_LEN,
+  MAX_COMMENT_LEN,
 };

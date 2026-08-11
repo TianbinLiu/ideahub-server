@@ -13,15 +13,18 @@ const BranchLike = require("../models/BranchLike");
 const BranchComment = require("../models/BranchComment");
 const BranchCommentLike = require("../models/BranchCommentLike");
 const BranchDanmaku = require("../models/BranchDanmaku");
-const Notification = require("../models/Notification"); // 只用于通知去重的 exists() 查询，写入一律走 service
+// 只用于「读」与「清理」：去重的 exists() 查询，以及删评论时把指向它的通知一起删掉。
+// **写入一律走 service**（createNotification），别在这里 create。
+const Notification = require("../models/Notification");
 const Follow = require("../models/Follow");
 const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 const { createNotification } = require("../services/notification.service");
-// @提及解析全仓只有这一份（ideas 那两个 controller 也调它），别在这里另写一个正则
-const { parseMentions } = require("../utils/mentionParser");
+// @提及解析全仓只有这一份（ideas 那两个 controller 走同一个模块的另一个入口），
+// 别在这里另写一个正则、更别在这里另写一遍 span 的核对规则
+const { parseMentionsWithSpans } = require("../utils/mentionParser");
 // 拉黑关系的权威判据。★ 全仓统一走它：messages.controller 用它拒私信、
 // users.controller 用它把拉黑对象从搜索结果里滤掉，通知这条路也必须认同一份判断。
 const { hasAnyBlockBetween } = require("../utils/blocking");
@@ -334,33 +337,90 @@ function toVideoPayload(doc, ctx = {}) {
 }
 
 /**
- * 一条评论里**解析成功**的 @提及，供客户端把 text 里那几段变成可点的链接。
+ * 一条评论里**核对通过**的 @提及，供客户端把 text 里那几段替换成 `@` + 当前显示名。
  *
- * ★ 只回解析成功的。`@nobody` 不在这个列表里，客户端就让它保持纯文本 ——
- *   用户由此**看得见**自己那个 @ 到底有没有生效（反正静默加个点不开的链接更糟）。
+ * ★★ 这就是「改名之后，已经发出去的那些 @ 跟着显示新名字」的实现：
+ *   落库的是 **userId + span**（`offset`/`length`），名字这里**现查**（populate 出来的
+ *   当下的值）。渲染端把 `text` 的 [offset, offset+1+length) 换成 `@` + displayName。
+ *   ⚠ 多个 span 要**从后往前**替换，否则前面那次替换会把后面的 offset 冲掉。
+ *
+ * ★ 只回核对通过的。`@nobody` 不在这个列表里，客户端就让它保持纯文本 ——
+ *   用户由此**看得见**自己那个 @ 到底有没有生效（静默加个点不开的链接更糟）。
  * ★ 存量评论没有 mentions 字段，读出来是 undefined。这里 `Array.isArray(x) ? x : []`
  *   把它归一成空数组：对老评论而言"没有提及"就是事实本身，不是把未知当成了否定
  *   ——所以这一处**可以**用肯定式判断（与 visibility 那种"后加字段必须判否定"不同：
  *   那边 undefined 的真实含义是 public，这边 undefined 的真实含义就是"没有"）。
- * ★ 名字取的是 populate 出来的**当下**的值，不是写入时的快照：displayName 可变，
- *   存快照就会在对方改名后对不上（app 仓 renameMyVideos 那个坑）。
+ * ★ `offset`/`length` 是**这一次新加**的字段，存量的提及行没有它们。同理是"全新字段"，
+ *   缺失的含义就是"这行是老数据"，可以正向判断（`Number.isInteger`）。老行用 `token`
+ *   在正文里反查一次把 span 补出来 —— 评论正文是**不可编辑**的，所以当年存进去的
+ *   token 一定还原样躺在 text 里，反查是确定性的。补不出来（正文里找不到）就不给
+ *   span，客户端退回按 token 做子串匹配（那正是老客户端一直在做的事）。
  */
 function toMentionsPayload(doc) {
   const rows = Array.isArray(doc?.mentions) ? doc.mentions : [];
+  const text = String(doc?.text || "");
   const out = [];
   for (const m of rows) {
     const u = m && m.user;
     // 没 populate（裸 ObjectId）或用户已被删 → 丢掉这一条，客户端当纯文本渲染。
     // 不能退化成"只给 userId"：客户端拿不到名字只会画出一串十六进制，比不加链接更糟。
     if (!u || typeof u !== "object" || !u._id) continue;
+    const token = m.token || `@${u.username || ""}`;
+    const span = resolveStoredSpan(text, m, token);
     out.push({
-      token: m.token || `@${u.username || ""}`,
+      token,
       userId: u._id,
       username: u.username || "",
       displayName: u.displayName || "",
+      ...(span || {}),
     });
   }
   return out;
+}
+
+/**
+ * token 反查时的前后边界，与 mentionParser 那条 `(?<![\w@])@([A-Za-z0-9_-]{1,32})`
+ * **逐字对应**（也与 app 仓 utils/mention.ts 的两条常量对应）。
+ *
+ * ★★ 反查**必须**带上这两道，裸 `indexOf` 会指错地方，而且指错的后果比不给 span 更糟：
+ *   存量评论「有事找我 bob@alice.com，顺便 @alice 看一下」里，当年解析成功的是**后面**
+ *   那个 `@alice`（邮箱里那个被前置断言挡掉了，从来不算一次提及）。裸 indexOf 命中的
+ *   却是**邮箱里**那一截 —— 客户端拿到这个 span 会把 [offset, offset+1+len) 换成
+ *   `@` + 当前显示名，于是用户那条评论里的**邮箱地址被当面改写成了一个可点的链接**，
+ *   而真正的那个 `@alice` 反倒不亮了（它已经带着 span，不会再走客户端的 token 兜底）。
+ *   同型的还有 `@bobby ... @bob`：`@bob` 会命中 `@bobby` 的前半截。
+ */
+const TOKEN_PREV_BLOCK = /[A-Za-z0-9_@]/;
+const TOKEN_NEXT_BLOCK = /[A-Za-z0-9_-]/;
+
+/** 找 token 在正文里**边界成立**的第一处；找不到回 -1。 */
+function findTokenAt(text, token) {
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf(token, from);
+    if (at < 0) return -1;
+    const prev = at > 0 ? text[at - 1] : "";
+    const next = text[at + token.length] || "";
+    if ((!prev || !TOKEN_PREV_BLOCK.test(prev)) && (!next || !TOKEN_NEXT_BLOCK.test(next))) return at;
+    from = at + 1;
+  }
+}
+
+/**
+ * 取这条提及在正文里的位置。存了就用存的（顺手核一次，正文与 token 必须对得上），
+ * 没存（老数据）就用 token 反查一次。都不成立时返回 null —— 宁可不给 span，
+ * 也不能给一个指错地方的 span：那会让客户端把正文里**别人的**名字换掉。
+ * （不给 span 时客户端会退回按 token 做子串匹配，那条路自己带同样的边界判断。）
+ */
+function resolveStoredSpan(text, m, token) {
+  if (Number.isInteger(m.offset) && Number.isInteger(m.length) && m.length >= 1) {
+    if (text.slice(m.offset, m.offset + token.length) === token) {
+      return { offset: m.offset, length: m.length };
+    }
+  }
+  const at = findTokenAt(text, token);
+  if (at < 0) return null;
+  return { offset: at, length: token.length - 1 };
 }
 
 /**
@@ -792,6 +852,13 @@ async function removeVideo(req, res, next) {
       BranchLike.deleteMany({ video: id }),
       BranchComment.deleteMany({ video: id }),
       commentIds.length ? BranchCommentLike.deleteMany({ comment: { $in: commentIds } }) : Promise.resolve(),
+      // ★ 弹幕也要一起删。漏掉它和上面那条 BranchCommentLike 是**同一个形状**的坑：
+      //   作品没了之后，这些行谁也查不到（列表接口先 assertVisible，作品不存在直接 404）、
+      //   也再删不掉（删弹幕的端点同样要先过作品这一关），就永远躺在库里。
+      BranchDanmaku.deleteMany({ video: id }),
+      // 指向这条作品的通知也一并清掉：点进去只会得到一条"作品不存在"，
+      // 而红点却实实在在地亮着 —— 用户没有任何办法让它消下去。
+      Notification.deleteMany({ videoId: id }),
     ]);
 
     res.json({ ok: true });
@@ -950,11 +1017,16 @@ async function addComment(req, res, next) {
       if (String(parent.video) !== String(id)) badRequest("parent comment belongs to another video");
     }
 
-    // ★★ @提及由**服务端自己从正文解析**，客户端传上来的收件人名单一概不看
-    //   （schema 里也没声明这个字段，z.object 会 strip 掉）。收客户端名单等于开一个
-    //   "给任意用户发推送"的接口：正文里一个 @ 都没有，照样能点名一百个人。
-    //   解析实现只有一份，在 utils/mentionParser（ideas 那两条评论路径共用同一份）。
-    const { mentions } = await parseMentions(req.body.text);
+    // ★★ @提及走两条路合并，实现只有一份（utils/mentionParser，铁律六）：
+    //   ① 客户端补全面板报上来的 `{userId, offset, length}` —— 服务端**逐条核对**
+    //      「正文那一段确实写着这个人当下的名字」才收，核不过就丢掉这一条
+    //      （不是整条评论 400：一个 @ 没生效不该把用户写好的一段话打回去）。
+    //      中文昵称走这条 —— CJK 没有词边界，服务端自己是切不出「我是王桑」的。
+    //   ② 服务端自己扫出来的 ASCII `@username` —— 手打的、以及**老版本 App**
+    //      （它压根不发 spans）发上来的评论走这条。
+    //   ⚠ 核对是这个字段的**全部**安全性：不核对就等于开一个"给任意用户发推送"的
+    //     接口（正文里一个 @ 都没有，照样能点名一百个人）。
+    const { mentions } = await parseMentionsWithSpans(req.body.text, req.body.mentions);
 
     const doc = await BranchComment.create({
       video: id,
@@ -963,11 +1035,19 @@ async function addComment(req, res, next) {
       // 两层封顶：回复一条回复时仍然挂到它的顶层父上（parent.parent 存在就用它）。
       // 不这么做的话评论区会无限缩进，而 UI 只画两层 —— 第三层往下会直接看不见。
       ...(parent ? { parent: parent.parent || parent._id } : {}),
-      // 只存 {user, token}：名字在读的时候 populate（见模型里的说明）。
-      // ★ 落库的是**全部解析成功**的提及，不是"被通知到的那些"。可见性闸门只管**通知**；
+      // 只存 {user, token, offset, length}：**名字一个字都不存**，读的时候 populate
+      // 出当下的值（见模型里的说明）—— 这就是"对方改名后，这条 @ 跟着显示新名字"。
+      // ★ 落库的是**全部核对通过**的提及，不是"被通知到的那些"。可见性闸门只管**通知**；
       //   渲染归渲染 —— 这条评论本身能被谁看见，早已由作品的可见性决定了。
       ...(mentions.length
-        ? { mentions: mentions.map((m) => ({ user: m.userId, token: m.token })) }
+        ? {
+            mentions: mentions.map((m) => ({
+              user: m.userId,
+              token: m.token,
+              offset: m.offset,
+              length: m.length,
+            })),
+          }
         : {}),
     });
 
@@ -1130,6 +1210,76 @@ async function unlikeComment(req, res, next) {
 }
 
 /**
+ * 删掉一批评论时要连带清理的**四样东西**。少清一样都不报错，只是留下垃圾：
+ *   ① 这些评论的**回复** —— 留着就是一堆没有上文的孤儿（UI 只画两层，父没了就没处挂）；
+ *   ② 它们的 BranchCommentLike 行 —— 挂在 comment 上，评论没了谁也再查不到、也删不掉
+ *      （removeVideo 里踩过同一条，那里也是先把 commentIds 捞出来再删）；
+ *   ③ 指向这些 commentId 的 Notification —— 不删的话点进去只会跳到一条已经不存在的
+ *      评论，用户看到的是"通知点了没反应"，而且一个错都不报；
+ *   ④ BranchVideo.commentCount —— 与 addComment 同一个口径：countDocuments 重算后
+ *      整体 $set，不做裸 $inc（并发下会漂移）。
+ *
+ * ★ 回复只用查一层：addComment 会把「回复的回复」挂回顶层父（`parent.parent || parent._id`），
+ *   所以评论树最多两层，`{parent: 顶层id}` 就是全部后代。删的是一条回复时它本身没有子节点。
+ *
+ * @returns {Promise<{removed: number, commentCount: number}>}
+ */
+async function purgeComments(videoId, rootCommentId) {
+  const replyIds = (await BranchComment.find({ parent: rootCommentId }).select("_id").lean()).map(
+    (c) => c._id
+  );
+  const ids = [rootCommentId, ...replyIds];
+  // payload 是 Mixed：现有写入点传的都是 ObjectId，但 Mixed 存什么就是什么，
+  // 两种形态一起匹配，免得以后有人传了字符串就留下一批指向空评论的通知。
+  const idKeys = [...ids, ...ids.map(String)];
+
+  const [removed] = await Promise.all([
+    BranchComment.deleteMany({ _id: { $in: ids } }),
+    BranchCommentLike.deleteMany({ comment: { $in: ids } }),
+    Notification.deleteMany({
+      $or: [{ "payload.commentId": { $in: idKeys } }, { "payload.parentCommentId": { $in: idKeys } }],
+    }),
+  ]);
+
+  const commentCount = await BranchComment.countDocuments({ video: videoId });
+  await BranchVideo.updateOne({ _id: videoId }, { $set: { commentCount } });
+  return { removed: Number(removed?.deletedCount || 0), commentCount };
+}
+
+/**
+ * DELETE /api/branch/videos/:id/comments/:commentId —— 删自己的评论。
+ *
+ * ★ 两种人能删：**评论作者本人**，以及**作品作者**（自己作品下的内容得能清理，
+ *   否则唯一的求助途径是找管理员，而这个 App 没有管理员）。
+ * ★ 无权时回 403 而不是 404：这条评论对请求者本来就是可见的（他刚在评论区看见它），
+ *   403 一个字节的新信息都没多给。反过来，弹幕那条必须小心得多 —— 见 removeDanmaku。
+ */
+async function removeComment(req, res, next) {
+  try {
+    const { id, commentId } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    if (!isValidId(commentId)) invalidId("Invalid comment id");
+
+    // 可见性先过一道：看不见的作品下的评论对你就是"不存在"（与 loadVisibleComment 同一条规则）。
+    // ★ 要 select author：下面判"是不是作品作者"要用它。
+    const video = await assertVisible(id, req.user, "_id author");
+
+    const comment = await BranchComment.findById(commentId).select("_id video author").lean();
+    // 评论 id 是全局唯一的，只按 id 查就绕开了作品的可见性 —— 必须核对归属（同 loadVisibleComment）
+    if (!comment || String(comment.video) !== String(id)) notFound("Comment not found");
+
+    const isCommentAuthor = String(comment.author) === String(req.user._id);
+    const isVideoAuthor = String(video.author) === String(req.user._id);
+    if (!isCommentAuthor && !isVideoAuthor) forbidden("Forbidden");
+
+    const { removed, commentCount } = await purgeComments(id, comment._id);
+    res.json({ ok: true, removed, commentCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
  * 看不见的作品在子端点上也必须是「不存在」。
  * 否则点赞/评论/弹幕这几条就成了探测私密作品是否存在的旁路（403 与 404 是两种信息）。
  * ★ 原来这段在三个函数里各写了一遍，加弹幕就是第四遍 —— 收成一处（铁律六）。
@@ -1209,6 +1359,47 @@ async function addDanmaku(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/branch/videos/:id/danmaku/:danmakuId —— 删自己的弹幕。
+ *
+ * ★ 能删的两种人与评论一致：**弹幕作者本人** 或 **作品作者**。
+ *
+ * ★★ 回包与错误文案**一个字都不许透出作者是谁**（契约里写死了弹幕对外只有一个 `mine`
+ *   布尔）。挂上作者，一条作品的弹幕墙就成了"谁在什么时间看了这个视频"的公开记录 ——
+ *   而"删除"这条路是最容易顺手漏出去的：随手回一个
+ *   `403 这条弹幕属于 xxx` 就等于给整面弹幕墙开了一个逐条查作者的接口
+ *   （对每条弹幕试删一次即可）。所以这里只回 `Forbidden` 四个字。
+ * ★ 为什么 403 就够、不必回 404 装作不存在：请求者本来就能从列表里的 `mine: false`
+ *   知道"这条不是我发的"，403 没有多给任何信息。真正要守的是**不说出是谁**。
+ *
+ * ★ 回包刻意**不带剩余条数**：弹幕列表是采样的（最新 N 条），给一个数只会让客户端
+ *   以为那是"全部"。客户端要同步内存里那份，删掉本地那条即可。
+ */
+async function removeDanmaku(req, res, next) {
+  try {
+    const { id, danmakuId } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    if (!isValidId(danmakuId)) invalidId("Invalid danmaku id");
+
+    const video = await assertVisible(id, req.user, "_id author");
+
+    // 与评论同理：弹幕 id 全局唯一，必须连 video 一起查，否则就是绕开可见性的旁路
+    const danmaku = await BranchDanmaku.findOne({ _id: danmakuId, video: id }).select("_id author").lean();
+    if (!danmaku) notFound("Danmaku not found");
+
+    const isDanmakuAuthor = String(danmaku.author) === String(req.user._id);
+    const isVideoAuthor = String(video.author) === String(req.user._id);
+    if (!isDanmakuAuthor && !isVideoAuthor) forbidden("Forbidden");
+
+    await BranchDanmaku.deleteOne({ _id: danmaku._id });
+    // 弹幕不发通知（契约「通知」一节），所以没有指向它的收件箱记录要清 ——
+    // 这不是遗漏：发通知等于把匿名的弹幕去匿名化。
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listVideos,
   createVideo,
@@ -1220,10 +1411,12 @@ module.exports = {
   unlikeVideo,
   listComments,
   addComment,
+  removeComment,
   likeComment,
   unlikeComment,
   listDanmaku,
   addDanmaku,
+  removeDanmaku,
   // 导出给测试/其它模块复用
   transferDraftAssets,
   isArkVideoUrl,
