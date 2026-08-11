@@ -14,6 +14,12 @@ const segmentSchema = new mongoose.Schema(
     lastFrame: { type: String, default: "" },
     durationSec: { type: Number, default: 0, min: 0 },
     videoUrl: { type: String, default: "" },
+    /** Seedance 档位 id（app 的 data/economy VIDEO_TIERS）。缺省=标准档 */
+    videoTier: { type: String, default: undefined, trim: true, maxlength: 80 },
+    /** 画幅。★ 不给 default："没有这个字段"和"明确是横屏"要分得开——
+     *  app 侧 aspectOf() 把缺省当横屏（老作品全是 16:9 写死的），给了 default
+     *  等于替老数据做了一个它没做过的声明 */
+    aspect: { type: String, enum: ["portrait", "landscape"], default: undefined },
   },
   { _id: false }
 );

@@ -14,6 +14,14 @@ const segmentBody = z.object({
   lastFrame: assetUrl,
   durationSec: z.coerce.number().min(0).max(3600).optional().default(0),
   videoUrl: assetUrl,
+  // ★ 画幅与档位：客户端（app 的 VideoSegment）一直在发这两个字段，但这里没声明，
+  //   于是被 z.object 默默 strip 掉 —— 客户端发了、服务端 201 了、读回来没有，全程零报错。
+  //   `deck` 也是这么丢的，同一个坑第二次。给 DraftVideo 加字段就必须同步这份 schema。
+  //   aspect 丢了的后果：首页在首帧解码出来之前按错的比例排版（横片被当竖片铺满裁掉两边），
+  //   解码完才跳回正确比例，看起来就是"闪一下"。播放端最终以真实解码尺寸为准，所以不致命，
+  //   但没有理由让它丢。videoTier 丢了则是回看时不知道这段当初用的哪档，对不上账。
+  videoTier: z.string().trim().max(80).optional(),
+  aspect: z.enum(["portrait", "landscape"]).optional(),
 });
 
 const choiceBody = z.object({
