@@ -338,3 +338,46 @@ describe("段字段不会被悄悄 strip 掉", () => {
       .expect(400);
   });
 });
+
+describe("付费设置与封面编辑", () => {
+  test("pricing 随作品落库（之前被 z.object strip 掉，作者收益恒为 0）", async () => {
+    const author = await registerUser();
+    const created = await publish(author.token, {
+      title: "付费作品",
+      pricing: { mode: "paid", partPrices: [5000] },
+    }).expect(201);
+    expect(created.body.video.pricing).toEqual({ mode: "paid", partPrices: [5000] });
+
+    const detail = await request(app).get(`/api/branch/videos/${created.body.video._id}`).expect(200);
+    expect(detail.body.video.pricing.partPrices).toEqual([5000]);
+  });
+
+  test("免费作品不落 pricing，也不在响应里冒出来", async () => {
+    const author = await registerUser();
+    const a = await publish(author.token, { title: "免费1" }).expect(201);
+    const b = await publish(author.token, { title: "免费2", pricing: { mode: "free", partPrices: [0] } }).expect(201);
+    expect(a.body.video.pricing).toBeUndefined();
+    expect(b.body.video.pricing).toBeUndefined();
+  });
+
+  test("PATCH 可以换封面，但只收 http(s) URL（dataURL 一律 400）", async () => {
+    const author = await registerUser();
+    const id = String((await publish(author.token, { title: "换封面" })).body.video._id);
+    const auth = { Authorization: `Bearer ${author.token}` };
+
+    const ok = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set(auth)
+      .send({ cover: "https://res.cloudinary.com/x/new-cover.jpg" })
+      .expect(200);
+    expect(ok.body.video.cover).toBe("https://res.cloudinary.com/x/new-cover.jpg");
+
+    // ★ dataURL 必须挡在门口：几百 KB 的 base64 会撞上网关 1MB 上限，
+    //   而且撞了只表现成 fetch failed，看不出是因为太大。客户端要先传成 URL。
+    await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set(auth)
+      .send({ cover: "data:image/jpeg;base64,/9j/4AAQSkZJRg==" })
+      .expect(400);
+  });
+});
