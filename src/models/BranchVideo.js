@@ -4,6 +4,8 @@
 // cover / firstFrame / lastFrame / videoUrl 落库前已由 controller 转存到 Cloudinary，
 // 转存失败的单个资源会降级保留原值（见 branchVideo.controller.js 的 transferDraftAssets）。
 const mongoose = require("mongoose");
+// 卡片多图参考的子文档形状与 BranchCard / BranchDeck 快照共用同一份（见那个文件的文件头）
+const { cardViewSchema } = require("./cardView.schema");
 
 const segmentSchema = new mongoose.Schema(
   {
@@ -63,6 +65,11 @@ const deckCardSchema = new mongoose.Schema(
     // 转存失败时可能残留 dataURL，同 segment 的帧字段，不设 maxlength
     cover: { type: String, default: "" },
     tags: { type: [String], default: [] },
+    /** 卡片的多图参考（http(s)，最多 3 张）。★ 与 modelUrl/genPrompt 那两个**刻意不入**
+     *  快照的字段不同：views 是喂给 Seedream 锁形象的图，观众把这套卡组装走后要靠它
+     *  炼出同一个人。漏声明的话 mongoose 落库时静默丢掉 —— 卡还在、参考图没了，
+     *  用户只会觉得"这套卡本来就不太稳"，没人查得到这里（同 deck 当年那次）。 */
+    views: { type: [cardViewSchema], default: [] },
   },
   { _id: false }
 );

@@ -6,10 +6,17 @@ const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { rateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
-const { addCardsBody, createDeckBody, updateDeckBody, publishBody } = require("../schemas/branchAsset.schemas");
+const {
+  addCardsBody,
+  updateCardBody,
+  createDeckBody,
+  updateDeckBody,
+  publishBody,
+} = require("../schemas/branchAsset.schemas");
 const {
   listCards,
   addCards,
+  updateCard,
   removeCard,
   listDecks,
   createDeck,
@@ -38,6 +45,9 @@ const {
 router.get("/cards/shared", optionalAuth, listSharedCards);
 router.get("/cards", requireAuth, listCards);
 router.post("/cards", requireAuth, validate({ body: addCardsBody }), addCards);
+// 改一张已有的卡（只收 views）。★ 不能并进 POST /cards：那条是 $setOnInsert 的
+//   新增语义，用它改卡会 201 但库里一字未动，见 controller 的 updateCard 注释
+router.patch("/cards/:cardId", requireAuth, validate({ body: updateCardBody }), updateCard);
 router.delete("/cards/:cardId", requireAuth, removeCard);
 
 // 卡片分享到创意工坊

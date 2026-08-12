@@ -17,7 +17,13 @@ const { clientIp } = require("../middleware/rateLimit");
 const { forbidden, notFound, invalidId, badRequest } = require("../utils/http");
 // 热度只有一份公式（想法榜也调它），见 utils/hotScore.js 的说明
 const { hotScore, roundHeat } = require("../utils/hotScore");
-const { assetKey: assetKeySchema, assetKind: assetKindSchema } = require("../schemas/branchAsset.schemas");
+const {
+  assetKey: assetKeySchema,
+  assetKind: assetKindSchema,
+  CARD_VIEW_KINDS,
+  MAX_CARD_VIEWS,
+  isShareableViewUrl,
+} = require("../schemas/branchAsset.schemas");
 const { searchRegex } = require("../utils/regex");
 
 const CLOUDINARY_FOLDER = "branch-cards";
@@ -66,8 +72,41 @@ async function loadStats(kind, keys) {
   return new Map(rows.map((r) => [r.key, statsPayload(r)]));
 }
 
+// ── 多图参考（views）的唯一闸门 ───────────────────────────────────
+/**
+ * 一批 views → 能存下来、也能发出去的那几张。**入库、快照、安装、回包全走这一个函数**。
+ *
+ * ★ 为什么读的时候也过一遍（而不是"入库时干净了就直接吐出去"）：这是同一条规则的
+ *   同一处实现，多调几次代价是零；而分成"入口一份、出口一份"的写法，两边一旦分叉
+ *   （比如以后放宽了入口），出口那份会把用户真实存着的图**静默少给几张** —— 卡片
+ *   详情页上看不出少了，只有生成出来的人物"有点不像"，没人查得到这里。
+ *
+ * ⚠ 这里**不做**第三方版权判断（isThirdPartyModel 那套）：views 是 Seedream 出的图，
+ *   是我们自己的产物，不是 BOOTH 购入的模型。挡的只有"发出去对别人没意义"的地址。
+ */
+function shareableViews(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const url = String(item?.url || "").trim().slice(0, 2000);
+    // 同一张图挂两次没有意义，还会挤掉真正该带上的第 3 张（方舟按图片顺序编号引用）
+    if (!isShareableViewUrl(url) || seen.has(url)) continue;
+    seen.add(url);
+    out.push({
+      url,
+      // 认不出的 kind 退 "detail" 而不是丢掉这张图：kind 只影响提示词里怎么描述它
+      // （face=面部特征 / body=服装与体型），退成中性的说法仍然有用，丢掉就真没了
+      kind: CARD_VIEW_KINDS.includes(item?.kind) ? item.kind : "detail",
+      note: String(item?.note || "").trim().slice(0, 200),
+    });
+    if (out.length >= MAX_CARD_VIEWS) break;
+  }
+  return out;
+}
+
 // ── 序列化 ────────────────────────────────────────────────────────
-// 客户端 Card 形状是 { id, type, name, summary, cover, hot?, tags?, modelUrl?, genPrompt? }，
+// 客户端 Card 形状是 { id, type, name, summary, cover, hot?, tags?, modelUrl?, genPrompt?, views? }，
 // 这里同时给出 id 与 cardId，前端两种写法都能直接吃。
 function toCardPayload(doc, stats = EMPTY_STATS) {
   if (!doc) return null;
@@ -84,6 +123,9 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     modelUrl: doc.modelUrl || "",
     genPrompt: doc.genPrompt || "",
+    // ★ 老卡这里是空数组。**不在服务端补"拿 cover 当唯一一张图"** —— 那份归一
+    //   只在 app 的 viewsOf() 一处做（理由见 models/BranchCard.js 的字段注释）。
+    views: shareableViews(doc.views),
     published: !!doc.published,
     publishedAt: doc.publishedAt,
     description: doc.description || "",
@@ -220,7 +262,9 @@ function isThirdPartyModel(raw) {
   return THIRD_PARTY_MODEL_RE.test(url) && !OWN_WORK_MODEL_RE.test(url);
 }
 
-/** 可以跟着卡片发出去的 modelUrl；不合格返回空串（调用方据此不给别人这条） */
+/** 可以跟着卡片发出去的 modelUrl；不合格返回空串（调用方据此不给别人这条）。
+ *  ⚠ 多图参考（views）**不走这个函数**，它有自己的闸门 shareableViews()：
+ *    第三方版权那一半对 views 不成立（那是我们自己 Seedream 出的图）。 */
 function shareableModelUrl(raw) {
   const url = String(raw || "").trim();
   if (!/^https?:\/\//i.test(url)) return ""; // idb:/相对路径/空 —— 对别人没有意义
@@ -282,6 +326,9 @@ async function addCards(req, res, next) {
         //   自己那份记录的一部分）；发布/安装时才由 shareableModelUrl 剥掉。
         modelUrl: typeof raw.modelUrl === "string" ? raw.modelUrl.slice(0, 2000) : "",
         genPrompt: typeof raw.genPrompt === "string" ? raw.genPrompt.slice(0, 4000) : "",
+        // ★ 越界的 views 在 zod 那层就已经 400 了（超过 3 张 / 非 http(s)），
+        //   这里只做去重与归一，不承担"拒绝"的职责。
+        views: shareableViews(raw.views),
       });
     }
 
@@ -359,6 +406,32 @@ async function addCards(req, res, next) {
 }
 
 // DELETE /cards/:cardId —— 删卡，并从该用户所有卡组里摘掉
+// PATCH /cards/:cardId（requireAuth）—— 改自己那张卡的多图参考（views）。
+// ★★ 这条端点存在的全部理由：POST /cards 是 `$setOnInsert`（新增语义），拿它改卡
+//   会 201 得漂漂亮亮、库里一个字节没变；而客户端每次登录都用服务端那份整体覆盖
+//   本地卡库 —— 用户加的参考图会在下一次冷启动时无声消失（见 schemas 里的说明）。
+// ★ 卡不在（只存在于本地、或换了账号）一律 404，让客户端把原因显红字。返回 200
+//   假装存上了，是把"没同步"变成"以为同步了"，那才是真的丢数据（铁律八）。
+async function updateCard(req, res, next) {
+  try {
+    const owner = req.user._id;
+    const cardId = String(req.params.cardId || "").trim();
+    if (!cardId) invalidId("Invalid card id");
+
+    const doc = await BranchCard.findOneAndUpdate(
+      { owner, cardId },
+      // 去重与归一走与入库/发布同一个闸门，别在这里另写一遍（铁律六）
+      { $set: { views: shareableViews(req.body.views) } },
+      { new: true }
+    ).lean();
+    if (!doc) notFound("card not found");
+
+    res.json({ ok: true, card: toCardPayload(doc) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function removeCard(req, res, next) {
   try {
     const owner = req.user._id;
@@ -507,6 +580,8 @@ async function publishDeck(req, res, next) {
         // 本地指针对别人本来就没有任何意义，剥掉它不会少给用户任何东西。
         modelUrl: shareableModelUrl(c.modelUrl),
         genPrompt: c.genPrompt || "",
+        // 参考图必须跟着快照走：少了它，装走的人炼出来的人物就不是同一个人
+        views: shareableViews(c.views),
       }));
     // ★ 简介**只在这次真给了的时候**才覆盖：客户端的分享按钮调 publishDeck(id) 时
     //   可能不带 description（简介是在卡组详情页单独 PATCH 上来的），
@@ -639,6 +714,7 @@ async function installDeck(req, res, next) {
                 //   剥掉是唯一能做的事 —— 拒绝安装只会让用户装不了一套他没参与制作的卡组。
                 modelUrl: shareableModelUrl(c.modelUrl),
                 genPrompt: c.genPrompt || "",
+                views: shareableViews(c.views),
                 createdAt: new Date(),
               },
             },
@@ -740,6 +816,8 @@ function toSharedCardPayload(doc, stats = EMPTY_STATS) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     modelUrl: shareableModelUrl(doc.modelUrl),
     genPrompt: doc.genPrompt || "",
+    // 广场里就要能看到"这张卡挂了几张参考图"，否则装回来才发现是两张卡
+    views: shareableViews(doc.views),
     description: doc.description || "",
     author: doc.owner && typeof doc.owner === "object" ? doc.owner : undefined,
     stats,
@@ -897,6 +975,7 @@ async function installCard(req, res, next) {
           // ★ 设备本地指针与第三方素材都在这里被拦下：别人拿到的必须是他真能用的东西
           modelUrl: shareableModelUrl(src.modelUrl),
           genPrompt: src.genPrompt || "",
+          views: shareableViews(src.views),
           createdAt: new Date(),
         },
       },
@@ -1102,7 +1181,11 @@ async function getAssetStats(req, res, next) {
 module.exports = {
   listCards,
   addCards,
+  updateCard,
   removeCard,
+  // ★ 导出给 branchVideo.controller：随作品发布的卡组快照也要带 views，
+  //   而"哪几张能存/能发出去"这条规则只能有一处实现（铁律六）
+  shareableViews,
   listDecks,
   createDeck,
   updateDeck,

@@ -21,6 +21,8 @@ const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
+// 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用
+const { shareableViews } = require("./branchAsset.controller");
 const { createNotification } = require("../services/notification.service");
 // @提及解析全仓只有这一份（ideas 那两个 controller 走同一个模块的另一个入口），
 // 别在这里另写一个正则、更别在这里另写一遍 span 的核对规则
@@ -250,6 +252,10 @@ async function transferDraftAssets(draft, userId) {
         summary: c.summary || "",
         cover: await transferImage(ctx, c.cover, `deck.cards[${i}]`),
         tags: Array.isArray(c.tags) ? c.tags : [],
+        // 多图参考跟着快照走：少了它，观众装走这套卡组后炼出来的人物不是同一个人，
+        // 而且一点错都不报。★ 这里**不需要**转存：views 只可能是永久 URL
+        //   （客户端在加图那一刻就传过了），能不能带出去由 shareableViews 一处判（铁律六）
+        views: shareableViews(c.views),
       });
     }
     deck = { name: draft.deck.name || "", cards };

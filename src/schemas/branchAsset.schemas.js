@@ -8,6 +8,8 @@
 //   snapshotCardSchema、controller 的 toCardPayload/toDeckPayload、以及 app 仓的
 //   api/branch.ts。漏任何一处的表现都是「客户端发了、服务端 201 了、读回来是空的，
 //   全程零报错」——`deck` 与 `modelUrl` 都这么丢过。
+//   ★ 2026-08-11 的 `views`（多图参考）少抄了一遍：它的子文档形状收在
+//     models/cardView.schema.js 一处，两个 model 共用同一份 subschema。
 const { z } = require("../middleware/validate");
 
 // 卡片类型的唯一事实源：models/BranchCard.js 的 enum 也从这里取，
@@ -17,6 +19,52 @@ const CARD_TYPES = ["character", "scene", "background", "prop", "style"];
 // 互动实体的种类与动作，models/BranchAssetStat.js 与 BranchAssetLike.js 的 enum 从这里取
 const ASSET_KINDS = ["card", "deck"];
 const ASSET_ACTIONS = ["like", "bookmark"];
+
+// ── 多图参考（views）─────────────────────────────────────────────────
+// 一张卡除封面外还能挂几张参考图。它们会被喂给 Seedream 去画方案的首尾帧
+// （形象因此被烤进帧里，Seedance 仍然只按首尾帧出片 —— 方舟明说
+//  「图生视频-首帧 / 首尾帧 / 全模态参考生视频是 3 种互斥场景，不可混用」）。
+//
+// ★ 上限 3 是**方舟提示词指南的建议**，不是拍脑袋：「不建议用满素材上限，
+//   过多素材会导致模型难以判断特征优先级」。人物卡的推荐组合就是「面部特写 + 全身」。
+// ★ kind 里**没有**"多视图/三视图"这种东西，也不要往那个方向引导用户：
+//   同一人物的多角度素材会被模型识别成多个不同主体，反而加剧 ID 漂移
+//   （方舟提示词指南原文）。道具/场景卡不存在这个问题（它们不是"主体身份"）。
+const CARD_VIEW_KINDS = ["face", "body", "detail"];
+const MAX_CARD_VIEWS = 3;
+
+// ★★ views[].url 只收 http(s)。这一条挡的是两件**性质不同**、都出过事的问题：
+//   ① dataURL —— 一张卡三张 base64，卡组发布时会整个快照进 BranchDeck.cards，
+//      `GET /decks` 一次返回全部快照就是几十 MB 的响应体。cover 走 Cloudinary 转存、
+//      modelUrl 当年改成 idb: 指针，都是为了同一件事。所以客户端必须先把本地图
+//      转存成永久 URL 再发上来（app 的 api/uploads），不是在这里再转一次。
+//   ② `idb:*` 这类**设备本地指针** —— 只在卡主那台机器上有意义，跟着分享/安装
+//      走出去就是死链，而死链不报错，只表现成"参考图那一格是空的"。
+//
+//   ⚠ 与 modelUrl 的处置**刻意不同**：modelUrl 允许 idb: 入库（那是卡主自己那份
+//     记录的一部分），发布/安装时才由 shareableModelUrl() 剥掉。views 则**入库就拒**
+//     —— 卡片详情页会把 views 一张张画出来给卡主自己看，存一个连他自己下次换设备
+//     都打不开的地址，没有任何一方受益。
+//   ⚠ shareableModelUrl 附近那套**第三方版权判断不适用于 views**：views 是 Seedream
+//     出的图（我们自己的产物），不是 BOOTH 购入的第三方模型。别顺手套上去。
+const VIEW_URL_RE = /^https?:\/\//i;
+
+/** views[].url 能不能发出去 —— 这条规则的唯一实现（zod 与 controller 都调它） */
+function isShareableViewUrl(raw) {
+  return VIEW_URL_RE.test(String(raw || "").trim());
+}
+
+const cardView = z.object({
+  url: z
+    .string()
+    .trim()
+    .min(1)
+    // 2000 与 modelUrl 同一个数：够长的 CDN 签名 URL 也放得下，但放不下一张 base64
+    .max(2000)
+    .regex(VIEW_URL_RE, "view url must be an http(s) URL (dataURL / idb: 不收)"),
+  kind: z.enum(CARD_VIEW_KINDS).optional().default("detail"),
+  note: z.string().trim().max(200).optional().default(""),
+});
 
 // 互动 key 的字符集：卡片是客户端 id（mkt_/card_/deck_ 前缀 + 随机串），卡组是 ObjectId 串。
 // ★ 收窄不是洁癖：这个值会进 Mongo 查询、也会被当成计数表的主键，放任意字符串
@@ -43,12 +91,27 @@ const cardItem = z
     //   但发布/安装时会被 shareableModelUrl() 剥掉——见 controller。
     modelUrl: z.string().trim().max(2000).optional().default(""),
     genPrompt: z.string().trim().max(4000).optional().default(""),
+    // ★ 超过 3 张 / 非 http(s) 一律 **400，不是悄悄截断**：截断的话用户挂了 4 张、
+    //   界面上显示 3 张，他只会以为自己少点了一下；而"第 4 张没生效"和
+    //   "第 4 张生效了但 AI 没用上"在结果里长得一模一样，查都没法查（铁律八）。
+    views: z.array(cardView).max(MAX_CARD_VIEWS).optional().default([]),
   })
   .refine((v) => Boolean(v.id || v.cardId), { message: "card id is required" });
 
 // POST /cards —— 批量加卡（按 { owner, cardId } 幂等）
 const addCardsBody = z.object({
   cards: z.array(cardItem).min(1).max(100),
+});
+
+// PATCH /cards/:cardId —— 改一张**已有**卡（目前只有 views）。
+// ★★ 为什么不能让客户端拿 POST /cards 代替：那条是**新增**语义，控制器用的是
+//   `$setOnInsert`（"已存在的字段一个不动"）。拿它去改卡会 201 得漂漂亮亮、库里一个
+//   字节都没变，而客户端每次登录都用服务端那份**整体覆盖**本地卡库 —— 用户加的参考图
+//   于是在下一次冷启动时无声消失。那是丢数据，不是"暂未同步"。
+// ★ views 是**必填**：body 里没有它就 400。可选的话，一个拼错字段名的调用会拿到
+//   200 + "改好了"，而库里什么都没发生 —— 同一类静默 no-op，只是换了个地方发生。
+const updateCardBody = z.object({
+  views: z.array(cardView).max(MAX_CARD_VIEWS),
 });
 
 const deckName = z.string().trim().max(60);
@@ -92,12 +155,17 @@ const publishBody = z
 
 module.exports = {
   addCardsBody,
+  updateCardBody,
   createDeckBody,
   updateDeckBody,
   publishBody,
   assetKey,
   assetKind,
+  cardView,
   CARD_TYPES,
   ASSET_KINDS,
   ASSET_ACTIONS,
+  CARD_VIEW_KINDS,
+  MAX_CARD_VIEWS,
+  isShareableViewUrl,
 };

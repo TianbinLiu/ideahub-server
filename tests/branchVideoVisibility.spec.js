@@ -184,6 +184,36 @@ describe("卡组快照", () => {
     expect(detail.body.video.deck.cards[0].genPrompt).toBeUndefined();
   });
 
+  // ★ views（卡片多图参考）是 2026-08-11 新加的字段，和 deck 当年一样有"发得出、存不下"
+  //   的风险：deckCardBody 是 .loose()（收下未声明字段），所以坏在**模型 + 控制器白名单**
+  //   那一层 —— 落库时被静默丢掉。后果不会让任何请求失败，只是观众装走这套卡组后，
+  //   AI 少了形象参考，炼出来的人物"有点不像"，没人查得到这里。
+  test("V3b deck 里的 views 跟着作品一起落库（非 http 的那张不带出去）", async () => {
+    const author = await registerUser();
+    const deck = {
+      name: "带参考图的卡组",
+      cards: [
+        {
+          id: "card_hero",
+          type: "character",
+          name: "主角",
+          cover: "https://cdn.example.com/hero.jpg",
+          views: [
+            { url: "https://cdn.example.com/hero-face.jpg", kind: "face", note: "大头照" },
+            { url: "idb:local-only", kind: "body" }, // 设备本地指针：别人拿到是死链
+          ],
+        },
+      ],
+    };
+    const created = await publish(author.token, { title: "带参考图的作品", deck }).expect(201);
+    const id = String(created.body.video._id);
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    const card = detail.body.video.deck.cards[0];
+    expect(card.views).toHaveLength(1);
+    expect(card.views[0].url).toBe("https://cdn.example.com/hero-face.jpg");
+    expect(card.views[0].kind).toBe("face");
+  });
+
   test("没有卡组的作品不会凭空多出一个空 deck", async () => {
     const author = await registerUser();
     const created = await publish(author.token, { title: "没卡组" }).expect(201);

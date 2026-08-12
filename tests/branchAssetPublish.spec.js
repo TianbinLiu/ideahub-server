@@ -466,6 +466,188 @@ describe("卡片/卡组发布到创意工坊", () => {
       .expect(200);
   });
 
+  // ── 多图参考（views）────────────────────────────────────────────
+  // A12/A13 盯的是同一类【做错了不报错】的问题，只是这次的后果更隐蔽：
+  // views 丢了不会让任何请求失败，只会让 AI 少拿到几张形象参考 ——
+  // 生成出来的人物"有点不像"，用户只会觉得模型不稳，不会怀疑数据没存下来。
+  test("A12 views 能存能读，并跟着分享/安装/卡组快照一起走", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+
+    const views = [
+      { url: "https://cdn.example.com/hero-face.jpg", kind: "face", note: "面部特写" },
+      { url: "https://cdn.example.com/hero-body.jpg", kind: "body" },
+    ];
+    const card = cardOf({ name: "带参考图的卡", views });
+    const created = await addCards(author.token, [card]).expect(201);
+    expect(created.body.cards[0].views).toHaveLength(2);
+    // note 省了要有个空串兜底，别让客户端去判 undefined
+    expect(created.body.cards[0].views[1]).toEqual({
+      url: "https://cdn.example.com/hero-body.jpg",
+      kind: "body",
+      note: "",
+    });
+
+    // 回读：201 的回包可能只是内存里的对象，真正的判据是从库里查出来还在
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).views).toEqual([
+      { url: "https://cdn.example.com/hero-face.jpg", kind: "face", note: "面部特写" },
+      { url: "https://cdn.example.com/hero-body.jpg", kind: "body", note: "" },
+    ]);
+
+    // 广场上就要能看到（不然装回来才发现是两张卡）
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    const shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.find((c) => c.cardId === card.cardId).views).toHaveLength(2);
+
+    // 装走的那份也要带上 —— 少了它，装卡的人炼出来的人物不是同一个人
+    const installed = await request(app)
+      .post(`/api/branch/cards/${card.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    expect(installed.body.card.views.map((v) => v.url)).toEqual(views.map((v) => v.url));
+  });
+
+  test("A12b 卡组快照里带得上 views（modelUrl 当年就是快照那份漏了声明）", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+
+    const card = cardOf({
+      name: "卡组里的角色",
+      views: [{ url: "https://cdn.example.com/deck-face.jpg", kind: "face" }],
+    });
+    await addCards(author.token, [card]).expect(201);
+
+    const deck = (
+      await request(app)
+        .post("/api/branch/decks")
+        .set("Authorization", `Bearer ${author.token}`)
+        .send({ name: "带参考图的卡组", cardIds: [card.cardId] })
+        .expect(201)
+    ).body.deck;
+    await request(app)
+      .post(`/api/branch/decks/${deck._id}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    const installed = await request(app)
+      .post(`/api/branch/decks/${deck._id}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    const got = installed.body.cards.find((c) => c.cardId === card.cardId);
+    expect(got.views).toEqual([{ url: "https://cdn.example.com/deck-face.jpg", kind: "face", note: "" }]);
+  });
+
+  test("A12c PATCH /cards/:cardId 真的改得动 views（POST /cards 是 $setOnInsert，改不动）", async () => {
+    const me = await registerUser();
+    const card = cardOf({ name: "要改参考图的卡" });
+    await addCards(me.token, [card]).expect(201);
+
+    // ★ 先证明"拿 POST 去改"是无效的 —— 这正是 PATCH 必须存在的理由：
+    //   $setOnInsert 只在插入时生效，改卡会 201 得漂漂亮亮、库里一个字节没变。
+    await addCards(me.token, [{ ...card, views: [{ url: "https://cdn.example.com/x.jpg", kind: "face" }] }]).expect(201);
+    const afterPost = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(afterPost.body.cards.find((c) => c.cardId === card.cardId).views).toEqual([]);
+
+    const patched = await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .send({ views: [{ url: "https://cdn.example.com/face.jpg", kind: "face", note: "大头照" }] })
+      .expect(200);
+    expect(patched.body.card.views).toEqual([
+      { url: "https://cdn.example.com/face.jpg", kind: "face", note: "大头照" },
+    ]);
+
+    // 回读才算数：201/200 的回包可能只是内存里的对象
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).views).toHaveLength(1);
+
+    // 清空也要存得下（"这张卡明确地不要参考图"）
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .send({ views: [] })
+      .expect(200);
+    const cleared = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(cleared.body.cards.find((c) => c.cardId === card.cardId).views).toEqual([]);
+
+    // 别人的卡 / 不存在的卡：404 而不是 200 假装存上了（客户端据此显红字）
+    const other = await registerUser();
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${other.token}`)
+      .send({ views: [] })
+      .expect(404);
+    // 越界的 views 在这条路上同样是 400，与 POST 同一套规则
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .send({ views: [{ url: "idb:local", kind: "body" }] })
+      .expect(400);
+  });
+
+  test("A13 超过 3 张 / dataURL / idb: 一律 400，而且一行都不落库", async () => {
+    const me = await registerUser();
+
+    // ① 上限 3（方舟指南：素材堆满反而让模型分不清特征优先级）。
+    //    ★ 必须是 400 而不是"悄悄截断"：截断的话用户挂了 4 张、界面显示 3 张，
+    //      他只会以为自己少点了一下。
+    const tooMany = cardOf({
+      views: [1, 2, 3, 4].map((i) => ({ url: `https://cdn.example.com/v${i}.jpg`, kind: "detail" })),
+    });
+    await addCards(me.token, [tooMany]).expect(400);
+
+    // ② dataURL：一张卡三张 base64 会把卡组快照撑爆，客户端必须先转存成永久 URL
+    const inlined = cardOf({
+      views: [{ url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA=", kind: "body" }],
+    });
+    await addCards(me.token, [inlined]).expect(400);
+
+    // ③ 设备本地指针：别人（以及换台设备的本人）拿到就是死链，而死链不报错
+    const local = cardOf({ views: [{ url: `idb:cardview:${Date.now()}`, kind: "body" }] });
+    await addCards(me.token, [local]).expect(400);
+
+    // 真正的判据：三张卡一张都没进库（zod 是整批拒，不是"坏的那张跳过"）
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const ids = new Set(listed.body.cards.map((c) => c.cardId));
+    for (const bad of [tooMany, inlined, local]) expect(ids.has(bad.cardId)).toBe(false);
+  });
+
+  test("A13b 老卡（没有 views）读回来是空数组，服务端不替客户端补 cover 那一张", async () => {
+    // ★ 「老卡 = 拿封面当唯一一张形象参考」这条归一只在 app 的 viewsOf() 一处做。
+    //   服务端也补一份的话就是同一条规则的第二处实现，两边一旦分叉，
+    //   用户看到的参考图和真正喂给 AI 的那批会不是同一批，且看不出来。
+    const me = await registerUser();
+    const card = cardOf({ cover: "https://cdn.example.com/only-cover.jpg" });
+    await addCards(me.token, [card]).expect(201);
+
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const back = listed.body.cards.find((c) => c.cardId === card.cardId);
+    expect(back.views).toEqual([]);
+    expect(back.cover).toBe("https://cdn.example.com/only-cover.jpg");
+  });
+
   test("A7 卡组也有热度，且与卡片各算各的（key 不共用一个命名空间）", async () => {
     const me = await registerUser();
     const card = cardOf({ cardId: `shared_key_${Date.now().toString(36)}` });

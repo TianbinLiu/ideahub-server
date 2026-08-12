@@ -4,6 +4,8 @@
 // 卡片删除时由控制器 $pull 出所有卡组，保证不留悬空引用。
 // ★ Mongoose 9 的 pre hook 不接收 next——本模型刻意不写任何 hook。
 const mongoose = require("mongoose");
+// 多图参考的子文档形状与 BranchCard 共用同一份（见那个文件的文件头）
+const { cardViewSchema } = require("./cardView.schema");
 
 // 发布到工坊时对卡片内容做的快照。
 // 卡片是按 { owner, cardId } 私有存的，别人装这套卡组时需要给他自己建一份；
@@ -22,6 +24,10 @@ const snapshotCardSchema = new mongoose.Schema(
     //   modelUrl 只可能是 http(s)（发布时 shareableModelUrl 已经剥过本地指针）。
     modelUrl: { type: String, default: "" },
     genPrompt: { type: String, default: "" },
+    /** 多图参考。★ 快照里漏声明的后果和 modelUrl 那次一模一样、而且更难发现：
+     *  装走的卡少了参考图，AI 照样能出片 —— 只是人物形象对不上，
+     *  用户会以为是"这套卡本来就不太稳"，不会怀疑是少了几张图。 */
+    views: { type: [cardViewSchema], default: [] },
   },
   { _id: false }
 );

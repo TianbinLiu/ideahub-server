@@ -8,6 +8,8 @@
 const mongoose = require("mongoose");
 // 类型枚举只在 schemas/branchAsset.schemas.js 定义一份，避免改一处漏一处（表现是整批加卡 400）
 const { CARD_TYPES } = require("../schemas/branchAsset.schemas");
+// 多图参考的子文档形状与 BranchDeck 的快照共用同一份（见那个文件的文件头）
+const { cardViewSchema } = require("./cardView.schema");
 
 const branchCardSchema = new mongoose.Schema(
   {
@@ -27,6 +29,13 @@ const branchCardSchema = new mongoose.Schema(
     modelUrl: { type: String, default: "" },
     /** 铸卡时的完整生成提示词（卡片详情页的「生成蓝图」） */
     genPrompt: { type: String, default: "" },
+    /** 多图参考（最多 3 张，只可能是 http(s)）。喂给 Seedream 画方案首尾帧时锁形象。
+     *  ★ 空数组与「字段不存在」在这里是**同一件事**（都表示"只有封面这一张形象"），
+     *    所以 default 给 `[]` 而不是 undefined：客户端的归一（老卡 → 拿 cover 当唯一
+     *    一张 body 图）只在 app 的 viewsOf() 一处做，服务端**不**替它补一份 ——
+     *    补了就是同一条规则的第二处实现，两边一旦分叉，用户看到的参考图和真正喂给
+     *    AI 的参考图会不是同一批，而这种偏差在结果里根本看不出来。 */
+    views: { type: [cardViewSchema], default: [] },
 
     // ── 发布到创意工坊（与 BranchDeck 同一套语义）──
     published: { type: Boolean, default: false },
