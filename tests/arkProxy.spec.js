@@ -6,8 +6,10 @@
 //   「拆掉也不会有任何报错」—— 功能照常，只有账单和攻击者会发现：
 //     ① 少了 requireAuth        → 任何人知道 URL 就能用我们的 key
 //     ② 白名单外的上游路径可达  → 变成通用反向代理，能调方舟任意模型
-//     ③ model 不校验            → 能点名 seedance-2.5（70 元/M，是标准档的 4.7 倍）
+//     ③ model 不校验            → 能点名任何贵模型
 //     ④ asset 的域名/SSRF 不校验 → 变成公开下载代理 + 内网探测器
+//     ⑤ 套餐门禁没了            → 免费用户能调 seedance-2.5（70 元/M，标准档的 4.7 倍，
+//                                 一段 10 秒 ≈ 100 万 token，是他整月额度的三倍多）
 //
 // ★ 这些用例**不会真的打方舟**：测试环境没有 ARK_API_KEY，forward() 在发请求之前
 //   就回 501；而 model / 域名 / SSRF 三道检查又都排在 forward 之前。
@@ -19,8 +21,20 @@ const request = require("supertest");
 
 let mongod;
 let app;
-let token;
+let token; // 免费版用户（注册即 free）
+let freeUserId;
+let paidToken; // 已购标准套餐
 let fetchSpy;
+
+/** 注册一个新用户，返回 { token, id }。付费门禁的用例需要两个身份 */
+async function registerUser(tag) {
+  const name = `ark_${tag}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const res = await request(app)
+    .post("/api/auth/register")
+    .send({ username: name, email: `${name}@test.local`, password: "secret123" })
+    .expect(201);
+  return { token: res.body.token, id: res.body.user._id };
+}
 
 beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
@@ -32,12 +46,15 @@ beforeAll(async () => {
   await connectDB();
   app = require("../src/app");
 
-  const name = `ark_${Date.now().toString(36)}`;
-  const res = await request(app)
-    .post("/api/auth/register")
-    .send({ username: name, email: `${name}@test.local`, password: "secret123" })
-    .expect(201);
-  token = res.body.token;
+  const free = await registerUser("free");
+  token = free.token;
+  freeUserId = free.id;
+
+  const paid = await registerUser("paid");
+  paidToken = paid.token;
+  // 直接发套餐（绕开支付渠道）：这里要测的是门禁，不是下单链路
+  const wallet = require("../src/services/tokenWallet.service");
+  await wallet.buyPlan(paid.id, "std");
 });
 
 afterAll(async () => {
@@ -101,7 +118,10 @@ describe("这是白名单转发，不是通用反向代理", () => {
 
 describe("模型白名单：拦住「点名贵模型」", () => {
   const rejected = [
-    "doubao-seedance-2-5-260601", // 70 元/M，标准档的 4.7 倍
+    // ★ 2.5 现在**有一个**在册的 id（doubao-seedance-2-5-260628）。这里这个版本戳
+    //   不一样，仍然必须被拒 —— 白名单是精确等值，不是前缀/家族匹配。
+    //   松成前缀匹配的话，方舟以后发一个更贵的 2.5-pro 就自动被放行了。
+    "doubao-seedance-2-5-260601",
     "doubao-seedance-2-0-260615",
     "",
     undefined,
@@ -144,6 +164,93 @@ describe("产物代理不是公开下载器，也不是内网探测器", () => {
     const res = await request(app).get(`/api/ark/asset?url=${encodeURIComponent(url)}`).set(auth());
     expect(res.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("套餐门禁：seedance-2.5 只对付费套餐开放", () => {
+  const { SEEDANCE_2_5 } = require("../src/config/tokens");
+  const taskBody = { model: SEEDANCE_2_5, duration: 5, content: [] };
+
+  test("免费版调 2.5 → 403 PLAN_REQUIRED，理由可读，且不出网", async () => {
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(auth()).send(taskBody);
+
+    expect(res.status).toBe(403); // 不是 402：充值解决不了，得换套餐
+    expect(res.body.code).toBe("PLAN_REQUIRED");
+    // ★ message 必须是一句能直接贴到界面上的话。客户端只会把它原样显示
+    //   （全 app 没有地方监听 emitApiError，也没有第二份文案表）。
+    expect(typeof res.body.message).toBe("string");
+    expect(res.body.message).toMatch(/付费套餐/);
+    expect(res.body.message).toMatch(/免费版/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("被门禁拒掉时一分钱都不许扣（门禁排在扣费之前）", async () => {
+    // ★ 顺序写反的话这条会红：免费用户 30 万额度扣不动 50 万，会先变成 402，
+    //   真正的原因被"余额不足"盖住，用户只会一直去充值。
+    const walletSvc = require("../src/services/tokenWallet.service");
+    const before = await walletSvc.getWallet(freeUserId);
+    await request(app).post("/api/ark/contents/generations/tasks").set(auth()).send(taskBody).expect(403);
+    const after = await walletSvc.getWallet(freeUserId);
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test("付费套餐调 2.5 过得了门禁（没配 key 时到 501，说明已经走到 forward）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(taskBody);
+    expect(res.status).toBe(501); // ark not configured —— 门禁与扣费都过了
+    expect(fetchSpy).not.toHaveBeenCalled(); // 501 在发请求之前返回
+  });
+
+  test("免费版调其它在册档位不受影响（门禁只针对 paidOnly 那一档）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send({ model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [] });
+    expect(res.status).toBe(501);
+  });
+});
+
+describe("跨仓档位系数一致性（app 的报价 vs 服务端的结算）", () => {
+  // ★ 为什么把 app 那份**抄**在这里，而不是 fs 读 app 仓的 economy.ts：
+  //   server 是独立部署的（ECS 上只有这一个仓，CI 里也没有 app 的代码）。
+  //   读文件的写法在这台开发机上能过、在 CI 上只能"文件不在就跳过"——
+  //   而一条会自己跳过的用例，正是本项目最怕的那种静默失败：以后有人改了 app
+  //   的 mult 却没改这边，测试照样全绿，用户看到的是"报价 216k、扣了 1,015,200"。
+  //   抄一份的代价是改价时要动两个仓，但那正是我们想要的提醒（payOrder.spec.js
+  //   末尾的价目表用的是同一招）。
+  const APP_VIDEO_TIERS = [
+    { id: "fast", model: "doubao-seedance-1-0-pro-fast-251015", mult: 0.3 },
+    { id: "std", model: "doubao-seedance-1-0-pro-250528", mult: 1 },
+    { id: "hd", model: "doubao-seedance-2-0-mini-260615", mult: 1.6 },
+    { id: "ultra", model: "doubao-seedance-2-5-260628", mult: 4.7 },
+  ];
+
+  test("两张表的 key 集合与数值完全相等", () => {
+    const { VIDEO_MULT } = require("../src/config/tokens");
+    const fromApp = Object.fromEntries(APP_VIDEO_TIERS.map((t) => [t.model, t.mult]));
+    // toEqual 对对象是**双向**比较：这边多一个模型、少一个模型、或者数值差一点，都会红
+    expect(VIDEO_MULT).toEqual(fromApp);
+  });
+
+  test("在册模型与档位表一一对应（新增档位不许漏掉 ALLOWED_MODELS）", async () => {
+    // 白名单是私有常量，所以从行为上验：每个档位的 model 都得能过"在册"这一关。
+    // 漏掉一行的症状是 400 model not allowed —— 用户那边表现为"这一档永远失败"。
+    for (const t of APP_VIDEO_TIERS) {
+      const res = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send({ model: t.model, duration: 5, content: [] });
+      expect({ id: t.id, status: res.status }).toEqual({ id: t.id, status: 501 });
+    }
+  });
+
+  test("2.5 的一段片确实超过免费版整月额度（门禁的前提，也是给用户的说法）", () => {
+    const { segTokens, planOf } = require("../src/config/tokens");
+    // 取**最短**的 3 秒：连最便宜的一段都超月额，说明"免费版怎么都用不了这一档"
+    // 是事实陈述，不是营销话术。
+    expect(segTokens(3, "doubao-seedance-2-5-260628")).toBeGreaterThan(planOf("free").monthlyTokens);
   });
 });
 

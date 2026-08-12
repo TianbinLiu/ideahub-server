@@ -13,8 +13,9 @@
  *
  * ★ 这不是一个通用反向代理，是**白名单转发**。
  *   上游 path 只允许下面这四条 App 真正用到的；model 也必须在册。
- *   开成通用代理的话，任何登录用户都能拿我们的 key 调方舟的任意模型
- *   （包括 seedance-2.5 这种 70 元/M 的），账单直接爆。
+ *   开成通用代理的话，任何登录用户都能拿我们的 key 调方舟的任意模型，账单直接爆
+ *   （最贵的一档 seedance-2.5 是 70 元/M，标准档的 4.7 倍；它现在**在册**，
+ *    但另有一道套餐门禁挡着免费用户，见 billedForward）。
  *
  * ★ 花钱的闸门有三道，缺一不可：
  *     ① requireAuth —— 不许裸奔；
@@ -31,7 +32,7 @@ const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
 const wallet = require("../services/tokenWallet.service");
-const { priceOf } = require("../config/tokens");
+const { priceOf, paidOnlyDenial, SEEDANCE_2_5 } = require("../config/tokens");
 
 const router = express.Router();
 
@@ -47,6 +48,10 @@ const ALLOWED_MODELS = new Set([
   "doubao-seedance-1-0-pro-250528",    // Seedance 标准档（首尾帧）
   "doubao-seedance-1-0-pro-fast-251015", // Seedance 极速档（只收首帧）
   "doubao-seedance-2-0-mini-260615",   // Seedance 高清档（需控制台开通）
+  // Seedance 2.5「电影级」档。70 元/M，是标准档的 4.7 倍 —— 全站最贵的一次调用
+  // （10 秒一段 ≈ 1,015,200 token）。所以它在白名单之外还有**第二道门**：
+  // 免费套餐一律拒（见下面 billedForward 里的 paidOnlyDenial）。
+  SEEDANCE_2_5,
   "doubao-seed-2-1-turbo-260628",      // 豆包对话 / 看图说话
   "doubao-seed3d-2-0-260328",          // Seed3D 图生 3D
 ]);
@@ -114,6 +119,11 @@ function setWalletHeaders(res, w) {
  *
  * ★ 只有**创建类**请求计费。轮询任务状态与取产物不计费：它们既不产生算力消耗，
  *   又高频（一段视频轮询上百次），按次收会把一段片的价格翻好几倍。
+ *
+ * ★ 三道判断的顺序是有讲究的：**在册 → 套餐够不够格 → 钱够不够**。
+ *   套餐门禁必须排在扣费**之前**：排在后面的话，免费用户点一次 2.5 会先被扣掉
+ *   一百万 token（大概率直接 402），错误信息还是"余额不足"——真正的原因
+ *   （这一档不对你开放）被彻底盖住，用户会去充值，然后再被拒一次。
  */
 function billedForward(kind, path, timeoutMs) {
   return async (req, res, next) => {
@@ -124,19 +134,43 @@ function billedForward(kind, path, timeoutMs) {
         return res.status(400).json({ ok: false, message: "model not allowed" });
       }
 
+      // ★ 一趟读，三个用途：套餐门禁的判据、402 时报给用户的余额、顺带完成钱包
+      //   初始化与跨月刷新。402 那一路原来就要读一次，这里只是提前；成功那一路
+      //   确实多了一次查询——**故意选贵的那一种写法**：换成"只有 paidOnly 的模型
+      //   才去读套餐"就等于把门禁的判据劈成两半（一半在这儿决定要不要查，一半在
+      //   paidOnlyDenial 里决定放不放），以后往 PAID_ONLY_MODELS 里加第二个模型时，
+      //   漏改任何一半都不会报错，只会静默放行。
+      //   代价也确实小：这条路每次都要等方舟几秒到几十秒，一次 Mongo 读可以忽略。
+      const before = await wallet.getWallet(req.user._id);
+
+      // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端的置灰是提示，不是边界）。
+      const denied = paidOnlyDenial(before?.planId, model);
+      if (denied) {
+        console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
+        setWalletHeaders(res, before);
+        // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，
+        // 得换套餐。合并成同一个码，用户会一直充值一直被拒。
+        return res.status(403).json({
+          ok: false,
+          code: "PLAN_REQUIRED",
+          message: denied,
+          planId: before?.planId ?? null,
+          model,
+        });
+      }
+
       const cost = priceOf(kind, req.body);
       const memo = `${kind} ${model}`;
       let w = await wallet.debit(req.user._id, cost, memo);
       if (!w) {
         // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
-        const cur = await wallet.getWallet(req.user._id);
-        setWalletHeaders(res, cur);
+        setWalletHeaders(res, before);
         return res.status(402).json({
           ok: false,
           code: "INSUFFICIENT_TOKENS",
           message: "token 余额不足",
           need: cost,
-          balance: cur ? cur.plan + cur.addon : 0,
+          balance: before ? before.plan + before.addon : 0,
         });
       }
 
