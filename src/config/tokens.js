@@ -26,8 +26,111 @@ function planOf(id) {
 // 折算基准：标准档视频 15 元/M token。其余按各自单价折成同一把尺子，
 // 用户看到的数字就是真实资源消耗，不做虚拟汇率。
 
-/** 一次 Seedream 出图（约 0.2 元/张 ⇒ 0.2/15 M ≈ 13.3k） */
-const IMAGE_TOKENS = 13_300;
+// ── 出图（Seedream）：按 model 计价，不是一口价 ─────────────────────────
+//
+// ★ 2026-08-11 之前这里是一个常量 `IMAGE_TOKENS = 13_300`，而 priceOf **拿到了请求体
+//   却不读里面的 model** —— 也就是顶档按最低档收费。铸卡分成三档之后顶档与低档差 3 倍，
+//   这个缺口就是每张顶档图白送 0.4 元。而它没有任何症状：用户无感、界面无错、
+//   测试全绿，只有火山账单知道。这正是本仓最怕的那种错，所以价目必须挂在 model 上。
+//
+// 折算口径与视频同一把尺子：**元/张 ÷ 15 元/百万 token**（15 = Seedance 1.0-pro 标准档）。
+// ⚠ 单价取自方舟公开价目（2026-08-11 核对），**尚未与控制台账单对过**。
+//   真实结算永远以账单为准；发现偏差改这一张表，并同步 app 的 IMAGE_TOKENS_BY_MODEL。
+
+/**
+ * 三档铸卡（速写/定妆/精绘）用的出图模型与单价。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 `IMAGE_TOKENS_BY_MODEL` **逐条相等**（跨仓契约）。
+ *   对照钉在 `tests/arkProxy.spec.js`「跨仓出图价目一致性」，改一边不改另一边就会红。
+ */
+const IMAGE_TOKENS_BY_MODEL = {
+  // 0.20 元/张 ÷ 15 元/M = 13,333。像素区间实测 [921,600, 16,777,216]
+  "doubao-seedream-4-0-250828": 13_333,
+  // 0.25 元/张 ÷ 15 元/M = 16,667。像素区间实测 [3,686,400, 16,777,216]
+  "doubao-seedream-4-5-251128": 16_667,
+  // 0.60 元/张 ÷ 15 元/M = 40,000。
+  // ★ 为什么按 0.60 不按 0.30：pro 的单价按**输出像素**分档（≤236 万 0.30、>236 万 0.60），
+  //   而铸卡画布 CARD_SIZE = 1728×2304 = 3,981,312 像素，落在贵的那一档。
+  //   app 的 ImageTier.size 是有意用满画布的（压到 236 万以下会让顶档比中档还小）。
+  //   哪天 app 把 size 调小了，这个数要一起改成 20,000 —— 两张表都改。
+  "doubao-seedream-5-0-pro-260628": 40_000,
+};
+
+/**
+ * 老客户端还在发的出图模型。**不能从在册名单里删。**
+ *
+ * 新版 app 已经把 `arkClient.MODELS.image` 改成跟着默认档走
+ * （`imageTierOf(DEFAULT_IMAGE_TIER).model` = 4.0），所以**新包不再发它**；
+ * 但**已经装机的 APK 改不了** —— 它们补设定帧、推三套方案的首尾帧、出 AI 封面
+ * 全都还在发这个 id。从白名单里删掉的表现不是"降级"，是那批用户**出图整条 400**
+ * （而客户端把 400 当敏感词处理，连重试都不会做）。铁律七。
+ *
+ * ⚠ 它的单价在方舟公开价目里**查不到**（这正是 app 的档位表把它排除在外的原因），
+ *   所以这里不去猜，直接沿用**老客户端自己报的那个价**：13,300
+ *   （老包 `economy.IMAGE_TOKENS` 就是这个常量）。这样老用户的「报价 = 实收」
+ *   逐分不变，这次改价对他们是**零影响**。
+ * ★ 代价是：若 5.0 实际比 0.20 元贵，差价我们自己吃。**明知故犯，不是遗漏** ——
+ *   多收才是骗人，少收只是我们亏钱，两害相权宁可亏在自己这边；而且这批调用会随
+ *   老版本淘汰而归零。
+ * ★ 这张表的寿命 = 老版本的寿命。确认线上没有旧包在发它之后，连同白名单一起删。
+ */
+const LEGACY_IMAGE_TOKENS = {
+  "doubao-seedream-5-0-260128": 13_300,
+};
+
+/**
+ * 出图的完整查价表（在册档 + 老客户端那一档）。
+ *
+ * ★ 用 Map 而不是把两个对象拼成一个普通对象：`model` 是**用户可控的字符串**，
+ *   普通对象上 `obj["constructor"]` / `obj["toString"]` 会顺着原型链返回一个**函数**，
+ *   而那个"价格"再往下传就是把函数交给 Mongo 的 $inc —— 500，甚至更难看的东西。
+ *   Map 只认自己塞进去的 key。（路由上其实够不着：在册检查排在扣费之前；
+ *   但 imageTokensOf 是导出的，别的调用方不该依赖那个顺序。）
+ */
+const IMAGE_PRICES = new Map([
+  ...Object.entries(IMAGE_TOKENS_BY_MODEL),
+  ...Object.entries(LEGACY_IMAGE_TOKENS),
+]);
+
+/**
+ * 出图的**在册模型**。★ 「在册」与「有价」是同一件事，所以只有这一处数据 ——
+ * `routes/ark.routes.js` 的 ALLOWED_MODELS 直接摊开它，不另写一份字面量（铁律六）。
+ * 分成两张表的话有两种漏法，而且都不报错：
+ *   在册了没定价 → 落到下面的兜底，按最贵档收（用户被多扣）；
+ *   定价了没在册 → 这一档永远 400（用户觉得"这档坏了"）。
+ */
+const IMAGE_MODELS = new Set(IMAGE_PRICES.keys());
+
+/** 已知最贵的一档出图。认不出的模型按它收，理由见 imageTokensOf */
+const MAX_IMAGE_TOKENS = Math.max(...Object.values(IMAGE_TOKENS_BY_MODEL));
+
+/**
+ * 一次出图扣多少 token。
+ *
+ * ★ 认不出的 model **按已知最贵的一档收，并且吼一嗓子**。三个选项各自的后果：
+ *   - 按最便宜的收（或沿用老常量）：等于白送，而且**永远不会有人发现** ——
+ *     界面正常、日志干净，只有火山账单知道。今天这个缺口就是这么来的。
+ *   - 直接 throw / 500：billedForward 会把它变成 500，**整条出图链路当场全挂**。
+ *     出图端点是用户可控 model 的转发口，老客户端随时可能发一个我们没登记的 id
+ *     （`MODELS.image` 已经换过两次，每换一次就多一批发老 id 的存量装机），
+ *     拿全站可用性去赌一次配置疏漏不划算（铁律七）。
+ *   - 按最贵的收：方向选对了 —— 少收是隐形的，多收会被用户当天投诉出来。
+ * ★ 而且这条兜底在路由上**够不着**：ALLOWED_MODELS 的出图部分就是 IMAGE_MODELS 本身，
+ *   没登记的 model 在扣费之前就被 400 挡掉了。它是第二道保险，不是常规路径。
+ *   真跑到这里说明有人扩了白名单却没定价，所以要 console.error；
+ *   同时流水的 memo 里带着 `image <model>`，对账时能一眼看出是哪个模型被兜了底。
+ * ★ 与 app 的同名函数**行为不同是刻意的**：app 那份是【报价】，在开发期就该当场炸
+ *   （抛异常）把配置错暴露出来；这一份是【结算】，跑在真实用户的请求上，不能炸。
+ */
+function imageTokensOf(model) {
+  const known = IMAGE_PRICES.get(model);
+  if (known) return known;
+  console.error(
+    `[tokens] 出图模型 ${String(model).slice(0, 64)} 不在价目表里，` +
+      `按最贵档 ${MAX_IMAGE_TOKENS} 收费。请补 IMAGE_TOKENS_BY_MODEL（两仓一起改）`,
+  );
+  return MAX_IMAGE_TOKENS;
+}
+
 /** 一次豆包对话往返（含人设与历史的保守值） */
 const CHAT_TURN_TOKENS = 400;
 /** 一次 Seed3D 建模（约 2.4 元/次 ⇒ 160k）。全站最贵的单次操作 */
@@ -115,7 +218,7 @@ function segTokens(durationSec, model) {
  *   1 次 chat(400) + 1 次 image(13.3k) = app 的 forgeCost(1)。
  *
  * ★ 已知不完全一致的两处（写在这里免得以后被当成 bug 反复查）：
- *   1. 「生成本段」时管线可能额外调 Seedream，服务端如实各收一次 IMAGE_TOKENS：
+ *   1. 「生成本段」时管线可能额外调 Seedream，服务端如实按 model 各收一次出图费：
  *      **补画缺失的设定帧那部分 app 已经报进去了**（2026-08 加的 economy.segmentCost，
  *      简约模式两张都补、走参考生视频则一张都不补），别再往这边加一遍——会变成双算。
  *      仍然没报的只剩**圈选改帧**（segmentGen 第①步，每条标注一次 refineFrame），
@@ -125,7 +228,8 @@ function segTokens(durationSec, model) {
  *   两边都是"如实按调用收"，要对齐得改 app 的报价口径，不是改这里。
  */
 function priceOf(kind, body) {
-  if (kind === "image") return IMAGE_TOKENS;
+  // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
+  if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
   if (kind === "chat") return CHAT_TURN_TOKENS;
   if (kind === "task") {
     const model = String(body?.model ?? "");
@@ -143,11 +247,17 @@ function priceOf(kind, body) {
 //   `tokenWallet.service.mintedToday` 还留着：它是查"今天发了多少币"的现成工具，
 //   对账时用得上，只是没有调用方在拿它做闸门了。
 
+// ★ 这里原来导出过一个 `IMAGE_TOKENS`（"一张图多少钱"）。**故意删掉**：
+//   留着它就等于在按 model 的价目表旁边放第二处"一张图的价"，而两者迟早分叉
+//   （今天这个缺口正是分叉的产物）。要一张图的价一律走 imageTokensOf(model)。
 module.exports = {
   PLANS,
   DEFAULT_PLAN_ID,
   planOf,
-  IMAGE_TOKENS,
+  IMAGE_TOKENS_BY_MODEL,
+  LEGACY_IMAGE_TOKENS,
+  IMAGE_MODELS,
+  imageTokensOf,
   CHAT_TURN_TOKENS,
   MODEL3D_TOKENS,
   MODEL3D_ID,

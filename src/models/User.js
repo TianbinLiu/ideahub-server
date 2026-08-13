@@ -117,10 +117,23 @@ const userSchema = new mongoose.Schema(
 //   对不上不会报错，只是默默退化成全表扫（users 表迟早会大到让每条评论都拖一下）。
 //   所以这里直接引那个常量，不再手抄一份 `{locale:"en",strength:2}`。
 //
-//   为什么不直接把 `username` 那条 unique 索引改成 ci：那会顺带改变**唯一性语义**
-//   （从此 "Bob" 和 "bob" 不能共存），而库里可能已经存在这样两个账号，
-//   改索引会当场建不出来、启动即失败。这里只加一条独立的非唯一次级索引，零语义变更。
-userSchema.index({ username: 1 }, { name: "username_ci", collation: CI_COLLATION });
+//   ★★ 这条索引现在**同时承担唯一性**（2026-08-13 改）：原来 `username_1` 是 unique
+//   但**不带 collation**，于是 "tianbinliu" 和 "TianbinLiu" 可以同时存在 ——
+//   而 username 是本 app 公开的 @ 句柄，换个大小写注册一个就能冒充别人，
+//   注册那侧的查重（auth.controller）当时也没带 collation，两道关一起漏。
+//   2026-08-13 在生产库上确认过：26 个用户，忽略大小写后**没有任何重复**，
+//   所以现在收紧是安全的（有存量冲突的话建索引会当场失败、启动即挂，那属于要先清人的情况）。
+//
+//   ⚠ **改这行不会自动生效**：mongoose 只创建"缺失"的索引，**从不修改已存在索引的选项**，
+//   而 `username_ci` 已经以非唯一形态存在于生产库。要真正落地必须先删再建：
+//     db.users.dropIndex("username_ci")
+//   然后重启服务让 autoIndex 重建（或手动 createIndex 带上同样的 name/collation/unique）。
+//   删掉到重建之间有一个"唯一性不生效"的窗口，只有几秒，但要知道它存在。
+//
+//   为什么不去动 `username_1`：那条是 mongoose 从 `unique: true` 自动建的，
+//   动它要连 schema 一起改，而两条 unique 索引（一条区分大小写、一条不区分）
+//   同时存在是合法的，后者更严，前者自然就成了它的子集。少动一处是一处。
+userSchema.index({ username: 1 }, { name: "username_ci", collation: CI_COLLATION, unique: true });
 
 // ★ displayName 的同款索引，服务的是**找人搜索里的"精确档"**
 //   （users.controller 的 searchUsers 单独发的那条等值查询）。

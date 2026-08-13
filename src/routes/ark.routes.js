@@ -31,20 +31,27 @@ const { Readable } = require("node:stream");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
+// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
+const { isAdmin } = require("../utils/roles");
 const wallet = require("../services/tokenWallet.service");
-const { priceOf, paidOnlyDenial, SEEDANCE_2_5 } = require("../config/tokens");
+const { priceOf, paidOnlyDenial, SEEDANCE_2_5, IMAGE_MODELS } = require("../config/tokens");
 
 const router = express.Router();
 
 const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
 /**
- * 允许调用的模型白名单。**与 app 仓 src/ai/arkClient.ts 的 MODELS 和
- * src/data/economy.ts 的 VIDEO_TIERS 一一对应**——App 新增一个档位，就要在这里补一行，
+ * 允许调用的模型白名单。**与 app 仓 src/ai/arkClient.ts 的 MODELS、
+ * src/data/economy.ts 的 VIDEO_TIERS 与 IMAGE_TIERS 一一对应**——App 新增一个档位，
+ * 就要在这里补一行（出图那几行由价目表自动带出，见下），
  * 这是刻意的：每加一个模型都是一笔新的单价，应该有人明确点头。
  */
 const ALLOWED_MODELS = new Set([
-  "doubao-seedream-5-0-260128",        // Seedream 出图（卡面 / 首尾帧）
+  // Seedream 出图（卡面 / 首尾帧 / AI 封面）。★ 这一段**不写字面量**，直接摊开价目表的
+  // key：出图的「在册」与「有价」必须是同一件事（见 config/tokens.js 的 IMAGE_MODELS）。
+  // 分成两张手写的表，两种漏法都不报错——在册没定价 = 按最贵档兜底多扣用户的钱，
+  // 定价没在册 = 这一档永远 400，用户只会觉得"这档坏了"。
+  ...IMAGE_MODELS,
   "doubao-seedance-1-0-pro-250528",    // Seedance 标准档（首尾帧）
   "doubao-seedance-1-0-pro-fast-251015", // Seedance 极速档（只收首帧）
   "doubao-seedance-2-0-mini-260615",   // Seedance 高清档（需控制台开通）
@@ -124,6 +131,14 @@ function setWalletHeaders(res, w) {
  *   套餐门禁必须排在扣费**之前**：排在后面的话，免费用户点一次 2.5 会先被扣掉
  *   一百万 token（大概率直接 402），错误信息还是"余额不足"——真正的原因
  *   （这一档不对你开放）被彻底盖住，用户会去充值，然后再被拒一次。
+ *
+ * ★★ 管理员免单，但**照实记一笔流水**（见下面的 free 分支）。
+ *   跳过的是"钱"的那两道（套餐门禁 + 扣费），**没跳过**的是：
+ *     · 模型白名单 —— 在册与否是"这个模型我们认不认、有没有定价"，与谁在调无关；
+ *       管理员也不该能点名一个我们从没估过价的模型。
+ *     · 限流（aiRateLimit）—— 管理员账号被盗、或者自己写了个循环，
+ *       在这条路上就是直接往火山账单上打洞。免单免的是我们内部的记账，
+ *       不是外面那张账单。
  */
 function billedForward(kind, path, timeoutMs) {
   return async (req, res, next) => {
@@ -134,6 +149,10 @@ function billedForward(kind, path, timeoutMs) {
         return res.status(400).json({ ok: false, message: "model not allowed" });
       }
 
+      // 管理员免单。★ 判据来自 req.user.role，而 requireAuth **每次请求都从库里重读**
+      //   role（不信 JWT 里的快照）—— 撤掉某人的管理员身份立刻生效，不用等他的 token 过期。
+      const free = isAdmin(req.user);
+
       // ★ 一趟读，三个用途：套餐门禁的判据、402 时报给用户的余额、顺带完成钱包
       //   初始化与跨月刷新。402 那一路原来就要读一次，这里只是提前；成功那一路
       //   确实多了一次查询——**故意选贵的那一种写法**：换成"只有 paidOnly 的模型
@@ -142,47 +161,70 @@ function billedForward(kind, path, timeoutMs) {
       //   漏改任何一半都不会报错，只会静默放行。
       //   代价也确实小：这条路每次都要等方舟几秒到几十秒，一次 Mongo 读可以忽略。
       const before = await wallet.getWallet(req.user._id);
-
-      // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端的置灰是提示，不是边界）。
-      const denied = paidOnlyDenial(before?.planId, model);
-      if (denied) {
-        console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
-        setWalletHeaders(res, before);
-        // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，
-        // 得换套餐。合并成同一个码，用户会一直充值一直被拒。
-        return res.status(403).json({
-          ok: false,
-          code: "PLAN_REQUIRED",
-          message: denied,
-          planId: before?.planId ?? null,
-          model,
-        });
-      }
-
       const cost = priceOf(kind, req.body);
       const memo = `${kind} ${model}`;
-      let w = await wallet.debit(req.user._id, cost, memo);
-      if (!w) {
-        // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
-        setWalletHeaders(res, before);
-        return res.status(402).json({
-          ok: false,
-          code: "INSUFFICIENT_TOKENS",
-          message: "token 余额不足",
-          need: cost,
-          balance: before ? before.plan + before.addon : 0,
-        });
+
+      // ★ 管理员这一路的 w 保持 before（余额没动）。**不能给 null**：
+      //   下面 setWalletHeaders 拿 null 会一个头都不写，App 的钱包镜像就停在
+      //   "本地先减过一次"的那个值上，界面显示的余额比真实值少 —— 一个不报错的假账。
+      let w = before;
+
+      // ★ 免单这一路把整段"钱的判断"跳过：套餐门禁 + 扣费 + 余额不足的 402。
+      //   套餐门禁也必须跳 —— 否则一个还挂在免费档上的管理员账号会在 seedance-2.5 上
+      //   被 403，而那道门守的是"钱"，对一个根本不花钱的人守它没有任何意义。
+      //   同理，余额不足的 402 也误伤不到他：这一整段都没执行。
+      //   ★ 流水**不在这里写**，等转发回来再写（见下面 accepted && free 那一段）。
+      if (!free) {
+        // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端的置灰是提示，不是边界）。
+        const denied = paidOnlyDenial(before?.planId, model);
+        if (denied) {
+          console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
+          setWalletHeaders(res, before);
+          // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，
+          // 得换套餐。合并成同一个码，用户会一直充值一直被拒。
+          return res.status(403).json({
+            ok: false,
+            code: "PLAN_REQUIRED",
+            message: denied,
+            planId: before?.planId ?? null,
+            model,
+          });
+        }
+
+        w = await wallet.debit(req.user._id, cost, memo);
+        if (!w) {
+          // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
+          setWalletHeaders(res, before);
+          return res.status(402).json({
+            ok: false,
+            code: "INSUFFICIENT_TOKENS",
+            message: "token 余额不足",
+            need: cost,
+            balance: before ? before.plan + before.addon : 0,
+          });
+        }
       }
 
       const { status, text } = await callArk(req, path, timeoutMs);
 
+      const accepted = status >= 200 && status < 300;
+
       // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
       // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
       //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
-      if (status < 200 || status >= 300) {
+      if (!accepted && !free) {
         const back = await wallet.credit(req.user._id, cost, "ark_refund", `${memo} 上游 ${status}`);
         w = back ?? w;
         console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
+      }
+
+      // ★★ 管理员那笔账**记在转发之后、且只在上游受理时记**，与扣费的顺序正好相反。
+      //   扣费必须在前（"条件原子扣减成功 = 拿到许可"，否则并发下双花）；
+      //   而免单这一路不动余额，没有双花可言，于是可以等到"确实花出去了"再落账。
+      //   反过来先记的话，敏感词 400 那种根本没被受理的调用也会记成一笔花销 ——
+      //   而这张账本存在的唯一目的就是与方舟账单对得上，多记等于自己给自己造对不上的账。
+      if (accepted && free) {
+        await wallet.noteAdminFree(req.user._id, cost, `admin ${memo}`, before);
       }
 
       setWalletHeaders(res, w);
@@ -202,7 +244,8 @@ function billedForward(kind, path, timeoutMs) {
 const genLimit = aiRateLimit({ max: 30, scope: "ark-gen" });
 const pollLimit = aiRateLimit({ max: 90, scope: "ark-poll" });
 
-/** Seedream 出图 */
+/** Seedream 出图。★ **按 body.model 计价**（三档差 3 倍：13,333 / 16,667 / 40,000），
+ *  不是一口价——写成常量就是"顶档按最低档收费"，零症状白送。见 config/tokens.imageTokensOf */
 router.post("/images/generations", requireAuth, genLimit, billedForward("image", "/images/generations", T_CREATE));
 
 /** Seedance 出视频 / Seed3D 建模（同一个异步任务端点）。

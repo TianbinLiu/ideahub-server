@@ -7,7 +7,7 @@ const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
-const { normalizeNewUsername } = require("../utils/username");
+const { normalizeNewUsername, CI_COLLATION } = require("../utils/username");
 const { grantSignupBonus } = require("../services/points.service");
 
 function serializeAuthUser(user) {
@@ -99,7 +99,17 @@ async function register(req, res, next) {
     //   而且表现是"打了 @ 没反应"，一个错都不报。
     const username = normalizeNewUsername(rawUsername);
 
-    const exists = await User.findOne({ $or: [{ username }, { email }] });
+    // ★★ 查重必须带 CI_COLLATION：username 是本 app 公开的 @ 句柄，不带 collation 的话
+    //   "tianbinliu" 已存在时还能注册出 "TianbinLiu" —— 两个账号在界面上肉眼几乎分不出，
+    //   而 @ 的补全面板会把它们并排列出来，这就是最省事的冒名手法。
+    //   ⚠ collation 是**整条查询**的属性，不能只作用于 $or 的某一个分支，所以 email 也一并
+    //   变成大小写不敏感 —— 这对 email 恰好是**想要**的（邮箱本地部分理论上区分大小写，
+    //   但没有任何真实邮箱服务商这么用，而 "A@x.com" 与 "a@x.com" 注册成两个账号只会制造
+    //   找回密码时的悬案）。email 的唯一索引仍是区分大小写的那条，所以这里只是**更严**，
+    //   不会放过任何原本会被挡下的重复。
+    //   兜底仍在 DB：models/User.js 的 username_ci 索引现在是 unique，
+    //   并发注册撞车时由它抛 E11000（下面的 catch 会转成 409）。
+    const exists = await User.findOne({ $or: [{ username }, { email }] }).collation(CI_COLLATION);
     if (exists) {
       res.status(409);
       throw new Error("username or email already in use");

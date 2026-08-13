@@ -254,6 +254,106 @@ describe("跨仓档位系数一致性（app 的报价 vs 服务端的结算）",
   });
 });
 
+describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）", () => {
+  // ★ 这一组盯的是 2026-08-11 之前真实存在的缺口：`priceOf` 拿到了请求体却不读 model，
+  //   于是**顶档按最低档收费**（三档差 3 倍）。它没有任何症状 —— 用户无感、界面无错、
+  //   测试全绿，只有火山账单知道。所以必须由测试从外面把"真的读了 model"钉住。
+  //
+  // 抄自 app/src/data/economy.ts 的 IMAGE_TIERS + IMAGE_TOKENS_BY_MODEL。
+  // 为什么抄而不是 fs 读 app 仓：理由同上面视频那组（server 独立部署，CI 里没有 app 的代码；
+  // 会自己跳过的用例是本项目最怕的静默失败）。
+  const APP_IMAGE_TIERS = [
+    { id: "sketch", model: "doubao-seedream-4-0-250828", tokens: 13_333 }, // 0.20 元/张
+    { id: "studio", model: "doubao-seedream-4-5-251128", tokens: 16_667 }, // 0.25 元/张
+    { id: "master", model: "doubao-seedream-5-0-pro-260628", tokens: 40_000 }, // 0.60 元/张
+  ];
+
+  /** 老客户端（已装机的 APK）还在发的出图模型：新包的 MODELS.image 已经改成 4.0，
+   *  但装出去的那些改不了。老包对它的报价是 economy.IMAGE_TOKENS = 13,300 */
+  const LEGACY_IMAGE_MODEL = "doubao-seedream-5-0-260128";
+  const LEGACY_IMAGE_TOKENS = 13_300;
+
+  test("两张表的 key 集合与数值完全相等", () => {
+    const { IMAGE_TOKENS_BY_MODEL } = require("../src/config/tokens");
+    const fromApp = Object.fromEntries(APP_IMAGE_TIERS.map((t) => [t.model, t.tokens]));
+    // toEqual 是**双向**比较：这边多一个模型、少一个模型、或者数值差一点，都会红
+    expect(IMAGE_TOKENS_BY_MODEL).toEqual(fromApp);
+  });
+
+  test("priceOf 真的按 model 定价（写成一口价这条就红）", () => {
+    const { priceOf } = require("../src/config/tokens");
+    for (const t of APP_IMAGE_TIERS) {
+      expect({ id: t.id, cost: priceOf("image", { model: t.model }) }).toEqual({ id: t.id, cost: t.tokens });
+    }
+    // ★ 再钉一条"三个价互不相同"：只有上面那三条逐条断言的话，把实现换成
+    //   「常量恰好等于其中一档」会红两条 —— 而这里要证明的不是"某一档对不对"，
+    //   是"根本有没有读 model"。互不相同是那件事最直接的形状。
+    const distinct = new Set(APP_IMAGE_TIERS.map((t) => priceOf("image", { model: t.model })));
+    expect(distinct.size).toBe(APP_IMAGE_TIERS.length);
+  });
+
+  test("档位越高越贵（顺序倒挂 = 用户为更好的图付更少，账单我们自己吃）", () => {
+    const { priceOf } = require("../src/config/tokens");
+    const costs = APP_IMAGE_TIERS.map((t) => priceOf("image", { model: t.model }));
+    expect(costs).toEqual([...costs].sort((a, b) => a - b));
+  });
+
+  test("认不出的出图模型：按最贵档收 + 吼一嗓子，既不白送也不抛", () => {
+    // ★ 三个选项的后果写在 config/tokens.imageTokensOf 的注释里：
+    //   按最便宜收 = 白送且永远没人发现；throw = billedForward 变 500，出图整条全挂；
+    //   按最贵收 = 少收是隐形的、多收当天就被投诉，方向选对了。
+    const { priceOf, IMAGE_TOKENS_BY_MODEL } = require("../src/config/tokens");
+    const max = Math.max(...Object.values(IMAGE_TOKENS_BY_MODEL));
+    const min = Math.min(...Object.values(IMAGE_TOKENS_BY_MODEL));
+    const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(priceOf("image", { model: "doubao-seedream-9-9-999999" })).toBe(max);
+      expect(priceOf("image", {})).toBe(max);
+      // ★ model 是用户可控的字符串：拿普通对象查表时 `constructor`/`toString` 会顺着
+      //   原型链返回一个**函数**，那个"价格"交给 Mongo 的 $inc 就是 500。查价表用 Map。
+      expect(priceOf("image", { model: "constructor" })).toBe(max);
+      expect(priceOf("image", { model: "toString" })).toBe(max);
+      expect(max).toBeGreaterThan(min); // 兜底值确实是"最贵"而不是碰巧
+      // 兜底必须留痕（铁律八）：静默兜底 = 有人扩了白名单忘了定价，而没人会知道
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("三档的出图模型都在册（漏一行的症状是这一档永远 400）", async () => {
+    // 白名单是私有常量，所以从行为上验：501 = 已经走到 forward，说明在册与扣费都过了。
+    for (const t of APP_IMAGE_TIERS) {
+      const res = await request(app)
+        .post("/api/ark/images/generations")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send({ model: t.model, prompt: "x" });
+      expect({ id: t.id, status: res.status }).toEqual({ id: t.id, status: 501 });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled(); // 501 在发请求之前返回
+  });
+
+  test("老客户端的出图模型仍在册且按老价收（已装机的 APK 改不了 model）", async () => {
+    // ★ 把它从白名单里删掉不是"降级"，是那批用户**出图整条全挂 400**：补设定帧 /
+    //   三套方案的首尾帧 / AI 封面全走这条路，而客户端把 400 当敏感词处理，连重试都没有。
+    const { priceOf } = require("../src/config/tokens");
+    const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 有价，且是**老包自己报的那个价** —— 这次改价对老用户必须是零影响。
+      // 落到"认不出"的兜底上就是老客户端被按顶档多扣 3 倍（40,000 vs 报价 13,300）。
+      expect(priceOf("image", { model: LEGACY_IMAGE_MODEL })).toBe(LEGACY_IMAGE_TOKENS);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    const res = await request(app)
+      .post("/api/ark/images/generations")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send({ model: LEGACY_IMAGE_MODEL, prompt: "x" });
+    expect(res.status).toBe(501);
+  });
+});
+
 describe("健康端点", () => {
   test("不需要登录，且只说配没配、不泄露 key", async () => {
     const res = await request(app).get("/api/ark/health").expect(200);

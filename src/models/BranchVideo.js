@@ -93,6 +93,38 @@ const pricingSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 平台下架（管理员操作）。
+//
+// ★★ **不复用 visibility**：那是**作者自己的开关**，作者随时能 PATCH 回 public
+//   （updateVideo 只校验"是不是作者"）。下架必须是作者**改不动**的，
+//   所以它是另一个字段，而且全仓只有 admin 那两条端点写得动它。
+//   （updateBody 那份 zod 是 z.object，未声明字段一律 strip —— 作者就算在 PATCH 里
+//    塞一个 takedown 也到不了 controller。这次是 strip 帮了忙，但它是**第二道**，
+//    第一道是"这个字段压根不在 updateBody 里"。tests/branchAdmin.spec.js 钉住了。）
+//
+// ★ 状态用「这个子文档在不在」表示，不另加一个 takenDown 布尔：
+//   布尔 + 三个平行字段会长出"布尔是 true 但没有原因"的半状态，
+//   而查询条件也就得跟着判两处。撤销下架一律 `$unset` 把整个子文档删掉 ——
+//   写成 `takedown: null` 的话 `$exists` 仍然为真，作品会永远出不来，且一个错都不报。
+//   （正因如此，controller 里的库内判据用的是 **`takedown.at`** 这条路径而不是
+//    `takedown` 本身：null 的 `takedown.at` 判为"没下架"，坏数据的失败方向是
+//    "作品还在"而不是"作品永远消失"。）
+//
+// ★ 三样都要记，各有各的用处：
+//   by     —— 事后追责/申诉时找得到人（**不回给作者**，见 controller 的 toVideoPayload）
+//   at     —— 申诉时效、后台按时间倒序列出
+//   reason —— **作者会看到这句话**。凭空消失比下架更糟：用户只会以为系统吞了他的作品，
+//             然后原样再发一遍。所以端点上 reason 是必填的。
+const takedownSchema = new mongoose.Schema(
+  {
+    by: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    at: { type: Date, required: true },
+    // 给人读的一句话，不是自由文本存储，所以给上限
+    reason: { type: String, default: "", trim: true, maxlength: 500 },
+  },
+  { _id: false }
+);
+
 const branchVideoSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -106,6 +138,9 @@ const branchVideoSchema = new mongoose.Schema(
     // 可见性。★ 查询一律用 { visibility: { $ne: "private" } } 而不是 { visibility: "public" }：
     // 这个字段是后加的，**存量作品没有它**，按等值查会把所有老作品从首页上抹掉。
     visibility: { type: String, enum: ["public", "private"], default: "public" },
+    // 平台下架。★ 不给 default：绝大多数作品**没有**这个字段，给 default 会让
+    // 每一条老作品都凭空多出一个空的下架记录（同 pricing / aspect 那两处的理由）。
+    takedown: { type: takedownSchema, default: undefined },
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     plays: { type: Number, default: 0, min: 0 },
     likes: { type: Number, default: 0, min: 0 },
@@ -129,5 +164,13 @@ branchVideoSchema.index({ category: 1, createdAt: -1 });
 branchVideoSchema.index({ createdAt: -1 });
 // 公开流现在每条查询都带 visibility 条件，给它一条能整条走索引的复合索引
 branchVideoSchema.index({ visibility: 1, createdAt: -1, _id: -1 });
+// 后台「下架列表」用。★ partial 索引：全站绝大多数作品没有这个字段，
+// 建全量索引等于给一张几乎全空的列建一棵树。条件与 controller 的 TAKEN_DOWN
+// **逐字相同**（`takedown.at` 是 date）——不同的话这条索引就永远用不上，
+// 而且不会有任何报错，只是查询慢慢地变成全表扫。
+branchVideoSchema.index(
+  { "takedown.at": -1 },
+  { partialFilterExpression: { "takedown.at": { $type: "date" } } }
+);
 
 module.exports = mongoose.model("BranchVideo", branchVideoSchema);

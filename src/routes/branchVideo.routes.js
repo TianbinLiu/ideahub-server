@@ -31,7 +31,13 @@ router.post("/videos", requireAuth, validate({ body: publishBody }), createVideo
 router.get("/videos/:id", optionalAuth, getVideo);
 // 作品编辑：只改标题/简介/分区/可见性。片段与卡组不可改（发布即定稿）
 router.patch("/videos/:id", requireAuth, validate({ body: updateBody }), updateVideo);
+// 删作品：作者本人 或 管理员（判据在 controller 的 assertCanDelete 一处）
 router.delete("/videos/:id", requireAuth, removeVideo);
+
+// ★ 管理端（下架 / 撤销 / 下架列表 / 平台统计）**不在这个文件里**：
+//   它们挂在 `/api/admin/branch`（routes/branchAdmin.routes.js），
+//   与举报那条线的 `/api/admin/branch/reports` 同一个前缀，后台只用记一个 base。
+//   ⚠ 别在这里再开一条"顺手的"管理路径 —— 同一件事两条路径，迟早有一条被改漏。
 
 // 播放计数保持匿名可调（未登录也要能看视频），但必须限频：
 // 这是个无鉴权的 $inc，不限的话一个循环就能把任意视频刷到榜首。

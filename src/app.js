@@ -126,6 +126,18 @@ app.use("/api/auth", oauthRoutes);
 app.use("/api/me", meRoutes);
 app.use("/api/company", companyRoutes);
 app.use("/api/notifications", notificationsRoutes);
+// 举报（视频 / 评论 / 弹幕）。两个入口、一份实现（见 routes/report.routes.js）：
+// 用户提交挂在 /api/branch 下，管理端的列队与处理挂在既有的 /api/admin 门后面。
+// ★ 管理端这条**必须排在 `app.use("/api/admin", adminRoutes)` 之前**：admin.routes.js
+//   开头就是 `router.use(requireAuth, requireRole)`，排在它后面的话每个请求会白白
+//   多做一次 requireAuth（多一次 User.findById），行为一样但平白多一趟库。
+const reportRoutes = require("./routes/report.routes");
+app.use("/api/admin/branch/reports", reportRoutes.adminRouter);
+app.use("/api/branch/reports", reportRoutes.publicRouter);
+// 分支视频的其余管理端：下架 / 撤销下架 / 下架列表 / 平台统计。
+// ★ 与上面那条同一个 base（`/api/admin/branch`），后台控制台只用记一个前缀；
+//   同样必须排在 `app.use("/api/admin", adminRoutes)` **之前**，理由与上面逐字相同。
+app.use("/api/admin/branch", require("./routes/branchAdmin.routes"));
 app.use("/api/admin", adminRoutes);
 app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
 app.use("/api/tag-rank", tagRankRoutes);

@@ -17,6 +17,8 @@ const BranchDanmaku = require("../models/BranchDanmaku");
 // **写入一律走 service**（createNotification），别在这里 create。
 const Notification = require("../models/Notification");
 const Follow = require("../models/Follow");
+// 平台统计只用它数人头（countDocuments），不读任何字段
+const User = require("../models/User");
 const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
@@ -30,6 +32,9 @@ const { parseMentionsWithSpans } = require("../utils/mentionParser");
 // 拉黑关系的权威判据。★ 全仓统一走它：messages.controller 用它拒私信、
 // users.controller 用它把拉黑对象从搜索结果里滤掉，通知这条路也必须认同一份判断。
 const { hasAnyBlockBetween } = require("../utils/blocking");
+// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）。这里三个用途：
+// 删除授权（assertCanDelete）、按 id 直取时越过可见性（assertVisible）、后台端点。
+const { isAdmin } = require("../utils/roles");
 
 const AUTHOR_FIELDS = "_id username displayName avatarUrl";
 // 评论里 @ 到的人。★ 与 AUTHOR_FIELDS 同一组字段：提及在客户端也是渲染成
@@ -334,6 +339,19 @@ function toVideoPayload(doc, ctx = {}) {
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
+  // 下架信息：**有这个键就是被下架了**，没有就是正常（与 pricing / deck 同一种给法）。
+  // 能读到这条作品的只剩作者本人与管理员（readableBy），所以带上它是安全的，
+  // 而且是必须的 —— 作者要看得见"为什么没了"。
+  // ★ 刻意**不回 `by`**（除非是后台自己在看）：作者知道被下架了、为什么，就够了。
+  //   把"具体是哪个管理员干的"透给用户，等于把审核员摆到被骚扰的位置上；
+  //   库里存着，后台查得到，追责不受影响。
+  if (isTakenDown(doc)) {
+    payload.takedown = {
+      at: doc.takedown.at,
+      reason: doc.takedown.reason || "",
+      ...(ctx.admin ? { by: doc.takedown.by } : {}),
+    };
+  }
   const tree = toBranchTreePayload(doc.branchTree);
   if (tree) payload.branchTree = tree;
   if (doc.deck && Array.isArray(doc.deck.cards) && doc.deck.cards.length) payload.deck = doc.deck;
@@ -467,20 +485,84 @@ function ownedBy(doc, user) {
 }
 
 /**
- * 仅自己可见的作品：除作者本人外谁都不该看到。
+ * 「这次删除放不放行」的**唯一**判据（铁律六）。三条删除端点共用：
+ *   删作品   removeVideo   —— 主人只有作品作者
+ *   删评论   removeComment —— 主人有两个：评论作者、作品作者
+ *   删弹幕   removeDanmaku —— 同上：弹幕作者、作品作者
  *
- * ★ 用 `!== "private"` 判而不是 `=== "public"`：字段是后加的，**存量作品这一项是
- *   undefined**，按等值判会把库里所有老作品判成不可见（表现是首页突然空了）。
- *   同一条规则在 listVideos 的 Mongo 查询里是 `{ visibility: { $ne: "private" } }`
- *   ——改一处必须改另一处（铁律六）。
+ * ★ 为什么收成一个函数而不是在每处写 `if (isOwner || isAdmin) ... else forbidden`：
+ *   那样"管理员算不算主人"这件事就有了三份实现。以后加第四条删除端点（比如删卡片）
+ *   会**忘掉管理员**，而忘了不报错 —— 表现是"后台清不掉这一类内容"，
+ *   要等到有人真的举报了才会发现。反方向更糟：某天把 isAdmin 写成 `role === "Admin"`
+ *   之类，也只会在其中一处生效。
+ *
+ * ★ 返回**是谁批准的**而不是 true/false：调用方要靠它决定"要不要留一条管理员操作日志"。
+ *   管理员删别人的东西是不可逆的越权操作，日志里必须留下痕迹（铁律八）。
+ *
+ * ★ 无权时抛 403 而不是 404：能走到这一步说明请求者本来就看得见这条内容
+ *   （前面已经过了 assertVisible），403 一个字节的新信息都没多给。
+ *   ⚠ 但**错误文案里不许带上主人是谁** —— 弹幕那条尤其致命，见 removeDanmaku。
+ *
+ * @param {{_id: any, role?: string}} user 当前用户
+ * @param {...any} owners 这次删除涉及的全部"主人"（ObjectId / 已 populate 的对象 / undefined）
+ * @returns {"owner"|"admin"} 授权来源
  */
-function visibleTo(doc, user) {
-  return doc?.visibility !== "private" || ownedBy(doc, user);
+function assertCanDelete(user, ...owners) {
+  for (const owner of owners) {
+    if (!owner) continue;
+    if (String(owner._id || owner) === String(user._id)) return "owner";
+  }
+  // ★ 管理员判在最后：本人删自己的东西是常态，不该被记成一条管理员操作日志。
+  if (isAdmin(user)) return "admin";
+  return forbidden("Forbidden"); // forbidden 是 throw，这行只为让返回类型显式
 }
 
-/** 列表用的可见性条件：公开的 + 自己的（未登录就只有公开的） */
-function visibilityFilter(user) {
-  const open = { visibility: { $ne: "private" } };
+/**
+ * 「已下架」的**库内**判据。全仓只有这一对（铁律六）：列表过滤、后台列表、统计计数
+ * 三处共用，模型里那条 partial 索引的条件也与 TAKEN_DOWN 逐字相同。
+ *
+ * ★ 判的是 **`takedown.at`** 而不是 `takedown` 本身。撤销下架走 `$unset`（整个子文档
+ *   删掉），但万一哪天有人写成了 `takedown: null`，`{takedown:{$exists:true}}` 会判成
+ *   "已下架" —— 那条作品就**永远**出不来了，而且一个错都不报。走 dot 路径的话
+ *   null 的 `takedown.at` 判为"没下架"，坏数据的失败方向是"作品还在"，比"作品消失"轻得多。
+ */
+const TAKEN_DOWN = { "takedown.at": { $type: "date" } };
+const NOT_TAKEN_DOWN = { "takedown.at": { $exists: false } };
+
+/** 文档侧的同一条判据。⚠ 调用前确认 select 里带了 takedown，否则恒为 false（见 addComment） */
+function isTakenDown(doc) {
+  return !!(doc && doc.takedown && doc.takedown.at);
+}
+
+/**
+ * 一条作品「谁读得到」的**唯一**判据，两条规则合在一起：
+ *
+ *   ① 可见性（作者自己的开关）：private 只有作者本人看得到。
+ *      ★ 用 `!== "private"` 判而不是 `=== "public"`：字段是后加的，**存量作品这一项是
+ *        undefined**，按等值判会把库里所有老作品判成不可见（表现是首页突然空了）。
+ *   ② 下架（平台的开关）：被管理员下架的作品对所有人隐藏 —— **作者除外**。
+ *      ★★ 作者必须看得见，而且看得见原因（toVideoPayload 会带上 takedown.reason）。
+ *        直接从作者眼前抹掉比下架更糟：他只会以为系统吞了自己的作品，
+ *        然后原样再发一遍，我们再下架一次，谁都不知道发生了什么。
+ *
+ * ★ 管理员在这里**能**越权 —— 但只在"按 id 直取"这条路上（getVideo / assertVisible）。
+ *   列表那条路（readableFilter）**不给**：管理员刷首页、搜索时看到的应该和普通人一样，
+ *   否则全站的私密作品会静静地躺在他的推荐流里。要审一条具体的作品就按 id 打开它。
+ * ★ 传进来的 user 可能是"半个用户"（addComment 的提及闸门构造的是 `{_id: userId}`，
+ *   没有 role）—— isAdmin 那时返回 false，方向是对的：拿不准就少给权限。
+ */
+function readableBy(doc, user) {
+  if (ownedBy(doc, user) || isAdmin(user)) return true;
+  return doc?.visibility !== "private" && !isTakenDown(doc);
+}
+
+/**
+ * 列表用的可读条件：公开且未下架的 + 自己的（未登录就只有前者）。
+ * ★ 与 readableBy 是同一条规则的两种写法（一份给 Mongo，一份给已经取出来的文档），
+ *   改一处必须改另一处。管理员在这里**不**越权，理由见 readableBy。
+ */
+function readableFilter(user) {
+  const open = { visibility: { $ne: "private" }, ...NOT_TAKEN_DOWN };
   return user ? { $or: [open, { author: user._id }] } : open;
 }
 
@@ -655,11 +737,13 @@ async function listVideos(req, res, next) {
     //   feed=following 时 filter.author 已经是 `{$in:[...]}` 了，直接赋值会把它覆盖掉
     //   （表现是"关注页按作者筛"变成"全站按作者筛"，静默越权到未关注的人）。
     //   拆成两个分量则天然是交集：既在关注列表里、又是这个作者。
-    // ★★ visibilityFilter 那一项**必须留在这里**：author 只是"筛谁的"，
+    // ★★ readableFilter 那一项**必须留在这里**：author 只是"筛谁的"，
     //   "能不能看"仍然由它决定。所以问别人要作品拿到的是对方的公开作品，
     //   问自己要才连私密的一起给 —— 少了它就是一行代码把所有人的私密作品全泄了。
+    //   被下架的作品也走同一条（首页 / 分区 / 搜索 / 他人主页全部是这一个查询，
+    //   所以"逐处过滤"实际上只有这一处 —— 别在别的地方另加一遍）。
     const range = cursorFilter(cursor);
-    const parts = [filter, visibilityFilter(req.user)];
+    const parts = [filter, readableFilter(req.user)];
     if (authorFilter) parts.push(authorFilter);
     if (range) parts.push(range);
     const query = { $and: parts };
@@ -776,8 +860,9 @@ async function getVideo(req, res, next) {
     const doc = await BranchVideo.findById(id).populate("author", AUTHOR_FIELDS).lean();
     if (!doc) notFound("Video not found");
     // 仅自己可见的作品对别人一律 404 而不是 403：403 等于确认「这个 id 上有东西」，
-    // 拿着链接的人照样能数出作者发了多少条私密作品。
-    if (!visibleTo(doc, req.user)) notFound("Video not found");
+    // 拿着链接的人照样能数出作者发了多少条私密作品。被下架的作品同理
+    // （作者与管理员除外，见 readableBy）。
+    if (!readableBy(doc, req.user)) notFound("Video not found");
 
     const [comments, liked] = await Promise.all([
       BranchComment.find({ video: id })
@@ -825,6 +910,14 @@ async function updateVideo(req, res, next) {
     // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那五个键。
     // ★ cover 的 schema 已经把它限成 http(s) URL（不收 dataURL，见 schemas 里的说明），
     //   所以这里不需要再走 transferImage —— 客户端传上来的就已经是永久地址了。
+    // ★★ 作者**改不动 takedown**，这条现在是一道安全边界，不是顺手的性质：
+    //   updateBody 里根本没有这个键，z.object 默认 strip，`$set: patch` 也就永远
+    //   碰不到它。这是**核对过的**（读了 schemas/branchVideo.schemas.js 的 updateBody），
+    //   不是假设；而且 tests/branchAdmin.spec.js 从外面钉了一条
+    //   「作者 PATCH takedown 无效」的用例 —— 哪天有人给 updateBody 加个 .loose()
+    //   或者把 takedown 声明进去，那条会红。
+    //   ⚠ 这里**刻意不再写一遍 `delete patch.takedown`**：同一条规则写两处，
+    //     以后只会有人改一处（铁律六）。真正的门在 schema 上。
     const patch = req.body;
     const updated = await BranchVideo.findByIdAndUpdate(id, { $set: patch }, { returnDocument: "after" })
       .populate("author", AUTHOR_FIELDS)
@@ -839,38 +932,68 @@ async function updateVideo(req, res, next) {
   }
 }
 
-// DELETE /api/branch/videos/:id
+/**
+ * DELETE /api/branch/videos/:id —— 硬删除，**不可逆**。
+ *
+ * ★ 两种人能删：作者本人、管理员（授权判据只有 assertCanDelete 一处）。
+ *   这是管理员手里"不可逆"的那一档，可逆的那一档是下架（takedownVideo）——
+ *   两档都要有：违规内容要能永久清掉，误判/申诉成立要能原样恢复。
+ *   拿不准就先下架，删除没有后悔药（级联删掉的评论、弹幕、通知都回不来）。
+ */
 async function removeVideo(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    const doc = await BranchVideo.findById(id).select("_id author").lean();
+    // ★ 这里刻意**不过 assertVisible**：删自己的私密作品、管理员删一条已经下架的作品，
+    //   都得走这条路。归属判断由 assertCanDelete 负责。
+    const doc = await BranchVideo.findById(id).select("_id author title").lean();
     if (!doc) notFound("Video not found");
-    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+    const by = assertCanDelete(req.user, doc.author);
+    if (by === "admin") {
+      // 管理员删别人的作品是不可逆越权操作，必须留痕（铁律八）
+      console.warn(
+        `[branch] 管理员删除作品 video=${id} title=${String(doc.title || "").slice(0, 40)} ` +
+          `author=${doc.author} admin=${req.user._id}`
+      );
+    }
 
-    // 评论点赞表挂在 comment 上而不是 video 上，所以要先把这条作品的评论 id 捞出来，
-    // 否则删完作品那些 BranchCommentLike 会永远留在库里（谁也再查不到、也删不掉）。
-    const commentIds = (await BranchComment.find({ video: id }).select("_id").lean()).map((c) => c._id);
-
-    await Promise.all([
-      BranchVideo.deleteOne({ _id: id }),
-      BranchLike.deleteMany({ video: id }),
-      BranchComment.deleteMany({ video: id }),
-      commentIds.length ? BranchCommentLike.deleteMany({ comment: { $in: commentIds } }) : Promise.resolve(),
-      // ★ 弹幕也要一起删。漏掉它和上面那条 BranchCommentLike 是**同一个形状**的坑：
-      //   作品没了之后，这些行谁也查不到（列表接口先 assertVisible，作品不存在直接 404）、
-      //   也再删不掉（删弹幕的端点同样要先过作品这一关），就永远躺在库里。
-      BranchDanmaku.deleteMany({ video: id }),
-      // 指向这条作品的通知也一并清掉：点进去只会得到一条"作品不存在"，
-      // 而红点却实实在在地亮着 —— 用户没有任何办法让它消下去。
-      Notification.deleteMany({ videoId: id }),
-    ]);
+    await purgeVideo(id);
 
     res.json({ ok: true });
   } catch (err) {
     next(err);
   }
+}
+
+/**
+ * 硬删一条作品要连带清掉的**五样东西**。少清一样都不报错，只是留下垃圾。
+ *
+ * ★ 提成函数是因为它现在有**两个**调用方：作者/管理员直接删（removeVideo），
+ *   以及举报处理里的 action=delete（services/takedown.service）。
+ *   在那边抄一份的结果一定是漏掉其中一两样，而漏了没有任何症状 ——
+ *   库里只是多出一批谁也查不到、也再删不掉的行（铁律六）。
+ */
+async function purgeVideo(videoId) {
+  // 评论点赞表挂在 comment 上而不是 video 上，所以要先把这条作品的评论 id 捞出来，
+  // 否则删完作品那些 BranchCommentLike 会永远留在库里（谁也再查不到、也删不掉）。
+  const commentIds = (await BranchComment.find({ video: videoId }).select("_id").lean()).map((c) => c._id);
+
+  await Promise.all([
+    BranchVideo.deleteOne({ _id: videoId }),
+    BranchLike.deleteMany({ video: videoId }),
+    BranchComment.deleteMany({ video: videoId }),
+    commentIds.length ? BranchCommentLike.deleteMany({ comment: { $in: commentIds } }) : Promise.resolve(),
+    // ★ 弹幕也要一起删。漏掉它和上面那条 BranchCommentLike 是**同一个形状**的坑：
+    //   作品没了之后，这些行谁也查不到（列表接口先 assertVisible，作品不存在直接 404）、
+    //   也再删不掉（删弹幕的端点同样要先过作品这一关），就永远躺在库里。
+    BranchDanmaku.deleteMany({ video: videoId }),
+    // 指向这条作品的通知也一并清掉：点进去只会得到一条"作品不存在"，
+    // 而红点却实实在在地亮着 —— 用户没有任何办法让它消下去。
+    Notification.deleteMany({ videoId }),
+  ]);
+
+  return { removed: 1 + commentIds.length };
 }
 
 // POST /api/branch/videos/:id/play
@@ -882,7 +1005,7 @@ async function addPlay(req, res, next) {
     // 可见性条件写进**更新的查询条件**里，而不是先查再改：
     // 拆成两步就多一个竞态窗口，而且白白多一次往返。
     const updated = await BranchVideo.findOneAndUpdate(
-      { $and: [{ _id: id }, visibilityFilter(req.user)] },
+      { $and: [{ _id: id }, readableFilter(req.user)] },
       { $inc: { plays: 1 } },
       { returnDocument: "after", select: "plays" }
     ).lean();
@@ -1004,10 +1127,12 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    // ★ 这里必须把 visibility 也 select 出来：下面 @提及的可见性闸门要拿它喂 visibleTo。
-    //   漏掉的表现是 doc.visibility === undefined → `!== "private"` 恒真 → 私密作品里的
-    //   @ 照样把通知发出去（闸门静默失效，且一个错都不报）。
-    const video = await assertVisible(id, req.user, "_id author title visibility");
+    // ★ 这里必须把 visibility **和 takedown** 也 select 出来：下面 @提及的可见性闸门
+    //   要拿它们喂 readableBy。漏掉的表现是 doc.visibility === undefined →
+    //   `!== "private"` 恒真 → 私密作品里的 @ 照样把通知发出去（闸门静默失效，
+    //   且一个错都不报）。takedown 漏了是同一个形状：被下架的作品里 @ 一个人，
+    //   等于告诉他"这里有个你看不见的东西"。
+    const video = await assertVisible(id, req.user, "_id author title visibility takedown");
 
     const parentId = req.body.parentId;
     let parent = null;
@@ -1114,9 +1239,10 @@ async function addComment(req, res, next) {
       // ★★ 可见性闸门：只通知**真的看得见这条作品**的人。
       //   不判的话，在一条私密作品下 @ 某人 = 主动告诉他"这里有个你看不见的东西存在"，
       //   @ 就成了探测私密作品的探针（与 assertVisible / 核对 parent.video 挡的是同一类旁路）。
-      //   复用 visibleTo 这**一处**判断（铁律六），绝不在这里另写一遍 visibility 的条件 ——
+      //   复用 readableBy 这**一处**判断（铁律六），绝不在这里另写一遍 visibility 的条件 ——
       //   另写一遍就意味着以后加"仅粉丝可见"时这里会被忘掉，而且忘了不报错。
-      if (!visibleTo(video, { _id: m.userId })) continue;
+      //   （下架那条规则就是这么白捡的：加进 readableBy 之后这里自动跟上。）
+      if (!readableBy(video, { _id: m.userId })) continue;
       notified.add(uid);
       await notifyBranch("addMention", {
         userId: m.userId,
@@ -1255,8 +1381,9 @@ async function purgeComments(videoId, rootCommentId) {
 /**
  * DELETE /api/branch/videos/:id/comments/:commentId —— 删自己的评论。
  *
- * ★ 两种人能删：**评论作者本人**，以及**作品作者**（自己作品下的内容得能清理，
- *   否则唯一的求助途径是找管理员，而这个 App 没有管理员）。
+ * ★ 三种人能删：**评论作者本人**、**作品作者**（自己作品下的内容得能清理）、
+ *   以及**管理员**（作品作者不作为时的兜底，也是举报处理的落点）。
+ *   判据只有 assertCanDelete 一处 —— 别在这里另写一遍 `isOwner || isAdmin`。
  * ★ 无权时回 403 而不是 404：这条评论对请求者本来就是可见的（他刚在评论区看见它），
  *   403 一个字节的新信息都没多给。反过来，弹幕那条必须小心得多 —— 见 removeDanmaku。
  */
@@ -1268,15 +1395,20 @@ async function removeComment(req, res, next) {
 
     // 可见性先过一道：看不见的作品下的评论对你就是"不存在"（与 loadVisibleComment 同一条规则）。
     // ★ 要 select author：下面判"是不是作品作者"要用它。
+    // ★ 管理员在 assertVisible 里越过可见性，所以已下架/私密作品下的评论他也清理得掉 ——
+    //   否则"下架 + 清评论"这套组合动作会在第二步卡住。
     const video = await assertVisible(id, req.user, "_id author");
 
     const comment = await BranchComment.findById(commentId).select("_id video author").lean();
     // 评论 id 是全局唯一的，只按 id 查就绕开了作品的可见性 —— 必须核对归属（同 loadVisibleComment）
     if (!comment || String(comment.video) !== String(id)) notFound("Comment not found");
 
-    const isCommentAuthor = String(comment.author) === String(req.user._id);
-    const isVideoAuthor = String(video.author) === String(req.user._id);
-    if (!isCommentAuthor && !isVideoAuthor) forbidden("Forbidden");
+    const by = assertCanDelete(req.user, comment.author, video.author);
+    if (by === "admin") {
+      console.warn(
+        `[branch] 管理员删除评论 video=${id} comment=${commentId} author=${comment.author} admin=${req.user._id}`
+      );
+    }
 
     const { removed, commentCount } = await purgeComments(id, comment._id);
     res.json({ ok: true, removed, commentCount });
@@ -1291,11 +1423,17 @@ async function removeComment(req, res, next) {
  * ★ 原来这段在三个函数里各写了一遍，加弹幕就是第四遍 —— 收成一处（铁律六）。
  * ★ 返回那条 doc（默认只取 _id）：点赞/评论要给**作者**发通知，就得知道作者是谁。
  *   为此再查一次 BranchVideo 等于把可见性判断的入口开成两个，早晚有一边忘了加条件。
+ * ★ 条件写进**查询**而不是取出来再判，除了省一次往返，还挡掉一类静默失效：
+ *   调用方给的 select 里少一列（比如没 select visibility / takedown），
+ *   取出来再判就会把 undefined 当成"可见"，闸门一个错都不报地失效。
+ *
+ * ★★ 管理员在这里越过全部条件。这是**按 id 直取**才有的特权，理由是后台要干三件事：
+ *   审一条被举报的作品、在已下架/私密作品下清理评论与弹幕、以及下架之后还能再看一眼。
+ *   列表那条路（readableFilter）**不给**这个特权 —— 管理员刷首页不该看到全站的私密作品。
  */
 async function assertVisible(id, user, select = "_id") {
-  const doc = await BranchVideo.findOne({ $and: [{ _id: id }, visibilityFilter(user)] })
-    .select(select)
-    .lean();
+  const filter = isAdmin(user) ? { _id: id } : { $and: [{ _id: id }, readableFilter(user)] };
+  const doc = await BranchVideo.findOne(filter).select(select).lean();
   if (!doc) notFound("Video not found");
   return doc;
 }
@@ -1368,7 +1506,8 @@ async function addDanmaku(req, res, next) {
 /**
  * DELETE /api/branch/videos/:id/danmaku/:danmakuId —— 删自己的弹幕。
  *
- * ★ 能删的两种人与评论一致：**弹幕作者本人** 或 **作品作者**。
+ * ★ 能删的三种人与评论一致：**弹幕作者本人**、**作品作者**、**管理员**
+ *   （判据同样只有 assertCanDelete 一处）。
  *
  * ★★ 回包与错误文案**一个字都不许透出作者是谁**（契约里写死了弹幕对外只有一个 `mine`
  *   布尔）。挂上作者，一条作品的弹幕墙就成了"谁在什么时间看了这个视频"的公开记录 ——
@@ -1393,14 +1532,211 @@ async function removeDanmaku(req, res, next) {
     const danmaku = await BranchDanmaku.findOne({ _id: danmakuId, video: id }).select("_id author").lean();
     if (!danmaku) notFound("Danmaku not found");
 
-    const isDanmakuAuthor = String(danmaku.author) === String(req.user._id);
-    const isVideoAuthor = String(video.author) === String(req.user._id);
-    if (!isDanmakuAuthor && !isVideoAuthor) forbidden("Forbidden");
+    // ⚠ assertCanDelete 抛的是不带任何主人信息的 `Forbidden` —— 这条端点必须如此
+    //   （回一句"这条属于 xxx"就等于给整面弹幕墙开了逐条查作者的接口）。
+    const by = assertCanDelete(req.user, danmaku.author, video.author);
+    if (by === "admin") {
+      // ★ 日志里可以写作者是谁：日志是我们自己看的，回包才是对外的。两者不要混为一谈。
+      console.warn(
+        `[branch] 管理员删除弹幕 video=${id} danmaku=${danmakuId} author=${danmaku.author} admin=${req.user._id}`
+      );
+    }
 
     await BranchDanmaku.deleteOne({ _id: danmaku._id });
     // 弹幕不发通知（契约「通知」一节），所以没有指向它的收件箱记录要清 ——
     // 这不是遗漏：发通知等于把匿名的弹幕去匿名化。
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── 管理端点（全部要求 role=admin，门在路由上）──────────────────────────
+//
+// ★★ 为什么下架是**另一个字段**而不是把 visibility 改成 private：
+//   visibility 是作者自己的开关，`updateVideo` 只校验"是不是作者" —— 作者一个 PATCH
+//   就能把自己改回 public。用它当下架等于给了被下架的人一个"撤销下架"按钮。
+//   （而且语义也不对：private 的意思是"仅作者可见"，作者照样看得见，
+//    首页少了一条对他来说毫无解释。）
+//
+// ★ 这几条挂在 **/api/admin/branch**（routes/branchAdmin.routes.js），
+//   与举报那条线的 /api/admin/branch/reports 同一个前缀 —— 后台控制台只用记一个 base。
+//   ⚠ 硬删除**不在这里另开一条**：DELETE /api/branch/videos/:id 已经放行管理员了
+//     （assertCanDelete 一处判据）。同一件事两条路径，迟早有一条被改漏。
+
+/** 下架原因的长度上限。与模型里 takedownSchema.reason 的 maxlength 同一个数（铁律六） */
+const TAKEDOWN_REASON_MAX = 500;
+
+/**
+ * 下架/撤销下架的**唯一写入点**。两个调用方：
+ *   ① 管理端点 takedownVideo / revokeTakedown（本文件）
+ *   ② 举报处理 action=takedown（services/takedown.service → report.controller）
+ * ★ 在②那边另写一遍 `$set: { takedown: ... }` 的话，字段形状迟早分叉
+ *   （比如漏了 at，于是那条作品在"已下架"的判据下反而是可见的 —— 还不报错）。
+ *
+ * @param {boolean} on true = 下架；false = 撤销
+ * @returns {Promise<object|null>} 更新后的文档（已 populate 作者）；作品不存在 → null
+ */
+async function applyTakedown(videoId, { by, reason = "", on = true } = {}) {
+  // ★ 撤销必须 $unset（整个子文档删掉），不能 $set null —— 理由见 TAKEN_DOWN 的说明
+  const update = on
+    ? { $set: { takedown: { by, at: new Date(), reason: String(reason).slice(0, TAKEDOWN_REASON_MAX) } } }
+    : { $unset: { takedown: "" } };
+  return BranchVideo.findByIdAndUpdate(videoId, update, { returnDocument: "after" })
+    .populate("author", AUTHOR_FIELDS)
+    .lean();
+}
+
+/**
+ * POST /api/admin/branch/videos/:id/takedown —— 下架一条作品（可逆）。
+ *
+ * ★ reason **必填**。作者会看到这句话；空原因等于"你的作品消失了，不告诉你为什么"，
+ *   用户唯一的下一步就是原样再发一遍。
+ * ★ 重复下架不报错，只是把 by/at/reason 覆盖成最新的一次 —— 后台重复点、
+ *   或者换个原因重下，都不该失败。
+ * ★ body 的校验放在这里而不是 schemas/branchVideo.schemas.js：这条端点只有一个短字符串
+ *   要判，也不走 validate 中间件（列表 query 同理，见 listVideos）。
+ *   要收进那份 schema 就把这一整段挪过去，别在两边各留一份（铁律六）。
+ */
+async function takedownVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const reason = String(req.body?.reason ?? "").trim();
+    if (!reason) badRequest("reason is required");
+    if (reason.length > TAKEDOWN_REASON_MAX) badRequest(`reason too long (max ${TAKEDOWN_REASON_MAX})`);
+
+    const updated = await applyTakedown(id, { by: req.user._id, reason, on: true });
+    if (!updated) notFound("Video not found");
+
+    console.warn(
+      `[branch] 管理员下架作品 video=${id} author=${updated.author?._id || updated.author} ` +
+        `admin=${req.user._id} reason=${reason.slice(0, 80)}`
+    );
+
+    res.json({ ok: true, video: toVideoPayload(updated, { isOwner: ownedBy(updated, req.user), admin: true }) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * DELETE /api/admin/branch/videos/:id/takedown —— 撤销下架。
+ *
+ * ★★ 必须用 `$unset` 把整个子文档删掉，**不能** `$set: { takedown: null }`：
+ *   过滤条件判的是 `takedown.at` 存不存在，写成 null 时这条恰好也判成"没下架"、
+ *   看起来能用 —— 但库里会留下一堆半截记录，partial 索引也认不出它们。
+ *   一个字段只有两种状态：有，或者没有。
+ * ★ 对一条本来就没下架的作品调这个端点：直接成功（幂等）。回 404/400 只会让
+ *   后台在"到底下没下"这件事上多一轮往返，而结果是一样的。
+ */
+async function revokeTakedown(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+
+    const updated = await applyTakedown(id, { on: false });
+    if (!updated) notFound("Video not found");
+
+    console.warn(`[branch] 管理员撤销下架 video=${id} admin=${req.user._id}`);
+
+    res.json({ ok: true, video: toVideoPayload(updated, { isOwner: ownedBy(updated, req.user), admin: true }) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/admin/branch/takedowns —— 列出当前被下架的作品（最近的在前）。
+ *
+ * ★ 没有这条的话"撤销下架"就是个找不到入口的功能：管理员手里只有一个 videoId
+ *   （从举报里来的），下完架就再也列不出来了 —— 被误下架的作品会永远躺在那儿。
+ * ★ 走 `TAKEN_DOWN` 这一份条件 + 模型里那条 partial 索引，不要在这里另写一遍条件。
+ */
+async function listTakedowns(req, res, next) {
+  try {
+    const raw = Number(req.query.limit);
+    const limit = Number.isFinite(raw) ? Math.max(1, Math.min(50, Math.trunc(raw))) : 20;
+
+    const docs = await BranchVideo.find(TAKEN_DOWN)
+      .sort({ "takedown.at": -1 })
+      .limit(limit)
+      .populate("author", AUTHOR_FIELDS)
+      .lean();
+
+    res.json({ ok: true, items: docs.map((d) => toVideoPayload(d, { admin: true })) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 待处理举报数。举报是**另一条线**的功能（models/Report.js + routes/report.routes.js）。
+ *
+ * ★ 用 try/require + "只吞自己不存在"：那条线还没落地的部署上（或者以后有人把它拆走），
+ *   裸 require 会抛 MODULE_NOT_FOUND 把整个统计端点炸成 500 —— 一个不在的功能
+ *   不该让已经上线的看板打不开。同一招用在 branchVideo.routes 引 branchAsset.routes 上。
+ *   ⚠ 只吞"这个模块不存在"，模块自己内部的报错必须原样抛出去：否则那边写错一行 require，
+ *   表现会变成"举报数永远是 —"，谁也查不到为什么。
+ * ★ 问不到时回 **null 而不是 0**：0 的意思是"没有待处理的举报"，null 的意思是
+ *   "这台服务端没有举报功能"。合成一个数字就是在骗人（铁律八）——
+ *   后台该把 null 画成 "—"，而不是一个让人放心的零。
+ * ★ `status: "pending"` 与 models/Report.js 的 STATUSES 同源（那份枚举里 pending 是
+ *   唯一的"未处理"）。那边改了状态名，这里跟着改**一处**。
+ */
+let ReportModel; // undefined = 还没探测过；null = 探测过、不存在
+function loadReportModel() {
+  if (ReportModel !== undefined) return ReportModel;
+  try {
+    ReportModel = require("../models/Report");
+  } catch (err) {
+    const selfMissing =
+      err && err.code === "MODULE_NOT_FOUND" && /models[\\/]Report/.test(String(err.message || ""));
+    if (!selfMissing) throw err;
+    console.warn("[branch] models/Report 未就绪，平台统计里的待处理举报数将回 null");
+    ReportModel = null;
+  }
+  return ReportModel;
+}
+
+async function pendingReportCount() {
+  const Report = loadReportModel();
+  if (!Report) return null;
+  try {
+    return await Report.countDocuments({ status: "pending" });
+  } catch (err) {
+    // 字段名对不上（比如状态那一档改了名）时不该把整个看板拖垮，但必须留痕
+    console.error("[branch] 待处理举报数查询失败:", err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * GET /api/admin/branch/stats —— 平台数据（最小可用的一屏）。
+ *
+ * ★ 一律 `countDocuments`，绝不 `find().length`：这几张表是会长到百万级的
+ *   （弹幕尤其），把整表捞进内存数一遍会把进程直接顶死，而且是在"后台看一眼数据"
+ *   这种最不该出事的场景下。
+ * ★ 用 countDocuments 而不是 estimatedDocumentCount：后者读的是集合元数据，
+ *   不接受查询条件（takedown 那一项就没法数），而且分片/异常关机后会偏。
+ *   这几张表的量级下，一次带索引的 count 完全够快。
+ */
+async function branchStats(req, res, next) {
+  try {
+    const [users, videos, takenDown, comments, danmaku] = await Promise.all([
+      User.countDocuments({}),
+      BranchVideo.countDocuments({}),
+      BranchVideo.countDocuments(TAKEN_DOWN),
+      BranchComment.countDocuments({}),
+      BranchDanmaku.countDocuments({}),
+    ]);
+    const pendingReports = await pendingReportCount();
+
+    res.json({
+      ok: true,
+      stats: { users, videos, takenDown, comments, danmaku, pendingReports },
+    });
   } catch (err) {
     next(err);
   }
@@ -1412,6 +1748,10 @@ module.exports = {
   getVideo,
   updateVideo,
   removeVideo,
+  takedownVideo,
+  revokeTakedown,
+  listTakedowns,
+  branchStats,
   addPlay,
   likeVideo,
   unlikeVideo,
@@ -1423,6 +1763,11 @@ module.exports = {
   listDanmaku,
   addDanmaku,
   removeDanmaku,
+  // ★ 给 services/takedown.service.js（举报处理那条线的落点）复用的三样。
+  //   下架与清理的实现只有这一份 —— 那边**只调用，不重写**（铁律六）。
+  applyTakedown,
+  purgeVideo,
+  purgeComments,
   // 导出给测试/其它模块复用
   transferDraftAssets,
   isArkVideoUrl,

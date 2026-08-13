@@ -18,7 +18,9 @@ let TokenLedger;
 let walletSvc;
 
 const FREE = 300_000;
-const IMAGE = 13_300;
+/** 默认档（Seedream 4.0，0.20 元/张 ÷ 15 元/M）单图。
+ *  ★ 出图**按 model 计价**，所以这个常量只对下面那条用 4.0 的用例成立，不是"一张图的价"。 */
+const IMAGE = 13_333;
 const CHAT = 400;
 
 let mongoUri;
@@ -153,17 +155,34 @@ describe("扣费口径：先扣 plan 再扣 addon（W1）", () => {
 });
 
 describe("/api/ark 的扣费闸门", () => {
-  test("出图成功：按 IMAGE_TOKENS 扣，响应头带回最新余额", async () => {
+  test("出图成功：按这次用的 model 扣，响应头带回最新余额", async () => {
     const { token, userId } = await registerUser();
     mockArk(200, { data: [{ url: "https://x.volces.com/a.png" }] });
     const res = await request(app)
       .post("/api/ark/images/generations")
       .set(auth(token))
-      .send({ model: "doubao-seedream-5-0-260128", prompt: "x" })
+      .send({ model: "doubao-seedream-4-0-250828", prompt: "x" })
       .expect(200);
     expect(await balanceOf(userId)).toBe(FREE - IMAGE);
     expect(Number(res.headers["x-wallet-plan"])).toBe(FREE - IMAGE);
     expect(Number(res.headers["x-wallet-addon"])).toBe(0);
+  });
+
+  test("出图按档位定价：精绘档确实比速写档贵（写成一口价这条会红）", async () => {
+    // ★ 这条钉的是一个**真实发生过**的缺口：priceOf 拿到了 body 却不读 model，
+    //   顶档按最低档收 —— 用户无感、界面无错、测试全绿，只有火山账单知道。
+    //   跨仓价目表的逐条对照在 arkProxy.spec.js，这里验的是"扣费链路真的用上了它"。
+    const cases = [
+      ["doubao-seedream-4-0-250828", 13_333], // 速写
+      ["doubao-seedream-4-5-251128", 16_667], // 定妆
+      ["doubao-seedream-5-0-pro-260628", 40_000], // 精绘
+    ];
+    for (const [model, cost] of cases) {
+      const { token, userId } = await registerUser();
+      mockArk(200, { data: [{ url: "https://x.volces.com/a.png" }] });
+      await request(app).post("/api/ark/images/generations").set(auth(token)).send({ model, prompt: "x" }).expect(200);
+      expect({ model, spent: FREE - (await balanceOf(userId)) }).toEqual({ model, spent: cost });
+    }
   });
 
   test("视频按时长与档位定价：极速档比标准档便宜", async () => {
