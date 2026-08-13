@@ -91,3 +91,65 @@ describe("App 版本清单", () => {
     expect(res.body.sha256).toBe("abc");
   });
 });
+
+describe("App 下载跳转", () => {
+  // 官网下载页的按钮打的是 /api/app/download。它和 latest.json 的区别只有一个：
+  // **地址里不带版本号**，所以它会被印在海报、二维码、聊天记录里长期流传 ——
+  // 坏了的表现是「按钮点了没反应 / 下到的是旧包」，同样没有人会来报。
+
+  test("B1 302 到清单里的安装包", async () => {
+    fetchMock.mockResolvedValue(ok());
+    const res = await request(freshApp()).get("/api/app/download").expect(302);
+    expect(res.headers.location).toBe(MANIFEST.apkUrl);
+  });
+
+  test("B2 跳转**不许**被缓存住", async () => {
+    // ★ 这条跳转的指向会随发版改变。浏览器或线上那层 Cloudflare 一旦把 302 存下来，
+    //   点过一次的人就被钉死在旧版本上了，而且是静默的。
+    fetchMock.mockResolvedValue(ok());
+    const res = await request(freshApp()).get("/api/app/download").expect(302);
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
+  test("B3 换源开关对下载跳转同样生效", async () => {
+    // 两个端点必须给出同一个地址，否则「页面显示的包」和「点下载拿到的包」会分家
+    fetchMock.mockResolvedValue(ok());
+    const app = freshApp({ APP_APK_BASE: "https://cdn.example.com/app/" });
+    const res = await request(app).get("/api/app/download").expect(302);
+    expect(res.headers.location).toBe("https://cdn.example.com/app/qimeng-9.9.apk");
+  });
+
+  test("B4 和 latest.json 共用同一份缓存，不各拉各的", async () => {
+    // 分开缓存 = 两边可能停在不同版本上：页面写着新版，点下载给的是旧包
+    fetchMock.mockResolvedValue(ok());
+    const app = freshApp();
+    await request(app).get("/api/app/latest.json").expect(200);
+    await request(app).get("/api/app/download").expect(302);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("B5 上游挂了：用旧清单照样能下，不能把人挡在门外", async () => {
+    const app = freshApp();
+    fetchMock.mockResolvedValueOnce(ok());
+    await request(app).get("/api/app/download").expect(302);
+
+    jest.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000); // 缓存已过期
+    fetchMock.mockRejectedValue(new Error("boom"));
+    const res = await request(app).get("/api/app/download").expect(302);
+    expect(res.headers.location).toBe(MANIFEST.apkUrl);
+    Date.now.mockRestore();
+  });
+
+  test("B6 上游挂了且一份缓存都没有：503，不能把人送去一个瞎猜的地址", async () => {
+    fetchMock.mockRejectedValue(new Error("boom"));
+    const res = await request(freshApp()).get("/api/app/download").expect(503);
+    expect(res.body.ok).toBe(false);
+  });
+
+  test("B7 清单里的地址不是 http(s) 就拒绝跳转", async () => {
+    // 匿名端点上的可控跳转 = 开放重定向；这里只挡协议，因为清单是自家发布产物
+    fetchMock.mockResolvedValue(ok({ ...MANIFEST, apkUrl: "javascript:alert(1)" }));
+    const res = await request(freshApp()).get("/api/app/download").expect(502);
+    expect(res.body.code).toBe("BAD_MANIFEST");
+  });
+});
