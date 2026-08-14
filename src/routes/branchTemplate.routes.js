@@ -134,7 +134,11 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     //   在这里都会 404。
     let resource;
     try {
-      resource = await cloudinary.api.resource(own.publicId, { resource_type: "video" });
+      // ★ media_metadata: true 是**必须的**，不是锦上添花：Admin API 对视频默认只回
+      //   width/height/bytes，**不回 duration**（2026-08-14 生产实测——上传回执带时长、
+      //   资源详情却不带，测试的 mock 把这层差异盖住了，第一发真登记就 400）。
+      //   duration 正是 r2v 结算的输入时长，缺它整个登记不成立。
+      resource = await cloudinary.api.resource(own.publicId, { resource_type: "video", media_metadata: true });
     } catch (e) {
       const http = e?.error?.http_code ?? e?.http_code;
       if (http === 404) {

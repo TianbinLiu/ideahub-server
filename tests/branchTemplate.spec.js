@@ -132,7 +132,12 @@ describe("videoUrl 三重白名单（host + 目录 + 归属）", () => {
     // 元数据来自假回执（duration 10 / 720×1280），不是客户端能给的
     expect(tpl.refVideo).toMatchObject({ durationSec: 10, width: 720, height: 1280, bytes: 5_000_000 });
     expect(tpl.refVideo.url).toBe(`${CLOUD_PREFIX}/ideahub/template-videos/${owner.id}-2001.mp4`);
-    expect(resourceSpy).toHaveBeenCalledWith(`ideahub/template-videos/${owner.id}-2001`, { resource_type: "video" });
+    // ★ media_metadata: true 是行为钉子：Admin API 对视频**默认不回 duration**
+    //   （2026-08-14 生产实测，mock 盖不住这层差异）——去掉这个选项登记必炸
+    expect(resourceSpy).toHaveBeenCalledWith(
+      `ideahub/template-videos/${owner.id}-2001`,
+      { resource_type: "video", media_metadata: true },
+    );
   });
 
   test("同一段视频不能登记两个模板（unique 索引 → 409 整句）", async () => {
