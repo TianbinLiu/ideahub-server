@@ -361,3 +361,40 @@ describe("健康端点", () => {
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+describe("r2v 未开放：带 reference_video 的任务一律 400", () => {
+  // ★ 为什么钉这条：priceOf 的 task 分支不读 content，而方舟 2.x 实测接受
+  //   role:"reference_video"（r2v 的计费还要算输入视频时长）。不拦的话任何客户端
+  //   都能发 r2v 任务且按纯任务价结算 —— 能通、少收、账目瞎。白模模板上线时
+  //   这条测试改成"只准已登记模板 URL"，别直接删。
+  test("带 reference_video → 400 R2V_NOT_AVAILABLE，且不出网、不扣费", async () => {
+    const walletSvc = require("../src/services/tokenWallet.service");
+    const before = await walletSvc.getWallet(freeUserId);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send({
+        model: "doubao-seedance-2-0-mini-260615",
+        duration: 5,
+        content: [
+          { type: "text", text: "t" },
+          { type: "video_url", role: "reference_video", video_url: { url: "https://example.com/x.mp4" } },
+        ],
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_AVAILABLE");
+    expect(typeof res.body.message).toBe("string"); // 整句可显示，不是错误码天书
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await walletSvc.getWallet(freeUserId);
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test("不带 reference_video 的任务不受影响（别把正常出片一起拦了）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send({ model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [{ type: "text", text: "t" }] });
+    expect(res.status).toBe(501); // 没配 key 时到 501 = 门都过了、走到 forward
+  });
+});

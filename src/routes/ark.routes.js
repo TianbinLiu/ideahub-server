@@ -248,12 +248,39 @@ const pollLimit = aiRateLimit({ max: 90, scope: "ark-poll" });
  *  不是一口价——写成常量就是"顶档按最低档收费"，零症状白送。见 config/tokens.imageTokensOf */
 router.post("/images/generations", requireAuth, genLimit, billedForward("image", "/images/generations", T_CREATE));
 
+/**
+ * 参考视频生视频（r2v）**暂未开放** —— 在计价能力就位前一律 400 整句拒。
+ *
+ * ★★ 为什么必须拦：`priceOf` 的 task 分支只读 model 与 duration，**完全不读 content**。
+ *   方舟侧 2.0-mini/2.5 已实测接受 `role:"reference_video"`（2026-08-14 探针），
+ *   而 r2v 的官方计费公式是 **(输入视频时长 + 输出时长)×宽×高×帧率/1024** ——
+ *   输入视频的时长计进 token。也就是说不拦的话，任何持 JWT 的客户端今天就能发
+ *   r2v 任务：能通、按纯任务系数结算（输入时长一分不收）、流水 memo（`task <model>`）
+ *   完全看不出来。这不是"功能没做"，是"能白用且账目瞎"。
+ * ★ 400 而不是静默剥掉那个条目：剥掉的话任务照跑、产出却是一段没有参考视频的
+ *   无关视频，钱照收 —— 那是偷换商品（铁律八）。
+ * ★ 白模模板功能上线时，这里换成"只准已登记模板 URL"的注册表校验（见
+ *   docs 里白模模板方案第六章），别直接删。
+ */
+function rejectReferenceVideo(req, res, next) {
+  const content = req.body?.content;
+  if (Array.isArray(content) && content.some((e) => e && e.role === "reference_video")) {
+    return res.status(400).json({
+      ok: false,
+      code: "R2V_NOT_AVAILABLE",
+      message: "参考视频生视频功能还没开放，敬请期待——当前请求未被受理，也没有扣费。",
+    });
+  }
+  next();
+}
+
 /** Seedance 出视频 / Seed3D 建模（同一个异步任务端点）。
  *  两者单价差一个数量级（一段 720p 视频约 216k，一次建模 160k），按 body.model 分别定价 */
 router.post(
   "/contents/generations/tasks",
   requireAuth,
   genLimit,
+  rejectReferenceVideo,
   billedForward("task", "/contents/generations/tasks", T_CREATE),
 );
 
