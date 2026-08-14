@@ -34,7 +34,10 @@ const { assertPublicUrl } = require("../utils/ssrfGuard");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
 const { isAdmin } = require("../utils/roles");
 const wallet = require("../services/tokenWallet.service");
-const { priceOf, paidOnlyDenial, SEEDANCE_2_5, IMAGE_MODELS } = require("../config/tokens");
+const { priceOf, paidOnlyDenial, SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V } = require("../config/tokens");
+// 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
+const BranchTemplate = require("../models/BranchTemplate");
+const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 
 const router = express.Router();
 
@@ -161,8 +164,12 @@ function billedForward(kind, path, timeoutMs) {
       //   漏改任何一半都不会报错，只会静默放行。
       //   代价也确实小：这条路每次都要等方舟几秒到几十秒，一次 Mongo 读可以忽略。
       const before = await wallet.getWallet(req.user._id);
-      const cost = priceOf(kind, req.body);
-      const memo = `${kind} ${model}`;
+      // req.r2v 由 resolveR2v 挂上（只有任务端点有它）：白模出片按登记时长换公式计价。
+      // 定价规则仍只在 config/tokens.js 一处，这里只把解析结果递进去。
+      const cost = priceOf(kind, req.body, req.r2v ?? null);
+      // r2v 的流水 memo 带模板 id：不带的话 `task <model>` 与纯任务一模一样，
+      // 月底对方舟账单时分不出哪些钱是白模花的（B4 对账靠这个标记）
+      const memo = `${kind} ${model}` + (req.r2v ? ` r2v tpl:${req.r2v.templateId}` : "");
 
       // ★ 管理员这一路的 w 保持 before（余额没动）。**不能给 null**：
       //   下面 setWalletHeaders 拿 null 会一个头都不写，App 的钱包镜像就停在
@@ -227,6 +234,25 @@ function billedForward(kind, path, timeoutMs) {
         await wallet.noteAdminFree(req.user._id, cost, `admin ${memo}`, before);
       }
 
+      // r2v 任务被受理 → 落一条试炼追踪 { taskId, templateId, userId }（TTL 48h）。
+      // 轮询看到 succeeded 且发起人就是模板作者时，靠它置 provenAt（发布的前置）——
+      // 服务端两头都自己看见了，不用信客户端一句「我跑通了」。
+      // ★ 落库失败不打断响应（任务已受理、钱已扣，此时 5xx 会让客户端误以为没受理去重试），
+      //   但必须吼：追踪丢了 = 作者这一发试炼白跑，他会看到"出片成功却还是不能发布"。
+      if (accepted && req.r2v) {
+        try {
+          const parsed = JSON.parse(text || "{}");
+          const taskId = String(parsed?.id || "");
+          if (TASK_ID_RE.test(taskId)) {
+            await BranchTemplateTrial.create({ taskId, templateId: req.r2v.templateId, userId: req.user._id });
+          } else {
+            console.error(`[ark] r2v 任务受理但响应里没有可用的任务 id（tpl:${req.r2v.templateId}）`);
+          }
+        } catch (e) {
+          console.error(`[ark] r2v 试炼追踪落库失败 tpl:${req.r2v.templateId}:`, e.message);
+        }
+      }
+
       setWalletHeaders(res, w);
       // 原样透传状态码与 JSON：App 侧对 429（限流退避）与 400（敏感词，不该重试）
       // 有不同的处理，聚合成 502 会把这个区分抹掉。
@@ -249,29 +275,137 @@ const pollLimit = aiRateLimit({ max: 90, scope: "ark-poll" });
 router.post("/images/generations", requireAuth, genLimit, billedForward("image", "/images/generations", T_CREATE));
 
 /**
- * 参考视频生视频（r2v）**暂未开放** —— 在计价能力就位前一律 400 整句拒。
+ * 参考视频生视频（r2v，白模模板）的解析闸门 —— **只准已登记模板的 URL**。
+ * （前身是一律 400 的 rejectReferenceVideo：计价能力就位前的临时钉子，2026-08-14 换成本实现。）
  *
- * ★★ 为什么必须拦：`priceOf` 的 task 分支只读 model 与 duration，**完全不读 content**。
- *   方舟侧 2.0-mini/2.5 已实测接受 `role:"reference_video"`（2026-08-14 探针），
- *   而 r2v 的官方计费公式是 **(输入视频时长 + 输出时长)×宽×高×帧率/1024** ——
- *   输入视频的时长计进 token。也就是说不拦的话，任何持 JWT 的客户端今天就能发
- *   r2v 任务：能通、按纯任务系数结算（输入时长一分不收）、流水 memo（`task <model>`）
- *   完全看不出来。这不是"功能没做"，是"能白用且账目瞎"。
+ * ★★ 为什么必须收窄到注册表：r2v 的官方计费公式是
+ *   **(输入视频时长 + 输出时长)×宽×高×帧率/1024** —— 输入视频的时长计进 token，
+ *   而「输入多长」只能有一个可信来源：服务端建模板时自己从 Cloudinary 登记的
+ *   durationSec（models/BranchTemplate.refVideo）。放任意 URL 的话输入时长没有可信
+ *   来源，要么信客户端报数（等于让用户自己标价）、要么按纯任务价结算（输入一分不收）。
+ *   代价是封死了「拿任意视频二创」这类非模板 r2v —— 有意的范围取舍，放开前必须先
+ *   解决输入时长的可信来源。
+ * ★ 查不到 / 模型不在 R2V 价目表 → 400 整句拒，**绝不静默按纯任务系数（4.7）结算**。
+ *   伪造一个"像模像样"的假 URL 也蹭不到 2.8 的价：查不到登记直接 400，根本到不了扣费。
  * ★ 400 而不是静默剥掉那个条目：剥掉的话任务照跑、产出却是一段没有参考视频的
  *   无关视频，钱照收 —— 那是偷换商品（铁律八）。
- * ★ 白模模板功能上线时，这里换成"只准已登记模板 URL"的注册表校验（见
- *   docs 里白模模板方案第六章），别直接删。
+ * ★ 「这个请求是不是 r2v」只在这里判一次，结论挂在 req.r2v 上 ——
+ *   billedForward 的计价、memo、试炼追踪都只消费这个结论（铁律六）。
  */
-function rejectReferenceVideo(req, res, next) {
-  const content = req.body?.content;
-  if (Array.isArray(content) && content.some((e) => e && e.role === "reference_video")) {
-    return res.status(400).json({
-      ok: false,
-      code: "R2V_NOT_AVAILABLE",
-      message: "参考视频生视频功能还没开放，敬请期待——当前请求未被受理，也没有扣费。",
-    });
+async function resolveR2v(req, res, next) {
+  try {
+    const content = req.body?.content;
+    // ★★ 「是不是 r2v」按**形状**判（type 或 video_url 键任一命中），不按 role 判 ——
+    //   role 是客户端完全可控的字符串：只认 role==="reference_video" 的话，
+    //   去掉 role 的 video_url 条目会整个绕过本闸门、按纯任务 4.7 系数放行
+    //   （输入视频时长一分不收，且流水与纯任务无法区分）。方舟对缺 role 的
+    //   video_url 是拒是收**没有实测过**，而这道闸的意义恰恰是不赌上游行为。
+    //   全 App 没有任何合法的非 r2v video_url 用途，命中即走全套校验。
+    const vids = Array.isArray(content)
+      ? content.filter((e) => e && (e.type === "video_url" || e.video_url !== undefined))
+      : [];
+    if (!vids.length) return next();
+
+    const deny = (message) => res.status(400).json({ ok: false, code: "R2V_NOT_ALLOWED", message });
+
+    // 方舟协议里参考视频就是单条；多条不是我们客户端会拼出的形状，按可疑请求整句拒
+    if (vids.length > 1) {
+      return deny("一次出片只能带一个参考视频——当前请求未被受理，也没有扣费。");
+    }
+    const refs = vids.filter((e) => e.role === "reference_video");
+    if (!refs.length) {
+      // 有 video_url 却不带规范 role：不是我们客户端拼得出的形状，也没法按 r2v 计价
+      return deny("参考视频条目缺少 reference_video 标记——当前请求未被受理，也没有扣费。");
+    }
+
+    const model = String(req.body?.model ?? "");
+    if (VIDEO_MULT_R2V[model] === undefined) {
+      // 模型不在 r2v 价目表：宁可拒单也不落回纯任务价（那是不含视频输入的价，会少收且账目瞎）
+      return deny(`这一档（${model.slice(0, 64) || "未知模型"}）暂不支持参考视频出片——当前请求未被受理，也没有扣费。`);
+    }
+
+    const url = String(refs[0]?.video_url?.url || "").slice(0, 2000);
+    // 反查登记（refVideo.url 是 unique 索引，等值匹配服务端规范化过的 secure_url）
+    const tpl = url
+      ? await BranchTemplate.findOne({ "refVideo.url": url }).select("_id ownerId status refVideo.durationSec").lean()
+      : null;
+    if (!tpl) {
+      return deny("参考视频必须先登记为白模模板（且地址与登记完全一致）——当前请求未被受理，也没有扣费。");
+    }
+    // blocked = 平台已下架：继续可用的话「事后治理」就没有牙齿
+    if (tpl.status === "blocked") {
+      return deny("这个白模模板已被平台下架，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+    }
+    // 未发布的模板只有作者本人能用（那正是发布前的「试炼」一步）；
+    // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现
+    if (tpl.status !== "published" && String(tpl.ownerId) !== String(req.user._id)) {
+      return deny("这个白模模板还没有发布，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+    }
+
+    // ★★ 把 r2v 的**生成参数钉死在计价假设上**，不符整句 400。
+    //   计价是 (登记时长×2)×720p×24fps（tokens.r2vTokens），成立的前提是
+    //   edit 子任务 + duration:-1（输出≈输入）+ 720p —— 这三件只有客户端
+    //   BLOCKOUT_TASK 在遵守，而代理是原样转发的：不在这里钉，改一行客户端
+    //   就能按 4s 模板的价买 30s/1080p 的产出（reference 子任务 duration 自由、
+    //   -1 会推到 30s 上界，A7 实测），差额全进我们的方舟账单，memo 还与正常
+    //   r2v 一模一样，零症状。「不信客户端报的任何数」在这条路上就是这四行。
+    const dur = req.body?.duration;
+    if (req.body?.omni_reference_task_type !== "edit") {
+      return deny("白模出片只支持 edit 参考子任务——当前请求未被受理，也没有扣费。");
+    }
+    if (dur !== undefined && dur !== -1) {
+      return deny("白模出片的时长跟随模板视频（duration 只能是 -1）——当前请求未被受理，也没有扣费。");
+    }
+    const resl = req.body?.resolution;
+    if (resl !== undefined && resl !== "720p") {
+      return deny("白模出片目前只支持 720p——当前请求未被受理，也没有扣费。");
+    }
+    const ratio = req.body?.ratio;
+    if (ratio !== undefined && ratio !== "adaptive") {
+      return deny("白模出片的画幅跟随模板视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
+    }
+
+    req.r2v = {
+      templateId: String(tpl._id),
+      ownerId: String(tpl.ownerId),
+      // ★ 计价的输入时长只从服务端登记值读（建模板时从 Cloudinary 写入的那份），
+      //   请求体里客户端说什么都不作数
+      durationSec: Number(tpl.refVideo?.durationSec),
+    };
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
+}
+
+/**
+ * 轮询响应的试炼闸挂钩：r2v 任务 succeeded 且发起人就是模板作者 → 置 provenAt。
+ * 证据链两头都在服务端（受理时的追踪记录 + 方舟自己吐的 succeeded），
+ * 轮询者是谁无关紧要 —— 追踪里记的是**创建任务**的人。
+ * ★ 任何失败都不打断轮询响应（出片进行中的用户不该因为我们的记账问题看到报错），
+ *   但要吼出来：吞掉的话作者会遇到"出片成功却还是不能发布"，查无可查（铁律八）。
+ */
+async function noteR2vOutcome(taskId, text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text || "{}");
+  } catch {
+    return; // 上游给的不是 JSON —— 轮询端点会原样透传，这里不掺和
+  }
+  if (parsed?.status !== "succeeded") return;
+  try {
+    const trial = await BranchTemplateTrial.findOne({ taskId }).lean();
+    if (!trial) return; // 非 r2v 任务（绝大多数轮询），零额外开销地走人
+    const tpl = await BranchTemplate.findById(trial.templateId).select("ownerId provenAt").lean();
+    if (tpl && !tpl.provenAt && String(trial.userId) === String(tpl.ownerId)) {
+      await BranchTemplate.updateOne({ _id: tpl._id, provenAt: null }, { $set: { provenAt: new Date() } });
+      console.log(`[ark] 白模模板试炼通过 tpl:${trial.templateId} task:${taskId}`);
+    }
+    // 任务已出结果，追踪的使命结束（TTL 只是兜底）；消费者的任务同样清掉
+    await BranchTemplateTrial.deleteOne({ taskId });
+  } catch (e) {
+    console.error(`[ark] r2v 试炼记录处理失败 task=${taskId}:`, e.message);
+  }
 }
 
 /** Seedance 出视频 / Seed3D 建模（同一个异步任务端点）。
@@ -280,7 +414,7 @@ router.post(
   "/contents/generations/tasks",
   requireAuth,
   genLimit,
-  rejectReferenceVideo,
+  resolveR2v,
   billedForward("task", "/contents/generations/tasks", T_CREATE),
 );
 
@@ -291,6 +425,9 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
   try {
     if (!TASK_ID_RE.test(req.params.id)) return res.status(400).json({ ok: false, message: "bad task id" });
     const { status, text } = await callArk(req, `/contents/generations/tasks/${req.params.id}`, T_POLL);
+    // 白模模板的试炼闸：succeeded 的 r2v 任务在这里被看见（只有 status 为 succeeded 的
+    // 响应才会碰库，running/queued 的高频轮询零额外开销）。失败只吼不打断轮询。
+    if (status === 200) await noteR2vOutcome(req.params.id, text);
     return res.status(status).type("application/json").send(text || "{}");
   } catch (err) {
     return next(err);

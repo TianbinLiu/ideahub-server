@@ -211,11 +211,72 @@ function segTokens(durationSec, model) {
   return Math.round(base * (VIDEO_MULT[model] ?? 1));
 }
 
+// ── r2v（参考视频生视频 / 白模模板）─────────────────────────────────
+//
+// 计费公式已**逐 token 实测钉死**（2026-08-14 A3 两发账单，分毫不差）：
+//   raw = (输入视频时长 + 输出时长) × 输出宽 × 输出高 × fps ÷ 1024
+// 输出是 720p 档（16:9 给 1280×720=921,600px；自适应给 1266×728=921,648px，
+// 都是 92 万 px 级）、fps=24 ⇒ 每秒 21,600 raw token。
+
+/** r2v 每秒 raw token（720p 档 92 万 px × 24fps ÷ 1024）。上面公式的落点 */
+const R2V_TOKENS_PER_SEC = 21_600;
+
+/**
+ * r2v 档位系数（相对标准档 1-0-pro 的 15 元/M 折算口径，与 VIDEO_MULT 同一把尺子）。
+ * ★ 2.8 = 42 ÷ 15：2.5 的「视频输入」档官方刊例 42 元/M；A3 两发实测账单与该公式
+ *   分毫不差。促销价（如 2.0-mini 视频输入档的 4 折）**不入表** —— 价目只写刊例价，
+ *   按促销价定价等于促销一结束就开始亏钱且无任何症状（economy.ts:166-169 的教训）。
+ * ★ 只有登记进这张表的模型才许发 r2v 任务（ark.routes 的 resolveR2v）——
+ *   不在表 = 400 拒单，**绝不**静默落回 VIDEO_MULT 的纯任务系数结算：
+ *   那等于输入视频时长一分不收（4.7 是不含视频输入的价），能通、少收、账目瞎。
+ * ★ 与 app 仓 economy.ts 各档位的 r2vMult 逐条相等（跨仓契约，钉在 arkProxy.spec.js）。
+ */
+const VIDEO_MULT_R2V = {
+  [SEEDANCE_2_5]: 2.8,
+};
+
+/** 表里最贵的 r2v 系数。兜底方向与 imageTokensOf 同理：多收会被投诉、少收永远没人发现 */
+const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
+
+/**
+ * 一次 r2v 出片扣多少 token。
+ *
+ * @param {number} inputDurationSec 模板视频的登记时长（服务端从 Cloudinary 写入的那份，
+ *   见 models/BranchTemplate.refVideo —— 不收客户端报的数）
+ *
+ * ★ 输出时长按 **等于输入时长** 取上界，所以是 `inputSec × 2`：
+ *   路线是 edit（duration=-1、全时长逐镜头复刻），输出≈输入是协议行为；
+ *   实测方舟会略微裁短输出（14.04s 输入 → 13.67s 计费），即实收略低于报价（~1%）。
+ *   方向刻意选「报价 ≥ 实收」：多估的那 1% 我们退不退都不算骗人，反过来
+ *   报价 < 实收就是「页面报 X、扣了 X+」——CLAUDE.md 头号事故形状。
+ * ★ 不走 clampDuration/segTokens 的 10s 上限：那是纯 t2v 档位的约束（用户自选时长），
+ *   r2v 的时长跟随模板（上传窗口 [4,15]s），两条路的规则本来就不同。
+ * ★ 时长夹回 [4,15]（上传验收窗口，middleware/upload.js 的 TEMPLATE_VIDEO_RULES）：
+ *   登记值只可能落在窗口里，夹到边界还不等于原值 = 登记数据被弄坏了，吼出来。
+ */
+function r2vTokens(inputDurationSec, model) {
+  const raw = Number(inputDurationSec);
+  const d = Math.max(4, Math.min(15, Math.round(Number.isFinite(raw) ? raw : 0)));
+  if (d !== raw) {
+    console.error(`[tokens] r2v 输入时长异常（${String(inputDurationSec)}），已按 ${d}s 计价 —— 模板登记数据可能被弄坏了`);
+  }
+  let mult = VIDEO_MULT_R2V[model];
+  if (mult === undefined) {
+    // 路由上够不着（resolveR2v 已把不在表的模型 400 掉），这是导出函数的第二道保险
+    console.error(`[tokens] r2v 模型 ${String(model).slice(0, 64)} 不在 VIDEO_MULT_R2V 里，按最贵档 ${MAX_R2V_MULT} 收费`);
+    mult = MAX_R2V_MULT;
+  }
+  return Math.round(d * 2 * R2V_TOKENS_PER_SEC * mult);
+}
+
 /**
  * 这一次方舟调用要扣多少 token。
  *
  * @param {string} kind "image" | "chat" | "task"
  * @param {object} body 已解析的请求体
+ * @param {{ durationSec: number }|null} [r2v] r2v 解析结果（ark.routes 的 resolveR2v 给的，
+ *   durationSec 是模板的**服务端登记时长**）。有它 = 这是白模出片，按 r2vTokens 计价。
+ *   ★ 定价规则仍只在本文件一处 —— 路由只负责把「是不是 r2v、输入多长」查清楚递进来。
  * @returns {number} 0 = 不计费（轮询、产物代理）
  *
  * ★ 只按**真实发生的调用**计费，不按"客户端说他要干什么"。
@@ -232,13 +293,17 @@ function segTokens(durationSec, model) {
  *      也就是**实际可能比报价低**。
  *   两边都是"如实按调用收"，要对齐得改 app 的报价口径，不是改这里。
  */
-function priceOf(kind, body) {
+function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
   if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
   if (kind === "chat") return CHAT_TURN_TOKENS;
   if (kind === "task") {
     const model = String(body?.model ?? "");
     if (model === MODEL3D_ID) return MODEL3D_TOKENS;
+    // r2v（白模出片）：输入时长计进 token，走单独的公式与系数表。
+    // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
+    //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
+    if (r2v) return r2vTokens(r2v.durationSec, model);
     return segTokens(body?.duration, model);
   }
   return 0;
@@ -268,6 +333,9 @@ module.exports = {
   MODEL3D_ID,
   SEEDANCE_2_5,
   VIDEO_MULT,
+  VIDEO_MULT_R2V,
+  R2V_TOKENS_PER_SEC,
+  r2vTokens,
   PAID_ONLY_MODELS,
   isFreePlan,
   paidOnlyDenial,

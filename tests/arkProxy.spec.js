@@ -24,6 +24,7 @@ let app;
 let token; // 免费版用户（注册即 free）
 let freeUserId;
 let paidToken; // 已购标准套餐
+let paidUserId;
 let fetchSpy;
 
 /** 注册一个新用户，返回 { token, id }。付费门禁的用例需要两个身份 */
@@ -52,6 +53,7 @@ beforeAll(async () => {
 
   const paid = await registerUser("paid");
   paidToken = paid.token;
+  paidUserId = paid.id;
   // 直接发套餐（绕开支付渠道）：这里要测的是门禁，不是下单链路
   const wallet = require("../src/services/tokenWallet.service");
   await wallet.buyPlan(paid.id, "std");
@@ -363,31 +365,231 @@ describe("健康端点", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-describe("r2v 未开放：带 reference_video 的任务一律 400", () => {
-  // ★ 为什么钉这条：priceOf 的 task 分支不读 content，而方舟 2.x 实测接受
-  //   role:"reference_video"（r2v 的计费还要算输入视频时长）。不拦的话任何客户端
-  //   都能发 r2v 任务且按纯任务价结算 —— 能通、少收、账目瞎。白模模板上线时
-  //   这条测试改成"只准已登记模板 URL"，别直接删。
-  test("带 reference_video → 400 R2V_NOT_AVAILABLE，且不出网、不扣费", async () => {
-    const walletSvc = require("../src/services/tokenWallet.service");
+describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计价", () => {
+  // ★ 为什么钉这一组：priceOf 的 task 分支不读 content，而 r2v 的官方计费要把
+  //   **输入视频时长**也算进 token。resolveR2v 是唯一挡在中间的闸门 ——
+  //   拆掉/写松它的后果全都零症状：任意 URL 白嫖（按纯任务价结算，输入一分不收）、
+  //   伪造 URL 蹭价、blocked 模板照常可用。所以每一条边界都从行为上钉住。
+  const { SEEDANCE_2_5, VIDEO_MULT_R2V, r2vTokens } = require("../src/config/tokens");
+  const BranchTemplate = require("../src/models/BranchTemplate");
+  const BranchTemplateTrial = require("../src/models/BranchTemplateTrial");
+  const walletSvc = require("../src/services/tokenWallet.service");
+
+  // 模板作者 = 外层的付费用户（2.5 是 paidOnly，作者试炼也得过套餐门禁）
+  let publishedTpl; // 已发布，10s
+  let pendingTpl; // 作者自己的待发布（试炼路径）
+  let blockedTpl; // 平台已下架
+
+  /** 造一条服务端登记（绕开 HTTP：这里测的是 ark 代理，不是建模板链路） */
+  async function seedTemplate(ownerId, tag, status) {
+    return BranchTemplate.create({
+      ownerId,
+      authorName: "seed",
+      title: `tpl-${tag}`,
+      recipe: { styleHint: "", beats: ["b"], durationSec: 5, videoTier: "ultra", framePrompt: "" },
+      refVideo: {
+        url: `https://res.cloudinary.com/demo/video/upload/v1/ideahub/template-videos/${ownerId}-${tag}.mp4`,
+        durationSec: 10,
+        width: 720,
+        height: 1280,
+        bytes: 5_000_000,
+        cloudinaryPublicId: `ideahub/template-videos/${ownerId}-${tag}`,
+      },
+      status,
+      provenAt: null,
+    });
+  }
+
+  /** 拼一个带参考视频的 2.5 任务体 —— 形状 = App 侧 BLOCKOUT_TASK 的真实请求
+   *  （edit + duration:-1 + adaptive 三件套是计价公式的前提，服务端已把它们钉死，
+   *  见 resolveR2v；不带就 400，所以测试体必须带全） */
+  function r2vBody(url, model = SEEDANCE_2_5) {
+    return {
+      model,
+      content: [
+        { type: "text", text: "把视频里的红色小人替换成角色" },
+        { type: "video_url", role: "reference_video", video_url: { url } },
+      ],
+      omni_reference_task_type: "edit",
+      duration: -1,
+      ratio: "adaptive",
+    };
+  }
+
+  beforeAll(async () => {
+    publishedTpl = await seedTemplate(paidUserId, "1001", "published");
+    pendingTpl = await seedTemplate(paidUserId, "1002", "pending");
+    blockedTpl = await seedTemplate(paidUserId, "1003", "blocked");
+  });
+
+  test("未登记的 URL → 400 整句拒，且不出网、不扣费（堵白嫖与蹭价）", async () => {
     const before = await walletSvc.getWallet(freeUserId);
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth())
-      .send({
-        model: "doubao-seedance-2-0-mini-260615",
-        duration: 5,
-        content: [
-          { type: "text", text: "t" },
-          { type: "video_url", role: "reference_video", video_url: { url: "https://example.com/x.mp4" } },
-        ],
-      });
+      .send(r2vBody("https://example.com/x.mp4"));
     expect(res.status).toBe(400);
-    expect(res.body.code).toBe("R2V_NOT_AVAILABLE");
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
     expect(typeof res.body.message).toBe("string"); // 整句可显示，不是错误码天书
+    expect(res.body.message).toMatch(/登记/);
     expect(fetchSpy).not.toHaveBeenCalled();
     const after = await walletSvc.getWallet(freeUserId);
     expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test("model 不在 r2v 价目表（2.0-mini）→ 400，绝不静默按纯任务价结算", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(publishedTpl.refVideo.url, "doubao-seedance-2-0-mini-260615"));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("多条 reference_video → 400（不是我们客户端会拼出的形状）", async () => {
+    const body = r2vBody(publishedTpl.refVideo.url);
+    body.content.push({ type: "video_url", role: "reference_video", video_url: { url: publishedTpl.refVideo.url } });
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(body);
+    expect(res.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ★★ 参数钉死组：计价是 (登记时长×2)×720p，成立前提是 edit + duration:-1 + 720p ——
+  //   代理原样转发，不钉的话改一行客户端就能按 4s 模板的价买 30s/1080p 的产出
+  //   （2026-08-14 对抗审查发现的高危：计费与转发参数解耦）。
+  test.each([
+    ["reference 子任务", (b) => { b.omni_reference_task_type = "reference"; }],
+    ["缺 omni_reference_task_type", (b) => { delete b.omni_reference_task_type; }],
+    ["duration=30（[4,30] 合法区间也不行）", (b) => { b.duration = 30; }],
+    ["resolution=1080p", (b) => { b.resolution = "1080p"; }],
+    ["ratio=16:9（钉 adaptive）", (b) => { b.ratio = "16:9"; }],
+  ])("r2v 生成参数越出计价假设（%s）→ 400，不出网不扣费", async (_name, mutate) => {
+    const body = r2vBody(publishedTpl.refVideo.url);
+    mutate(body);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(body);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("不带 role 的 video_url 条目 → 400（role 是客户端可控字段，去掉它不能绕过注册表按纯任务价放行）", async () => {
+    const body = r2vBody(publishedTpl.refVideo.url);
+    body.content[1] = { type: "video_url", video_url: { url: "https://evil.example.com/any.mp4" } };
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(body);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("blocked 模板 → 400（事后治理要有牙齿：下架就是不能再用）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(blockedTpl.refVideo.url));
+    expect(res.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("pending 模板：非作者 → 400；作者本人 → 过闸门（501 = 走到 forward，试炼路径通）", async () => {
+    // 非作者（free 用户）拿到 URL 也不能蹭未发布的模板
+    const other = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send(r2vBody(pendingTpl.refVideo.url));
+    expect(other.status).toBe(400);
+
+    // 作者本人：这正是发布前「用自己的模板出一次片」的试炼路
+    const mine = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(pendingTpl.refVideo.url));
+    expect(mine.status).toBe(501); // 没配 key：闸门与扣费都过了才到 forward
+  });
+
+  test("免费用户走 r2v 照样撞 2.5 的套餐门禁（r2v 不是绕开 paidOnly 的旁路）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send(r2vBody(publishedTpl.refVideo.url));
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("PLAN_REQUIRED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("已登记 → 按 (输入+输出)×21600×2.8 扣费，流水 memo 带模板 id（501 后原路退回）", async () => {
+    const TokenLedger = require("../src/models/TokenLedger");
+    const expected = r2vTokens(10, SEEDANCE_2_5); // 登记 10s ⇒ (10+10)×21600×2.8 = 1,209,600
+    expect(expected).toBe(1_209_600); // 公式实测钉死（A3 两发分毫不差），改公式必须先改这条
+
+    const before = await walletSvc.getWallet(paidUserId);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(publishedTpl.refVideo.url));
+    expect(res.status).toBe(501); // 无 key：扣费发生在 forward 之前，501 后 W2 原路退回
+
+    const after = await walletSvc.getWallet(paidUserId);
+    // 扣的是 r2v 价（先扣 plan），退回进 addon —— 总额不变、构成移动，两头都对得上
+    expect(after.plan).toBe(before.plan - Math.min(before.plan, expected));
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+
+    // 流水必须带 r2v 标记（对账时把白模的钱从纯任务里分出来靠它）。
+    // 按 memo 里的模板 id 查而不是按时间排序：金额相同的两笔（试炼那发也是 1,209,600）
+    // 在同一毫秒落库时排序不稳，按 id 查没有这个坑
+    const spend = await TokenLedger.findOne({
+      user: paidUserId,
+      reason: "ark_spend",
+      memo: new RegExp(`r2v tpl:${String(publishedTpl._id)}`),
+    }).lean();
+    expect(spend).toBeTruthy();
+    expect(spend.delta).toBe(-expected);
+  });
+
+  test("试炼闸端到端：作者的 r2v 任务受理 → 轮询 succeeded → provenAt 被置上", async () => {
+    // 这一条要走完整条证据链，所以放行出网（fetch 全程是假的，不真花钱）
+    process.env.ARK_API_KEY = "test-key";
+    try {
+      fetchSpy.mockImplementation(async () => ({
+        status: 200,
+        text: async () => JSON.stringify({ id: "cgt-trial-0001" }),
+      }));
+      const createRes = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send(r2vBody(pendingTpl.refVideo.url));
+      expect(createRes.status).toBe(200);
+
+      // 受理即落追踪：{taskId, templateId, userId} —— 试炼的证据由服务端自己记
+      const trial = await BranchTemplateTrial.findOne({ taskId: "cgt-trial-0001" }).lean();
+      expect(String(trial.templateId)).toBe(String(pendingTpl._id));
+      expect(String(trial.userId)).toBe(String(paidUserId));
+
+      // 轮询到 succeeded：provenAt 置上（发起人 = 模板作者），追踪记录清掉
+      fetchSpy.mockImplementation(async () => ({
+        status: 200,
+        text: async () => JSON.stringify({ id: "cgt-trial-0001", status: "succeeded" }),
+      }));
+      const poll = await request(app)
+        .get("/api/ark/contents/generations/tasks/cgt-trial-0001")
+        .set({ Authorization: `Bearer ${paidToken}` });
+      expect(poll.status).toBe(200);
+
+      const tpl = await BranchTemplate.findById(pendingTpl._id).lean();
+      expect(tpl.provenAt).toBeTruthy();
+      expect(await BranchTemplateTrial.findOne({ taskId: "cgt-trial-0001" }).lean()).toBeNull();
+    } finally {
+      delete process.env.ARK_API_KEY;
+    }
   });
 
   test("不带 reference_video 的任务不受影响（别把正常出片一起拦了）", async () => {
@@ -396,5 +598,24 @@ describe("r2v 未开放：带 reference_video 的任务一律 400", () => {
       .set(auth())
       .send({ model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [{ type: "text", text: "t" }] });
     expect(res.status).toBe(501); // 没配 key 时到 501 = 门都过了、走到 forward
+  });
+});
+
+describe("跨仓 r2v 系数一致性（app 的报价 vs 服务端的结算）", () => {
+  // 抄自 app/src/data/economy.ts 的 VIDEO_TIERS[ultra].r2vMult（为什么抄不 fs 读：
+  // 与上面视频/出图两组逐字相同的理由 —— server 独立部署，会自己跳过的用例是静默失败）。
+  // app 侧四档里只有 ultra 有 r2v 价；refVid 布尔是**开闸开关**（另一个 commit 才翻 true），
+  // 价目先行、开关后动 —— 价目缺失时 app 既不报价也不开炼。
+  const APP_R2V_MULTS = { "doubao-seedance-2-5-260628": 2.8 };
+
+  test("两张表的 key 集合与数值完全相等", () => {
+    const { VIDEO_MULT_R2V } = require("../src/config/tokens");
+    expect(VIDEO_MULT_R2V).toEqual(APP_R2V_MULTS);
+  });
+
+  test("r2v 单价确实比纯任务贵（输入时长计费：42<70 的直觉是反的）", () => {
+    const { r2vTokens, segTokens, SEEDANCE_2_5 } = require("../src/config/tokens");
+    // 同样出 10s：r2v 还要为 10s 的输入付钱 ⇒ (10+10)×2.8 > 10×4.7
+    expect(r2vTokens(10, SEEDANCE_2_5)).toBeGreaterThan(segTokens(10, SEEDANCE_2_5));
   });
 });

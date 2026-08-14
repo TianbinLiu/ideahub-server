@@ -155,6 +155,9 @@ app.use("/api/speaking-style", speakingStyleRoutes);
 app.use("/api/personas", personaRoutes);
 app.use("/api/memes", memeRoutes);
 app.use("/api/branch", require("./routes/branchVideo.routes"));
+// 白模模板（blockout r2v）：同一个 /api/branch base（App 只记一个前缀），
+// 路径全在 /templates 下，与 /videos /cards /decks 不重叠
+app.use("/api/branch", require("./routes/branchTemplate.routes"));
 // 工坊 NPC 的语音合成。原来只是 app 仓 vite dev 的一个中间件，打成 APK 后无人应答
 // （真机上 NPC 全程哑巴），且密钥不能进前端包，所以收到服务端
 app.use("/api/tts", require("./routes/tts.routes"));
