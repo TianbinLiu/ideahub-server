@@ -35,6 +35,8 @@ const { hasAnyBlockBetween } = require("../utils/blocking");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）。这里三个用途：
 // 删除授权（assertCanDelete）、按 id 直取时越过可见性（assertVisible）、后台端点。
 const { isAdmin } = require("../utils/roles");
+// 封禁判据的查询侧写法（statsBanned 用）。文档侧判断在 middleware/auth，这里用不上
+const { BANNED_FILTER } = require("../utils/banned");
 
 const AUTHOR_FIELDS = "_id username displayName avatarUrl";
 // 评论里 @ 到的人。★ 与 AUTHOR_FIELDS 同一组字段：提及在客户端也是渲染成
@@ -1724,8 +1726,10 @@ async function pendingReportCount() {
  */
 async function branchStats(req, res, next) {
   try {
-    const [users, videos, takenDown, comments, danmaku] = await Promise.all([
+    const [users, banned, videos, takenDown, comments, danmaku] = await Promise.all([
       User.countDocuments({}),
+      // 封禁判据的查询侧写法在 utils/banned.js 一处（与 TAKEN_DOWN 同一种收口）
+      User.countDocuments(BANNED_FILTER),
       BranchVideo.countDocuments({}),
       BranchVideo.countDocuments(TAKEN_DOWN),
       BranchComment.countDocuments({}),
@@ -1735,7 +1739,8 @@ async function branchStats(req, res, next) {
 
     res.json({
       ok: true,
-      stats: { users, videos, takenDown, comments, danmaku, pendingReports },
+      // banned 是后加的键：老 App 读不到就当没有（只加不减，铁律七）
+      stats: { users, banned, videos, takenDown, comments, danmaku, pendingReports },
     });
   } catch (err) {
     next(err);
@@ -1768,6 +1773,16 @@ module.exports = {
   applyTakedown,
   purgeVideo,
   purgeComments,
+  // ★ 给 branchAdmin.controller（用户管理 / 内容钻取）复用的几样，同一条铁律：
+  //   序列化（toVideoPayload）、「已下架」的库内判据（TAKEN_DOWN 那一对）、
+  //   点赞计数回写（syncLikes / syncCommentLikes —— 级联删用户时，他点过的赞
+  //   要从别人的作品/评论上撤走并把快照重算回来）。那边**只调用，不重写**。
+  toVideoPayload,
+  TAKEN_DOWN,
+  NOT_TAKEN_DOWN,
+  syncLikes,
+  syncCommentLikes,
+  AUTHOR_FIELDS,
   // 导出给测试/其它模块复用
   transferDraftAssets,
   isArkVideoUrl,

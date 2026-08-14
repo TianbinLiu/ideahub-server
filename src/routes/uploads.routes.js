@@ -1,9 +1,17 @@
 const router = require("express").Router();
 const { requireAuth } = require("../middleware/auth");
+const { userRateLimit } = require("../middleware/rateLimit");
 const { upload, uploadMedia, uploadToCloudinary, MAX_IMAGE_SIZE_BYTES, MAX_MEDIA_SIZE_BYTES } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 
-router.post("/image", requireAuth, upload.single("image"), async (req, res, next) => {
+// ★ 上传此前**一个限流器都没有**（2026-08-14 复查发现）：每一发都真实占用
+//   Cloudinary 配额与出网带宽，且上传即永久留存（全服务端目前零 destroy 调用）——
+//   一个脚本就能把配额刷满。按【账号】限不按 IP（NAT 后面的真实用户共享出口 IP，
+//   与登录限流同一条理由）。20/分钟对真实使用绰绰有余：发布一条作品的
+//   materializeDraft 串行传帧，一分钟传不到 20 张。
+const uploadLimit = userRateLimit({ max: 20, windowMs: 60 * 1000, scope: "uploads" });
+
+router.post("/image", requireAuth, uploadLimit, upload.single("image"), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ ok: false, message: "No file uploaded" });
@@ -28,7 +36,7 @@ router.post("/image", requireAuth, upload.single("image"), async (req, res, next
   }
 });
 
-router.post("/media", requireAuth, uploadMedia.single("media"), async (req, res, next) => {
+router.post("/media", requireAuth, uploadLimit, uploadMedia.single("media"), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ ok: false, message: "No media uploaded" });

@@ -3,6 +3,8 @@
 const jwt = require("jsonwebtoken");
 const AppError = require("./AppError");
 const CODES = require("./errorCodes");
+// 「封没封 / 给用户看哪句话」只有 utils/banned.js 一处（铁律六）
+const { isBanned, bannedMessage } = require("./banned");
 
 /**
  * 签发登录 token。
@@ -13,11 +15,16 @@ const CODES = require("./errorCodes");
  * 「注销后仍能登录成功、拿到 token、然后每个接口都 401」的死循环 ——
  * 前端还写着「账号将无法登录」，那就成了对用户撒谎。
  *
- * 注意：本判定依赖传入的 user 文档【真的加载了 deactivatedAt】。
+ * ★【被封禁账号同样不得签发】与上一条同一个收口、同一条理由（放进各登录入口迟早漏）。
+ * 差别在对外的说法：注销是 401（用户自己关的门，说一句就够），封禁是 **403 BANNED
+ * 且 message 里带原因** —— 封禁的人第一反应是「为什么」，不告诉他只会引来重复注册与
+ * 客服轰炸。app 侧对 401 的处置是「登出重登」，重登对封禁没用，所以必须分状态码。
+ *
+ * 注意：本判定依赖传入的 user 文档【真的加载了 deactivatedAt / banned】。
  * 三条无需鉴权即可到达的真·登录路径（auth.controller 的 login、
  * authOtp.controller 的 reset/verify、oauth.routes 的两个 callback）都用
  * User.findOne(...) 取全量文档，故字段必在。若日后有人改用 .select(...)
- * 精简字段而漏掉 deactivatedAt，这道守卫会【静默失效】—— 加字段时务必带上它。
+ * 精简字段而漏掉这两个字段，这道守卫会【静默失效】—— 加字段时务必带上它们。
  * （requireAuth 那道门是真正的安全边界，此处主要保证「说到做到」与体验。）
  */
 function signToken(user) {
@@ -26,6 +33,13 @@ function signToken(user) {
       code: CODES.UNAUTHORIZED,
       status: 401,
       message: "Account deactivated",
+    });
+  }
+  if (isBanned(user)) {
+    throw new AppError({
+      code: CODES.BANNED,
+      status: 403,
+      message: bannedMessage(user.banned),
     });
   }
   return jwt.sign(

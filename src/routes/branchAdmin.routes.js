@@ -28,6 +28,18 @@ const {
   listTakedowns,
   branchStats,
 } = require("../controllers/branchVideo.controller");
+// 用户管理与内容钻取（封禁/删号/发通知/三张后台列表）在自己的 controller 里，
+// 复用件（清理、序列化、计数回写）仍然只有 branchVideo/branchAsset 那一份
+const {
+  listUsers,
+  banUser,
+  unbanUser,
+  deleteUser,
+  notifyUser,
+  listVideosAdmin,
+  listCommentsAdmin,
+  listDanmakuAdmin,
+} = require("../controllers/branchAdmin.controller");
 
 router.use(requireAuth, requireRole(ADMIN_ROLE));
 
@@ -40,8 +52,26 @@ router.delete("/videos/:id/takedown", revokeTakedown);
 // 下完架之后那条作品从所有列表里消失，管理员手上只剩一个当时的 videoId。
 router.get("/takedowns", listTakedowns);
 
-// 平台数据（用户 / 作品 / 下架 / 评论 / 弹幕 / 待处理举报）
+// 平台数据（用户 / 封禁数 / 作品 / 下架 / 评论 / 弹幕 / 待处理举报）
 router.get("/stats", branchStats);
+
+// ── 用户管理 ────────────────────────────────────────────────────
+// 列表：分页 + username/displayName 子串搜索 + role/封禁状态筛选。
+// 回包 email/phone 一律打码（理由见 controller 的 maskEmail）。
+router.get("/users", listUsers);
+// 封禁（可逆对，与下架/撤销同构）。reason 必填；拒绝封禁管理员。
+// 封禁挡的是登录与一切带 token 的请求，**不**自动隐藏内容（两权分开，见 User model）。
+router.post("/users/:id/ban", banUser);
+router.delete("/users/:id/ban", unbanUser);
+// 硬删账号（级联，不可逆）。拒绝删管理员 —— 要删先降权，防手滑团灭。
+router.delete("/users/:id", deleteUser);
+// 给某个用户发一条平台通知（ADMIN_NOTICE，自由文本，不透操作人）
+router.post("/users/:id/notify", notifyUser);
+
+// ── 内容钻取（只读列表；删除走各内容自己的既有端点，不在这里另开）────
+router.get("/videos", listVideosAdmin);
+router.get("/comments", listCommentsAdmin);
+router.get("/danmaku", listDanmakuAdmin);
 
 // ★ 不额外限流：这几条只有管理员打得动，而管理员本来就能删库；再套一个桶
 //   只会在处理一波刷屏举报时把自己卡住。

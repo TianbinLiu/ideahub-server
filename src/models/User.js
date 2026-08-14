@@ -71,6 +71,32 @@ const userSchema = new mongoose.Schema(
     // null = 正常账号；有值 = 已注销，auth 中间件一律视为未授权。
     deactivatedAt: { type: Date, default: null },
 
+    // ✅ 平台封禁（管理员的开关，与 deactivatedAt 那把「用户自己的开关」是两回事）。
+    // **没有这个键 = 没封**（与 BranchVideo.takedown 同一种给法：$set 整个子文档 = 封，
+    // $unset = 解封；判据走 `banned.at` 的 dot 路径，绝不 $set null —— 理由见
+    // branchVideo.controller 的 TAKEN_DOWN：写成 null 的坏数据该往「没封」方向倒）。
+    //
+    // ★ 封禁挡的是**登录与一切带 token 的请求**（signToken 拒签 + requireAuth 拦截，
+    //   403 + 可读原因），**不**自动隐藏其内容 —— 内容处置走每条内容自己的下架/删除。
+    //   两权分开是刻意的：封人是「这个人不能再进来」，下架是「这条内容不能再被看到」，
+    //   合成一个开关的话，解封一个改好了的人会连带把他真正违规的那几条一起放出来，
+    //   反之封人时全量藏内容又会把他没问题的作品也一起消失（对看过的人毫无解释）。
+    // ★ 刻意不给 default：给了 default（哪怕 null）每个新用户都会带着这个键落库，
+    //   「有没有这个键」就不再是判据本身（与 tokenWallet 不给 default 同一条理由）。
+    banned: {
+      type: new mongoose.Schema(
+        {
+          /** 谁封的。只进库与日志，**永不**透给被封的用户（与 takedown.by 同一条理由） */
+          by: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+          at: { type: Date, required: true },
+          /** 给用户看的原因。必填 —— 「你被封了但不告诉你为什么」只会引来重复注册 */
+          reason: { type: String, default: "", maxlength: 500 },
+        },
+        { _id: false },
+      ),
+      required: false,
+    },
+
     // ✅ 虚拟点数余额。★不是真钱：无现金价值，不可提现/兑换，不接任何真实支付。
     //
     // 新用户的这 1000 点就是「注册赠送」本身（default 直接给足），

@@ -25,6 +25,14 @@ const NotificationSchema = new mongoose.Schema(
         // 评论里 @ 到了你。★ 与 ideas 那套的 "MENTION" 刻意分开：同上，deeplink 目标不同
         // （videoId vs ideaId），而且 app 的消息页按类型白名单过滤，混用会让它跳错地方。
         "BRANCH_MENTION",
+        // 平台通知（管理员手动发给某个用户的自由文本）。payload 形状：{ text }。
+        // ★ **不带 actorId**（写入点在 branchAdmin.controller 的 notifyUser，传的就是
+        //   undefined）：通知以**平台口径**发出，「具体是哪个管理员发的」不透给用户 ——
+        //   与 takedown.by 同一条理由，审核员不该被摆到被骚扰的位置上；操作日志里有留痕。
+        // ★★ 跨仓枚举（铁律九）：App 的 NotificationsPage 必须能渲染它；而且对**再未来的
+        //   未知类型**必须降级显示（画成「系统通知 + 原样文本」之类），不许崩、不许吞 ——
+        //   老包收到新类型是常态，不是异常（铁律七；契约见 docs/api-contract.md）。
+        "ADMIN_NOTICE",
       ],
       index: true,
     },

@@ -1146,20 +1146,31 @@ async function setAssetAction(req, res, next, action, on) {
       await BranchAssetLike.deleteOne({ user, kind, key, action });
     }
 
-    const [likes, bookmarks] = await Promise.all([
-      BranchAssetLike.countDocuments({ kind, key, action: "like" }),
-      BranchAssetLike.countDocuments({ kind, key, action: "bookmark" }),
-    ]);
-    try {
-      await BranchAssetStat.updateOne({ kind, key }, { $set: { likes, bookmarks } }, { upsert: true });
-    } catch (e) {
-      if (!e || e.code !== 11000) throw e;
-      await BranchAssetStat.updateOne({ kind, key }, { $set: { likes, bookmarks } });
-    }
+    await recountAssetStat(kind, key);
 
     res.json({ ok: true, stats: await readAssetStats(kind, key, user) });
   } catch (err) {
     next(err);
+  }
+}
+
+/**
+ * 从去重表重算一个实体的 likes/bookmarks 并回写快照。
+ * ★ 抽成函数是因为它现在有**两个**调用方：上面的点赞/收藏端点，以及
+ *   branchAdmin.controller 的级联删用户（把他点过的赞从别人的卡片/卡组上撤走后，
+ *   受影响的每个实体都要重算一次 —— 在那边另写一遍 countDocuments+$set，
+ *   两处早晚分叉，而分叉没有任何症状，只是数字悄悄不对）。
+ */
+async function recountAssetStat(kind, key) {
+  const [likes, bookmarks] = await Promise.all([
+    BranchAssetLike.countDocuments({ kind, key, action: "like" }),
+    BranchAssetLike.countDocuments({ kind, key, action: "bookmark" }),
+  ]);
+  try {
+    await BranchAssetStat.updateOne({ kind, key }, { $set: { likes, bookmarks } }, { upsert: true });
+  } catch (e) {
+    if (!e || e.code !== 11000) throw e;
+    await BranchAssetStat.updateOne({ kind, key }, { $set: { likes, bookmarks } });
   }
 }
 
@@ -1204,4 +1215,6 @@ module.exports = {
   bookmarkAsset,
   unbookmarkAsset,
   getAssetStats,
+  // ★ 给 branchAdmin.controller（级联删用户）复用：计数回写只有这一份实现（铁律六）
+  recountAssetStat,
 };
