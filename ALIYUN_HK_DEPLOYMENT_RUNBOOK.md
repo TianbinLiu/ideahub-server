@@ -208,12 +208,15 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Real-IP $remote_addr;
 
-        # ★★ 白模化（POST /api/branch/templates/blockoutize）是**长请求**：
-        #   服务端在这一条请求里等方舟出片，上限 5 分钟
-        #   （services/blockoutize.service.js 的 POLL_MAX_MS）。
-        #   nginx 默认 proxy_read_timeout 只有 60s —— 网关会先掐断，用户看到 504，
-        #   而**钱已经花掉了**（方舟受理后失败不退费），我们这边的日志却显示成功。
-        #   给到 400s：比 POLL_MAX_MS 多留一分多钟的余量。
+        # ★★ 白模化（POST /api/branch/templates/blockoutize）虽然 2026-08-16 拆成了两阶段、
+        #   **服务端不再等出片**（轮询搬回客户端，取回结果走 …/blockoutize/finish），
+        #   它仍然是一条**慢请求**：一发里串着预热 + 抽帧 + 一次 chat vision + 一次 r2v 创建，
+        #   而后两者的上游超时各是 150s（services/arkGateway.service.js 的 T_CREATE）
+        #   ⇒ 最坏情况仍有五分钟量级。
+        #   nginx 默认 proxy_read_timeout 只有 60s —— 网关先掐断的话用户看到 504，
+        #   而**钱可能已经花掉了**（方舟受理后失败不退费），我们这边的日志却显示成功；
+        #   更糟的是：掐断发生在"落取件凭据"之前的话，那一发连取件单都没有。
+        #   给到 400s，留足余量。改小之前先想清楚上面这一条。
         proxy_read_timeout 400s;
         proxy_send_timeout 400s;
     }

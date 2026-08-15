@@ -5,7 +5,9 @@
 //
 // 生命周期与闸门（每道闸门只有一处实现，铁律六）：
 //   上传视频（uploads.routes /template-video，回执复核）
-//   → 建模板（本文件：videoUrl 三重白名单 + 服务端向 Cloudinary 取元数据）status=pending
+//   → 建模板 status=pending，两条路二选一：
+//       · V1 登记（本文件：videoUrl 三重白名单 + 服务端向 Cloudinary 取元数据）
+//       · V2 白模化（本文件，**两阶段**：blockoutize 开炼落取件凭据 → blockoutize/finish 取回建模板）
 //   → 作者自己付费出一次片（ark.routes 的 r2v 追踪在轮询到 succeeded 时置 provenAt）
 //   → （白模 V2 多一步）作者核对角色位编号（本文件：PATCH /templates/:id/roles）
 //   → 发布（本文件：**两道独立的门** —— provenAt 非空 + 编号已核对）status=published → 上市场
@@ -15,8 +17,15 @@ const mongoose = require("mongoose");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
-const { createTemplateBody, blockoutizeBody, patchRolesBody } = require("../schemas/branchTemplate.schemas");
+const {
+  createTemplateBody,
+  blockoutizeBody,
+  finishBlockoutizeBody,
+  patchRolesBody,
+} = require("../schemas/branchTemplate.schemas");
 const BranchTemplate = require("../models/BranchTemplate");
+// 白模 V2 的**取件凭据**（两阶段的分界线）。为什么非拆不可见该文件的文件头
+const BlockoutJob = require("../models/BlockoutJob");
 const { cloudinary } = require("../config/cloudinary");
 const { templateVideoMeta, templateRefIssue } = require("../middleware/upload");
 const { forbidden, notFound, invalidId, badRequest } = require("../utils/http");
@@ -35,6 +44,23 @@ const { SEEDANCE_2_5, VIDEO_MULT_R2V, paidOnlyDenial } = require("../config/toke
 const wallet = require("../services/tokenWallet.service");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
 const { isAdmin } = require("../utils/roles");
+
+/**
+ * 角色位怎么出到响应里 —— **一处实现**（模板详情与白模化受理回执共用）。
+ *
+ * ★ `labelConfirmed` 只有明确 `true` 才算核对过：存量 V2 模板那一项是 `undefined`，
+ *   按未核对出，与 BranchTemplate.rolesNeedConfirm 同一条口径 ——
+ *   两处分家会让界面（显示"已核对"）与闸门（拒绝发布）打架，而两边各自看着都没错。
+ * ★ 白模化受理回执里那份是**草案**（还没有模板），形状仍与模板里的一模一样：
+ *   App 侧那个角色位列表组件两处共用，形状分家就得写两个渲染器，迟早只改一个。
+ */
+function rolesPayload(roles) {
+  return (Array.isArray(roles) ? roles : []).map((r) => ({
+    label: String(r.label || ""),
+    desc: String(r.desc || ""),
+    labelConfirmed: r.labelConfirmed === true,
+  }));
+}
 
 /** 响应形状。cloudinaryPublicId 刻意不出（纯内部回收记账，客户端拿它没有正当用途） */
 function toTemplatePayload(doc, viewer) {
@@ -66,19 +92,7 @@ function toTemplatePayload(doc, viewer) {
     //   回一个空数组会让客户端分不清"这是老模板"和"新模板但一个人都没认出来"
     //   （后者根本建不出来 —— 见 blockoutize 的「roles 为空整句拒」）。
     //   客户端判它一律用存在性（`roles?.length`），别用等值。
-    //   `labelConfirmed` 一起出：作者那边要据它显示「编号待核对」并挡住发布按钮，
-    //   套用者那边则是"这个模板的编号是作者亲自对过的"这句承诺的来源。
-    ...(Array.isArray(doc.roles) && doc.roles.length
-      ? {
-          roles: doc.roles.map((r) => ({
-            label: String(r.label || ""),
-            desc: String(r.desc || ""),
-            // 只有明确 true 才算核对过（存量 V2 模板那一项是 undefined —— 按未核对出，
-            // 与 BranchTemplate.rolesNeedConfirm 同一条口径，两处分家会让界面与闸门打架）
-            labelConfirmed: r.labelConfirmed === true,
-          })),
-        }
-      : {}),
+    ...(Array.isArray(doc.roles) && doc.roles.length ? { roles: rolesPayload(doc.roles) } : {}),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
     status: doc.status,
@@ -171,16 +185,27 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
   }
 });
 
-// ── 白模化：任意视频 → 带编号的白模模板（白模 V2）─────────────────────
+// ── 白模化：任意视频 → 带编号的白模模板（白模 V2，**两阶段**）─────────
 //
-// POST /api/branch/templates/blockoutize
+//   阶段一 POST /api/branch/templates/blockoutize          ①~⑥ + 落取件凭据（钱在这里花掉）
+//   客户端自己轮询 GET /api/ark/contents/generations/tasks/:id（不计费、已有限流桶）
+//   阶段二 POST /api/branch/templates/blockoutize/finish   ⑦~⑨（核实 → 转存 → 建模板）
+//   掉线兜底 GET /api/branch/templates/blockoutize/pending 列出还没取回结果的凭据
 //
 // 用户在编辑页框出「哪一段 + 画面哪一块」，提交**四组数**（startSec/durSec/crop），
-// 服务端走完九步：
+// 阶段一走六步：
 //   ① 归属校验 → ② 服务端自己拼 Cloudinary 变换 URL → ③ 预热（F9）
 //   → ④ 复核裁后元数据满足方舟约束（F1/F3）→ ⑤ chat vision 先看一眼列出画面里有谁（F4 的"先看"）
-//   → ⑥ 点名式提示词发 r2v edit（F4 的"点名"）→ ⑦ 轮询 → ⑧ 产物转存 Cloudinary（F12）
-//   → ⑨ 建模板 status=pending（试炼闸照旧）
+//   → ⑥ 点名式提示词发 r2v edit（F4 的"点名"），**到"方舟受理了"为止**
+// 阶段二走三步：⑦ 向方舟核实任务状态 → ⑧ 产物转存 Cloudinary（F12）→ ⑨ 建模板 status=pending。
+//
+// ══ 为什么要拆（2026-08-16，拆之前是一条同步长请求）══════════════════
+// 拆之前这九步在**同一条 HTTP 请求**里跑完，中间含最长 5 分钟的服务端轮询。而这条链路的
+// 钱是在**中途**花掉的（看帧一笔 + r2v 受理一笔，受理后失败不退，F11）—— 于是手机切后台、
+// 弱网断线、App 进程被系统回收、nginx 超时掐断，任何一条都会让用户**丢掉这一发的结果，
+// 而钱已经花了**，我们这边的日志里却是一次成功。一条要等五分钟的请求本身就是脆的：
+// 它把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接的命上。
+// 拆成两阶段之后，「结果」变成一件**可以再来取**的东西（凭据见 models/BlockoutJob.js）。
 //
 // ★★ 为什么这一整条必须在服务端：变换 URL 里的 `du_` 就是 r2v 的计价输入时长
 //   （方舟公式把输入视频时长计进 token）。让客户端拼 URL = 让用户自己标价。
@@ -210,12 +235,29 @@ const VISION_FRAMES = 3;
 const VISION_BILLED_NOTE = "看画面那一步的费用已经产生、无法退回";
 
 // ★ 限流比建模板更严：一发要打 1 次 Cloudinary Admin API（免费档全局 500 次/小时）、
-//   3 次抽帧、1 次 chat、1 次 r2v，还要占着一个连接轮询好几分钟。
+//   3 次抽帧、1 次 chat、1 次 r2v，每一发都是真金白银。
 //   3 次/10 分钟对真人足够（框选 + 等出片本身就要几分钟）。
 const blockoutizeLimit = userRateLimit({ max: 3, windowMs: 10 * 60 * 1000, scope: "branchTemplate:blockoutize" });
 
+/** 取回结果的限流。★ 比开炼松得多（它**不花钱**，只做一次方舟查询 + 一次转存），
+ *  但不能不限：转存是一次 100MB 级的出网，拿它当循环打同样能把出网账单打洞。
+ *  20 次/5 分钟 —— 正常路径是"出片了点一次"，重试几次也远够。 */
+const blockoutFinishLimit = userRateLimit({ max: 20, windowMs: 5 * 60 * 1000, scope: "branchTemplate:blockoutFinish" });
+
+/** 「还有哪些没取回」列表的限流。纯本库查询，给一个防呆值即可 */
+const blockoutPendingLimit = userRateLimit({ max: 30, windowMs: 60 * 1000, scope: "branchTemplate:blockoutPending" });
+
 /** 整句失败 —— 全 app 没有任何地方监听 emitApiError，只回错误码等于让用户对着转圈干等（铁律八）。
- *  `billed` 明确告诉客户端"这一次的钱退没退"，让它照实说，别自己猜。 */
+ *
+ * ★★ `billed` 的语义在两阶段里必须**分得开**，别把两件事混成一位：
+ *   · 阶段一（开炼）：r2v 一旦被方舟受理就是 `billed:true` —— 受理后失败不退（F11）；
+ *   · 阶段二（取回结果）：**它自己一分钱都不花**（核实任务、转存、建模板都不计费），
+ *     所以它的失败一律 `billed:false` —— 那是「这次没取到」，不是「又花了一笔」。
+ *     写成 true 的话，用户会以为每点一次「取回结果」就再扣一笔钱，于是不敢重试 ——
+ *     而重试恰恰是我们拆两阶段给他的那条活路。
+ *   · 钱确实没了的那两种终局（产物过期、方舟受理后 failed）另有 `lost:true` 一位，
+ *     并且**话要说满**（见 BlockoutJob.stateOf 的整句）。
+ */
 function fail(res, status, message, extra = {}) {
   return res.status(status).json({ ok: false, message, ...extra });
 }
@@ -242,6 +284,26 @@ router.post(
       });
       if (used) {
         return fail(res, 400, "这段素材已经做过白模模板了，请直接使用那一个，或换一段素材。", { billed: false });
+      }
+      // ★★ 两阶段专有的一道：**还没取回结果**的那一发也占着这段素材。
+      //   拆开之前，"做过了"等价于"库里有模板"；拆开之后，从受理到取回之间有一段
+      //   **世上还没有模板**的窗口 —— 不问这一句的话，用户在等出片时手一抖再点一次，
+      //   同一段素材就被扣**第二笔** r2v 的钱（几十万 token），而两发都会成功，
+      //   他只会看到"怎么多了一个一模一样的模板"，完全对不上那笔账。
+      const running = await BlockoutJob.findOne({
+        "source.publicId": publicId,
+        status: { $in: ["pending", "claimed"] },
+        expiresAt: { $gt: new Date() },
+      })
+        .select("_id")
+        .lean();
+      if (running) {
+        return fail(
+          res,
+          400,
+          "这段素材已经有一发白模化在进行中了（费用已经产生）。请到「待取回的白模」里把那一发的结果取回来，别重复开炼——重开一发会再花一笔钱。",
+          { billed: false, jobId: String(running._id) },
+        );
       }
 
       // ── 钱的门禁前置：套餐不够格就别让他等完整条链路 ────────────────
@@ -449,41 +511,293 @@ router.post(
         return fail(res, 502, "AI 已经开始生成，但我们没能拿到任务编号，无法跟进这一发的结果。这一发的费用已经产生、无法退回。", { billed: true });
       }
 
-      // ── ⑦ 轮询到出结果 ──────────────────────────────────────────────
-      const done = await blockout.pollTask(taskId);
-      if (!done.ok) return fail(res, 502, done.message, { billed: Boolean(done.billed) });
+      // ── ⑦ 落取件凭据：**两阶段的分界线就在这里** ──────────────────────
+      //
+      // ★★ 到这一行为止钱已经全花掉了（看帧一笔 + r2v 受理一笔，受理后失败不退）。
+      //   凭据落不下去 = 用户付了钱却拿不到任何能取回结果的句柄 —— 所以它必须在返回
+      //   之前落库成功，落不下要**响亮到能人工兜底**（把 taskId 交给用户），
+      //   绝不能只在日志里叹口气然后回 500（那就是把一笔钱静默扔了，铁律八）。
+      const startedAt = Date.now();
+      let job;
+      try {
+        job = await BlockoutJob.create({
+          ownerId: req.user._id,
+          taskId,
+          status: "pending",
+          expiresAt: new Date(startedAt + BlockoutJob.TTL_MS),
+          // ★★ 建模板需要的一切都存在这里，finish **不许让客户端再报一遍**：
+          //   durSec 是 r2v 的计价输入时长（重报 = 开炼按 4 秒报价、取件按 30 秒建模板），
+          //   roles 是套用者挂卡的唯一依据（重报 = 让提交方自己写"1 号位是谁"）。
+          source: { publicId, startSec, durSec, crop },
+          roles,
+          title,
+          intro,
+          coverUrl,
+          videoTier,
+          ...(aspect ? { aspect } : {}),
+          // 产物的落点在这里就定死：取回结果是可以重来的一步，每次现取新 id 会在
+          // 云端散出孤儿资产（零症状，只有配额账单看得见）
+          outPublicId: `${userId}-${startedAt}`,
+        });
+      } catch (e) {
+        if (e?.code === 11000) {
+          // taskId 唯一索引：这个方舟任务已经有一张取件单了（只可能是重试撞上）。
+          // 回既有那一张 —— 回 500 会让客户端以为这一发废了，而它好好地在方舟那边跑
+          const exist = await BlockoutJob.findOne({ taskId, ownerId: req.user._id }).lean();
+          if (exist) return res.status(202).json(startedPayload(exist));
+        }
+        console.error(`[blockoutize] 取件凭据落库失败 task=${taskId}:`, e.message);
+        return fail(
+          res,
+          500,
+          `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生、无法退回。请把这个任务编号发给我们：${taskId}`,
+          { billed: true, taskId },
+        );
+      }
+
+      // ★ 202 而不是 201：**什么都还没建出来**。老客户端（等着 201 + template 的那一版）
+      //   会当场判失败并把整句 message 显示出来 —— 这正是我们要的"响亮"：它拿不到模板，
+      //   就绝不能让它以为拿到了（铁律八）。
+      return res.status(202).json(startedPayload(job));
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+/** 阶段一的受理回执 —— **一处实现**（首次受理与"撞上既有凭据"两条路共用）。
+ *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经花了、失败也不退（F11）。
+ *    这一位在阶段一是"钱花了没有"，在阶段二是"这一次调用花钱了没有"（恒 false），
+ *    两边的措辞都要写满，别让 App 自己去猜。 */
+function startedPayload(job) {
+  return {
+    ok: true,
+    state: "accepted",
+    jobId: String(job._id),
+    taskId: job.taskId,
+    durSec: job.source.durSec,
+    roles: rolesPayload(job.roles),
+    expiresAt: job.expiresAt,
+    billed: true,
+    message:
+      "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 受理之后失败也不退费）。" +
+      `出片之后回来点「取回结果」才会建成模板；产物只保 ${BlockoutJob.TTL_HOURS} 小时，过期这一发就没法挽回了。`,
+  };
+}
+
+// ── 阶段二：取回结果 ────────────────────────────────────────────────
+//
+// POST /api/branch/templates/blockoutize/finish   body { jobId }
+//
+// 做 ⑦ 向方舟核实 → ⑧ 产物转存 Cloudinary（F12）→ ⑨ 建模板 status=pending。
+//
+// ★★ 四条硬规矩，每一条拆掉都不报错：
+//   ① **自己向方舟核实**，绝不信客户端一句「成功了」（与试炼闸 provenAt 同一条理由）；
+//   ② **幂等**：重复取回只会拿到同一个模板。靠两层 —— 先原子认领（status→claimed，
+//      挡住并发），再由 `BranchTemplate.blockoutJobId` 的唯一索引兜底。
+//      ⚠ 只靠 refVideo.url 的唯一索引是**不够的**：每次转存都是一次新的 Cloudinary
+//      上传，secure_url 里带着**新的 version**，两条 URL 并不相等 —— 索引根本不会撞；
+//   ③ **归属只认凭据的 ownerId**：别人拿到 jobId 也取不走（且回 404 不回 403，
+//      403 等于承认"这个 id 存在但不是你的"）；
+//   ④ **这一步不花钱**：核实任务状态与转存都不计费，所以失败一律 `billed:false` ——
+//      它是「这次没取到」，不是「又花了一笔」。用户敢重试，两阶段才有意义。
+
+/** 放开认领：这一发还能再取（任务还在跑、转存抖了一下）。
+ *  ★ 不放开的话凭据会一直卡在 claimed 到 CLAIM_STALE_MS 超时为止 ——
+ *    用户点一次「取回结果」就要罚站 5 分钟，而他什么错都没犯。 */
+async function releaseJob(jobId) {
+  await BlockoutJob.updateOne({ _id: jobId, status: "claimed" }, { $set: { status: "pending", claimedAt: null } });
+}
+
+/** 判定这一发**终局失败**（方舟明说没成 / 产物不合格）。整句理由存下来：
+ *  用户可能几小时后才回来看列表，那时再去问方舟已经问不到了，而"为什么没了"必须还说得出口。 */
+async function failJob(jobId, message) {
+  await BlockoutJob.updateOne(
+    { _id: jobId, status: { $in: ["pending", "claimed"] } },
+    { $set: { status: "failed", failMessage: message, claimedAt: null } },
+  );
+}
+
+/** 「这一发已经取回过了」的回法 —— 幂等路径与首次成功共用同一个形状。
+ *  ★ 模板被作者删掉的情况要照实说：把它当成"还能再取"会让用户点一次、再点一次，
+ *    每次都失败且不知道为什么（凭据里的产物地址早过期了，重取也拿不回来）。 */
+async function respondDone(req, res, job, status = 200) {
+  const doc = job.templateId ? await BranchTemplate.findById(job.templateId).lean() : null;
+  if (!doc) {
+    return fail(
+      res,
+      410,
+      "这一发的结果早就取回过了，但那个模板现在已经不在了（多半是被删掉了）。要再来一份的话得重新做一发白模化（会重新计费）。",
+      { billed: false, state: "gone" },
+    );
+  }
+  return res.status(status).json({
+    ok: true,
+    state: "done",
+    template: toTemplatePayload(doc, req.user),
+    blockout: { jobId: String(job._id), taskId: job.taskId, durSec: job.source.durSec },
+    billed: false,
+  });
+}
+
+/** 非 pending 的状态怎么回 —— **一处实现**（进门那一次与"抢认领输了"重读那一次共用）。
+ *  两处各写一遍的话，并发那条路迟早说出与列表不一样的话。
+ *  @returns {boolean} true = 已经回过响应了，调用方直接返回 */
+async function respondNonFinishable(req, res, job, st) {
+  if (st.state === "done") {
+    await respondDone(req, res, job, 200);
+    return true;
+  }
+  if (st.state === "failed") {
+    // ★ lost:true = 钱确实没了且拿不回任何东西。与 billed 分开两位：
+    //   billed 说的是"这一次调用花钱没有"（没有），lost 说的是"开炼那笔还剩什么"（什么都没剩）。
+    fail(res, 502, st.message, { billed: false, lost: true, state: "failed" });
+    return true;
+  }
+  if (st.state === "expired") {
+    // 只是备忘（判据永远是 expiresAt，见 stateOf）：让列表少算一次时间差
+    await BlockoutJob.updateOne(
+      { _id: job._id, status: { $in: ["pending", "claimed"] } },
+      { $set: { status: "expired", claimedAt: null } },
+    );
+    // 410 Gone：这个资源确实**曾经存在、现在永久没了**，与 404「查无此物」不是一回事
+    fail(res, 410, st.message, { billed: false, lost: true, state: "expired" });
+    return true;
+  }
+  if (st.state === "working") {
+    // 202：不是错误，是"另一发正在取，等几秒"
+    res.status(202).json({ ok: false, state: "working", message: st.message, billed: false });
+    return true;
+  }
+  return false;
+}
+
+router.post(
+  "/templates/blockoutize/finish",
+  requireAuth,
+  blockoutFinishLimit,
+  validate({ body: finishBlockoutizeBody }),
+  async (req, res, next) => {
+    try {
+      const { jobId } = req.body;
+      // ★ 「查不到」与「不是你的」回**同一句 404**：403 等于承认这个 jobId 存在，
+      //   把别人凭据的存在性泄露成可枚举的事实（与 GET /templates/:id 同一条口径）。
+      const gone = () =>
+        fail(
+          res,
+          404,
+          `找不到这一发的取件凭据（可能已经取回过了，或者超过 ${BlockoutJob.TTL_HOURS} 小时被清理了）。可以到「待取回的白模」里看看还有哪些没取。`,
+          { billed: false, state: "gone" },
+        );
+      if (!mongoose.isValidObjectId(jobId)) return gone();
+      const job = await BlockoutJob.findOne({ _id: jobId, ownerId: req.user._id });
+      if (!job) return gone();
+
+      const now = new Date();
+      // 状态判据只有 BlockoutJob.stateOf 一处（列表与这里读同一份结论）
+      if (await respondNonFinishable(req, res, job, BlockoutJob.stateOf(job, now))) return;
+
+      // ── 原子认领：pending（或已经卡死的 claimed）→ claimed ─────────────
+      // ★★ 这一步是幂等的第一层：并发的第二发 finish 抢不到认领，就不会同时走到
+      //   "转存 + 建模板"，也就不会建出第二个模板、多传一份 100MB 的资产。
+      // ★ 允许抢走**卡死**的认领（claimedAt 老于 CLAIM_STALE_MS）：进程被 pm2 重启掉时
+      //   凭据会永远停在 claimed，而两阶段的全部意义就是"取得回来"。
+      const staleBefore = new Date(now.getTime() - BlockoutJob.CLAIM_STALE_MS);
+      const claimed = await BlockoutJob.findOneAndUpdate(
+        {
+          _id: job._id,
+          ownerId: req.user._id,
+          $or: [{ status: "pending" }, { status: "claimed", claimedAt: { $lt: staleBefore } }],
+        },
+        { $set: { status: "claimed", claimedAt: now } },
+        { new: true },
+      );
+      if (!claimed) {
+        // 抢输了（另一发刚刚认领/刚刚取完）。重读一次照实说，别猜
+        const fresh = await BlockoutJob.findById(job._id);
+        if (!fresh) return gone();
+        if (await respondNonFinishable(req, res, fresh, BlockoutJob.stateOf(fresh, new Date()))) return;
+        // 窄竞态：抢认领与重读之间那一发又把它放开了。措辞走同一个常量（别在这儿另写一句）
+        return res.status(202).json({
+          ok: false,
+          state: "working",
+          message: BlockoutJob.WORKING_HINT,
+          billed: false,
+        });
+      }
+
+      // ── ⑦ 向方舟核实（★ 绝不信客户端一句「成功了」）─────────────────
+      const verdict = await blockout.fetchTaskState(claimed.taskId);
+      if (verdict.state === "running") {
+        await releaseJob(claimed._id);
+        // ★ 内存里那份也要跟着放开再问 stateOf：不然它会照着"我刚认领的"那一位
+        //   回一句「正在取回」，与我们下面要说的「还没出片」自相矛盾（同一条响应里两种说法）
+        claimed.status = "pending";
+        claimed.claimedAt = null;
+        const st = BlockoutJob.stateOf(claimed, new Date());
+        // 202 + 整句「还没出片，稍后再来取」—— **不是报错**：任务好端端地在跑，
+        // 回 4xx/5xx 会让 App 把一发正常的生成显示成失败，用户以为钱白花了
+        return res.status(202).json({
+          ok: false,
+          state: "running",
+          message: `AI 还没出片，这一发的结果暂时取不了。等出片之后再来点一次「取回结果」就行（产物 ${BlockoutJob.TTL_HOURS} 小时后过期，${st.remainingText}）。`,
+          billed: false,
+          jobId: String(claimed._id),
+          taskId: claimed.taskId,
+          expiresAt: claimed.expiresAt,
+          remainingSec: st.remainingSec,
+        });
+      }
+      if (verdict.state === "failed") {
+        // 终局：方舟明说这一发没成（含 F11 真人脸）。钱不退，照实说，凭据钉成 failed
+        await failJob(claimed._id, verdict.message);
+        return fail(res, 502, verdict.message, { billed: false, lost: true, state: "failed" });
+      }
+      if (verdict.state !== "succeeded") {
+        // unknown：我们**没问清楚**（上游抖动/回包读不懂）。不替方舟宣判 ——
+        // 凭据放回 pending，用户过一会儿再取
+        await releaseJob(claimed._id);
+        return fail(res, 502, verdict.message, { billed: false, state: "retry" });
+      }
 
       // ── ⑧ 转存（F12：方舟产物是 TOS 签名地址，24 小时过期）────────────
-      const moved = await blockout.transferToCloudinary(done.videoUrl, userId);
-      // ★ 转存失败 → **模板不落库**：宁可让用户重来，也不留一个明天就打不开的模板
-      //   （那种模板零症状，直到有人套用它出片时方舟拉不到参考视频才 400）
-      if (!moved.ok) return fail(res, 502, moved.message, { billed: true });
+      const moved = await blockout.transferToCloudinary(verdict.videoUrl, claimed.outPublicId);
+      if (!moved.ok) {
+        // ★★ 这一条在拆两阶段之前是**终局**（"费用无法退回，请重来一次" = 再花一笔钱）。
+        //   现在产物还在方舟那边（24h 内）、凭据也还在 —— 放回 pending 让他再取一次，
+        //   这正是两阶段换来的东西，别把它写回成终局。
+        await releaseJob(claimed._id);
+        return fail(res, 502, moved.message, { billed: false, state: "retry" });
+      }
 
       const outMeta = templateVideoMeta(moved.receipt);
       const outIssue = templateRefIssue(outMeta, "生成出来的白模视频");
       if (outIssue) {
         // 产物本身过不了下一发的输入窗口 —— 落库了也是个谁都用不了的模板。
+        // 这是**确定性**的失败（再取一百次也是同一段产物），所以钉成 failed 而不是放回 pending。
         // 回收掉再拒（不回收就是永久占配额，零症状）
         await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 不合格产物");
-        return fail(res, 502, `${outIssue}（这一发的费用已经产生、无法退回，请换一段素材重试。）`, { billed: true });
+        const msg = `${outIssue}（这一发的费用已经产生、无法挽回，请换一段素材重做。）`;
+        await failJob(claimed._id, msg);
+        return fail(res, 502, msg, { billed: false, lost: true, state: "failed" });
       }
 
       // ── ⑨ 建模板（pending，试炼闸照旧）────────────────────────────────
       let doc;
       try {
         doc = await BranchTemplate.create({
-          ownerId: req.user._id,
+          ownerId: claimed.ownerId,
           authorName: req.user.username || "",
-          title,
-          intro,
-          coverUrl,
+          title: claimed.title,
+          intro: claimed.intro,
+          coverUrl: claimed.coverUrl,
           recipe: {
             styleHint: "",
             beats: [],
             // 经典降级路的镜像时长：白模路的真实时长以 refVideo.durationSec 为准
             durationSec: Math.max(3, Math.min(30, outMeta.duration)),
-            videoTier,
-            ...(aspect ? { aspect } : {}),
+            videoTier: claimed.videoTier,
+            ...(claimed.aspect ? { aspect: claimed.aspect } : {}),
             framePrompt: "",
           },
           refVideo: {
@@ -494,29 +808,108 @@ router.post(
             bytes: outMeta.bytes,
             cloudinaryPublicId: moved.receipt.public_id,
           },
-          roles,
-          source: { publicId, startSec, durSec, crop },
+          // ★ roles / source 全部来自**凭据**，不是客户端这一发的 body（body 里只有 jobId）
+          roles: claimed.roles,
+          source: claimed.source,
+          blockoutJobId: claimed._id,
           status: "pending",
           provenAt: null,
         });
       } catch (e) {
-        await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 落库失败后回收产物");
         if (e?.code === 11000) {
-          return fail(res, 409, "这段白模视频已经登记过一个模板了，请直接使用那一个。", { billed: true });
+          // ★★ 幂等的第二层（最后一道兜底）：同一张凭据已经建过模板了 ——
+          //   两个 pm2 实例同时收到 finish、或者认领超时被抢走之后原来那发又活过来。
+          //   回**既有那一条**，不是 500：用户要的是"我的模板呢"，不是一个错误码。
+          const exist =
+            (await BranchTemplate.findOne({ blockoutJobId: claimed._id }).lean()) ||
+            (await BranchTemplate.findOne({ "refVideo.url": moved.receipt.secure_url }).lean());
+          // 自己刚传的那一份是多余的，回收掉（不回收就是永久占配额，零症状）
+          if (exist && String(exist.refVideo?.cloudinaryPublicId) !== String(moved.receipt.public_id)) {
+            await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 重复取回的多余产物");
+          }
+          if (exist) {
+            await BlockoutJob.updateOne(
+              { _id: claimed._id },
+              { $set: { status: "done", templateId: exist._id, claimedAt: null } },
+            );
+            // ★ 回包形状走 respondDone 那一份（成功、幂等重取、这条兜底三处同一个形状）——
+            //   在这里另拼一遍的话，以后往回包里加字段必漏一处，而客户端读不到时零报错
+            claimed.templateId = exist._id;
+            return respondDone(req, res, claimed, 200);
+          }
+          // 撞了唯一索引却找不到那一条（refVideo.url 被别的模板占着）——
+          // 只能整句拒，但凭据放回 pending（说不定那条模板一会儿被删了）
+          await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 落库失败后回收产物");
+          await releaseJob(claimed._id);
+          return fail(res, 409, "这段白模视频已经登记过一个模板了，请直接使用那一个。", { billed: false, state: "retry" });
         }
+        await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 落库失败后回收产物");
+        await releaseJob(claimed._id);
         throw e;
       }
 
-      return res.status(201).json({
-        ok: true,
-        template: toTemplatePayload(doc.toObject(), req.user),
-        blockout: { taskId, durSec },
-      });
+      // 凭据收官。★ 失败只吼不抛：模板已经建好了，此时回 5xx 会让用户以为没建成、
+      // 再点一次 —— 而幂等那一层会把他导到同一个模板上，不会重复建（但话要说得对）。
+      try {
+        await BlockoutJob.updateOne({ _id: claimed._id }, { $set: { status: "done", templateId: doc._id, claimedAt: null } });
+      } catch (e) {
+        console.error(`[blockoutize] 凭据收官失败 job=${claimed._id} tpl=${doc._id}:`, e.message);
+      }
+
+      // 201：这一发**确实建出了新东西**（重复取回那两条路回 200，客户端可据此分辨
+      // "刚建好"与"早就建好了"）。形状与幂等那两条共用 respondDone 一份。
+      claimed.templateId = doc._id;
+      return respondDone(req, res, claimed, 201);
     } catch (err) {
       return next(err);
     }
   },
 );
+
+// ── 掉线兜底：还没取回结果的凭据 ────────────────────────────────────
+//
+// GET /api/branch/templates/blockoutize/pending
+//
+// ★★ **不做这条，两阶段就白拆了**：App 进程被系统回收之后 jobId 也跟着没了，
+//   用户手里就什么都不剩 —— 与拆之前一样丢结果，只是多了一张他看不见的取件单。
+//   App 必须有一个真入口把用户领回来取（不是藏在某个调试页里）。
+// ★ 只出**还没取回**的（done 的不出：那些的结果已经在他的模板列表里了）。
+//   过期与失败的**要出**，而且要整句说明钱已经没了 —— 这类"东西没了"如果直接从列表
+//   消失，用户只会以为是我们把它弄丢了（铁律八：失败要响亮，不要静默）。
+// ★ 这里**不去问方舟**每一发跑到哪了：那是 N 次出网、会把这个列表变成一个慢且贵的端点，
+//   而客户端本来就在用既有的轮询端点跟进任务（不计费）。这里只回"凭据自己知道的事"。
+router.get("/templates/blockoutize/pending", requireAuth, blockoutPendingLimit, async (req, res, next) => {
+  try {
+    const docs = await BlockoutJob.find({ ownerId: req.user._id, status: { $ne: "done" } })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+    const now = new Date();
+    return res.json({
+      ok: true,
+      jobs: docs.map((d) => {
+        const st = BlockoutJob.stateOf(d, now);
+        return {
+          jobId: String(d._id),
+          taskId: d.taskId,
+          title: d.title || "",
+          durSec: Number(d.source?.durSec || 0),
+          roles: rolesPayload(d.roles),
+          createdAt: d.createdAt,
+          expiresAt: d.expiresAt,
+          // 剩余时间两种形态都给：App 要画倒计时（秒），也要直接显示一句人话
+          remainingSec: st.remainingSec,
+          remainingText: st.remainingText,
+          state: st.state, // pending | working | failed | expired
+          canFinish: st.canFinish,
+          message: st.message,
+        };
+      }),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** best-effort 回收。★ 失败只吼不抛：调用方那一路已经在报别的错了，
  *  在这里抛会把真正的原因盖住；但静默泄漏的配额没有任何症状（铁律八）。 */

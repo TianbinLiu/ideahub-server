@@ -127,6 +127,19 @@ const branchTemplateSchema = new mongoose.Schema(
     /** 白模化的来源。服务端写，且**不出公开响应** */
     source: { type: sourceSchema, default: undefined },
     /**
+     * 建出这个模板的那张**取件凭据**（models/BlockoutJob）。V1 与 V2 一体式那阵子建的
+     * 模板没有这一项 —— 判它一律用存在性。同样**不出公开响应**（纯内部）。
+     *
+     * ★★ 它存在的唯一理由是**幂等**：白模 V2 拆成两阶段之后，「取回结果」（finish）是
+     *   一条**可以重来**的路（转存失败、用户手抖点两次、两台 pm2 实例同时收到）。
+     *   下面 refVideo.url 的唯一索引挡不住这种重来 —— 每次转存都是一次新的 Cloudinary
+     *   上传，**secure_url 里带着新的 version**，两条 URL 并不相等，于是同一发白模化会
+     *   建出两个模板（还各占一份 100MB 级的资产）。所以"一张取件单只许建一个模板"
+     *   必须由**数据库**来保证，而不是靠代码里那句 if。
+     * ★ sparse：没有这一项的老模板不该白占索引条目（也不该被当成"同一张凭据"互相冲突）。
+     */
+    blockoutJobId: { type: mongoose.Schema.Types.ObjectId, ref: "BlockoutJob", default: undefined },
+    /**
      * pending  —— 刚建好/已下架回炉，只有作者自己可见可用
      * published —— 上市场，人人可套
      * blocked  —— 平台下架（事后治理），只有管理员写得动，作者 publish/unpublish 都动不了
@@ -181,6 +194,9 @@ branchTemplateSchema.index({ ownerId: 1, createdAt: -1 });
 // 孤儿回收要问「这段原始素材还有模板在引用吗」（uploads.routes 的 DELETE /template-video）。
 // sparse：V1 模板没有 source，不该白占索引条目
 branchTemplateSchema.index({ "source.publicId": 1 }, { sparse: true });
+// ★★ 一张白模取件凭据只许建出**一个**模板（幂等的最后一道兜底，理由见 blockoutJobId 的 ★★）。
+// unique+sparse：老模板（没有这一项）不参与这条约束。
+branchTemplateSchema.index({ blockoutJobId: 1 }, { unique: true, sparse: true });
 // 市场列表：只查 published，按新旧排
 branchTemplateSchema.index({ status: 1, createdAt: -1 });
 

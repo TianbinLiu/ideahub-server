@@ -14,6 +14,8 @@ const {
 } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const BranchTemplate = require("../models/BranchTemplate");
+// 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
+const BlockoutJob = require("../models/BlockoutJob");
 // 归属判据只有一处（utils/templateVideoAsset），此前这里手写过一份 startsWith 前缀
 const { ownTemplateVideoPublicId } = require("../utils/templateVideoAsset");
 
@@ -190,6 +192,21 @@ router.delete("/template-video", requireAuth, uploadLimit, async (req, res, next
       return res.status(400).json({
         ok: false,
         message: "这段视频是某个白模模板的原始素材（重做时还要用它），请改用删除那个模板（会连带回收）。",
+      });
+    }
+    // ★★ 白模 V2 拆成两阶段之后多出的第三种引用：**还没取回结果**的那一发。
+    //   从受理到取回之间世上还没有模板，上面两条 exists 都落空 —— 而方舟那边可能
+    //   还要去拉这段素材的变换地址（懒生成），此刻删掉它，用户那一发就会莫名其妙失败，
+    //   **而钱已经花了**（受理后失败不退），且没有任何一层会说这是他自己删的。
+    const jobUsed = await BlockoutJob.exists({
+      "source.publicId": publicId,
+      status: { $in: ["pending", "claimed"] },
+      expiresAt: { $gt: new Date() },
+    });
+    if (jobUsed) {
+      return res.status(400).json({
+        ok: false,
+        message: "这段视频正在做白模化（费用已经产生），现在删掉会让那一发白花钱。请先到「待取回的白模」里把结果取回来。",
       });
     }
     const result = await cloudinary.uploader.destroy(publicId, { resource_type: "video" });

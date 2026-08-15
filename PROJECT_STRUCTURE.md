@@ -1635,11 +1635,20 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
-- `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、两段提示词（先看/点名）、方舟任务轮询与产物转存
+- `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
 
 > ⚠️ 本节曾长期只列 5 个服务而实际远多于此；新增服务请在这里补一行。
 > 白模模板（`routes/branchTemplate.routes.js`）与方舟代理（`routes/ark.routes.js`）
 > 这一整块的契约以 `ideahub-app/docs/api-contract.md` 为准（三仓共享）。
+>
+> ★★ 白模化（V2）是**两阶段**的，三个端点缺一不可（2026-08-16）：
+> `POST /api/branch/templates/blockoutize` 开炼并落一条取件凭据（`models/BlockoutJob.js`，
+> 钱在这一步花掉、TTL **24 小时**＝方舟产物 TOS 地址的寿命）→ 客户端用既有的
+> `GET /api/ark/contents/generations/tasks/:id` 自己轮询（不计费）→
+> `POST /api/branch/templates/blockoutize/finish` 凭 jobId 取回（服务端**自己向方舟核实**、
+> 转存、建模板；幂等；这一步不花钱）。掉线兜底是
+> `GET /api/branch/templates/blockoutize/pending`（列出还没取回的凭据）——
+> **少了它两阶段就白拆了**：App 进程被回收之后 jobId 也没了，用户手里什么都不剩。
 
 ---
 

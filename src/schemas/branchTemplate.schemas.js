@@ -104,6 +104,24 @@ const blockoutizeBody = z.object({
   note: z.string().trim().max(500).optional().default(""),
 });
 
+// ── POST /api/branch/templates/blockoutize/finish（取回结果，白模 V2 第二阶段）──
+//
+// ★★ 这条 body **只有一个 jobId**，这是刻意的、也是两阶段最容易被做错的地方：
+//   建模板需要的一切（publicId / startSec / durSec / crop / roles / title / intro /
+//   coverUrl / videoTier / aspect）在阶段一就**全部落进取件凭据**了（models/BlockoutJob），
+//   finish 一个字都不再收。收了就等于给了客户端一次"改价改内容"的机会 ——
+//   `durSec` 是 r2v 的计价输入时长（开炼时按 4 秒报的价、取件时报 30 秒），
+//   `roles` 是套用者挂卡的唯一依据（开炼时 AI 认出的人、取件时换成别人）。
+//   两者都不会报错，只会在账目和别人的作品里静默出事。
+// ★ 连"任务成功了没有"也不收：finish **自己向方舟核实**（services/blockoutize.fetchTaskState），
+//   与试炼闸 provenAt 同一条理由 —— 服务端两头自己看见才算数。
+// ★ 归属同样不在这里：只认凭据自己的 ownerId（路由里判），别人拿到 jobId 也取不走。
+const finishBlockoutizeBody = z.object({
+  // ObjectId 的十六进制形状。真正的合法性由路由的 isValidObjectId 判（唯一实现），
+  // 这里只把长度收住，别让一条 2KB 的字符串进到 Mongo 查询里
+  jobId: z.string().trim().min(1).max(64),
+});
+
 // ── PATCH /api/branch/templates/:id/roles（编号由作者确认）──────────────
 //
 // ★★ 上面刚说过「roles 由服务端写、客户端提交一律不收」，这里却收 —— 不矛盾，
@@ -131,4 +149,4 @@ const patchRolesBody = z.object({
   roles: z.array(roleItemBody).min(1).max(12),
 });
 
-module.exports = { createTemplateBody, blockoutizeBody, patchRolesBody, HTTPS_RE };
+module.exports = { createTemplateBody, blockoutizeBody, finishBlockoutizeBody, patchRolesBody, HTTPS_RE };

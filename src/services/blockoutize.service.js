@@ -2,8 +2,12 @@
 // 白模化（任意视频 → 带编号的白模视频）的三件"只能有一处"的东西：
 //   ① Cloudinary 变换的**预热**（F9）
 //   ② 两段提示词（"先看"的视觉清单 + "点名"的白模化）
-//   ③ 方舟任务的轮询与产物转存
-// 路由（routes/branchTemplate.js 的 /templates/blockoutize）只负责编排与整句报错。
+//   ③ 方舟任务状态的**一次性核实**与产物转存
+// 路由（routes/branchTemplate.js 的 /templates/blockoutize 与 …/finish）只负责编排与整句报错。
+//
+// ★★ 2026-08-16 拆成两阶段：这里**不再有轮询循环**（原来的 `pollTask` 已删）。
+//   服务端在一条 HTTP 请求里等五分钟，等于把"钱已经付了"和"东西拿到了"绑在同一个
+//   TCP 连接的命上 —— 详见 fetchTaskState 的文件内注释与 models/BlockoutJob.js 的文件头。
 //
 // ★ 提示词写在这里而不是路由里：白模化提示词是**产品的一部分**（F4 的成败全压在
 //   "包括…在内"那半句上），散在调用点各写一遍的话，改一处漏一处的表现是
@@ -178,67 +182,75 @@ function blockoutPrompt(roles) {
   ].join("");
 }
 
-// ── ③ 轮询与转存 ────────────────────────────────────────────────────
-
-/** 轮询上限。★ 不是"越大越好"：这条请求整段占着一个连接，
- *  超过它就该整句告诉用户"这次没成"，而不是让 App 对着转圈无限等。
- *  ⚠⚠ 跨组件：nginx 的 `proxy_read_timeout` 必须 > POLL_MAX_MS，否则网关会先掐断，
- *  用户看到 504 而**钱已经花掉了**（受理后失败不退），我们这边的日志里却是一次成功。
- *  见 ALIYUN_HK_DEPLOYMENT_RUNBOOK.md 的 nginx 小节。 */
-const IS_TEST = process.env.NODE_ENV === "test";
-const POLL_INTERVAL_MS = IS_TEST ? 0 : 5_000;
-const POLL_MAX_MS = IS_TEST ? 200 : 5 * 60 * 1000;
+// ── ③ 核实任务状态与转存 ──────────────────────────────────────────────
 
 /**
- * 轮询一个方舟任务到出结果。
- * @returns {Promise<{ ok:true, videoUrl:string } | { ok:false, message:string, billed:boolean }>}
- *   billed=true 表示**已经受理、算力已消耗、方舟已计费** —— 这种失败**不退款**
- *   （含 F11 的真人人脸：创建时不拒，受理后才失败）。调用方必须照实说出来。
+ * 问方舟一次：这个任务现在什么状况。**只问一次，绝不在服务端等**。
+ *
+ * ══ 为什么这里没有轮询循环了（两阶段拆分的要害）══════════════════════
+ * 这个文件之前有一个 `pollTask`：在**建模板那一条 HTTP 请求里**每 5 秒问一次、最长等
+ * 5 分钟。它把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接的命上 —— 手机切后台、
+ * 弱网断线、App 进程被回收、nginx `proxy_read_timeout` 掐断，任何一条都会让用户
+ * **丢掉这一发的结果，而钱已经花了**（方舟受理后失败不退，F11），我们这边的日志里
+ * 却还是一次成功。所以轮询整段搬回客户端（走既有的
+ * `GET /api/ark/contents/generations/tasks/:id` —— 不计费、已有限流桶），
+ * 服务端只在**取回结果**那一步问这一次。
+ *
+ * ★★ 这一问是**必须**的，不是走过场：finish 绝不能信客户端一句「成功了」
+ *   （与试炼闸 provenAt 同一条理由 —— 那边也是服务端两头自己看见才算数）。
+ *   信了的话，随便一个 jobId + 一句"succeeded"就能让我们去转存一条根本不存在的产物，
+ *   或者把一发失败的任务当成功建成模板。
+ *
+ * @returns {Promise<
+ *   | { state:"succeeded", videoUrl:string }
+ *   | { state:"running" }
+ *   | { state:"failed", message:string }
+ *   | { state:"unknown", message:string }>}
+ *   · failed  = 方舟明说这一发没成 —— 终局，**不退费**，调用方要照实说；
+ *   · unknown = 我们**没问清楚**（上游抖动/回包不是 JSON/说成功却没给地址）——
+ *     不是终局：凭据要留着让用户过一会儿再取。把它当失败处理等于替方舟宣判，
+ *     而那一句"这一发没了"是收不回来的。
  */
-async function pollTask(taskId, { intervalMs = POLL_INTERVAL_MS, maxMs = POLL_MAX_MS } = {}) {
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, intervalMs));
-    const { status, text } = await callArk({
-      method: "GET",
-      path: `/contents/generations/tasks/${taskId}`,
-      timeoutMs: T_POLL,
-    });
-    if (status !== 200) {
-      // 轮询本身抖一下不算失败（任务还在跑），继续等到超时
-      console.warn(`[blockoutize] 轮询 ${taskId} 上游 ${status}`);
-      continue;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(text || "{}");
-    } catch {
-      continue;
-    }
-    if (parsed?.status === "succeeded") {
-      const videoUrl = parsed?.content?.video_url;
-      if (!videoUrl) {
-        return { ok: false, billed: true, message: "AI 报告出片成功，却没有给出视频地址，这一发的费用已经产生、无法退回。请重试一次。" };
-      }
-      return { ok: true, videoUrl };
-    }
-    if (parsed?.status === "failed" || parsed?.status === "cancelled") {
-      const why = String(parsed?.error?.message || "").slice(0, 300);
-      return {
-        ok: false,
-        billed: true,
-        message:
-          `AI 中途拒绝了这段视频${why ? `（${why}）` : ""}。` +
-          "视频里出现真人面孔时最容易发生这种情况——任务已经被受理并消耗了算力，**这一发的费用不退**。" +
-          "建议换一段没有真人面孔的素材再试。",
-      };
-    }
+async function fetchTaskState(taskId) {
+  const { status, text } = await callArk({
+    method: "GET",
+    path: `/contents/generations/tasks/${taskId}`,
+    timeoutMs: T_POLL,
+  });
+  if (status !== 200) {
+    console.warn(`[blockoutize] 核实任务 ${taskId} 上游 ${status}`);
+    return {
+      state: "unknown",
+      message: `暂时问不到这一发的出片状态（AI 服务返回 ${status}），这一发的结果还留着，请过一会儿再来取一次。`,
+    };
   }
-  return {
-    ok: false,
-    billed: true,
-    message: `AI 出片超过 ${Math.round(maxMs / 1000)} 秒还没有结果，本次的费用已经产生、无法退回。请稍后到「我的模板」里看一下，或换一段更短的素材重试。`,
-  };
+  let parsed;
+  try {
+    parsed = JSON.parse(text || "{}");
+  } catch {
+    return { state: "unknown", message: "暂时问不到这一发的出片状态（AI 服务的回复读不懂），这一发的结果还留着，请过一会儿再来取一次。" };
+  }
+  if (parsed?.status === "succeeded") {
+    const videoUrl = parsed?.content?.video_url;
+    if (!videoUrl) {
+      // ★ 不当失败：报告成功却没给地址多半是上游一时的形状问题，而这一发的凭据
+      //   还在有效期内 —— 留着让他再取一次，比当场宣判"钱没了"诚实。
+      return { state: "unknown", message: "AI 报告出片成功，却没有给出视频地址。这一发的结果还留着，请过一会儿再来取一次。" };
+    }
+    return { state: "succeeded", videoUrl };
+  }
+  if (parsed?.status === "failed" || parsed?.status === "cancelled") {
+    const why = String(parsed?.error?.message || "").slice(0, 300);
+    return {
+      state: "failed",
+      message:
+        `AI 中途拒绝了这段视频${why ? `（${why}）` : ""}。` +
+        "视频里出现真人面孔时最容易发生这种情况——任务已经被受理并消耗了算力，**这一发的费用不退**。" +
+        "建议换一段没有真人面孔的素材再试。",
+    };
+  }
+  // queued / running / 其它进行中的状态
+  return { state: "running" };
 }
 
 /**
@@ -249,12 +261,16 @@ async function pollTask(taskId, { intervalMs = POLL_INTERVAL_MS, maxMs = POLL_MA
  *   直到有人套用它出片时方舟拉不到参考视频才 400。
  * ★ 落在与原始素材同一个 folder、同一种 public_id 形状（`<userId>-<ts>`），
  *   这样归属校验、r2v 反查、删除时的回收全都沿用现成的那一套。
+ * ★★ `publicId` 由调用方（取件凭据 BlockoutJob.outPublicId）**在阶段一就定死**，
+ *   这里不再现取 `Date.now()`：取回结果是可以重来的一步（转存失败/用户点两次），
+ *   每次现取新 id 的话，重来一次就在云端多留一份 100MB 级的孤儿资产，**零症状**，
+ *   只有月底的配额账单会告诉你。定死之后重来多少次都只覆盖同一份。
  */
-async function transferToCloudinary(remoteUrl, userId) {
+async function transferToCloudinary(remoteUrl, publicId) {
   try {
     const receipt = await cloudinary.uploader.upload(remoteUrl, {
       folder: "ideahub/template-videos",
-      public_id: `${userId}-${Date.now()}`,
+      public_id: publicId,
       resource_type: "video",
     });
     return { ok: true, receipt };
@@ -262,22 +278,22 @@ async function transferToCloudinary(remoteUrl, userId) {
     console.error("[blockoutize] 产物转存失败:", e?.error?.message || e.message);
     return {
       ok: false,
-      message:
-        "白模视频已经生成，但转存到我们的存储时失败了，模板没有创建（AI 给的地址 24 小时后就失效，留一个明天就打不开的模板反而更糟）。" +
-        "这一发的费用已经产生、无法退回，请稍后重试。",
+      // ★ 两阶段之后这条**不再是终局**：产物还在方舟那边（24h 内），凭据也还在，
+      //   用户过一会儿再点一次「取回结果」就能接着走 —— 所以话要说成"可以再来取"，
+      //   而不是一体式那时候的"费用无法退回，请重来一次"（那是让他再花一次钱）。
+      message: "白模视频已经生成好了，但转存到我们的存储时失败了，模板还没建出来。这一发的结果还留着，请过一会儿再来取一次。",
     };
   }
 }
 
 module.exports = {
   PREWARM_TRIES,
-  POLL_MAX_MS,
   prewarm,
   fetchFrameDataUrl,
   VISION_SYSTEM,
   visionPrompt,
   parseRoles,
   blockoutPrompt,
-  pollTask,
+  fetchTaskState,
   transferToCloudinary,
 };

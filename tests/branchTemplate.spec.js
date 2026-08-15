@@ -616,7 +616,7 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
 });
 
 // ─────────────────────────────────────────────────────────────────────
-describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2）", () => {
+describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finish）", () => {
   // ★ 这条链路**花两次真钱**（看帧的 chat + r2v 出片），而且 r2v 一旦被受理就
   //   **失败也不退费**（F11：含真人脸的视频创建时不拒、跑到一半才 failed）。
   //   所以每一道"能把用户的钱扔掉"的闸门都要从行为上钉住：
@@ -626,7 +626,16 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
   //     ④ 服务端拼 URL —— 客户端拿得到 URL = 让用户自己标价（du_ 就是计价输入时长）
   //     ⑤ roles 为空拒 —— 建一个点不了角色位的空壳，用户只会以为"点了没反应"
   //     ⑥ 转存失败不落库 —— 方舟地址 24h 过期，留下的模板明天就是死链且零症状
+  //
+  // ★★ 2026-08-16 拆成两阶段之后，这一组的用例**一条都没删**，只是从"一发同步请求"
+  //   改成"走完两段"（帮手 run()）—— 断言逐条对齐拆分前。删掉它们等于把拆分当成
+  //   "重写"，那些闸门是怎么没的就没人知道了。另加四组两阶段特有的：
+  //     · 幂等（连调两次 finish 只出一个模板）
+  //     · 归属（别人拿到 jobId 也取不走）
+  //     · 过期（24h 之后整句拒，且说清楚钱挽不回来）
+  //     · 任务还在跑（整句「还没出片，稍后再来取」，**不是报错**）
   const BranchTemplate = () => require("../src/models/BranchTemplate");
+  const BlockoutJob = () => require("../src/models/BlockoutJob");
   const walletSvc = require("../src/services/tokenWallet.service");
   const { SEEDANCE_2_5, r2vTokens, CHAT_TURN_TOKENS } = require("../src/config/tokens");
 
@@ -663,6 +672,12 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
       ...over,
     };
   }
+
+  /** 方舟任务 id 的自增器。★ **绝不能全测试共用一个固定 id**：取件凭据按 taskId 建了
+   *  唯一索引（一个方舟任务只许有一张取件单），共用同一个 id 的话第二条用例开炼时会撞上
+   *  第一条那张单子，然后"取回结果"取到的是上一条用例的模板 —— 症状极其误导。
+   *  真实的方舟每次也给不同的 id。 */
+  let taskSeq = 0;
 
   /** 记录所有出网请求，按 URL 分派。★ 断言"服务端拼的那条 URL 原样进了方舟"靠它 */
   function installNet() {
@@ -720,15 +735,17 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
         if (!net.taskAccepted) {
           return { status: 400, text: async () => JSON.stringify({ error: { message: "输入视频不合格" } }) };
         }
-        return { status: 200, text: async () => JSON.stringify({ id: "cgt-blockout-1" }) };
+        taskSeq += 1;
+        return { status: 200, text: async () => JSON.stringify({ id: `cgt-blockout-${taskSeq}` }) };
       }
-      // ⑤ 方舟：轮询
+      // ⑤ 方舟：查任务状态（阶段二的"自己核实"走这条；客户端轮询走 /api/ark 那条）
       if (u.startsWith(`${ARK}/contents/generations/tasks/`)) {
+        const id = u.slice(u.lastIndexOf("/") + 1);
         return {
           status: 200,
           text: async () =>
             JSON.stringify({
-              id: "cgt-blockout-1",
+              id,
               status: net.taskStatus,
               ...(net.taskStatus === "succeeded"
                 ? { content: { video_url: "https://x.volces.com/out.mp4" } }
@@ -783,15 +800,52 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     uploadSpy.mockRestore();
   });
 
+  /** 阶段一：开炼（到"方舟受理了"为止，钱在这里花掉） */
   async function post(body, who = asOwner) {
     return request(app).post("/api/branch/templates/blockoutize").set(who()).send(body);
   }
 
+  /** 阶段二：取回结果（**不花钱**，服务端自己向方舟核实） */
+  async function finish(jobId, who = asOwner, extra = {}) {
+    return request(app)
+      .post("/api/branch/templates/blockoutize/finish")
+      .set(who())
+      .send({ jobId, ...extra });
+  }
+
+  /**
+   * 两阶段走完 —— 等价于拆分前那一发同步请求。
+   * ★ 大多数用例关心的是"整条链路的行为"而不是"哪一阶段"，共用这个帮手之后，
+   *   断言与拆分前逐条对齐（改坏了任何一段都会红在原来那条用例上）。
+   */
+  async function run(body, who = asOwner) {
+    const started = await post(body, who);
+    expect(started.status).toBe(202); // 阶段一只是受理，**什么都还没建出来**
+    const finished = await finish(started.body.jobId, who);
+    return { started, finished, jobId: started.body.jobId };
+  }
+
   // ── happy path ──────────────────────────────────────────────────────
-  test("九步走通 → 201：roles 出、source 不出、status=pending、refVideo 是转存后的地址", async () => {
+  test("两阶段走完 → 201：roles 出、source 不出、status=pending、refVideo 是转存后的地址", async () => {
     const body = baseBody();
-    const res = await post(body);
+    const { started, finished: res } = await run(body);
+
+    // 阶段一的受理回执：客户端靠它拿到取件凭据 + 自己轮询的 taskId
+    expect(started.body).toMatchObject({ ok: true, state: "accepted", durSec: 8, billed: true });
+    expect(typeof started.body.jobId).toBe("string");
+    expect(started.body.taskId).toMatch(/^cgt-/); // 客户端拿它去既有的轮询端点自己跟进
+    // ★ 有效期是 **24 小时**（方舟产物是 TOS 签名地址、24h 过期，F12）——
+    //   写成 48h 的话用户会在第 30 小时回来取，撞上一句拉不到产物的失败，而钱早花了
+    const ttlH = (new Date(started.body.expiresAt) - Date.now()) / 3600_000;
+    expect(ttlH).toBeGreaterThan(23.5);
+    expect(ttlH).toBeLessThanOrEqual(24);
+    // 角色位草案随受理回执一起给（App 要马上显示"AI 在这段里认出了谁"）
+    expect(started.body.roles.map((r) => r.label)).toEqual(["1", "2"]);
+
     expect(res.status).toBe(201);
+    expect(res.body.state).toBe("done");
+    // ★ 取回结果这一步**一分钱不花**：它的失败是"没取到"，不是"又花了一笔"
+    expect(res.body.billed).toBe(false);
     const tpl = res.body.template;
 
     expect(tpl.status).toBe("pending"); // 试炼闸照旧：作者自己跑通一次才能发布
@@ -824,7 +878,7 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     // ★ 这条与「角色位编号由作者确认」那一组是两回事：那组测的是闸门本身（模板是造的），
     //   这条测的是**真走完九步**的产物身上也带着这道门 —— 中间任何一处顺手把
     //   labelConfirmed 填成 true（比如为了"少一步"），只有这条会红。
-    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8016` }));
+    const { finished: made } = await run(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8016` }));
     expect(made.status).toBe(201);
     const id = made.body.template.id;
     // 试炼闸先满足（模拟作者自己跑通了一发），把编号那道门单独露出来
@@ -868,14 +922,15 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     expect(text).toContain("每个人偶胸口");
   });
 
-  test("计价：一次看帧（chat）+ 一次按 durSec 算的 r2v，两笔都真扣", async () => {
+  test("计价：钱**全在阶段一**花掉（看帧 chat + 按 durSec 算的 r2v），取回结果一分不加", async () => {
     const TokenLedger = require("../src/models/TokenLedger");
     const before = await walletSvc.getWallet(owner.id);
-    await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8002`, durSec: 12 }));
-    const after = await walletSvc.getWallet(owner.id);
+    const started = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8002`, durSec: 12 }));
+    expect(started.status).toBe(202);
+    const afterStart = await walletSvc.getWallet(owner.id);
 
     const expected = CHAT_TURN_TOKENS + r2vTokens(12, SEEDANCE_2_5);
-    expect(before.plan + before.addon - (after.plan + after.addon)).toBe(expected);
+    expect(before.plan + before.addon - (afterStart.plan + afterStart.addon)).toBe(expected);
     // r2v 那笔的流水带来源标记（对账时分得出白模化那一发）
     const spend = await TokenLedger.findOne({
       user: owner.id,
@@ -883,6 +938,12 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
       memo: new RegExp(`r2v src:ideahub/template-videos/${owner.id}-8002`),
     }).lean();
     expect(spend.delta).toBe(-r2vTokens(12, SEEDANCE_2_5));
+
+    // ★★ 取回结果这一步**必须一分钱不花** —— 这正是 `billed:false` 那一位的实证。
+    //   它要是也扣钱，用户就不敢重试，而"能再来取一次"是拆两阶段换来的全部东西。
+    expect((await finish(started.body.jobId)).status).toBe(201);
+    const afterFinish = await walletSvc.getWallet(owner.id);
+    expect(afterFinish.plan + afterFinish.addon).toBe(afterStart.plan + afterStart.addon);
   });
 
   // ── ① 归属校验 ──────────────────────────────────────────────────────
@@ -905,11 +966,29 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
 
   test("同一段素材不许做第二次（第一次的 source 已经占住它）", async () => {
     const pid = `ideahub/template-videos/${owner.id}-8004`;
-    expect((await post(baseBody({ publicId: pid }))).status).toBe(201);
+    const { finished } = await run(baseBody({ publicId: pid }));
+    expect(finished.status).toBe(201);
     const again = await post(baseBody({ publicId: pid }));
     expect(again.status).toBe(400);
     expect(again.body.message).toMatch(/已经做过/);
     expect(again.body.billed).toBe(false);
+  });
+
+  test("★ 同一段素材**还没取回结果**时也不许再开一发（不然同一段素材被扣两笔 r2v）", async () => {
+    // ★★ 这是拆两阶段之后新出现的窗口：从"受理"到"取回"之间世上还没有模板，
+    //   只判 BranchTemplate 的话这一句拦不住 —— 用户等出片时手一抖再点一次，
+    //   第二笔几十万 token 就出去了，而两发都会成功，他只会看到"怎么多了一个一样的模板"。
+    const pid = `ideahub/template-videos/${owner.id}-8017`;
+    const started = await post(baseBody({ publicId: pid }));
+    expect(started.status).toBe(202);
+    const before = await walletSvc.getWallet(owner.id);
+    const again = await post(baseBody({ publicId: pid }));
+    expect(again.status).toBe(400);
+    expect(again.body.message).toMatch(/进行中|取回/);
+    expect(again.body.billed).toBe(false);
+    expect(again.body.jobId).toBe(started.body.jobId); // 告诉他去哪儿取，而不是只说"不行"
+    const after = await walletSvc.getWallet(owner.id);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon); // 第二发一分钱没动
   });
 
   // ── ② 四组数校验 ────────────────────────────────────────────────────
@@ -951,14 +1030,14 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     //   "云端还没准备好"上永远失败，而它看起来像是 Cloudinary 的问题（查不到真因）。
     net.headNoLength = true;
     const res = await post(baseBody());
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(202);
     expect(net.calls.some((c) => c.url.endsWith(".mp4") && c.method === "GET")).toBe(true);
   });
 
   test("预热：连续两次相同才算准备好（读一次就走的话这条会红）", async () => {
     net.headBytes = [1000, 2000, 2000]; // 第 2、3 次才稳定
     const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8007` }));
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(202);
     expect(net.calls.filter((c) => c.method === "HEAD").length).toBeGreaterThanOrEqual(3);
   });
 
@@ -975,15 +1054,29 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
   });
 
   // ── ⑥ 受理后失败 / 转存失败 ──────────────────────────────────────────
-  test("方舟受理后 failed（F11 真人脸）→ 整句说明**不退费**，不落库", async () => {
+  test("方舟受理后 failed（F11 真人脸）→ 取回时整句说明**不退费**，不落库", async () => {
     net.taskStatus = "failed";
-    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8009` }));
+    const pid = `ideahub/template-videos/${owner.id}-8009`;
+    const started = await post(baseBody({ publicId: pid }));
+    expect(started.status).toBe(202); // 受理是真的：钱就是在这一步花掉的
+    const res = await finish(started.body.jobId);
     expect(res.status).toBe(502);
-    expect(res.body.billed).toBe(true);
+    // ★★ 两阶段之后 billed 分两件事说：**这一次调用**没花钱（false），
+    //   但开炼那一笔**什么都没剩**（lost:true）。合成一位的话必然有一半是假话。
+    expect(res.body.billed).toBe(false);
+    expect(res.body.lost).toBe(true);
+    expect(res.body.state).toBe("failed");
     // ★ 这句话必须说出口：方舟受理后失败不退费，含糊其辞等于骗人
     expect(res.body.message).toMatch(/不退/);
     expect(res.body.message).toMatch(/真人/);
-    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8009` }).lean()).toBeNull();
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    // 凭据钉成终局：再点一次不会又去问方舟，而是原样把那句话再说一遍
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.status).toBe("failed");
+    expect(job.failMessage).toMatch(/不退/);
+    const again = await finish(started.body.jobId);
+    expect(again.status).toBe(502);
+    expect(again.body.message).toMatch(/不退/);
   });
 
   test("方舟受理**前** 400（敏感词/输入不合格）→ 出片那笔退回、看帧那笔不退，两笔分开说", async () => {
@@ -1026,17 +1119,33 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     await walletSvc.credit(owner.id, 50_000_000, "recharge", "测试用例后复原");
   });
 
-  test("★ 产物转存失败 → 模板**不落库**（宁可重来，也不留一个明天就失效的模板）", async () => {
-    uploadSpy.mockRejectedValue({ error: { message: "cloudinary down" } });
-    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8011` }));
+  test("★ 产物转存失败 → 模板**不落库**，但凭据留着：**再取一次就成**（拆两阶段换来的活路）", async () => {
+    const pid = `ideahub/template-videos/${owner.id}-8011`;
+    const started = await post(baseBody({ publicId: pid }));
+    expect(started.status).toBe(202);
+    // 第一次转存挂掉（Cloudinary 抖一下）
+    uploadSpy.mockRejectedValueOnce({ error: { message: "cloudinary down" } });
+    const res = await finish(started.body.jobId);
     expect(res.status).toBe(502);
-    expect(res.body.billed).toBe(true);
-    // 方舟给的是 TOS 签名地址、24 小时过期 —— 用它建模板，明天就是一条死链，且零症状
-    expect(res.body.message).toMatch(/24 小时|转存/);
-    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8011` }).lean()).toBeNull();
+    // ★★ 拆之前这条是**终局**（"费用无法退回，请重来一次" = 让他再花一笔钱）。
+    //   现在产物还在方舟那边（24h 内）、凭据也还在 —— 话必须说成"可以再来取"。
+    expect(res.body.billed).toBe(false);
+    expect(res.body.lost).toBeUndefined(); // 钱没白花：东西还取得回来
+    expect(res.body.state).toBe("retry");
+    expect(res.body.message).toMatch(/转存/);
+    expect(res.body.message).toMatch(/再来取/);
+    // 模板不落库（那种模板明天就是死链，且零症状）
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    // 凭据放回可取状态 —— 不放开的话用户要罚站到认领超时，而他什么错都没犯
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("pending");
+
+    // 再取一次：这一发的结果一点没丢
+    const again = await finish(started.body.jobId);
+    expect(again.status).toBe(201);
+    expect(again.body.template.refVideo.url).toBe(lastUpload.secure_url);
   });
 
-  test("转存回来的产物自己过不了参考视频窗口 → 拒 + 回收产物，不落库", async () => {
+  test("转存回来的产物自己过不了参考视频窗口 → 拒 + 回收产物，不落库（**确定性失败，钉成终局**）", async () => {
     uploadSpy.mockImplementation(async (_url, opts) => ({
       public_id: `${opts.folder}/${opts.public_id}`,
       secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
@@ -1045,10 +1154,17 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
       height: 512,
       bytes: 1_000,
     }));
-    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8012` }));
+    const pid = `ideahub/template-videos/${owner.id}-8012`;
+    const started = await post(baseBody({ publicId: pid }));
+    const res = await finish(started.body.jobId);
     expect(res.status).toBe(502);
+    // ★ 与"转存抖了一下"不同：再取一百次也是同一段 2 秒产物 —— 所以是 failed 不是 retry，
+    //   而且要明说钱挽不回来。写成 retry 的话用户会一直点，一直失败，一直不知道为什么。
+    expect(res.body.state).toBe("failed");
+    expect(res.body.lost).toBe(true);
     expect(destroySpy).toHaveBeenCalled(); // 不回收就是永久占配额，零症状
-    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8012` }).lean()).toBeNull();
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("failed");
   });
 
   // ── 钱的门禁前置 ────────────────────────────────────────────────────
@@ -1069,9 +1185,14 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  test("取回结果与待取回列表同样不许裸奔 → 401", async () => {
+    expect((await request(app).post("/api/branch/templates/blockoutize/finish").send({ jobId: "x" })).status).toBe(401);
+    expect((await request(app).get("/api/branch/templates/blockoutize/pending")).status).toBe(401);
+  });
+
   // ── 级联回收 ────────────────────────────────────────────────────────
   test("删模板时连原始素材一起回收（不然每做一个模板就永久漏一份原片）", async () => {
-    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8014` }));
+    const { finished: made } = await run(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8014` }));
     expect(made.status).toBe(201);
     const refPublicId = lastUpload.public_id;
     destroySpy.mockClear();
@@ -1082,7 +1203,7 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
   });
 
   test("模板还在时，孤儿口不许删它的原始素材（否则再也重做不了）", async () => {
-    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8015` }));
+    const { finished: made } = await run(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8015` }));
     expect(made.status).toBe(201);
     destroySpy.mockClear();
     const res = await request(app)
@@ -1092,6 +1213,177 @@ describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2�
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/原始素材/);
     expect(destroySpy).not.toHaveBeenCalled();
+  });
+
+  test("★ 还没取回结果时，孤儿口也不许删原始素材（删了那一发就白花钱且没人会说）", async () => {
+    // ★★ 从受理到取回之间世上还没有模板，前两道 exists 都落空 —— 而方舟可能还要去拉
+    //   这段素材的变换地址（懒生成）。此刻删掉它，用户那一发会莫名其妙失败，**钱已经花了**。
+    const pid = `ideahub/template-videos/${owner.id}-8018`;
+    expect((await post(baseBody({ publicId: pid }))).status).toBe(202);
+    destroySpy.mockClear();
+    const res = await request(app).delete("/api/uploads/template-video").set(asOwner()).send({ publicId: pid });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/白模化|取回/);
+    expect(destroySpy).not.toHaveBeenCalled();
+  });
+
+  // ══ 两阶段特有的四道闸 ═══════════════════════════════════════════════
+
+  test("★ 幂等：连调两次 finish 只出**一个**模板（第二次回同一个，不是 500、不是第二份）", async () => {
+    // ★★ 只靠 refVideo.url 的唯一索引是**不够的**：每次转存都是一次新的 Cloudinary 上传，
+    //   secure_url 里带着新的 version —— 两条 URL 并不相等，索引根本不会撞。
+    //   所以"一张取件单只许建一个模板"必须由 BranchTemplate.blockoutJobId 的唯一索引兜底。
+    const pid = `ideahub/template-videos/${owner.id}-8019`;
+    const started = await post(baseBody({ publicId: pid }));
+    const first = await finish(started.body.jobId);
+    expect(first.status).toBe(201);
+    const second = await finish(started.body.jobId);
+    expect(second.status).toBe(200); // 已经取回过了：回既有那一个
+    expect(second.body.ok).toBe(true);
+    expect(second.body.state).toBe("done");
+    expect(second.body.template.id).toBe(first.body.template.id);
+    expect(await BranchTemplate().countDocuments({ "source.publicId": pid })).toBe(1);
+    expect(await BranchTemplate().countDocuments({ blockoutJobId: started.body.jobId })).toBe(1);
+  });
+
+  test("★ 幂等（并发）：两发 finish 同时打进来，也只出一个模板", async () => {
+    const pid = `ideahub/template-videos/${owner.id}-8020`;
+    const started = await post(baseBody({ publicId: pid }));
+    const [a, b] = await Promise.all([finish(started.body.jobId), finish(started.body.jobId)]);
+    // 一发建成（201），另一发要么被认领挡住（202 working）、要么撞唯一索引后回既有那条（200）——
+    // 三种都行，**唯独不许**建出第二个模板
+    const codes = [a.status, b.status].sort();
+    expect(codes).toContain(201);
+    expect(await BranchTemplate().countDocuments({ "source.publicId": pid })).toBe(1);
+  });
+
+  test("★ 归属：别人拿到 jobId 也取不走（404 而不是 403 —— 403 等于承认它存在）", async () => {
+    const pid = `ideahub/template-videos/${owner.id}-8021`;
+    const started = await post(baseBody({ publicId: pid }));
+    const stolen = await finish(started.body.jobId, asOther);
+    expect(stolen.status).toBe(404);
+    expect(typeof stolen.body.message).toBe("string");
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    // 本人还取得回来（没被那一发弄坏）
+    expect((await finish(started.body.jobId)).status).toBe(201);
+  });
+
+  test("★ 过期（24h）→ 410 整句：说清楚「产物已过期、这一发的费用无法挽回」", async () => {
+    const pid = `ideahub/template-videos/${owner.id}-8022`;
+    const started = await post(baseBody({ publicId: pid }));
+    // 把死期拨到过去（方舟产物是 TOS 签名地址、24h 过期，F12）
+    await BlockoutJob().updateOne({ _id: started.body.jobId }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(410);
+    expect(res.body.state).toBe("expired");
+    expect(res.body.billed).toBe(false); // 这一次调用没花钱
+    expect(res.body.lost).toBe(true); // 但开炼那一笔什么都没剩
+    // ★ 话要说满：只说"已过期"会让用户以为再开一发就好了（然后又扣一次钱）
+    expect(res.body.message).toMatch(/过期/);
+    expect(res.body.message).toMatch(/24 小时/);
+    expect(res.body.message).toMatch(/无法挽回/);
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("expired");
+  });
+
+  test("★ 任务还在跑 → 202 + 整句「还没出片，稍后再来取」，**不是报错**、凭据仍可取", async () => {
+    // ★ 回 4xx/5xx 的话，App 会把一发**好端端在跑**的生成显示成失败，用户以为钱白花了
+    net.taskStatus = "running";
+    const pid = `ideahub/template-videos/${owner.id}-8023`;
+    const started = await post(baseBody({ publicId: pid }));
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(202);
+    expect(res.body.state).toBe("running");
+    expect(res.body.billed).toBe(false);
+    expect(res.body.lost).toBeUndefined();
+    expect(res.body.message).toMatch(/还没出片/);
+    expect(res.body.message).toMatch(/再来|取回/);
+    expect(res.body.remainingSec).toBeGreaterThan(0);
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    // 凭据放回可取：出片之后再点一次就成（不放开的话他要罚站到认领超时）
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("pending");
+    net.taskStatus = "succeeded";
+    expect((await finish(started.body.jobId)).status).toBe(201);
+  });
+
+  test("★ finish **不收**客户端重报的任何数（重报 = 让他改价改内容）", async () => {
+    // ★★ durSec 是 r2v 的计价输入时长、roles 是套用者挂卡的唯一依据。
+    //   finish 要是收这些，就等于"开炼按 8 秒报价、取件时改成 30 秒"、
+    //   "AI 认出的是甲乙，落库时换成丙丁" —— 两件都不会报错。
+    const pid = `ideahub/template-videos/${owner.id}-8024`;
+    const started = await post(baseBody({ publicId: pid }));
+    const res = await finish(started.body.jobId, asOwner, {
+      durSec: 30,
+      title: "偷偷改掉的标题",
+      roles: [{ label: "9", desc: "客户端自己编的" }],
+      publicId: `ideahub/template-videos/${other.id}-1`,
+      taskId: "cgt-别人的任务",
+      status: "succeeded",
+    });
+    expect(res.status).toBe(201);
+    const doc = await BranchTemplate().findById(res.body.template.id).lean();
+    expect(doc.title).toBe("白模跑酷 V2"); // 凭据里那份
+    expect(doc.source.durSec).toBe(8); // 不是客户端报的 30
+    expect(doc.source.publicId).toBe(pid); // 不是别人的素材
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "2"]); // 视觉那一步的清单
+  });
+
+  test("jobId 是编的 / 形状不对 → 404 整句（不泄露任何凭据的存在性）", async () => {
+    for (const bad of ["not-an-id", new mongoose.Types.ObjectId().toString()]) {
+      const res = await finish(bad);
+      expect(res.status).toBe(404);
+      expect(typeof res.body.message).toBe("string");
+    }
+  });
+
+  // ── 掉线兜底：待取回列表（不做这条，两阶段就白拆了）──────────────────
+  describe("GET /api/branch/templates/blockoutize/pending", () => {
+    const listOf = (who = asOwner) => request(app).get("/api/branch/templates/blockoutize/pending").set(who());
+
+    test("★ 列出还没取回的那些，带剩余时间与整句说明；取回之后就不再出现", async () => {
+      const pid = `ideahub/template-videos/${owner.id}-8025`;
+      const started = await post(baseBody({ publicId: pid, title: "掉线也找得回来" }));
+      const list = await listOf();
+      expect(list.status).toBe(200);
+      const row = list.body.jobs.find((j) => j.jobId === started.body.jobId);
+      expect(row).toBeTruthy();
+      expect(row.state).toBe("pending");
+      expect(row.canFinish).toBe(true);
+      expect(row.title).toBe("掉线也找得回来");
+      expect(row.taskId).toBe(started.body.taskId); // App 拿它接着轮询
+      expect(row.durSec).toBe(8);
+      expect(row.roles.map((r) => r.label)).toEqual(["1", "2"]);
+      expect(row.remainingSec).toBeGreaterThan(23 * 3600);
+      expect(typeof row.remainingText).toBe("string");
+      expect(row.message).toMatch(/24 小时|过期/); // 别让用户以为随时能回来取
+
+      expect((await finish(started.body.jobId)).status).toBe(201);
+      const after = await listOf();
+      expect(after.body.jobs.map((j) => j.jobId)).not.toContain(started.body.jobId);
+    });
+
+    test("★ 过期的**要留在列表里**并整句说明，而不是悄悄消失", async () => {
+      // ★★ 直接从列表消失的话，用户只会以为是我们把他的东西弄丢了 ——
+      //   而事实是"产物过期了、这笔钱没了"，这句话必须有人说（铁律八）。
+      const pid = `ideahub/template-videos/${owner.id}-8026`;
+      const started = await post(baseBody({ publicId: pid }));
+      await BlockoutJob().updateOne({ _id: started.body.jobId }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+      const row = (await listOf()).body.jobs.find((j) => j.jobId === started.body.jobId);
+      expect(row.state).toBe("expired");
+      expect(row.canFinish).toBe(false);
+      expect(row.remainingSec).toBe(0);
+      expect(row.message).toMatch(/过期/);
+      expect(row.message).toMatch(/无法挽回/);
+    });
+
+    test("只看得见自己的（别人的凭据一条都不出）", async () => {
+      const pid = `ideahub/template-videos/${owner.id}-8027`;
+      const started = await post(baseBody({ publicId: pid }));
+      const mine = (await listOf()).body.jobs.map((j) => j.jobId);
+      expect(mine).toContain(started.body.jobId);
+      const theirs = (await listOf(asOther)).body.jobs.map((j) => j.jobId);
+      expect(theirs).not.toContain(started.body.jobId);
+    });
   });
 });
 
