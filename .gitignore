@@ -8,3 +8,8 @@ uploads/
 # 只挡本机工作区与可能含个人 token 的本地设置覆盖。
 .claude/worktrees/
 .claude/settings.local.json
+
+# ★ 4 月留下的嵌套旧克隆（另一份 server 的完整 checkout），不是本仓的一部分。
+#   2026-08-15 一次 git add -A 把它当成 gitlink 提交了进去（推出去才发现）——
+#   加进 .gitignore 免得下次又被卷进来。要删它本身请人工确认后再动。
+ideahub-server/
