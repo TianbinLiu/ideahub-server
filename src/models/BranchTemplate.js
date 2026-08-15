@@ -124,7 +124,16 @@ const branchTemplateSchema = new mongoose.Schema(
     refVideo: { type: refVideoSchema, required: true },
     /** 角色位（白模 V2）。**服务端写**：来自白模化那一步 chat vision 的清单，
      *  客户端提交的一律不收（与 refVideo 元数据同一条理由，schema 里压根没这个字段）。
-     *  V1 老模板没有这一项 —— 判它一律用存在性，别用 `=== []` 之类的等值 */
+     *  V1 老模板没有这一项 —— 判它一律用存在性，别用 `=== []` 之类的等值。
+     *
+     *  ★ **唯一的例外**是作者的编号核对（PATCH /templates/:id/roles）：那条路整份替换
+     *    这个数组，所以**这份清单的长度是会变的** —— 作者能补一条（视觉少认了一个人），
+     *    也能删掉一条（实测方舟会印重号、也会漏号：一段 5 人素材实出 2/2/1/1/5，
+     *    画面上找不到的那个号只能删）。任何按 `roles.length` 推"画面上有几个人"
+     *    或按下标推编号的写法都会在那之后错，且不报错。
+     *  ★ 删位之后**剩下的 label 逐字不动**（不重编、不排序）：label 就是画面上印着的
+     *    那个数字，也是这个子文档的全部身份（`_id: false`）。重编 = 把卡挂到别人身上。
+     *    下限"至少留一个"由路由 handler 判（那里说得出人话），不在这里也不在 zod。 */
     roles: { type: [roleSchema], default: undefined },
     /** 白模化的来源。服务端写，且**不出公开响应** */
     source: { type: sourceSchema, default: undefined },

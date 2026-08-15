@@ -160,9 +160,18 @@ const finishBlockoutizeBody = z.object({
 //     真出现 "1a" 这种，作者原样抄进来才对得上画面，我们替他"规整"就是把卡挂错人；
 //   · 不校连续 —— 1/2/4/5 是**实测的正常输出**，校连续等于把正确的确认判成非法；
 //     · 不锁个数 —— 视觉可能少认一个人（画面里 5 个只列了 4 个），作者补一条比
-//     "只能确认 AI 认出的那些"诚实。**但个数的上限锁住**：它与 parseRoles 的截断
-//     必须是同一个数（BLOCKOUT_ROLE_MAX），否则作者能从这条路把角色位加到 10 个以上，
-//     而套用侧的参考图预算（方舟 2.5 上限 30 张 ÷ 每张人物卡 2~3 张图）兜不住那么多。
+//     "只能确认 AI 认出的那些"诚实；**也可能反过来多认**，或者编号根本没印上画面
+//     （2026-08-15 实测一段 5 人素材实出 2/2/1/1/5 —— 两组重号、3 和 4 整个没出现），
+//     那时作者要做的是**删掉画面上找不到的那几个位子**，个数当然会变少。
+//     **但个数的上限锁住**：它与 parseRoles 的截断必须是同一个数（BLOCKOUT_ROLE_MAX），
+//     否则作者能从这条路把角色位加到 10 个以上，而套用侧的参考图预算
+//     （方舟 2.5 上限 30 张 ÷ 每张人物卡 2~3 张图）兜不住那么多。
+//
+// ★★ 下限（"至少留一个"）**不在这里**，在路由 handler 里（2026-08-15 从这里挪走）：
+//   zod 报错会被 middleware/error.js 统一抹成英文 `"Validation error"`。删角色位从
+//   "偶尔为之"变成**常规操作**之后，作者撞上下限的概率大增，而他会看到一句机器话，
+//   完全不知道下一步该干什么（正确答案是"整个模板不要了就删模板"）。
+//   规则本身仍然只有一处实现 —— 只是那一处搬到了说得出人话的地方。
 const roleItemBody = z.object({
   // 编号本身。maxlength 与 models/BranchTemplate.roleSchema 的 8 对齐
   label: z.string().trim().min(1).max(8),
@@ -171,7 +180,10 @@ const roleItemBody = z.object({
 });
 
 const patchRolesBody = z.object({
-  roles: z.array(roleItemBody).min(1).max(BLOCKOUT_ROLE_MAX),
+  // ★ 只锁上限（跨仓一处实现，见上）。下限由路由 handler 用中文整句拒 ——
+  //   缺 `roles` 这个键仍然在这里被拦（形状不对），而 `roles: []` 是**形状合法、
+  //   语义非法**的那一类，交给说得出人话的那一层。
+  roles: z.array(roleItemBody).max(BLOCKOUT_ROLE_MAX),
 });
 
 module.exports = { createTemplateBody, blockoutizeBody, finishBlockoutizeBody, patchRolesBody, HTTPS_RE };

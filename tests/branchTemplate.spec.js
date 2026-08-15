@@ -919,28 +919,62 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const text = body.content.find((c) => c.type === "text").text;
     expect(text).toContain("包括");
     expect(text).toContain("白发");
-    expect(text).toContain("头部的四面");
+    expect(text).toContain("头部前后左右四面");
   });
 
-  test("★ 编号印在**头部四面**、四处是**同一个数字**（胸口那个转身就看不见了）", async () => {
+  test("★ 编号印在**头部四面**、四处是**同一个**数字（胸口那个转身就看不见了）", async () => {
     // ★★ 2026-08-15 实测：胸口那个号本身清晰稳定、跨帧不串号，但人物一转身/背对镜头/
     //   换机位就**看不见** —— 而编号是"点这个人偶挂这张卡"的唯一连接键，看不见的那几帧
     //   对套用侧就等于"这个人没有号"。所以要四面都印。
-    // ★ 措辞里"**同一个数字**"这半句必须在：只说"头部四面各印一个编号"时，
+    // ★ 措辞里"**同一个**"这半句必须在：只说"头部四面各印一个编号"时，
     //   模型完全可能给同一个人偶印四个不同的号 —— 那比印在胸口还糟（作者核对时
     //   看哪一面都对不上，而列表里那格看着毫无问题）。
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(/头部的四面/);
-    expect(text).toMatch(/前额、后脑、左侧太阳穴、右侧太阳穴/);
-    expect(text).toMatch(/同一个数字/);
+    expect(text).toMatch(/头部前后左右四面/);
+    expect(text).toMatch(/同一个/);
     // 「取值范围钉死」那条老规矩没被这次改动带走（不写的话实测印出 115/116 这种号码牌）
-    expect(text).toMatch(/依次编到 2/);
-    expect(text).toMatch(/不要用多位数/);
+    expect(text).toMatch(/只用 1 到 2/);
+    expect(text).toMatch(/不要多位数/);
     // ★ 胸口那一处是**故意去掉**的：同一个号印在五个地方 = 五次各自印错的机会，
     //   而两处数字不一样时没有任何人能判哪个对（作者核对看哪个？套用者看哪个？）。
-    expect(text).toMatch(/不要出现任何数字或文字/);
+    expect(text).toMatch(/身上别处不要有数字或文字/);
+  });
+
+  test("★ 编号是**从点名清单抄**的，不是让模型自己编（自己编会重号又漏号）", async () => {
+    // ★★ 2026-08-15 实测钉下来的：措辞写成「给每个人偶编上 1 到 N 的编号」时，
+    //   等于把"谁是几号"当成一件**独立的分配活儿**交给模型 —— 5 人素材实出
+    //   **2/2/1/1/5**（两个 2、两个 1，3 和 4 整个没了），且三帧稳定复现、零报错。
+    //   而点名清单里 `3=红双马尾…` 本来就把号与人绑好了，让它照抄既省注意力、
+    //   又没有自由发挥的余地。这一句一旦被"优化"掉，症状是**套用者把卡挂到别人身上**：
+    //   列表里 1..N 齐整，画面上却重号漏号，两边都不报错。
+    await post(baseBody());
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text).toMatch(/清单写几号的那个人，他的人偶头上就印几号/);
+    expect(text).toMatch(/不许重复也不许漏号/);
+    // ★★ 反向钉一条：**不许**再出现"正好 N 个带号的人偶／每个号各出现一次"那种总量自查。
+    //   看着更严谨，实测反而让模型去"凑一套连号"——按画面从左到右重编成 1/1/2/3/4，
+    //   而清单里最左边那个是 3 号。重号只挂错一个人，**按位置重编是整份映射全错**。
+    //   （详见 blockoutPrompt 函数头 ★★⑤，那一发 605 字，抹外观也跟着退了。）
+    expect(text).not.toMatch(/各出现一次/);
+  });
+
+  test("★ 提示词总长度有预算：编号段不许再膨胀（膨胀就是拿「抹掉外观」去换）", async () => {
+    // ★★ 这一条不是洁癖，是 2026-08-15 三发对照实测的结论：
+    //   编号段六行（~205 字、全长 ~700 字）那一发，头上的号完全正确，
+    //   **衣服和头发却原封不动** —— 做出来是"穿着原衣服的球关节人偶"；
+    //   同素材同参数把编号段压到两行（全长 ~594 字）复跑，衣服头发被抹得干干净净。
+    //   开头那三句"没有头发/没有服装/不许保留原有的发型发色面部或衣服"一个字没动，
+    //   位置也还在最强的开头 —— 它们顶不住的是**总长度**。
+    // ★ 所以这里钉的是"别再让它长回去"。真要加句子，就在别处还回来
+    //   （"清单之外的人"那条就是这么压成一行的）。上限取实测通过值 594 + 余量。
+    //   ⚠ 它随角色位数量增长（每人一行点名），所以按 2 人这个固定 fixture 量。
+    await post(baseBody());
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text.length).toBeLessThan(600);
   });
 
   // ── 看几帧（自动按时长 / 用户自选）───────────────────────────────────
@@ -1041,9 +1075,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(/没有点名的其他人物/);
-    expect(text).toMatch(/不要给他们任何编号/);
-    expect(text).toMatch(/头部与身上保持完全空白/);
+    expect(text).toMatch(/清单之外若还出现别的人物/);
+    expect(text).toMatch(/不给编号/);
+    expect(text).toMatch(/头上身上保持空白/);
   });
 
   test("★ 视觉认出 12 个 → 只登记 9 个角色位，label 恒为连续的 1..9", async () => {
@@ -1060,7 +1094,7 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     // 提示词里的"编到 N"跟着截断后的个数走（不是视觉认出的 12）
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(/依次编到 9/);
+    expect(text).toMatch(/只用 1 到 9/);
     expect(text).toMatch(/共 9 人/);
     expect(text).not.toMatch(/第 10 个人的样子/); // 被丢掉的那几个一个字都不该进提示词
     // 落库那份也是 9 条（取回结果这一步不许把丢掉的补回来）
@@ -1758,7 +1792,7 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
   test("★ 提示词里那个 N 跟着**截断后**的个数走（说 12 而只印 9 个号 = 画面上凭空多出三个号）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(12)));
     expect(text).toMatch(/共 9 人/);
-    expect(text).toMatch(/依次编到 9/);
+    expect(text).toMatch(/只用 1 到 9/);
     expect(text).not.toContain("第 10 个");
     // 点名段是**一人一行的短句**（`编号=原来的样子`）：9 个人时长串会把要害那几句挤到尾巴上
     expect(text).toContain("\n1=位置1，第 1 个人\n");
@@ -1781,16 +1815,204 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
   test("★ 头部四面 + 同一个数字 + 清单外不编号 —— 三句都在（少一句就有一种挂错卡的路子）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
     // ① 四面：胸口那个一转身就看不见，而编号是挂卡的唯一连接键
-    expect(text).toMatch(/头部的四面/);
-    expect(text).toMatch(/前额、后脑、左侧太阳穴、右侧太阳穴/);
-    // ② 同一个数字：不说死的话，同一个人偶四面印四个不同的号，比印在胸口还糟
-    expect(text).toMatch(/同一个数字/);
+    expect(text).toMatch(/头部前后左右四面/);
+    // ② 同一个：不说死的话，同一个人偶四面印四个不同的号，比印在胸口还糟
+    expect(text).toMatch(/同一个/);
+    // ②' 号**从清单抄**，不让模型自己编（自己编实测出 2/2/1/1/5，重号又漏号）
+    expect(text).toMatch(/清单写几号的那个人，他的人偶头上就印几号/);
     // ③ 清单外的人白模化但不编号：画面上多一个列表里没有的号 = 一句我们兑现不了的承诺
-    expect(text).toMatch(/没有点名的其他人物/);
-    expect(text).toMatch(/不要给他们任何编号/);
-    expect(text).toMatch(/头部与身上保持完全空白/);
+    expect(text).toMatch(/清单之外若还出现别的人物/);
+    expect(text).toMatch(/不给编号/);
+    expect(text).toMatch(/头上身上保持空白/);
     // ④ F4 的要害（"包括…在内" + 主角那一句）没被这次压缩措辞带走
     expect(text).toContain("包括");
     expect(text).toMatch(/看起来像主角的那一个/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("★ 删角色位：整份替换里「少给一条」就是删除（白模 V2）", () => {
+  // ★★ 2026-08-15 实测：方舟画编号并不可靠。同一段 5 人素材实出过
+  //     2/2/1/1/5（两组重号，3 和 4 整个没出现）与 3/1/1/4/5（一组重号，2 没出现）。
+  //   而落库那份 label 是服务端自己编的**连续** 1..N —— 所以库里永远不会有两个「1」，
+  //   **重号只发生在画面上**。作者面对的真实局面是："可寻址的号"比登记的号少，
+  //   他必须把找得到的号改对，把**画面上根本找不到的那几个位子删掉**（5 个位退成 3~4 个）。
+  //   没有这条路，他唯一的出路是再花一次钱重炼整段。
+  //
+  // ★★ 这一组同时钉住三件"拆掉也不报错"的事：
+  //   ① 剩下的 label **逐字不动**（数组相等而不是集合相等 —— 集合相等漏得掉重排）；
+  //   ② "改号 + 删位"必须**一次提交**（分两步必撞重号闸，所以不该有 DELETE 端点）；
+  //   ③ 下限是 1 不是 0，且撞上它时说的是**人话**（不是 zod 的英文 Validation error）。
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+
+  /** 白模化落库那一刻的样子：label 恒为服务端编的**连续** 1..N，全部未核对 */
+  const guessed = (n) =>
+    Array.from({ length: n }, (_, i) => ({ label: String(i + 1), desc: `第 ${i + 1} 个人` }));
+
+  async function v2Template(ts, { roles = guessed(3), proven = true } = {}) {
+    const tpl = await createTemplate(ts);
+    await BranchTemplate().updateOne(
+      { _id: tpl.id },
+      { $set: { roles, ...(proven ? { provenAt: new Date() } : {}) } },
+    );
+    return tpl;
+  }
+
+  const patchRoles = (id, roles, who = asOwner) =>
+    request(app).patch(`/api/branch/templates/${id}/roles`).set(who()).send({ roles });
+
+  const labelsIn = async (id) => (await BranchTemplate().findById(id).lean()).roles.map((r) => r.label);
+
+  test("★ 删掉中间那个位子：剩下的 label 逐字不动（1/2/3 删掉 2 → 剩 1 和 3，**不是** 1 和 2）", async () => {
+    const tpl = await v2Template(6101);
+    const res = await patchRoles(tpl.id, [
+      { label: "1", desc: "第 1 个人" },
+      { label: "3", desc: "第 3 个人" },
+    ]);
+    expect(res.status).toBe(200);
+    // ★★ 数组相等，不是集合相等：重排（把 3 顺手改成 2）在集合相等下看不出来，
+    //   而它的后果是套用者挂给 3 号的卡换到了另一个人身上，两边都不报错。
+    expect(res.body.template.roles.map((r) => r.label)).toEqual(["1", "3"]);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "3"]);
+    expect(doc.roles.map((r) => r.label)).not.toContain("2"); // 没有把空出来的 2 补回来
+    // desc 跟着**自己那一条**走，没有按下标滑到别人身上
+    expect(doc.roles.map((r) => r.desc)).toEqual(["第 1 个人", "第 3 个人"]);
+    // 删位即确认：作者删掉它，正是因为他对着画面看清了"这个号不存在"
+    expect(doc.roles.every((r) => r.labelConfirmed === true)).toBe(true);
+  });
+
+  test("★ 重号场景的完整修复：改号 + 删位**一次**提交（实出 2/2/1/1/5 → 只剩 2、1、5 三个可寻址的号）", async () => {
+    const tpl = await v2Template(6102, { roles: guessed(5) });
+    const res = await patchRoles(tpl.id, [
+      { label: "2", desc: "第 1 个人" },
+      { label: "1", desc: "第 3 个人" },
+      { label: "5", desc: "第 5 个人" },
+    ]);
+    expect(res.status).toBe(200);
+    // ★ 顺序按**作者提交的**来，不许被排成 1,2,5：App 侧按 roles 原序落参考图，
+    //   这个顺序决定预算不够时谁先被挤掉，也是挂卡列表的显示顺序。
+    expect(await labelsIn(tpl.id)).toEqual(["2", "1", "5"]);
+    expect(res.body.template.roles.map((r) => r.label)).toEqual(["2", "1", "5"]);
+  });
+
+  test("★ 分两步做不到：任何「先改后删」的中间态都会撞重号闸，而那一句必须指出「删掉一个位子」", async () => {
+    // ★★ 这条是"为什么不新开 DELETE 端点"的证据：作者要把 1,2,3,4,5 改成 2,1,5，
+    //   先把 1 号位改成画面上真实的 "2" —— 库里已经有 "2" → 必然 400。
+    //   所以改号与删位只能是同一次原子提交，而整份替换本来就是为它设计的。
+    const tpl = await v2Template(6103, { roles: guessed(5) });
+    const denied = await patchRoles(tpl.id, [
+      { label: "2", desc: "第 1 个人（画面上其实印着 2）" },
+      ...guessed(5).slice(1),
+    ]);
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/编号/);
+    expect(denied.body.message).toMatch(/删掉/); // 只说"不许重复"等于把人堵在原地
+    expect(await labelsIn(tpl.id)).toEqual(["1", "2", "3", "4", "5"]); // 库里一个字没动
+  });
+
+  test("删一个库里压根不存在的号：这一格**没有错误路径**（提交那份本来就不含它 → 200 无操作）", async () => {
+    const tpl = await v2Template(6104);
+    const res = await patchRoles(tpl.id, guessed(3)); // 作者想删"9 号位"，可库里从来没有 9
+    expect(res.status).toBe(200);
+    expect(await labelsIn(tpl.id)).toEqual(["1", "2", "3"]);
+  });
+
+  test("删同一个号两次是幂等的（不 404、不报错）—— DELETE 端点才需要回答的那道题，这里不存在", async () => {
+    const tpl = await v2Template(6105);
+    const kept = [
+      { label: "1", desc: "第 1 个人" },
+      { label: "3", desc: "第 3 个人" },
+    ];
+    await patchRoles(tpl.id, kept).expect(200);
+    const again = await patchRoles(tpl.id, kept); // 作者手抖点了第二次
+    expect(again.status).toBe(200);
+    expect(await labelsIn(tpl.id)).toEqual(["1", "3"]);
+  });
+
+  test("非本人删不动（403，身份只认 ownerId，且说的是中文整句），库里一条都不少", async () => {
+    const tpl = await v2Template(6106);
+    const res = await patchRoles(tpl.id, [{ label: "1", desc: "第 1 个人" }], asOther);
+    expect(res.status).toBe(403);
+    // ★ App 把这句话原样显示给用户 —— 英文机器串印在界面上等于没解释
+    expect(res.body.message).toMatch(/作者本人/);
+    expect(await labelsIn(tpl.id)).toEqual(["1", "2", "3"]);
+  });
+
+  test("已发布的模板删不了位（400，「下架」和「删」两个字都要在），下架之后同一发就过", async () => {
+    // ★★ 删位比改号更狠：改号是"卡挂到别人身上"，删位是"这张卡直接挂不上了" ——
+    //   套用者手里的 cast[label] 会指向一个不存在的位子，而市场条目还挂着。
+    const tpl = await v2Template(6107);
+    await patchRoles(tpl.id, guessed(3)).expect(200);
+    await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner()).expect(200);
+
+    const shorter = [
+      { label: "1", desc: "第 1 个人" },
+      { label: "3", desc: "第 3 个人" },
+    ];
+    const denied = await patchRoles(tpl.id, shorter);
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/下架/);
+    expect(denied.body.message).toMatch(/删/); // 那句话必须把"删位"也明说进去
+    expect(await labelsIn(tpl.id)).toEqual(["1", "2", "3"]);
+
+    await request(app).patch(`/api/branch/templates/${tpl.id}/unpublish`).set(asOwner()).expect(200);
+    await patchRoles(tpl.id, shorter).expect(200);
+    expect(await labelsIn(tpl.id)).toEqual(["1", "3"]);
+  });
+
+  test("★ 边界：能删到只剩最后一个（200，且留下的那个号不被重编），再删空 → 400 中文整句，库里纹丝不动", async () => {
+    const tpl = await v2Template(6108);
+    const last = await patchRoles(tpl.id, [{ label: "3", desc: "第 3 个人" }]);
+    expect(last.status).toBe(200);
+    expect(await labelsIn(tpl.id)).toEqual(["3"]); // ★ 剩最后一个也不许被重编成 "1"
+
+    const empty = await patchRoles(tpl.id, []);
+    expect(empty.status).toBe(400);
+    // ★★ 删到 0 会触发一条四段全静默的降级链（响应退成 V1 形状 → App 静默退成泛指
+    //   出片，套用者付了钱换来一段"AI 自己挑人换"的片 → 发布闸同时失效）。
+    //   所以它必须被拒，而且要说得出下一步（"整个模板不要了就删模板"）。
+    expect(empty.body.message).not.toMatch(/Validation error/); // 不是 zod 那句英文
+    expect(empty.body.message).toMatch(/至少/);
+    expect(empty.body.message).toMatch(/删除这个模板/);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["3"]);
+    expect(doc.roles.every((r) => r.labelConfirmed === true)).toBe(true); // 没被这一发反悔
+  });
+
+  test("下限这条规则只有一处实现：zod 放行空数组（形状合法），由 handler 用人话拒；缺键仍归 zod", () => {
+    const { patchRolesBody } = require("../src/schemas/branchTemplate.schemas");
+    expect(patchRolesBody.safeParse({ roles: [] }).success).toBe(true);
+    expect(patchRolesBody.safeParse({}).success).toBe(false);
+  });
+
+  test("删位**不清 provenAt**：作者不用为了删一个画面上不存在的号再付一次 r2v 的钱", async () => {
+    // ★ 试炼证明的是"这个模板出得了片"，与角色位个数无关。顺手清掉就等于再收一次学费。
+    const tpl = await v2Template(6109);
+    await patchRoles(tpl.id, [{ label: "1", desc: "第 1 个人" }]).expect(200);
+    expect((await BranchTemplate().findById(tpl.id).lean()).provenAt).toBeTruthy();
+    await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner()).expect(200);
+  });
+
+  test("删位碰不到钱与身份：同一发里塞 refVideo/status/ownerId，删成功但那三样一个都没动", async () => {
+    const tpl = await v2Template(6110);
+    const res = await request(app)
+      .patch(`/api/branch/templates/${tpl.id}/roles`)
+      .set(asOwner())
+      .send({
+        roles: [
+          { label: "1", desc: "第 1 个人" },
+          { label: "3", desc: "第 3 个人" },
+        ],
+        status: "published",
+        ownerId: other.id,
+        refVideo: { durationSec: 1, url: "https://evil.example.com/x.mp4" },
+      });
+    expect(res.status).toBe(200);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "3"]);
+    expect(doc.status).toBe("pending");
+    expect(String(doc.ownerId)).toBe(String(owner.id));
+    expect(doc.refVideo.durationSec).toBe(10); // Cloudinary 的登记值，不是客户端报的 1
   });
 });
