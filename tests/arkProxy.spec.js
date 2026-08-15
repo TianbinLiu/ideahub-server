@@ -420,6 +420,10 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     publishedTpl = await seedTemplate(paidUserId, "1001", "published");
     pendingTpl = await seedTemplate(paidUserId, "1002", "pending");
     blockedTpl = await seedTemplate(paidUserId, "1003", "blocked");
+    // ★ 先充够：这一组里「试炼闸端到端」那条是**真受理**（200），钱不退 ——
+    //   一段 r2v 就是 120 万 token，标准套餐的 200 万撑不到本组末尾，
+    //   后面的用例会莫名其妙地收到 402 而不是它要测的那个码。
+    await walletSvc.credit(paidUserId, 50_000_000, "recharge", "测试预置额度");
   });
 
   test("未登记的 URL → 400 整句拒，且不出网、不扣费（堵白嫖与蹭价）", async () => {
@@ -467,8 +471,9 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     ["duration=30（[4,30] 合法区间也不行）", (b) => { b.duration = 30; }],
     ["resolution=1080p", (b) => { b.resolution = "1080p"; }],
     ["ratio=16:9（钉 adaptive）", (b) => { b.ratio = "16:9"; }],
-    // 方舟在 r2v edit 路真收 generate_audio（2026-08-15 探针实测），而 r2vTokens 没有音频项
-    ["generate_audio=true（无声价买有声产出）", (b) => { b.generate_audio = true; }],
+    // 方舟在 r2v edit 路真收 generate_audio（2026-08-15 探针实测）。这一格现在钉的是
+    // 「与该模型的支持情况一致」（见下面那一组），非布尔值一律不认
+    ["generate_audio 是个字符串（不是布尔）", (b) => { b.generate_audio = "yes"; }],
   ])("r2v 生成参数越出计价假设（%s）→ 400，不出网不扣费", async (_name, mutate) => {
     const body = r2vBody(publishedTpl.refVideo.url);
     mutate(body);
@@ -594,12 +599,309 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     }
   });
 
+  // ── 音频钉子：从「必须 false」改成「与该模型的支持情况一致」──────────
+  // ★ 为什么改：2026-08-15 费用中心逐行核对 —— 同素材有声/无声两发的用量与单价
+  //   **逐位相同**（各 209.71 千 tokens × ¥0.042/千），计费单元里也没有给音频单列的
+  //   条目 ⇒ 开音频零额外成本，「按无声价买有声产出」这件事根本不存在。
+  //   原来那条钉子是"这一版不开方舟音频"的代码表达，账单核完就该放开
+  //   （放开与价目同一个提交 —— 而这次价目一个字都没改，正说明它确实免费）。
+  test("2.x 档的 r2v 允许 generate_audio: true（501 = 钉子放行、走到 forward）", async () => {
+    const body = r2vBody(publishedTpl.refVideo.url);
+    body.generate_audio = true;
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(body);
+    expect(res.status).toBe(501);
+  });
+
+  test("generate_audio: false / 缺省 一直都放行（老客户端不受影响）", async () => {
+    for (const patch of [{ generate_audio: false }, {}]) {
+      const res = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send({ ...r2vBody(publishedTpl.refVideo.url), ...patch });
+      expect(res.status).toBe(501);
+    }
+  });
+
+  test("1.x 档不支持音频（能力表是唯一判据，别让用户以为有声其实是哑的）", () => {
+    const { audioSupported } = require("../src/config/tokens");
+    // ★ 1.x **收下这个参数却静默忽略**（2026-08-15 实测）—— 传过去两边都会以为
+    //   "这一发有声"，用户只会觉得自己手机静音了。所以不支持的档只许 false/缺省。
+    expect(audioSupported("doubao-seedance-1-0-pro-250528")).toBe(false);
+    expect(audioSupported("doubao-seedance-1-0-pro-fast-251015")).toBe(false);
+    expect(audioSupported("doubao-seedance-2-0-mini-260615")).toBe(true);
+    expect(audioSupported(SEEDANCE_2_5)).toBe(true);
+    // 认不出的 model 一律按"不支持"退（往不传那一侧退是安全的）
+    expect(audioSupported("doubao-seedance-9-9-999999")).toBe(false);
+    expect(audioSupported(undefined)).toBe(false);
+    // 用户可控字符串查表不许顺原型链拿到函数（同 imageTokensOf 那条）
+    expect(audioSupported("constructor")).toBe(false);
+  });
+
   test("不带 reference_video 的任务不受影响（别把正常出片一起拦了）", async () => {
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth())
       .send({ model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [{ type: "text", text: "t" }] });
     expect(res.status).toBe(501); // 没配 key 时到 501 = 门都过了、走到 forward
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("r2v 第二条分支：本账号刚传、尚未登记的素材（白模化那一发）", () => {
+  // ★ 为什么要开这条分支：白模化（原视频 → 带编号白模）那一发的输入是「用户刚传的
+  //   素材裁出来的那一段」，此时世上还没有任何模板，按 refVideo.url 反查必然落空。
+  //   而**绝不能**为了过闸门先把用户原视频登记成一个"模板"（会污染模板库、撞唯一索引、
+  //   让试炼闸对着中间物计数）。
+  // ★★ 这一组盯死的是**计价锚点**：输入时长只取 URL 里 `du_` 那个数 ——
+  //   服务端拼 URL 时写进去的，Cloudinary 照它投递，方舟收到的就是这么长的一段。
+  //   拆掉/写松的后果全都零症状：整条原片（最长 600s）按 4s 的价白嫖。
+  const { SEEDANCE_2_5, r2vTokens } = require("../src/config/tokens");
+  const BranchTemplate = require("../src/models/BranchTemplate");
+  const walletSvc = require("../src/services/tokenWallet.service");
+  const { cloudinary } = require("../src/config/cloudinary");
+
+  const CLOUD = "https://res.cloudinary.com/demo/video/upload";
+  let resourceSpy;
+
+  /** 服务端拼出来的那种地址（形状与 utils/templateVideoAsset.buildClipUrl 逐字对齐）。
+   *  ★ 测试里**手写**这个形状而不是调 buildClipUrl：要钉的正是"拼与解是同一种形状"，
+   *    两边都调同一个函数的话，形状一起改也不会红。 */
+  function clipUrlOf(ownerId, ts, { so = 0, du = 8, x = 0, y = 0, w = 900, h = 512 } = {}) {
+    return `${CLOUD}/so_${so},du_${du},c_crop,x_${x},y_${y},w_${w},h_${h}/ideahub/template-videos/${ownerId}-${ts}.mp4`;
+  }
+
+  function r2vBody(url) {
+    return {
+      model: SEEDANCE_2_5,
+      content: [
+        { type: "text", text: "把画面里的人物换成白色人偶" },
+        { type: "video_url", role: "reference_video", video_url: { url } },
+      ],
+      omni_reference_task_type: "edit",
+      duration: -1,
+      ratio: "adaptive",
+    };
+  }
+
+  const asPaid = () => ({ Authorization: `Bearer ${paidToken}` });
+
+  beforeAll(async () => {
+    // 同上：本组每条都要真扣一次 r2v 的钱（96 万起），先充够再测
+    await walletSvc.credit(paidUserId, 50_000_000, "recharge", "测试预置额度");
+  });
+
+  beforeEach(() => {
+    // 原片：1920×1080 / 60s（裁剪框与选段都落在里面）
+    resourceSpy = jest.spyOn(cloudinary.api, "resource").mockImplementation(async (publicId) => ({
+      public_id: publicId,
+      secure_url: `${CLOUD}/${publicId}.mp4`,
+      duration: 60,
+      width: 1920,
+      height: 1080,
+      bytes: 30_000_000,
+      version: 1712000000,
+    }));
+  });
+
+  afterEach(() => {
+    resourceSpy.mockRestore();
+  });
+
+  test("未登记但归属本账号 → 按 URL 里的 durSec 计价（不是纯任务价、不是客户端报的数）", async () => {
+    const TokenLedger = require("../src/models/TokenLedger");
+    const durSec = 8;
+    const expected = r2vTokens(durSec, SEEDANCE_2_5); // (8+8)×21600×2.8
+    expect(expected).toBe(967_680); // 公式钉死：改公式必须先改这一行
+
+    const before = await walletSvc.getWallet(paidUserId);
+    const url = clipUrlOf(paidUserId, 7001, { du: durSec });
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(r2vBody(url));
+    expect(res.status).toBe(501); // 没配 key：闸门与扣费都过了才到 forward
+
+    const after = await walletSvc.getWallet(paidUserId);
+    // 扣的是 r2v 价（先扣 plan），501 后 W2 退回 addon —— 总额不变、构成移动
+    expect(after.plan).toBe(before.plan - Math.min(before.plan, expected));
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+
+    // 流水必须带来源标记：不带的话月底对账分不出白模化那一发花的钱
+    const spend = await TokenLedger.findOne({
+      user: paidUserId,
+      reason: "ark_spend",
+      memo: new RegExp(`r2v src:ideahub/template-videos/${paidUserId}-7001`),
+    }).lean();
+    expect(spend).toBeTruthy();
+    expect(spend.delta).toBe(-expected);
+  });
+
+  test("时长不同 → 扣的钱真的跟着 du_ 走（写死成常量这条会红）", async () => {
+    const TokenLedger = require("../src/models/TokenLedger");
+    for (const du of [5, 20]) {
+      await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set(asPaid())
+        .send(r2vBody(clipUrlOf(paidUserId, 7100 + du, { du })))
+        .expect(501);
+      const spend = await TokenLedger.findOne({
+        user: paidUserId,
+        reason: "ark_spend",
+        memo: new RegExp(`r2v src:ideahub/template-videos/${paidUserId}-${7100 + du}`),
+      }).lean();
+      expect({ du, cost: spend.delta }).toEqual({ du, cost: -r2vTokens(du, SEEDANCE_2_5) });
+    }
+  });
+
+  test("没有 du_ 的地址（整段原片）→ 400：输入时长没有可信来源，不许按纯任务价放行", async () => {
+    const url = `${CLOUD}/v1712000000/ideahub/template-videos/${paidUserId}-7002.mp4`;
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(r2vBody(url));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("别人账号的素材 → 400（归属钉在 public_id 形状上）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(freeUserId, 7003)));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("du_ 越出方舟 edit 的 [4,30] → 400 整句（F1 实测硬窗口）", async () => {
+    for (const du of [3, 31]) {
+      const res = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set(asPaid())
+        .send(r2vBody(clipUrlOf(paidUserId, 7200 + du, { du })));
+      expect({ du, status: res.status }).toEqual({ du, status: 400 });
+      expect(typeof res.body.message).toBe("string"); // 整句可显示，不是错误码天书
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("裁后不满足像素硬门（407,696）→ 400，且不出网不扣费", async () => {
+    // 640×636 = 407,040 < 门
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(paidUserId, 7004, { w: 640, h: 636 })));
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/分辨率太低/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("裁剪框超出画面 / 选段超出片长 → 400（Cloudinary 会自己裁到边界，不报错）", async () => {
+    // 原片 1920×1080：x+w = 1900+900 越界
+    const over = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(paidUserId, 7005, { x: 1900 })));
+    expect(over.status).toBe(400);
+    expect(over.body.message).toMatch(/裁剪框超出/);
+
+    // 原片 60s：so_58 + du_8 越界
+    const late = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(paidUserId, 7006, { so: 58 })));
+    expect(late.status).toBe(400);
+    expect(late.body.message).toMatch(/超出了视频长度/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("Cloudinary 查无此资源（编造的 public_id）→ 400，不扣费", async () => {
+    resourceSpy.mockRejectedValue({ error: { http_code: 404, message: "not found" } });
+    const before = await walletSvc.getWallet(paidUserId);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(paidUserId, 7007)));
+    expect(res.status).toBe(400);
+    const after = await walletSvc.getWallet(paidUserId);
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test("已登记素材加一段裁剪变换 → 400（否则 blocked/未发布 两道门禁一裁剪就绕过去了）", async () => {
+    const tpl = await BranchTemplate.create({
+      ownerId: paidUserId,
+      authorName: "seed",
+      title: "tpl-blocked-src",
+      recipe: { styleHint: "", beats: ["b"], durationSec: 5, videoTier: "ultra", framePrompt: "" },
+      refVideo: {
+        url: `${CLOUD}/v1/ideahub/template-videos/${paidUserId}-7008.mp4`,
+        durationSec: 10,
+        width: 720,
+        height: 1280,
+        bytes: 5_000_000,
+        cloudinaryPublicId: `ideahub/template-videos/${paidUserId}-7008`,
+      },
+      status: "blocked",
+      provenAt: null,
+    });
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(r2vBody(clipUrlOf(paidUserId, 7008)));
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/已经登记过/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    await BranchTemplate.deleteOne({ _id: tpl._id });
+  });
+
+  test("四参数的钉子对新分支同样生效（否则这条分支就是绕过计价假设的旁门）", async () => {
+    const mutations = [
+      ["reference 子任务", (b) => { b.omni_reference_task_type = "reference"; }],
+      ["duration=30", (b) => { b.duration = 30; }],
+      ["resolution=1080p", (b) => { b.resolution = "1080p"; }],
+      ["ratio=16:9", (b) => { b.ratio = "16:9"; }],
+    ];
+    for (const [name, mutate] of mutations) {
+      const body = r2vBody(clipUrlOf(paidUserId, 7009));
+      mutate(body);
+      const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(body);
+      expect({ name, status: res.status }).toEqual({ name, status: 400 });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("免费用户走这条分支照样撞 2.5 的套餐门禁（不是绕开 paidOnly 的旁路）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send(r2vBody(clipUrlOf(freeUserId, 7010)));
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("PLAN_REQUIRED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("跨仓音频能力一致性（app 的档位表 vs 服务端的钉子）", () => {
+  // 抄自 app/src/data/economy.ts 的 VIDEO_TIERS[].audio（为什么抄不 fs 读：与上面
+  // 视频/出图两组逐字相同的理由 —— server 独立部署，会自己跳过的用例是静默失败）。
+  // ★ 分界在**模型代际不在价钱**：2.x 真出声，1.x 收下参数却静默忽略（2026-08-15 实测）。
+  const APP_AUDIO = {
+    "doubao-seedance-1-0-pro-fast-251015": false,
+    "doubao-seedance-1-0-pro-250528": false,
+    "doubao-seedance-2-0-mini-260615": true,
+    "doubao-seedance-2-5-260628": true,
+  };
+
+  test("两张表的 key 集合与数值完全相等", () => {
+    const { VIDEO_AUDIO } = require("../src/config/tokens");
+    expect(VIDEO_AUDIO).toEqual(APP_AUDIO);
+  });
+
+  test("开音频不改任何计价公式（实测零额外成本，加系数就是凭空多收）", () => {
+    const { r2vTokens, segTokens, SEEDANCE_2_5 } = require("../src/config/tokens");
+    // 公式里根本没有音频这个入参 —— 这条断言的意义是：哪天有人给它加一个，
+    // 得先回来解释为什么账单里两发有声/无声的用量与单价是逐位相同的
+    expect(r2vTokens.length).toBe(2); // (inputDurationSec, model)
+    expect(segTokens.length).toBe(2); // (durationSec, model)
+    expect(r2vTokens(10, SEEDANCE_2_5)).toBe(1_209_600);
   });
 });
 

@@ -31,17 +31,19 @@ const { Readable } = require("node:stream");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
-// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
-const { isAdmin } = require("../utils/roles");
-const wallet = require("../services/tokenWallet.service");
-const { priceOf, paidOnlyDenial, SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V } = require("../config/tokens");
+const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
+const { cloudinary } = require("../config/cloudinary");
+// 归属与「裁剪变换 URL」的形状判据只有一处（铁律六）
+const { parseOwnClipUrl } = require("../utils/templateVideoAsset");
+const { templateVideoMeta, templateRefIssue } = require("../middleware/upload");
+// ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
+//   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
+const { callArk, chargedArkCall, arkConfigured, T_CREATE, T_POLL } = require("../services/arkGateway.service");
 
 const router = express.Router();
-
-const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
 /**
  * 允许调用的模型白名单。**与 app 仓 src/ai/arkClient.ts 的 MODELS、
@@ -60,7 +62,7 @@ const ALLOWED_MODELS = new Set([
   "doubao-seedance-2-0-mini-260615",   // Seedance 高清档（需控制台开通）
   // Seedance 2.5「电影级」档。70 元/M，是标准档的 4.7 倍 —— 全站最贵的一次调用
   // （10 秒一段 ≈ 1,015,200 token）。所以它在白名单之外还有**第二道门**：
-  // 免费套餐一律拒（见下面 billedForward 里的 paidOnlyDenial）。
+  // 免费套餐一律拒（判据在 config/tokens.paidOnlyDenial，执行在 services/arkGateway）。
   SEEDANCE_2_5,
   "doubao-seed-2-1-turbo-260628",      // 豆包对话 / 看图说话
   "doubao-seed3d-2-0-260328",          // Seed3D 图生 3D
@@ -68,11 +70,6 @@ const ALLOWED_MODELS = new Set([
 
 /** 方舟任务 id 的字符集。直接拼进上游 URL 的东西一律先收口（铁律六的同一条口径） */
 const TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-
-/** 上游超时。★ 创建类请求体带 2-3MB base64 首尾帧，慢网上行 30s 会掐死在半途
- *  （app 侧实测连超两次后把创建超时提到了 120s，服务端必须给得更宽一点）。 */
-const T_CREATE = 150_000;
-const T_POLL = 30_000;
 
 /** 产物代理的单文件上限。Seed3D 的 zip 实测 36MB 级，视频 5-10MB。 */
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
@@ -86,31 +83,8 @@ const ASSET_HOST_RE = /(^|\.)(volces|volccdn)\.com$/i;
  * 不必去翻日志猜。
  */
 router.get("/health", (_req, res) => {
-  res.json({ ok: true, ark: Boolean(process.env.ARK_API_KEY) });
+  res.json({ ok: true, ark: arkConfigured() });
 });
-
-/** 转发一条已经过白名单的请求，返回上游的 { status, text }。
- *  key 只在这里出现，永远不回给客户端。 */
-async function callArk(req, path, timeoutMs) {
-  const apiKey = process.env.ARK_API_KEY;
-  if (!apiKey) return { status: 501, text: JSON.stringify({ message: "ark not configured" }) };
-
-  let up;
-  try {
-    up = await fetch(`${ARK_BASE}${path}`, {
-      method: req.method,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      ...(req.method === "GET" ? {} : { body: JSON.stringify(req.body ?? {}) }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (e) {
-    // ★ 超时/连接失败要**说出来**，不能吞（铁律八）。App 那边靠这条消息区分
-    //   "方舟慢"和"这台服务器没有代理"，两者的处置完全不同。
-    console.error(`[ark] upstream ${path} ${String((e && e.name) || e)}`);
-    return { status: 504, text: JSON.stringify({ message: `ark upstream ${String((e && e.name) || "error")}` }) };
-  }
-  return { status: up.status, text: await up.text() };
-}
 
 /** 把最新余额挂在响应头上，App 的钱包镜像据此同步（省掉一次 GET /api/me/wallet）。
  *  ★ 跨域可见需要 CORS 的 exposedHeaders 放行，见 app.js。 */
@@ -146,102 +120,40 @@ function setWalletHeaders(res, w) {
 function billedForward(kind, path, timeoutMs) {
   return async (req, res, next) => {
     try {
-      const model = String(req.body?.model ?? "");
-      if (!ALLOWED_MODELS.has(model)) {
-        console.warn(`[ark] 拒绝未在册的模型: ${model.slice(0, 64)}`);
-        return res.status(400).json({ ok: false, message: "model not allowed" });
-      }
+      // ★★ 整段"钱"的判断（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退 → 管理员免单
+      //   照实记账）都在 services/arkGateway.chargedArkCall 里 —— **只有那一份实现**。
+      //   白模化端点（POST /api/branch/templates/blockoutize）服务端自己发方舟请求时
+      //   走的也是它；在这里再抄一遍的话，两套记账迟早分叉，而分叉的表现是
+      //   「月底账单对不上，且查不出是哪个口子漏的」，零症状。
+      const out = await chargedArkCall({
+        user: req.user,
+        // 在册白名单是本路由的数据（"这个模型我们认不认"），不搬进服务层
+        modelAllowed: (m) => ALLOWED_MODELS.has(m),
+        kind,
+        path,
+        body: req.body,
+        // req.r2v 由 resolveR2v 挂上（只有任务端点有它）：白模出片按登记时长换公式计价
+        r2v: req.r2v ?? null,
+        timeoutMs,
+      });
 
-      // 管理员免单。★ 判据来自 req.user.role，而 requireAuth **每次请求都从库里重读**
-      //   role（不信 JWT 里的快照）—— 撤掉某人的管理员身份立刻生效，不用等他的 token 过期。
-      const free = isAdmin(req.user);
-
-      // ★ 一趟读，三个用途：套餐门禁的判据、402 时报给用户的余额、顺带完成钱包
-      //   初始化与跨月刷新。402 那一路原来就要读一次，这里只是提前；成功那一路
-      //   确实多了一次查询——**故意选贵的那一种写法**：换成"只有 paidOnly 的模型
-      //   才去读套餐"就等于把门禁的判据劈成两半（一半在这儿决定要不要查，一半在
-      //   paidOnlyDenial 里决定放不放），以后往 PAID_ONLY_MODELS 里加第二个模型时，
-      //   漏改任何一半都不会报错，只会静默放行。
-      //   代价也确实小：这条路每次都要等方舟几秒到几十秒，一次 Mongo 读可以忽略。
-      const before = await wallet.getWallet(req.user._id);
-      // req.r2v 由 resolveR2v 挂上（只有任务端点有它）：白模出片按登记时长换公式计价。
-      // 定价规则仍只在 config/tokens.js 一处，这里只把解析结果递进去。
-      const cost = priceOf(kind, req.body, req.r2v ?? null);
-      // r2v 的流水 memo 带模板 id：不带的话 `task <model>` 与纯任务一模一样，
-      // 月底对方舟账单时分不出哪些钱是白模花的（B4 对账靠这个标记）
-      const memo = `${kind} ${model}` + (req.r2v ? ` r2v tpl:${req.r2v.templateId}` : "");
-
-      // ★ 管理员这一路的 w 保持 before（余额没动）。**不能给 null**：
-      //   下面 setWalletHeaders 拿 null 会一个头都不写，App 的钱包镜像就停在
-      //   "本地先减过一次"的那个值上，界面显示的余额比真实值少 —— 一个不报错的假账。
-      let w = before;
-
-      // ★ 免单这一路把整段"钱的判断"跳过：套餐门禁 + 扣费 + 余额不足的 402。
-      //   套餐门禁也必须跳 —— 否则一个还挂在免费档上的管理员账号会在 seedance-2.5 上
-      //   被 403，而那道门守的是"钱"，对一个根本不花钱的人守它没有任何意义。
-      //   同理，余额不足的 402 也误伤不到他：这一整段都没执行。
-      //   ★ 流水**不在这里写**，等转发回来再写（见下面 accepted && free 那一段）。
-      if (!free) {
-        // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端的置灰是提示，不是边界）。
-        const denied = paidOnlyDenial(before?.planId, model);
-        if (denied) {
-          console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
-          setWalletHeaders(res, before);
-          // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，
-          // 得换套餐。合并成同一个码，用户会一直充值一直被拒。
-          return res.status(403).json({
-            ok: false,
-            code: "PLAN_REQUIRED",
-            message: denied,
-            planId: before?.planId ?? null,
-            model,
-          });
-        }
-
-        w = await wallet.debit(req.user._id, cost, memo);
-        if (!w) {
-          // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
-          setWalletHeaders(res, before);
-          return res.status(402).json({
-            ok: false,
-            code: "INSUFFICIENT_TOKENS",
-            message: "token 余额不足",
-            need: cost,
-            balance: before ? before.plan + before.addon : 0,
-          });
-        }
-      }
-
-      const { status, text } = await callArk(req, path, timeoutMs);
-
-      const accepted = status >= 200 && status < 300;
-
-      // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
-      // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
-      //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
-      if (!accepted && !free) {
-        const back = await wallet.credit(req.user._id, cost, "ark_refund", `${memo} 上游 ${status}`);
-        w = back ?? w;
-        console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
-      }
-
-      // ★★ 管理员那笔账**记在转发之后、且只在上游受理时记**，与扣费的顺序正好相反。
-      //   扣费必须在前（"条件原子扣减成功 = 拿到许可"，否则并发下双花）；
-      //   而免单这一路不动余额，没有双花可言，于是可以等到"确实花出去了"再落账。
-      //   反过来先记的话，敏感词 400 那种根本没被受理的调用也会记成一笔花销 ——
-      //   而这张账本存在的唯一目的就是与方舟账单对得上，多记等于自己给自己造对不上的账。
-      if (accepted && free) {
-        await wallet.noteAdminFree(req.user._id, cost, `admin ${memo}`, before);
+      if (!out.ok) {
+        // model 那一路刻意不带钱包头（一分钱没动）；plan/funds 两路带 before 的余额
+        setWalletHeaders(res, out.wallet);
+        return res.status(out.status).json(out.body);
       }
 
       // r2v 任务被受理 → 落一条试炼追踪 { taskId, templateId, userId }（TTL 48h）。
       // 轮询看到 succeeded 且发起人就是模板作者时，靠它置 provenAt（发布的前置）——
       // 服务端两头都自己看见了，不用信客户端一句「我跑通了」。
+      // ★ 只有**命中已登记模板**那一路才有试炼可言：resolveR2v 的第二条分支
+      //   （本账号刚传、尚未登记的素材）根本还没有模板，templateId 是 null ——
+      //   拿 null 去 create 会抛 ValidationError，而那时任务已受理、钱已扣。
       // ★ 落库失败不打断响应（任务已受理、钱已扣，此时 5xx 会让客户端误以为没受理去重试），
       //   但必须吼：追踪丢了 = 作者这一发试炼白跑，他会看到"出片成功却还是不能发布"。
-      if (accepted && req.r2v) {
+      if (out.accepted && req.r2v?.templateId) {
         try {
-          const parsed = JSON.parse(text || "{}");
+          const parsed = JSON.parse(out.text || "{}");
           const taskId = String(parsed?.id || "");
           if (TASK_ID_RE.test(taskId)) {
             await BranchTemplateTrial.create({ taskId, templateId: req.r2v.templateId, userId: req.user._id });
@@ -253,10 +165,10 @@ function billedForward(kind, path, timeoutMs) {
         }
       }
 
-      setWalletHeaders(res, w);
+      setWalletHeaders(res, out.wallet);
       // 原样透传状态码与 JSON：App 侧对 429（限流退避）与 400（敏感词，不该重试）
       // 有不同的处理，聚合成 502 会把这个区分抹掉。
-      return res.status(status).type("application/json").send(text || "{}");
+      return res.status(out.status).type("application/json").send(out.text || "{}");
     } catch (err) {
       return next(err);
     }
@@ -325,21 +237,90 @@ async function resolveR2v(req, res, next) {
     }
 
     const url = String(refs[0]?.video_url?.url || "").slice(0, 2000);
+    // ── 分支一：已登记的白模模板（套用出片 / 作者试炼）───────────────
     // 反查登记（refVideo.url 是 unique 索引，等值匹配服务端规范化过的 secure_url）
     const tpl = url
       ? await BranchTemplate.findOne({ "refVideo.url": url }).select("_id ownerId status refVideo.durationSec").lean()
       : null;
-    if (!tpl) {
-      return deny("参考视频必须先登记为白模模板（且地址与登记完全一致）——当前请求未被受理，也没有扣费。");
-    }
-    // blocked = 平台已下架：继续可用的话「事后治理」就没有牙齿
-    if (tpl.status === "blocked") {
-      return deny("这个白模模板已被平台下架，暂时不能用它出片——当前请求未被受理，也没有扣费。");
-    }
-    // 未发布的模板只有作者本人能用（那正是发布前的「试炼」一步）；
-    // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现
-    if (tpl.status !== "published" && String(tpl.ownerId) !== String(req.user._id)) {
-      return deny("这个白模模板还没有发布，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+
+    /** 计价结论（下面两条分支各自填一份，参数钉子对两者一视同仁） */
+    let verdict = null;
+
+    if (tpl) {
+      // blocked = 平台已下架：继续可用的话「事后治理」就没有牙齿
+      if (tpl.status === "blocked") {
+        return deny("这个白模模板已被平台下架，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+      }
+      // 未发布的模板只有作者本人能用（那正是发布前的「试炼」一步）；
+      // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现
+      if (tpl.status !== "published" && String(tpl.ownerId) !== String(req.user._id)) {
+        return deny("这个白模模板还没有发布，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+      }
+      verdict = {
+        templateId: String(tpl._id),
+        ownerId: String(tpl.ownerId),
+        // ★ 计价的输入时长只从服务端登记值读（建模板时从 Cloudinary 写入的那份），
+        //   请求体里客户端说什么都不作数
+        durationSec: Number(tpl.refVideo?.durationSec),
+      };
+    } else {
+      // ── 分支二：本账号刚传、**尚未登记**的托管素材（白模化那一发的输入）──
+      //
+      // ★★ 为什么必须有这条分支：白模化（原视频 → 带编号白模）那一发的输入是
+      //   「用户刚传的素材裁出来的那一段」，此时世上还没有任何模板，反查必然落空。
+      //   而**绝不能**为了过闸门先把用户原视频登记成一个"模板" —— 那会污染模板库、
+      //   撞 refVideo.url 的唯一索引，还让试炼闸对着中间物计数。
+      //
+      // ★★ 计价的输入时长取 **URL 里的 `du_` 那个数**，理由是它**自洽**：
+      //   Cloudinary 会照这条变换投递，方舟拿到的就是这么长的一段 ——
+      //   同一个字符串同时决定了"上游收到多长"和"我们收多少钱"，
+      //   客户端拼不出"少付多得"。反过来，**没有 `du_` 的地址一律不认**
+      //   （parseOwnClipUrl 直接返回 null）：那等于把整条原片（最长 600s）喂进去，
+      //   却只按纯任务价收 —— 输入时长一分不收，账目全瞎。
+      const clip = url ? parseOwnClipUrl(url, String(req.user._id)) : null;
+      if (!clip) {
+        return deny("参考视频必须先登记为白模模板（且地址与登记完全一致）——当前请求未被受理，也没有扣费。");
+      }
+      // 已经被登记过的素材不许从这条分支走：登记过的必须用**精确的登记地址**走分支一，
+      // 否则「加一段裁剪变换」就绕开了 blocked / 未发布 两道门禁
+      const registered = await BranchTemplate.exists({
+        $or: [{ "refVideo.cloudinaryPublicId": clip.publicId }, { "source.publicId": clip.publicId }],
+      });
+      if (registered) {
+        return deny("这段视频已经登记过白模模板了，请直接用模板出片——当前请求未被受理，也没有扣费。");
+      }
+      // 时长必须落在方舟 edit 的硬窗口里（F1 [4,30]，实测错误原文）。
+      // 窗口的唯一实现在 middleware/upload.js —— 这里只是把同一份规则用在"裁后那一段"上。
+      const issue = templateRefIssue(
+        { duration: clip.durSec, width: clip.crop.w, height: clip.crop.h },
+        "这一段",
+      );
+      if (issue) return deny(`${issue}（当前请求未被受理，也没有扣费。）`);
+      // 现查一次资源详情：确认这个 public_id 真的存在、且裁剪框没超出原片
+      // ——编造一个"形状对"的地址到不了扣费这一步。
+      let resource;
+      try {
+        resource = await cloudinary.api.resource(clip.publicId, { resource_type: "video", media_metadata: true });
+      } catch (e) {
+        const http = e?.error?.http_code ?? e?.http_code;
+        if (http === 404) {
+          return deny("找不到这段素材（可能未上传成功或已被回收），请重新上传后再试——当前请求未被受理，也没有扣费。");
+        }
+        console.error(`[ark] r2v 素材详情读取失败 public_id=${clip.publicId}:`, e?.error?.message || e.message);
+        return res
+          .status(502)
+          .json({ ok: false, message: "云端视频信息读取失败，本次请求未被受理，也没有扣费，请稍后重试。" });
+      }
+      const src = templateVideoMeta(resource);
+      const boundIssue = clipOutOfBounds(clip, src);
+      if (boundIssue) return deny(`${boundIssue}（当前请求未被受理，也没有扣费。）`);
+
+      verdict = {
+        templateId: null, // 还没有模板 —— 试炼追踪要靠这个判空跳过（见 billedForward）
+        ownerId: String(req.user._id),
+        durationSec: clip.durSec,
+        sourcePublicId: clip.publicId, // 流水 memo 用（对账时分得出白模化那一发）
+      };
     }
 
     // ★★ 把 r2v 的**生成参数钉死在计价假设上**，不符整句 400。
@@ -364,29 +345,72 @@ async function resolveR2v(req, res, next) {
     if (ratio !== undefined && ratio !== "adaptive") {
       return deny("白模出片的画幅跟随模板视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
     }
-    // ★ generate_audio 同样要钉：2026-08-15 零成本探针实测，**方舟在 r2v edit 路上真收
-    //   这个参数**（给非法值报的是 "parameter `generate_audio` is not valid"，param 精确
-    //   指向它；给 true 通过 schema）。而 r2vTokens 的公式里没有任何音频项 —— 不钉的话，
-    //   改一行客户端就能按无声价买到有声产出，差额全进我们的方舟账单且零症状
-    //   （与上面四个参数同一条理由：计价假设必须由服务端把住，不能只靠客户端自觉）。
-    //   ★ 这也是「这一版不开方舟音频」的**代码表达**：真要开，是「放开这一条 + tokens.js
-    //   加音频系数」同一个提交里的事，绝不能一边悄悄开着一边按无声价收。
+    // ★ generate_audio 同样要钉，但钉的是「**与该模型的支持情况一致**」，不是"必须 false"。
+    //   2026-08-15 零成本探针实测：方舟在 r2v edit 路上真收这个参数（给非法值报的是
+    //   "parameter `generate_audio` is not valid"，param 精确指向它）。
+    //   ★★ 这一条 2026-08-15 从「必须 false/缺省」放开，依据是**费用中心逐行核对**：
+    //     同素材有声/无声两发的用量与单价逐位相同（各 209.71 千 tokens × ¥0.042/千），
+    //     计费单元里也没有给音频单列的条目 ⇒ 开音频**零额外成本**，r2vTokens 不用加项，
+    //     「按无声价买有声产出」这件事根本不存在。放开与价目同一个提交（价目一个字没改）。
+    //   ★ 仍然要钉：**不支持的档只许 false/缺省**（1.x 收下参数却静默忽略 —— 传了会让
+    //     两边都以为"这一发有声"，用户只会觉得自己手机静音了）。能力表只有
+    //     config/tokens.js 的 VIDEO_AUDIO 一处（与 app 的 VideoTier.audio 逐条相等）。
     const genAudio = req.body?.generate_audio;
-    if (genAudio !== undefined && genAudio !== false) {
-      return deny("白模出片暂不支持生成音频——当前请求未被受理，也没有扣费。");
+    if (genAudio !== undefined && genAudio !== false && !(genAudio === true && audioSupported(model))) {
+      return deny(`这一档（${model.slice(0, 64) || "未知模型"}）出片不支持生成音频——当前请求未被受理，也没有扣费。`);
     }
 
-    req.r2v = {
-      templateId: String(tpl._id),
-      ownerId: String(tpl.ownerId),
-      // ★ 计价的输入时长只从服务端登记值读（建模板时从 Cloudinary 写入的那份），
-      //   请求体里客户端说什么都不作数
-      durationSec: Number(tpl.refVideo?.durationSec),
-    };
+    req.r2v = verdict;
     next();
   } catch (err) {
     next(err);
   }
+}
+
+/**
+ * 分支二专用的额外限流桶（**串在 genLimit 后面**，不是替代它）。
+ *
+ * ★ 为什么单独一道：分支二每一发都要向 Cloudinary Admin API 查一次资源详情，
+ *   而免费档 Admin API 是**全局** 500 次/小时（不是按账号）。genLimit 是 30/分，
+ *   一个账号 17 分钟就能把全 App 的**建模板**能力一起刷停摆 ——
+ *   而那时的症状是"别人建模板莫名其妙 502"，完全指不到这里。
+ *   （建模板那条路早就为同一个理由限成 5 次/分，见 createLimit。）
+ * ★ 6 次/分对真人绰绰有余：白模化一发要等好几分钟才出结果。
+ */
+const unregisteredR2vLimit = aiRateLimit({ max: 6, windowMs: 60 * 1000, scope: "ark-r2v-source" });
+
+/**
+ * 只有「带裁剪变换的自有素材」那条路走上面那道桶，其余请求原样放行。
+ * ★ 判据用的是同一个 parseOwnClipUrl（不另写一份形状匹配）：这里只是**要不要限流**的
+ *   预筛，真正的校验仍然在 resolveR2v 里 —— 预筛放宽了最多是少限一道，不会放行任何东西。
+ */
+function limitUnregisteredR2v(req, res, next) {
+  const content = req.body?.content;
+  if (!Array.isArray(content) || !req.user?._id) return next();
+  const hit = content.some(
+    (e) => e && e.video_url?.url && parseOwnClipUrl(String(e.video_url.url).slice(0, 2000), String(req.user._id)),
+  );
+  return hit ? unregisteredR2vLimit(req, res, next) : next();
+}
+
+/**
+ * 裁剪框是不是落在原片里（分支二专用）。
+ * ★ 为什么要查：`c_crop` 超出画面时 Cloudinary 的行为是**自己裁到边界**，不是报错 ——
+ *   于是方舟收到的尺寸与我们按 `w_/h_` 算出来的不一样，F3 的预检就白做了
+ *   （用户在付费那一步才撞 400，而那时钱已经扣了）。
+ * @returns {string|null} null = 合格；字符串 = 整句中文原因
+ */
+function clipOutOfBounds(clip, src) {
+  if (!Number.isFinite(src.duration) || !Number.isFinite(src.width) || !Number.isFinite(src.height)) {
+    return "云端没有返回这段素材的时长或尺寸，无法确定裁剪范围";
+  }
+  if (clip.crop.x + clip.crop.w > src.width || clip.crop.y + clip.crop.h > src.height) {
+    return `裁剪框超出了画面（原片 ${src.width}×${src.height}，裁剪到 ${clip.crop.x + clip.crop.w}×${clip.crop.y + clip.crop.h}）`;
+  }
+  if (clip.startSec + clip.durSec > src.duration) {
+    return `选的这一段超出了视频长度（原片约 ${src.duration} 秒，选到第 ${clip.startSec + clip.durSec} 秒）`;
+  }
+  return null;
 }
 
 /**
@@ -425,6 +449,7 @@ router.post(
   "/contents/generations/tasks",
   requireAuth,
   genLimit,
+  limitUnregisteredR2v,
   resolveR2v,
   billedForward("task", "/contents/generations/tasks", T_CREATE),
 );
@@ -435,7 +460,11 @@ router.post(
 router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req, res, next) => {
   try {
     if (!TASK_ID_RE.test(req.params.id)) return res.status(400).json({ ok: false, message: "bad task id" });
-    const { status, text } = await callArk(req, `/contents/generations/tasks/${req.params.id}`, T_POLL);
+    const { status, text } = await callArk({
+      method: "GET",
+      path: `/contents/generations/tasks/${req.params.id}`,
+      timeoutMs: T_POLL,
+    });
     // 白模模板的试炼闸：succeeded 的 r2v 任务在这里被看见（只有 status 为 succeeded 的
     // 响应才会碰库，running/queued 的高频轮询零额外开销）。失败只吼不打断轮询。
     if (status === 200) await noteR2vOutcome(req.params.id, text);

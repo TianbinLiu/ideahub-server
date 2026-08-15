@@ -192,6 +192,14 @@ server {
     ssl_certificate /etc/letsencrypt/live/ideahubs.org/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/ideahubs.org/privkey.pem;
 
+    # ★ 白模模板视频上传（POST /api/uploads/template-video）。
+    #   服务端的上限是 100MB（middleware/upload.js 的 MAX_TEMPLATE_VIDEO_BYTES），
+    #   这里要留出 multipart 边界与头部的余量 ⇒ 110m。
+    #   ⚠ 小于它的后果是**请求根本到不了 Node**：用户看到 nginx 那张 413 静态页，
+    #     服务端日志里一条记录都没有，查起来完全没有线索。
+    #   ⚠ 这两个数是**一起改**的：改了 MAX_TEMPLATE_VIDEO_BYTES 就回来改这里。
+    client_max_body_size 110m;
+
     location / {
         proxy_pass http://127.0.0.1:4000;
         proxy_http_version 1.1;
@@ -199,6 +207,15 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Real-IP $remote_addr;
+
+        # ★★ 白模化（POST /api/branch/templates/blockoutize）是**长请求**：
+        #   服务端在这一条请求里等方舟出片，上限 5 分钟
+        #   （services/blockoutize.service.js 的 POLL_MAX_MS）。
+        #   nginx 默认 proxy_read_timeout 只有 60s —— 网关会先掐断，用户看到 504，
+        #   而**钱已经花掉了**（方舟受理后失败不退费），我们这边的日志却显示成功。
+        #   给到 400s：比 POLL_MAX_MS 多留一分多钟的余量。
+        proxy_read_timeout 400s;
+        proxy_send_timeout 400s;
     }
 }
 ```
@@ -209,6 +226,10 @@ Enable and validate:
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+⚠️ `systemctl reload nginx` is **asynchronous**: old workers may still serve requests when the
+command returns. Measuring the old behaviour right after a reload does not mean the config failed
+to apply — re-check after a few seconds.
 
 ## Backend deployment
 

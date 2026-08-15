@@ -165,6 +165,38 @@ const VIDEO_MULT = {
 };
 
 /**
+ * 「这个模型出片带不带 AI 生成的环境音」—— **模型能力表，不是价目表**。
+ *
+ * ★★ 2026-08-15 实测 + 费用中心逐行核对（tasks/WM_V2_audio.md）：
+ *   · **分界在模型代际，不在价钱**：2.x（2-0-mini / 2-5）传 `generate_audio: true`
+ *     真出声（-30.2dB / -27.5dB 的真实内容）；1.x（1-0-pro 两档）**收下参数却静默忽略**。
+ *   · **开音频零额外成本**：同素材有声/无声两发的用量与单价逐位相同
+ *     （各 209.71 千 tokens × ¥0.042/千 = ¥8.807820），计费单元下拉里也没有给音频
+ *     单列的条目 ⇒ 这张表**不进任何计价公式**，r2vTokens/segTokens 一个字都不用改。
+ *
+ * ★ 服务端为什么还要有这张表：resolveR2v 的参数钉子要判「这一发传的 generate_audio
+ *   与该模型的支持情况一致吗」。原来那条钉子写的是「必须 false/缺省」——那是
+ *   "这一版不开方舟音频"的代码表达；现在账单核完了，钉子改成**按能力钉**：
+ *   支持的档允许 true，不支持的档只允许 false/缺省（发一个模型不认的参数没有好处，
+ *   而且那正是"以为开了、其实是哑的"的来源）。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 `VideoTier.audio` **逐条相等**（跨仓契约，
+ *   钉在 tests/arkProxy.spec.js「跨仓音频能力一致性」）。
+ * ★ 认不出的 model 一律**不支持**（= 只许 false/缺省）：往"不传"这一侧退是安全的
+ *   （实测有声无声同价，两个方向都不多收钱）。
+ */
+const VIDEO_AUDIO = {
+  "doubao-seedance-1-0-pro-fast-251015": false,
+  "doubao-seedance-1-0-pro-250528": false,
+  "doubao-seedance-2-0-mini-260615": true,
+  [SEEDANCE_2_5]: true,
+};
+
+/** 这个模型认不认 `generate_audio: true`。判据只有这一处（铁律六） */
+function audioSupported(model) {
+  return VIDEO_AUDIO[String(model || "")] === true;
+}
+
+/**
  * 仅付费套餐可调用的模型。★ **"这一档对不对某个套餐开放"的判据只有 `paidOnlyDenial` 一处**，
  * 这个集合只是它的数据。
  *
@@ -250,13 +282,16 @@ const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
  *   方向刻意选「报价 ≥ 实收」：多估的那 1% 我们退不退都不算骗人，反过来
  *   报价 < 实收就是「页面报 X、扣了 X+」——CLAUDE.md 头号事故形状。
  * ★ 不走 clampDuration/segTokens 的 10s 上限：那是纯 t2v 档位的约束（用户自选时长），
- *   r2v 的时长跟随模板（上传窗口 [4,15]s），两条路的规则本来就不同。
- * ★ 时长夹回 [4,15]（上传验收窗口，middleware/upload.js 的 TEMPLATE_VIDEO_RULES）：
+ *   r2v 的时长跟随参考视频（验收窗口 [4,30]s），两条路的规则本来就不同。
+ * ★ 时长夹回 [4,30]（参考视频验收窗口，middleware/upload.js 的 TEMPLATE_REF_RULES）：
  *   登记值只可能落在窗口里，夹到边界还不等于原值 = 登记数据被弄坏了，吼出来。
+ * ★★ 上限 2026-08-15 随白模 V2 从 15 放宽到 30，**必须与那套窗口同时改**：
+ *   窗口放到 30 而这里还夹 15 的话，一段 20s 的模板会按 15s 计价 ——
+ *   页面报价 < 实际扣费，正是 CLAUDE.md 里的头号事故形状（且只有账单知道）。
  */
 function r2vTokens(inputDurationSec, model) {
   const raw = Number(inputDurationSec);
-  const d = Math.max(4, Math.min(15, Math.round(Number.isFinite(raw) ? raw : 0)));
+  const d = Math.max(4, Math.min(30, Math.round(Number.isFinite(raw) ? raw : 0)));
   if (d !== raw) {
     console.error(`[tokens] r2v 输入时长异常（${String(inputDurationSec)}），已按 ${d}s 计价 —— 模板登记数据可能被弄坏了`);
   }
@@ -333,6 +368,8 @@ module.exports = {
   MODEL3D_ID,
   SEEDANCE_2_5,
   VIDEO_MULT,
+  VIDEO_AUDIO,
+  audioSupported,
   VIDEO_MULT_R2V,
   R2V_TOKENS_PER_SEC,
   r2vTokens,

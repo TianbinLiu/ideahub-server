@@ -160,14 +160,18 @@ describe("videoUrl 三重白名单（host + 目录 + 归属）", () => {
     expect(res.body.message).toMatch(/重新上传/);
   });
 
-  test("资源存在但不过验收窗口（30s 长片）→ 400 整句（与上传复核同一份规则）", async () => {
-    resourceSpy.mockImplementation(async (publicId) => fakeResource(publicId, { duration: 30 }));
+  test("资源存在但不过**参考视频**窗口（40s 长片）→ 400 整句", async () => {
+    // ★ 这条 V1 登记路把**整段原片直接当参考视频**用，所以复核走的是严窗口
+    //   （templateRefIssue，[4,30]s + F3），不是上传口那套放宽后的原始素材窗口。
+    //   拿松窗口复核的话，一段 300s 的素材会被登记成模板，然后每个套用它的人在
+    //   付费出片那一步撞 400 —— 而方舟受理后失败是不退费的。
+    resourceSpy.mockImplementation(async (publicId) => fakeResource(publicId, { duration: 40 }));
     const res = await request(app)
       .post("/api/branch/templates")
       .set(asOwner())
       .send(validBody(videoUrlOf(owner.id, 2004)));
     expect(res.status).toBe(400);
-    expect(res.body.message).toMatch(/最长 15 秒/);
+    expect(res.body.message).toMatch(/最长 30 秒/);
   });
 });
 
@@ -273,6 +277,206 @@ describe("试炼闸与发布状态机", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+describe("角色位编号由作者确认（PATCH /templates/:id/roles + 发布闸）", () => {
+  // ★★ 这一组钉的是白模 V2 最阴的一条错法（F5）：白模化落库那一刻的 label 是**服务端
+  //   按视觉清单顺序编的猜测**（1..N），而成片上人偶胸口的数字**稳定但不连续**
+  //   （实测一发四人实出 1/2/4/5）。错位时套用者点"3 号位"挂上张三，模型老老实实换掉
+  //   画面上的 3 号（另一个人）—— **钱照扣、零报错**，没有任何一层会喊。
+  //   所以编号只能由**看得见画面的人**确认，且未确认的模板不许上市场。
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+
+  const twoRoles = () => [
+    { label: "1", desc: "白发、黑金色长袍的少年" },
+    { label: "2", desc: "红发红甲的女武士" },
+  ];
+
+  /**
+   * 造一个「白模 V2 形状」的模板：走 V1 建模板路，再直接落 roles / provenAt。
+   * ★ 不走 blockoutize：那条路要整套假方舟网络，而这里测的是**发布闸与核对端点本身**
+   *   （与上面用 updateOne 模拟试炼通过同一种做法 —— 测什么就只造什么）。
+   */
+  async function v2Template(ts, { roles = twoRoles(), proven = true } = {}) {
+    const tpl = await createTemplate(ts);
+    await BranchTemplate().updateOne(
+      { _id: tpl.id },
+      { $set: { roles, ...(proven ? { provenAt: new Date() } : {}) } },
+    );
+    return tpl;
+  }
+
+  const patchRoles = (id, roles, who = asOwner) =>
+    request(app).patch(`/api/branch/templates/${id}/roles`).set(who()).send({ roles });
+
+  // ── 发布闸：两道独立的门 ────────────────────────────────────────────
+  test("试炼过了但编号没核对 → 发布 400，且整句说的就是「核对编号」这件事", async () => {
+    const tpl = await v2Template(6001);
+    const denied = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(denied.status).toBe(400);
+    // ★ 说的必须是编号这件事：这里如果落回试炼闸那句"先出一段片"，作者会去再花一次钱
+    //   出片，回来发现还是发不了 —— 两道门必须各说各的
+    expect(denied.body.message).toMatch(/核对/);
+    expect(denied.body.message).toMatch(/编号/);
+    expect((await BranchTemplate().findById(tpl.id).lean()).status).toBe("pending");
+  });
+
+  test("编号核对了但还没试炼 → 发布仍 400，说的是「先出一段片」（两道门不互相代替）", async () => {
+    const tpl = await v2Template(6002, { proven: false });
+    await patchRoles(tpl.id, twoRoles()).expect(200);
+    const denied = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/出一段片|出片/);
+  });
+
+  test("两道门都过 → 发布成功，市场上出得来", async () => {
+    const tpl = await v2Template(6003);
+    const done = await patchRoles(tpl.id, twoRoles());
+    expect(done.status).toBe(200);
+    expect(done.body.template.roles.every((r) => r.labelConfirmed === true)).toBe(true);
+    const ok = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(ok.status).toBe(200);
+    expect(ok.body.template.status).toBe("published");
+  });
+
+  test("存量 V2 模板（roles 里根本没有 labelConfirmed 这一位）→ 判成未核对，不许发布", async () => {
+    // ★ 本次改动之前建的模板就是这个形状。用原生驱动写入绕开 mongoose 的默认值填充 ——
+    //   判据写成 `=== false` 的话这类文档会被当成"已核对"漏过去，而它们的编号
+    //   确实一次都没有人核对过（后加字段判等值那条坑的同族）。
+    const tpl = await v2Template(6004, { roles: twoRoles() });
+    await BranchTemplate().collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(tpl.id) },
+      { $set: { roles: [{ label: "1", desc: "白发少年" }] } },
+    );
+    const denied = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/核对/);
+  });
+
+  test("V1 老模板（没有角色位）不受这道门影响：照旧只校试炼闸", async () => {
+    // ★ 判据必须写存在性。写成"roles 不是全 true 就拦"的话，V1 模板会突然发布不了，
+    //   而症状（"老模板怎么发不出去了"）完全指不到这条新代码。
+    const tpl = await createTemplate(6005);
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { provenAt: new Date() } });
+    const ok = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(ok.status).toBe(200);
+    expect(ok.body.template.roles).toBeUndefined(); // V1 连这个键都不该出
+  });
+
+  // ── 核对端点本身 ────────────────────────────────────────────────────
+  test("★ 收下**不连续、非 1..N** 的编号并原样存（F5：实出 1/2/4/5，重排就是把卡挂错人）", async () => {
+    const tpl = await v2Template(6006);
+    // 作者对着成片抄下来的：跳号、还多认出一个人（视觉那一步漏了）
+    const authoritative = [
+      { label: "1", desc: "白发、黑金色长袍的少年" },
+      { label: "2", desc: "红发红甲的女武士" },
+      { label: "4", desc: "画面最右侧的灰袍老人" },
+      { label: "7", desc: "背景里抱猫的小孩" },
+    ];
+    const res = await patchRoles(tpl.id, authoritative);
+    expect(res.status).toBe(200);
+    // 逐字相同：不排序、不补 3/5/6、不改成 1..4
+    expect(res.body.template.roles.map((r) => r.label)).toEqual(["1", "2", "4", "7"]);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "2", "4", "7"]);
+    expect(doc.roles.every((r) => r.labelConfirmed === true)).toBe(true);
+  });
+
+  test("整份替换：作者能删掉 AI 多认的那一条（逐条 merge 的话这种修正表达不出来）", async () => {
+    const tpl = await v2Template(6007);
+    const res = await patchRoles(tpl.id, [{ label: "1", desc: "白发少年" }]);
+    expect(res.status).toBe(200);
+    expect(res.body.template.roles).toHaveLength(1);
+  });
+
+  test("编号重复 → 400，库里一个字都没改（重了的话套用侧的映射会静默互相覆盖）", async () => {
+    const tpl = await v2Template(6008);
+    const res = await patchRoles(tpl.id, [
+      { label: "2", desc: "甲" },
+      { label: "2", desc: "乙" },
+    ]);
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/编号/);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "2"]);
+    expect(doc.roles.every((r) => r.labelConfirmed === true)).toBe(false); // 没被误标成已核对
+  });
+
+  test("非作者不能核对（403，身份只认 ownerId），库不变", async () => {
+    const tpl = await v2Template(6009);
+    const res = await patchRoles(tpl.id, [{ label: "9", desc: "冒名改的" }], asOther);
+    expect(res.status).toBe(403);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles.map((r) => r.label)).toEqual(["1", "2"]);
+  });
+
+  test("未登录 → 401", async () => {
+    const tpl = await v2Template(6010);
+    const res = await request(app).patch(`/api/branch/templates/${tpl.id}/roles`).send({ roles: twoRoles() });
+    expect(res.status).toBe(401);
+  });
+
+  test("已发布的模板不许改编号（先下架）——改了等于把别人手里的「几号位挂谁」偷偷换掉", async () => {
+    const tpl = await v2Template(6011);
+    await patchRoles(tpl.id, twoRoles()).expect(200);
+    await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner()).expect(200);
+
+    const denied = await patchRoles(tpl.id, [{ label: "5", desc: "改过的" }]);
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/下架/);
+    // 下架之后就能改了（改动可见，市场上那条先消失）
+    await request(app).patch(`/api/branch/templates/${tpl.id}/unpublish`).set(asOwner()).expect(200);
+    expect((await patchRoles(tpl.id, [{ label: "5", desc: "改过的" }])).status).toBe(200);
+  });
+
+  test("blocked（平台下架）的模板同样改不动", async () => {
+    const tpl = await v2Template(6012);
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { status: "blocked" } });
+    const res = await patchRoles(tpl.id, twoRoles());
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/平台/);
+  });
+
+  test("V1 模板调核对端点 → 400，且**不凭空造出角色位**", async () => {
+    const tpl = await createTemplate(6013);
+    const res = await patchRoles(tpl.id, [{ label: "1", desc: "编出来的" }]);
+    expect(res.status).toBe(400);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles).toBeUndefined();
+  });
+
+  test("空 roles / 缺 roles → 400（zod）：核对成「一个角色位都没有」不是合法的确认", async () => {
+    const tpl = await v2Template(6014);
+    expect((await patchRoles(tpl.id, [])).status).toBe(400);
+    expect((await request(app).patch(`/api/branch/templates/${tpl.id}/roles`).set(asOwner()).send({})).status).toBe(400);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.roles).toHaveLength(2);
+  });
+
+  test("核对端点碰不到钱与身份：塞 refVideo/source/status/ownerId 全被 strip", async () => {
+    // ★ 这条端点是**唯一**收客户端 roles 的地方，所以要钉住它没顺手开别的口子 ——
+    //   durSec/refVideo 是 r2v 的计价锚点，从这里改得动就等于让用户自己标价。
+    const tpl = await v2Template(6015);
+    const res = await request(app)
+      .patch(`/api/branch/templates/${tpl.id}/roles`)
+      .set(asOwner())
+      .send({
+        roles: [{ label: "1", desc: "白发少年" }],
+        status: "published",
+        ownerId: other.id,
+        provenAt: null,
+        refVideo: { durationSec: 1, url: "https://evil.example.com/x.mp4" },
+        source: { publicId: "ideahub/template-videos/hack-1", startSec: 0, durSec: 1, crop: { x: 0, y: 0, w: 1, h: 1 } },
+      });
+    expect(res.status).toBe(200);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.status).toBe("pending");
+    expect(String(doc.ownerId)).toBe(String(owner.id));
+    expect(doc.refVideo.durationSec).toBe(10); // Cloudinary 的登记值，不是客户端报的 1
+    expect(doc.refVideo.url).toContain("res.cloudinary.com");
+    expect(doc.source).toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
 describe("DELETE 连带回收云端资产（全仓第一个 uploader.destroy 的行为钉子）", () => {
   const BranchTemplate = () => require("../src/models/BranchTemplate");
 
@@ -355,11 +559,14 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
     expect(destroySpy).not.toHaveBeenCalled();
   });
 
+  // ★★ 上传口走的是**原始素材**那套窗口（V2 起放宽）：真正要满足方舟约束的是
+  //   "编辑页框选、服务端裁出来的那一段"，原片本身不再直接进方舟。
+  //   所以这里**不再**拒 3s / 20s / 细长比例 —— 那三条现在都是合法素材
+  //   （下面另有一组正面钉住"确实放行了"）。
   test.each([
-    ["太短（3s）", { duration: 3 }, /至少要 4 秒/],
-    ["太长（20s）", { duration: 20 }, /最长 15 秒/],
+    ["太长（700s）", { duration: 700 }, /最长 600 秒/],
+    ["边长不够（200×3000）", { width: 200, height: 3000 }, /边长至少 300 像素/],
     ["像素数不够（640×360）", { width: 640, height: 360 }, /分辨率太低/],
-    ["比例过细长（500×1500）", { width: 500, height: 1500 }, /宽高比/],
   ])("回执复核不过：%s → 先 destroy 再 400 整句", async (_label, over, msgRe) => {
     mockUploadReceipt(over);
     const res = await request(app)
@@ -370,6 +577,23 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
     expect(res.body.message).toMatch(msgRe); // 整句中文原因，不是错误码天书
     expect(destroySpy).toHaveBeenCalledTimes(1); // 不合格的上传不许占配额
     expect(destroySpy.mock.calls[0][1]).toEqual({ resource_type: "video" });
+  });
+
+  test.each([
+    ["3 秒（裁出来的那一段才要 ≥4s）", { duration: 3 }],
+    ["3 分钟长片（V2 的素材本来就长）", { duration: 180 }],
+    ["细长比例 500×1500（比例正是裁剪框能修的那一项）", { width: 500, height: 1500 }],
+  ])("原始素材窗口放宽后：%s → 200 放行，且不回收", async (_label, over) => {
+    // ★ 这一组是**放宽方向**的钉子。只钉"该拒的拒"是不够的：把窗口悄悄改回严的，
+    //   症状是"一段 3 分钟的素材连传都传不上来，而它裁出来的 8 秒完全合格"——
+    //   用户根本没法开始，而上面那组测试照样全绿。
+    mockUploadReceipt(over);
+    const res = await request(app)
+      .post("/api/uploads/template-video")
+      .set(asOwner())
+      .attach("video", Buffer.from("fake-mp4"), { filename: "a.mp4", contentType: "video/mp4" });
+    expect(res.status).toBe(200);
+    expect(destroySpy).not.toHaveBeenCalled();
   });
 
   test("webm 直接 400（r2v 只认 mp4/mov，/media 的白名单不适用）", async () => {
@@ -383,7 +607,7 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
     expect(uploadStreamSpy).not.toHaveBeenCalled(); // 挡在上传之前，不出网
   });
 
-  test("未登录 → 401（每一发都是 20MB 级出网 + 永久配额，不许裸奔）", async () => {
+  test("未登录 → 401（每一发都是 100MB 级出网 + 永久配额，不许裸奔）", async () => {
     const res = await request(app)
       .post("/api/uploads/template-video")
       .attach("video", Buffer.from("x"), { filename: "a.mp4", contentType: "video/mp4" });
@@ -392,23 +616,542 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
 });
 
 // ─────────────────────────────────────────────────────────────────────
-describe("templateVideoIssue：验收窗口的唯一实现（单元）", () => {
-  const { templateVideoIssue, TEMPLATE_VIDEO_RULES } = require("../src/middleware/upload");
+describe("POST /api/branch/templates/blockoutize：白模化九步（白模 V2）", () => {
+  // ★ 这条链路**花两次真钱**（看帧的 chat + r2v 出片），而且 r2v 一旦被受理就
+  //   **失败也不退费**（F11：含真人脸的视频创建时不拒、跑到一半才 failed）。
+  //   所以每一道"能把用户的钱扔掉"的闸门都要从行为上钉住：
+  //     ① 归属校验     —— 松了就能拿别人的素材开炼
+  //     ② 四组数校验   —— 松了就在方舟那一步才 400，而钱已经扣了
+  //     ③ 预热（F9）   —— 不预热就可能把半截视频喂给方舟，产出是废片、钱照扣
+  //     ④ 服务端拼 URL —— 客户端拿得到 URL = 让用户自己标价（du_ 就是计价输入时长）
+  //     ⑤ roles 为空拒 —— 建一个点不了角色位的空壳，用户只会以为"点了没反应"
+  //     ⑥ 转存失败不落库 —— 方舟地址 24h 过期，留下的模板明天就是死链且零症状
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+  const walletSvc = require("../src/services/tokenWallet.service");
+  const { SEEDANCE_2_5, r2vTokens, CHAT_TURN_TOKENS } = require("../src/config/tokens");
 
-  test("合格样本 → null", () => {
-    expect(templateVideoIssue({ duration: 10, width: 720, height: 1280 })).toBeNull();
-    expect(templateVideoIssue({ duration: 4, width: 640, height: 640 })).toBeNull(); // 409,600 ≥ 407,696
+  const ARK = "https://ark.cn-beijing.volces.com/api/v3";
+
+  let fetchSpy;
+  let uploadSpy;
+  /** 转存回执（产物的 public_id 里带 Date.now()，只能在跑完之后回读） */
+  let lastUpload;
+  /** 每条用例可改的行为开关（默认是 happy path） */
+  let net;
+
+  // ★ 每条用例默认用一段**没用过**的素材：白模化对同一段素材只许做一次
+  //   （第一次的 source 就占住它了）。共用同一个 id 的话，后面的用例全会撞上
+  //   "这段素材已经做过"，而错误信息与它们要测的东西对不上 —— 排查起来极其误导。
+  // 8500 起：与下面几条用例里写死的 8002~8015 分开，免得撞成"这段素材已经做过"
+  let pidSeq = 8500;
+  function nextPid() {
+    pidSeq += 1;
+    return `ideahub/template-videos/${owner.id}-${pidSeq}`;
+  }
+
+  function baseBody(over = {}) {
+    return {
+      publicId: nextPid(),
+      startSec: 2,
+      durSec: 8,
+      crop: { x: 0, y: 0, w: 900, h: 512 }, // 460,800 ≥ 407,696，比例 1.76
+      title: "白模跑酷 V2",
+      intro: "从一段实拍里裁出来的",
+      coverUrl: "",
+      videoTier: "ultra",
+      aspect: "landscape",
+      ...over,
+    };
+  }
+
+  /** 记录所有出网请求，按 URL 分派。★ 断言"服务端拼的那条 URL 原样进了方舟"靠它 */
+  function installNet() {
+    net = {
+      headBytes: [4_000_000, 4_000_000], // 连续两次相同 = 预热完成
+      frameOk: true,
+      visionText: "1|画面正中央|白发、黑金色长袍的少年\n2|左侧靠前|红发红甲的女武士",
+      taskAccepted: true,
+      taskStatus: "succeeded",
+      calls: [],
+    };
+    let headN = 0;
+    fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async (url, init = {}) => {
+      const u = String(url);
+      net.calls.push({ url: u, method: init.method || "GET", body: init.body });
+      // ① 预热：HEAD 变换地址
+      if (init.method === "HEAD") {
+        const bytes = net.headBytes[Math.min(headN, net.headBytes.length - 1)];
+        headN += 1;
+        // net.headNoLength = 模拟"生成中的派生资产以 chunked 回，HEAD 一个长度都没有"
+        return {
+          ok: bytes !== null,
+          status: bytes === null ? 500 : 200,
+          headers: { get: () => (net.headNoLength ? null : String(bytes ?? 0)) },
+        };
+      }
+      // ①b 预热的兜底：Range: bytes=0-0 的 GET，从 content-range 的分母读总长
+      if (init.headers?.Range) {
+        const bytes = net.headBytes[Math.min(headN - 1, net.headBytes.length - 1)];
+        return {
+          ok: true,
+          status: 206,
+          headers: { get: (k) => (k === "content-range" ? `bytes 0-0/${bytes}` : null) },
+        };
+      }
+      // ② 抽帧
+      if (u.endsWith(".jpg")) {
+        if (!net.frameOk) return { ok: false, status: 404, headers: { get: () => null } };
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (k) => (k === "content-type" ? "image/jpeg" : null) },
+          arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+        };
+      }
+      // ③ 方舟：看帧
+      if (u === `${ARK}/chat/completions`) {
+        return {
+          status: 200,
+          text: async () => JSON.stringify({ choices: [{ message: { content: net.visionText } }] }),
+        };
+      }
+      // ④ 方舟：建 r2v 任务
+      if (u === `${ARK}/contents/generations/tasks`) {
+        if (!net.taskAccepted) {
+          return { status: 400, text: async () => JSON.stringify({ error: { message: "输入视频不合格" } }) };
+        }
+        return { status: 200, text: async () => JSON.stringify({ id: "cgt-blockout-1" }) };
+      }
+      // ⑤ 方舟：轮询
+      if (u.startsWith(`${ARK}/contents/generations/tasks/`)) {
+        return {
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              id: "cgt-blockout-1",
+              status: net.taskStatus,
+              ...(net.taskStatus === "succeeded"
+                ? { content: { video_url: "https://x.volces.com/out.mp4" } }
+                : { error: { message: "内容审核未通过" } }),
+            }),
+        };
+      }
+      throw new Error(`测试里没有为这个地址准备回应：${u}`);
+    });
+  }
+
+  beforeAll(async () => {
+    // ★ 变换 URL 要用 cloud_name 拼（测试环境没有 .env）。给一个假的就够：
+    //   出网全被 fetch 间谍接管，这里只影响拼出来的字符串。
+    cloudinary.config({ cloud_name: "demo", api_key: "test-key", api_secret: "test-secret" });
+    // 2.5 是 paidOnly，且一发 r2v 就是百万级 token —— 作者得是付费用户且钱包够
+    await walletSvc.buyPlan(owner.id, "pro");
+    await walletSvc.credit(owner.id, 50_000_000, "recharge", "测试预置额度");
+  });
+
+  beforeEach(() => {
+    process.env.ARK_API_KEY = "test-key";
+    installNet();
+    // 原片：1920×1080 / 60s（四组数都落在里面）
+    resourceSpy.mockImplementation(async (publicId) => ({
+      public_id: publicId,
+      secure_url: `${CLOUD_PREFIX}/${publicId}.mp4`,
+      duration: 60,
+      width: 1920,
+      height: 1080,
+      bytes: 30_000_000,
+      version: 1712000000,
+    }));
+    // 转存回执：合格的白模产物（900×512 / 8s）
+    lastUpload = null;
+    uploadSpy = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (_url, opts) => {
+      lastUpload = {
+        public_id: `${opts.folder}/${opts.public_id}`,
+        secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+        duration: 8,
+        width: 900,
+        height: 512,
+        bytes: 3_000_000,
+      };
+      return lastUpload;
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.ARK_API_KEY;
+    fetchSpy.mockRestore();
+    uploadSpy.mockRestore();
+  });
+
+  async function post(body, who = asOwner) {
+    return request(app).post("/api/branch/templates/blockoutize").set(who()).send(body);
+  }
+
+  // ── happy path ──────────────────────────────────────────────────────
+  test("九步走通 → 201：roles 出、source 不出、status=pending、refVideo 是转存后的地址", async () => {
+    const body = baseBody();
+    const res = await post(body);
+    expect(res.status).toBe(201);
+    const tpl = res.body.template;
+
+    expect(tpl.status).toBe("pending"); // 试炼闸照旧：作者自己跑通一次才能发布
+    expect(tpl.provenAt).toBeNull();
+    // 角色位来自视觉清单；label 是**字符串**（F5：方舟给的编号不连续，别假设 1..N）。
+    // ★ labelConfirmed 出生就是 false：这份编号是 AI 猜的，作者点头之前不许当真（F5）
+    expect(tpl.roles).toEqual([
+      { label: "1", desc: expect.stringContaining("白发"), labelConfirmed: false },
+      { label: "2", desc: expect.stringContaining("红发"), labelConfirmed: false },
+    ]);
+    // ★ source **不出公开响应**：它指向作者自己上传的原始素材（可能有版权）
+    expect(tpl.source).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain(body.publicId);
+    // refVideo 是**转存后**的地址（F12：方舟那条 TOS 地址 24h 就过期）
+    expect(tpl.refVideo.url).toBe(lastUpload.secure_url);
+    expect(tpl.refVideo).toMatchObject({ durationSec: 8, width: 900, height: 512 });
+    expect(uploadSpy).toHaveBeenCalledWith("https://x.volces.com/out.mp4", expect.objectContaining({ resource_type: "video" }));
+
+    // 库里存了 source（溯源与重做要用），只是不回给客户端
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.source).toMatchObject({
+      publicId: body.publicId,
+      startSec: 2,
+      durSec: 8,
+      crop: { x: 0, y: 0, w: 900, h: 512 },
+    });
+  });
+
+  test("★ 端到端：白模化刚做出来的模板发布不了 —— 编号还等着作者核对", async () => {
+    // ★ 这条与「角色位编号由作者确认」那一组是两回事：那组测的是闸门本身（模板是造的），
+    //   这条测的是**真走完九步**的产物身上也带着这道门 —— 中间任何一处顺手把
+    //   labelConfirmed 填成 true（比如为了"少一步"），只有这条会红。
+    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8016` }));
+    expect(made.status).toBe(201);
+    const id = made.body.template.id;
+    // 试炼闸先满足（模拟作者自己跑通了一发），把编号那道门单独露出来
+    await BranchTemplate().updateOne({ _id: id }, { $set: { provenAt: new Date() } });
+    const denied = await request(app).patch(`/api/branch/templates/${id}/publish`).set(asOwner());
+    expect(denied.status).toBe(400);
+    expect(denied.body.message).toMatch(/核对/);
+    // 作者核对完（这一发是唯一收客户端 roles 的路）→ 才发得出去
+    await request(app)
+      .patch(`/api/branch/templates/${id}/roles`)
+      .set(asOwner())
+      .send({ roles: [{ label: "1", desc: "白发少年" }, { label: "4", desc: "红发女武士" }] })
+      .expect(200);
+    const ok = await request(app).patch(`/api/branch/templates/${id}/publish`).set(asOwner());
+    expect(ok.status).toBe(200);
+    expect(ok.body.template.roles.map((r) => r.label)).toEqual(["1", "4"]); // 跳号原样保留
+  });
+
+  test("★ 变换 URL 由服务端拼、原样进方舟（客户端一个 URL 都没给过）", async () => {
+    const sent = baseBody();
+    await post(sent);
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const body = JSON.parse(create.body);
+    const ref = body.content.find((c) => c.type === "video_url");
+    // so_/du_/c_crop 就是用户框的那四组数 —— `du_` 正是 r2v 的计价输入时长
+    expect(ref.video_url.url).toContain("/so_2,du_8,c_crop,x_0,y_0,w_900,h_512/");
+    expect(ref.video_url.url).toContain(`/${sent.publicId}.mp4`);
+    expect(ref.role).toBe("reference_video");
+    // 四参数与计价假设绑死（与 resolveR2v 的钉子同一组）
+    expect(body).toMatchObject({
+      model: SEEDANCE_2_5,
+      omni_reference_task_type: "edit",
+      duration: -1,
+      ratio: "adaptive",
+      resolution: "720p",
+    });
+    // F4：白模化提示词必须**点名**（"包括…在内"），泛指会漏掉主角
+    const text = body.content.find((c) => c.type === "text").text;
+    expect(text).toContain("包括");
+    expect(text).toContain("白发");
+    expect(text).toContain("每个人偶胸口");
+  });
+
+  test("计价：一次看帧（chat）+ 一次按 durSec 算的 r2v，两笔都真扣", async () => {
+    const TokenLedger = require("../src/models/TokenLedger");
+    const before = await walletSvc.getWallet(owner.id);
+    await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8002`, durSec: 12 }));
+    const after = await walletSvc.getWallet(owner.id);
+
+    const expected = CHAT_TURN_TOKENS + r2vTokens(12, SEEDANCE_2_5);
+    expect(before.plan + before.addon - (after.plan + after.addon)).toBe(expected);
+    // r2v 那笔的流水带来源标记（对账时分得出白模化那一发）
+    const spend = await TokenLedger.findOne({
+      user: owner.id,
+      reason: "ark_spend",
+      memo: new RegExp(`r2v src:ideahub/template-videos/${owner.id}-8002`),
+    }).lean();
+    expect(spend.delta).toBe(-r2vTokens(12, SEEDANCE_2_5));
+  });
+
+  // ── ① 归属校验 ──────────────────────────────────────────────────────
+  test.each([
+    ["别人的 public_id", () => ({ publicId: `ideahub/template-videos/${other.id}-8003` })],
+    ["别的目录", () => ({ publicId: `ideahub/workshop-media/${owner.id}-8003` })],
+    ["形状不对（后缀不是时间戳）", () => ({ publicId: `ideahub/template-videos/${owner.id}-abc` })],
+    ["多一层路径", () => ({ publicId: `ideahub/template-videos/evil/${owner.id}-8003` })],
+  ])("归属校验：%s → 400，且不查 Cloudinary、不出网、不扣费", async (_label, over) => {
+    const before = await walletSvc.getWallet(owner.id);
+    const res = await post(baseBody(over()));
+    expect(res.status).toBe(400);
+    expect(typeof res.body.message).toBe("string"); // 整句可显示
+    expect(res.body.billed).toBe(false);
+    expect(resourceSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await walletSvc.getWallet(owner.id);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+  });
+
+  test("同一段素材不许做第二次（第一次的 source 已经占住它）", async () => {
+    const pid = `ideahub/template-videos/${owner.id}-8004`;
+    expect((await post(baseBody({ publicId: pid }))).status).toBe(201);
+    const again = await post(baseBody({ publicId: pid }));
+    expect(again.status).toBe(400);
+    expect(again.body.message).toMatch(/已经做过/);
+    expect(again.body.billed).toBe(false);
+  });
+
+  // ── ② 四组数校验 ────────────────────────────────────────────────────
+  test.each([
+    // 原片 1920×1080 / 60s
+    ["裁剪框超出画面", { crop: { x: 1500, y: 0, w: 900, h: 512 } }, /裁剪框超出/],
+    ["选段超出片长", { startSec: 55, durSec: 8 }, /超出了视频长度/],
+    ["裁后像素不够（640×636 = 407,040）", { crop: { x: 0, y: 0, w: 640, h: 636 } }, /分辨率太低/],
+    ["这一段太短（3s < 方舟 edit 的 4s 下限）", { durSec: 3 }, /至少要 4 秒/],
+    ["这一段太长（31s > 30s 上限）", { durSec: 31, startSec: 0 }, /最长 30 秒/],
+    ["裁后比例过细长（400×1040）", { crop: { x: 0, y: 0, w: 400, h: 1040 } }, /宽高比/],
+  ])("四组数校验：%s → 400 整句，且一分钱不花", async (_label, over, msgRe) => {
+    const before = await walletSvc.getWallet(owner.id);
+    const res = await post(baseBody(over));
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(msgRe);
+    expect(res.body.billed).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled(); // 连预热都还没开始
+    const after = await walletSvc.getWallet(owner.id);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+  });
+
+  // ── ③ 预热（F9）─────────────────────────────────────────────────────
+  // ★ Cloudinary 的变换是懒生成的，首次请求可能拿到**不完整**的资产（2026-08-15 实测：
+  //   连发两次，字节数不一样）。不拦的话方舟拉到半截视频，产出是废片而**钱照扣**
+  //   （受理后失败不退）。所以"连续两次读到相同且非零的字节数"才算准备好。
+  test("预热：连续读到的字节数不稳定 → 502，且一次方舟都没打", async () => {
+    net.headBytes = [1000, 2000, 3000, 4000, 5000, 6000]; // 永远不相等
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8006` }));
+    expect(res.status).toBe(502);
+    expect(res.body.message).toMatch(/还没把选中的这一段准备好|稍后重试/);
+    expect(res.body.billed).toBe(false);
+    // 关键：一次方舟都不许打（打了就是花钱）
+    expect(net.calls.some((c) => c.url.startsWith(ARK))).toBe(false);
+  });
+
+  test("预热：HEAD 没有 content-length 时退到 Range 探测（否则整条白模化永远失败）", async () => {
+    // ★ 正在生成中的派生资产完全可能以 chunked 回 —— 只认 HEAD 的话，这条链路会在
+    //   "云端还没准备好"上永远失败，而它看起来像是 Cloudinary 的问题（查不到真因）。
+    net.headNoLength = true;
+    const res = await post(baseBody());
+    expect(res.status).toBe(201);
+    expect(net.calls.some((c) => c.url.endsWith(".mp4") && c.method === "GET")).toBe(true);
+  });
+
+  test("预热：连续两次相同才算准备好（读一次就走的话这条会红）", async () => {
+    net.headBytes = [1000, 2000, 2000]; // 第 2、3 次才稳定
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8007` }));
+    expect(res.status).toBe(201);
+    expect(net.calls.filter((c) => c.method === "HEAD").length).toBeGreaterThanOrEqual(3);
+  });
+
+  // ── ⑤ roles 为空 ────────────────────────────────────────────────────
+  test("视觉一个人都没认出 → 整句拒、不建空壳模板（但看帧的钱确实花了，照实说）", async () => {
+    net.visionText = "NONE";
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8008` }));
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/没能.*认出|人物/);
+    expect(res.body.billed).toBe(true); // 看帧那一步已经产生费用，不许粉饰成"没扣钱"
+    // 没建模板，也没发 r2v（真正贵的那一步没花）
+    expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(false);
+    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8008` }).lean()).toBeNull();
+  });
+
+  // ── ⑥ 受理后失败 / 转存失败 ──────────────────────────────────────────
+  test("方舟受理后 failed（F11 真人脸）→ 整句说明**不退费**，不落库", async () => {
+    net.taskStatus = "failed";
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8009` }));
+    expect(res.status).toBe(502);
+    expect(res.body.billed).toBe(true);
+    // ★ 这句话必须说出口：方舟受理后失败不退费，含糊其辞等于骗人
+    expect(res.body.message).toMatch(/不退/);
+    expect(res.body.message).toMatch(/真人/);
+    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8009` }).lean()).toBeNull();
+  });
+
+  test("方舟受理**前** 400（敏感词/输入不合格）→ 出片那笔退回、看帧那笔不退，两笔分开说", async () => {
+    // ★★ 这条钉子 2026-08-15 改过一次口径，改的原因本身就是本仓最怕的形状：
+    //   它原来一边断言"余额确实少了 CHAT_TURN_TOKENS"、一边期望回包 `billed:false`。
+    //   两条断言同时为真 = 测试**把"在钱上撒谎"钉成了正确行为** —— 客户端照 false
+    //   会告诉用户"一分钱没动"，用户按虚高的本地余额再开一发，第二次照样被扣看帧那笔。
+    //   现在的口径：**只要走过看帧那一步，billed 一律 true**，文案把两笔钱分开交代。
+    net.taskAccepted = false;
+    const before = await walletSvc.getWallet(owner.id);
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8010` }));
+    expect(res.status).toBe(502);
+    expect(res.body.billed).toBe(true);
+    // 两笔钱必须分别出现在同一句话里：退了的那笔 + 没退的那笔
+    expect(res.body.message).toMatch(/原路退回/);
+    expect(res.body.message).toMatch(/看画面.*(无法退回|不退)/);
+    const after = await walletSvc.getWallet(owner.id);
+    // 真实账：只掉了看帧那一次 chat 的钱（r2v 那一笔 W2 退回来了）——
+    // 这正是 billed 必须为 true 的实证：余额确实少了
+    expect(before.plan + before.addon - (after.plan + after.addon)).toBe(CHAT_TURN_TOKENS);
+  });
+
+  test("r2v 那一笔连发都没发出去（余额不足）→ 402 也要标 billed:true（看帧那笔已经花了）", async () => {
+    // ★ 造一个"付得起看帧、付不起出片"的余额：这条路走的是 chargedArkCall 的
+    //   `ok:false / reason:funds` 分支 —— 它自己那一笔一分钱没动，但看帧那笔已经花了。
+    //   审查前这里回的是 billed:false，与「roles 为空」那条（同样在看帧之后）自相矛盾。
+    const pid = `ideahub/template-videos/${owner.id}-8015`;
+    const w = await walletSvc.getWallet(owner.id);
+    // 只留下"够看一次帧、不够出片"的额度（r2v 那一笔是几十万级）
+    await walletSvc.debit(owner.id, w.plan + w.addon - CHAT_TURN_TOKENS * 2, "测试：压到看帧够、出片不够");
+    const res = await post(baseBody({ publicId: pid }));
+    expect(res.status).toBe(402);
+    expect(res.body.billed).toBe(true);
+    expect(res.body.message).toMatch(/看画面.*(无法退回|不退)/);
+    const after = await walletSvc.getWallet(owner.id);
+    // 看帧那一笔真的扣了（这就是 billed:true 的实证）
+    expect(after.plan + after.addon).toBe(CHAT_TURN_TOKENS);
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    // 恢复额度，别影响后面的用例（每个 test 共用同一个 owner 钱包）
+    await walletSvc.credit(owner.id, 50_000_000, "recharge", "测试用例后复原");
+  });
+
+  test("★ 产物转存失败 → 模板**不落库**（宁可重来，也不留一个明天就失效的模板）", async () => {
+    uploadSpy.mockRejectedValue({ error: { message: "cloudinary down" } });
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8011` }));
+    expect(res.status).toBe(502);
+    expect(res.body.billed).toBe(true);
+    // 方舟给的是 TOS 签名地址、24 小时过期 —— 用它建模板，明天就是一条死链，且零症状
+    expect(res.body.message).toMatch(/24 小时|转存/);
+    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8011` }).lean()).toBeNull();
+  });
+
+  test("转存回来的产物自己过不了参考视频窗口 → 拒 + 回收产物，不落库", async () => {
+    uploadSpy.mockImplementation(async (_url, opts) => ({
+      public_id: `${opts.folder}/${opts.public_id}`,
+      secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+      duration: 2, // < 4s：拿它当下一发的参考视频必然被方舟拒
+      width: 900,
+      height: 512,
+      bytes: 1_000,
+    }));
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8012` }));
+    expect(res.status).toBe(502);
+    expect(destroySpy).toHaveBeenCalled(); // 不回收就是永久占配额，零症状
+    expect(await BranchTemplate().findOne({ "source.publicId": `ideahub/template-videos/${owner.id}-8012` }).lean()).toBeNull();
+  });
+
+  // ── 钱的门禁前置 ────────────────────────────────────────────────────
+  test("免费套餐 → 403 PLAN_REQUIRED，且排在任何一次付费调用之前", async () => {
+    // ★ 顺序写反的话：免费用户会先被扣掉看帧那 400 token，然后在 r2v 那一步撞 403，
+    //   而他看到的错误与真正的原因对不上（"这一档不对你开放"被盖住）。
+    const res = await post(baseBody({ publicId: `ideahub/template-videos/${other.id}-8013` }), asOther);
+    // 归属先挡（other 的 publicId 对 other 是合法的）—— 这里用 other 自己的 id
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("PLAN_REQUIRED");
+    expect(res.body.billed).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("未登录 → 401（这条链路每一发都真花钱，不许裸奔）", async () => {
+    const res = await request(app).post("/api/branch/templates/blockoutize").send(baseBody());
+    expect(res.status).toBe(401);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── 级联回收 ────────────────────────────────────────────────────────
+  test("删模板时连原始素材一起回收（不然每做一个模板就永久漏一份原片）", async () => {
+    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8014` }));
+    expect(made.status).toBe(201);
+    const refPublicId = lastUpload.public_id;
+    destroySpy.mockClear();
+    await request(app).delete(`/api/branch/templates/${made.body.template.id}`).set(asOwner()).expect(200);
+    const destroyed = destroySpy.mock.calls.map((c) => c[0]);
+    expect(destroyed).toContain(refPublicId); // 参考视频本体
+    expect(destroyed).toContain(`ideahub/template-videos/${owner.id}-8014`); // 原始素材
+  });
+
+  test("模板还在时，孤儿口不许删它的原始素材（否则再也重做不了）", async () => {
+    const made = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8015` }));
+    expect(made.status).toBe(201);
+    destroySpy.mockClear();
+    const res = await request(app)
+      .delete("/api/uploads/template-video")
+      .set(asOwner())
+      .send({ publicId: `ideahub/template-videos/${owner.id}-8015` });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/原始素材/);
+    expect(destroySpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("两套验收窗口（单元）—— 各自的唯一实现，名字必须分得开", () => {
+  // ★★ 白模 V2 起窗口分成两件事，混用哪一个都不报错、只会静默出事：
+  //   · templateSourceIssue —— 用户传上来的**原始素材**（放宽：(0,600]s、不校比例）
+  //   · templateRefIssue    —— 真正喂给方舟的**那一段**（F1 [4,30]s + F3 像素/边长/比例）
+  //   把 ref 那套用在上传口 = 长素材连传都传不上来；
+  //   把 source 那套用在建模板 = 一段 300s 的片被登记成模板，套用者在付费那一步撞 400（不退费）。
+  const {
+    templateSourceIssue,
+    templateRefIssue,
+    TEMPLATE_SOURCE_RULES,
+    TEMPLATE_REF_RULES,
+  } = require("../src/middleware/upload");
+
+  test("参考视频窗口：合格样本 → null", () => {
+    expect(templateRefIssue({ duration: 10, width: 720, height: 1280 })).toBeNull();
+    expect(templateRefIssue({ duration: 4, width: 640, height: 640 })).toBeNull(); // 409,600 ≥ 407,696
+    expect(templateRefIssue({ duration: 30, width: 720, height: 1280 })).toBeNull(); // 上界含端点
+  });
+
+  test("参考视频窗口是 [4,30] 秒（F1 实测：方舟 edit 的硬窗口）", () => {
+    expect(TEMPLATE_REF_RULES.minSec).toBe(4);
+    expect(TEMPLATE_REF_RULES.maxSec).toBe(30);
+    expect(templateRefIssue({ duration: 3, width: 720, height: 1280 })).toMatch(/至少要 4 秒/);
+    expect(templateRefIssue({ duration: 31, width: 720, height: 1280 })).toMatch(/最长 30 秒/);
   });
 
   test("像素数硬门是 407,696（A2 探针实测值，改它必须两仓一起改）", () => {
-    expect(TEMPLATE_VIDEO_RULES.minPixels).toBe(407_696);
+    expect(TEMPLATE_REF_RULES.minPixels).toBe(407_696);
+    expect(TEMPLATE_SOURCE_RULES.minPixels).toBe(407_696); // 裁剪面积 ≤ 原片面积 ⇒ 这是必要条件
     // 640×636 = 407,040 < 门；640×640 = 409,600 ≥ 门
-    expect(templateVideoIssue({ duration: 10, width: 640, height: 636 })).toMatch(/分辨率太低/);
-    expect(templateVideoIssue({ duration: 10, width: 640, height: 640 })).toBeNull();
+    expect(templateRefIssue({ duration: 10, width: 640, height: 636 })).toMatch(/分辨率太低/);
+    expect(templateRefIssue({ duration: 10, width: 640, height: 640 })).toBeNull();
   });
 
-  test("缺元数据（回执没给 duration）→ 整句拒，不放行", () => {
-    expect(templateVideoIssue({ width: 720, height: 1280 })).toMatch(/无法登记/);
-    expect(templateVideoIssue(null)).toMatch(/无法登记/);
+  test("参考视频窗口仍校宽高比 [0.4,2.5]（方舟官方约束）", () => {
+    expect(templateRefIssue({ duration: 10, width: 500, height: 1500 })).toMatch(/宽高比/);
+  });
+
+  test("原始素材窗口：放宽了哪几项（改回去的话用户根本没法开始）", () => {
+    // 时长：只要 (0,600]，短到 1 秒、长到 10 分钟都收（真正的 [4,30] 是裁后那一段的事）
+    expect(templateSourceIssue({ duration: 1, width: 1920, height: 1080 })).toBeNull();
+    expect(templateSourceIssue({ duration: 600, width: 1920, height: 1080 })).toBeNull();
+    expect(templateSourceIssue({ duration: 601, width: 1920, height: 1080 })).toMatch(/最长 600 秒/);
+    // 比例：**不校** —— 比例正是裁剪框能修的那一项
+    expect(templateSourceIssue({ duration: 10, width: 500, height: 1500 })).toBeNull();
+    // 边长上限：**不设** —— 4K/8K 原片没问题，裁出来那块 ≤6000 即可
+    expect(templateSourceIssue({ duration: 10, width: 7680, height: 4320 })).toBeNull();
+    // 但边长下限与像素门保留：它们是"裁出来那块能合格"的必要条件，早拒省一次 100MB 白传
+    expect(templateSourceIssue({ duration: 10, width: 299, height: 3000 })).toMatch(/边长至少 300 像素/);
+    expect(templateSourceIssue({ duration: 10, width: 640, height: 360 })).toMatch(/分辨率太低/);
+  });
+
+  test("缺元数据（回执没给 duration）→ 两套窗口都整句拒，不放行", () => {
+    expect(templateSourceIssue({ width: 720, height: 1280 })).toMatch(/没有返回/);
+    expect(templateSourceIssue(null)).toMatch(/没有返回/);
+    expect(templateRefIssue({ width: 720, height: 1280 })).toMatch(/没有返回/);
+    expect(templateRefIssue(null)).toMatch(/没有返回/);
   });
 });

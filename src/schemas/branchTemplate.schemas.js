@@ -11,6 +11,16 @@
 //   不是漏了，是这些数**只由服务端从 Cloudinary 取**（r2v 结算的输入时长就是它，
 //   不信客户端报的任何数）。客户端只发 videoUrl 一个字符串，元数据在路由里由
 //   服务端按 public_id 向 Cloudinary 要（strip 在这里是帮手：就算客户端塞了也进不来）。
+//
+// ★★ 白模 V2 的 `roles` / `source` **同样刻意不在这里声明**，理由与 refVideo 逐字相同：
+//   两者都由服务端在白模化那一步自己写（roles 来自 chat vision 的清单，source 是服务端
+//   拼变换 URL 时用的那四组数）。收客户端报的 roles = 让用户自己写"1 号位是谁"，
+//   而那份描述正是套用者挂卡时的唯一依据；收客户端报的 source = 让用户自己标价
+//   （durSec 就是 r2v 的计价输入时长）。**这里 strip 是帮手，不是漏洞** ——
+//   文件头那条"每个字段都要显式声明"针对的是**我们想收的**字段，别把两件事混了。
+//   ⚠ 唯一的例外在文件末尾的 `patchRolesBody`：**作者对编号的确认**是收的
+//   （那是只有人做得出来的输入，且碰不到钱）。两条别混：建模板/白模化那两条路
+//   一律不收 roles，收了就等于让提交方自己写"1 号位是谁"。
 const { z } = require("../middleware/validate");
 
 // coverUrl 只收 https（或空串=暂无封面）。dataURL 一律拒：一张封面几百 KB 的 base64，
@@ -22,9 +32,11 @@ const recipeBody = z.object({
   // 白模模板只有一拍（单节点出片），但形状留成数组与经典配方对齐 ——
   // 老客户端把它当经典配方跑时逐拍读，单元素数组两边都吃得下
   beats: z.array(z.string().trim().max(2000)).max(12).optional().default([]),
-  // 经典降级路的镜像时长。[3,15]：下限对齐经典路的 clampDuration 下限，
-  // 上限对齐白模上传窗口（refVideo 最长 15s，镜像值不该比本体还长）
-  durationSec: z.number().int().min(3).max(15).optional().default(5),
+  // 经典降级路的镜像时长。[3,30]：下限对齐经典路的 clampDuration 下限，
+  // 上限对齐**参考视频**窗口（TEMPLATE_REF_RULES.maxSec = 30，镜像值不该比本体还长）。
+  // ★ 2026-08-15 从 15 放宽到 30：白模 V2 的那一段由编辑页框选，方舟 edit 的时长窗口
+  //   本来就是 [4,30]（F1 实测）。老客户端只发得出 ≤15 的值，放宽对它们零影响。
+  durationSec: z.number().int().min(3).max(30).optional().default(5),
   // app 档位 id。不写 enum：服务端不据此判断任何事，enum 只会让 app 加档位时老服务端 400
   videoTier: z.string().trim().max(40).optional().default(""),
   aspect: z.enum(["portrait", "landscape"]).optional(),
@@ -49,4 +61,74 @@ const createTemplateBody = z.object({
   videoUrl: z.string().trim().min(1).max(2000).regex(HTTPS_RE, "videoUrl must be an https URL"),
 });
 
-module.exports = { createTemplateBody, HTTPS_RE };
+// ── POST /api/branch/templates/blockoutize（白模 V2）──────────────────
+//
+// 客户端在编辑页框选出「哪一段 + 画面哪一块」，提交的是**四组数**，不是 URL：
+// 变换地址由服务端自己拼（utils/templateVideoAsset.buildClipUrl）。
+// ★ 为什么不收 URL：URL 里的 `du_` 就是 r2v 的计价输入时长，收 URL = 让用户自己标价。
+//
+// ★ 上下界只收「形状上不可能对」的那一档（非负整数、别把服务器撑爆），
+//   **真正的验收（F1 时长 [4,30]、F3 像素/边长/比例、裁剪框在原片内）在路由里**，
+//   与建模板复核共用 middleware/upload.js 的那一份窗口 —— 窗口只能有一处实现（铁律六），
+//   在 zod 里再写一遍数字就是第二处，改窗口时必漏。
+const cropBody = z.object({
+  x: z.number().int().min(0).max(20000),
+  y: z.number().int().min(0).max(20000),
+  w: z.number().int().min(1).max(20000),
+  h: z.number().int().min(1).max(20000),
+});
+
+const blockoutizeBody = z.object({
+  // 本账号刚传的原始素材（`ideahub/template-videos/<userId>-<ts>`）。归属在路由里校
+  publicId: z.string().trim().min(1).max(300),
+  startSec: z.number().int().min(0).max(600),
+  durSec: z.number().int().min(1).max(600),
+  crop: cropBody,
+  // 模板的展示信息（与 createTemplateBody 同口径：coverUrl 只收 https 或空串）
+  title: z.string().trim().min(1).max(120),
+  intro: z.string().trim().max(2000).optional().default(""),
+  coverUrl: z
+    .string()
+    .trim()
+    .max(2000)
+    .regex(HTTPS_RE, "coverUrl must be an https URL (dataURL 不收)")
+    .or(z.literal(""))
+    .optional()
+    .default(""),
+  // app 档位 id / 画幅：只进 recipe 当展示镜像，服务端不据此做任何判断
+  // （白模化那一发的模型由服务端定死，见 routes/branchTemplate.routes 的 BLOCKOUT_MODEL）
+  videoTier: z.string().trim().max(40).optional().default(""),
+  aspect: z.enum(["portrait", "landscape"]).optional(),
+  // 作者对画面的补充说明（"这段里的人都穿古装"之类），拼进白模化提示词。
+  // 不是必填：F4 的要害是**服务端自己先看一眼再点名**，不是让用户描述
+  note: z.string().trim().max(500).optional().default(""),
+});
+
+// ── PATCH /api/branch/templates/:id/roles（编号由作者确认）──────────────
+//
+// ★★ 上面刚说过「roles 由服务端写、客户端提交一律不收」，这里却收 —— 不矛盾，
+//   因为这一发提交的东西**只有人做得出来**：作者把成片放出来，看人偶胸口的数字，
+//   把它抄进对应的角色位。落库那份 label 是服务端按视觉清单顺序编的**猜测**，
+//   而 F5 实测编号稳定但**不连续**（实出 1/2/4/5）—— 猜错的后果是套用者把卡挂到
+//   别人身上，钱照扣、零报错。所以这条路收的不是"数据"，是**作者的确认**。
+// ★ 它收得起的前提是这份输入**碰不到钱**：refVideo/source/durSec 一个都不在这里，
+//   计价链路（r2vTokens 的输入时长）与它完全无关。路由再加两道：仅作者、仅 pending。
+//
+// ★ label 收**字符串**，且**不校"是数字""连续""与原来的个数相同"**：
+//   · 不校数字 —— 编号是人偶胸口画的东西，实测是阿拉伯数字，但校验它没有任何好处：
+//     真出现 "1a" 这种，作者原样抄进来才对得上画面，我们替他"规整"就是把卡挂错人；
+//   · 不校连续 —— 1/2/4/5 是**实测的正常输出**，校连续等于把正确的确认判成非法；
+//     · 不锁个数 —— 视觉可能少认一个人（画面里 5 个只列了 4 个），作者补一条比
+//     "只能确认 AI 认出的那些"诚实。上限 12 与 parseRoles 的截断同一个数。
+const roleItemBody = z.object({
+  // 编号本身。maxlength 与 models/BranchTemplate.roleSchema 的 8 对齐
+  label: z.string().trim().min(1).max(8),
+  // 「1 号位原来是谁」。套用者挂卡时**只看这句话**，所以作者可以改写得更好认
+  desc: z.string().trim().max(300).optional().default(""),
+});
+
+const patchRolesBody = z.object({
+  roles: z.array(roleItemBody).min(1).max(12),
+});
+
+module.exports = { createTemplateBody, blockoutizeBody, patchRolesBody, HTTPS_RE };
