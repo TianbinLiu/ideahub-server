@@ -22,6 +22,11 @@
 //   （那是只有人做得出来的输入，且碰不到钱）。两条别混：建模板/白模化那两条路
 //   一律不收 roles，收了就等于让提交方自己写"1 号位是谁"。
 const { z } = require("../middleware/validate");
+// ★ 「最多看几帧」这个数**只有 services/blockoutize.service 一处**（铁律六）：
+//   下面 frameTimes 的数组上限从那里 import，不在这儿抄一个 8。
+//   抄一份的表现是改上限时改一处漏一处，而两处都不报错 —— 只会变成
+//   "schema 放进来 10 个、真正抽帧只看 8 个、报价按 10 个算"（CLAUDE.md「上限自己抄一份」坑）。
+const { VISION_FRAMES_MAX } = require("../services/blockoutize.service");
 
 // coverUrl 只收 https（或空串=暂无封面）。dataURL 一律拒：一张封面几百 KB 的 base64，
 // shared 列表一次回包就是几十 MB（BranchDeck.cover 转存 Cloudinary 是同一条教训）。
@@ -102,6 +107,21 @@ const blockoutizeBody = z.object({
   // 作者对画面的补充说明（"这段里的人都穿古装"之类），拼进白模化提示词。
   // 不是必填：F4 的要害是**服务端自己先看一眼再点名**，不是让用户描述
   note: z.string().trim().max(500).optional().default(""),
+  /**
+   * 用户在编辑页自己标的「AI 看哪几帧」，**相对选段起点**的秒数（0 = 这一段的第一帧）。
+   *
+   * ★★ 必须在这里**显式声明**，否则 zod 的 `z.object` 默认 strip ——
+   *   表现是"客户端发了、服务端 202 了、AI 照样只看自动那几帧"，全程零报错（文件头那条坑）。
+   * ★ 缺省（不传 / 空数组）= **自动模式**：帧数按时长算（每 1.5 秒一帧，下限 3 上限 8），
+   *   规则的唯一实现在 services/blockoutize.visionFrameTimes。自选模式是给
+   *   **"画面里人数会变"的素材**用的：用户看得见哪里入场哪里离场，就在变化前后各标一帧。
+   * ★ 这里只收"形状上不可能对"的那一档（非负有限数、别把服务器撑爆、不超上限）。
+   *   **真正的验收在 `visionFrameTimes` 里再做一遍**（越界丢弃、去重、排序、截断）——
+   *   不是重复，是因为那一份才是报价与抽帧共同的锚点，而 zod 只管得到这一个请求。
+   * ★ 上界 600 与 `startSec`/`durSec` 同口径（上传窗口最长 600s），不是又一处窗口。
+   *   zod 4 的 `z.number()` 已经拒 NaN/Infinity，所以"有限数"这条不用再写一遍。
+   */
+  frameTimes: z.array(z.number().min(0).max(600)).max(VISION_FRAMES_MAX).optional(),
 });
 
 // ── POST /api/branch/templates/blockoutize/finish（取回结果，白模 V2 第二阶段）──

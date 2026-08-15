@@ -195,7 +195,8 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 // 用户在编辑页框出「哪一段 + 画面哪一块」，提交**四组数**（startSec/durSec/crop），
 // 阶段一走六步：
 //   ① 归属校验 → ② 服务端自己拼 Cloudinary 变换 URL → ③ 预热（F9）
-//   → ④ 复核裁后元数据满足方舟约束（F1/F3）→ ⑤ chat vision 先看一眼列出画面里有谁（F4 的"先看"）
+//   → ④ 复核裁后元数据满足方舟约束（F1/F3）→ ⑤ chat vision 先看一眼列出画面里有谁（F4 的"先看"，
+//        看几帧由 blockout.visionFrameTimes 一处说了算：自动按时长算 3~8 帧，或用户自己标）
 //   → ⑥ 点名式提示词发 r2v edit（F4 的"点名"），**到"方舟受理了"为止**
 // 阶段二走三步：⑦ 向方舟核实任务状态 → ⑧ 产物转存 Cloudinary（F12）→ ⑨ 建模板 status=pending。
 //
@@ -218,9 +219,10 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 const BLOCKOUT_MODEL = SEEDANCE_2_5;
 /** 看帧用的对话模型。与 app 的 MODELS.chat 同一个 id（看图说话走同一个模型） */
 const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
-/** 看几帧。★ 3 帧是"够认出人 + 别太贵"的折中：帧数越多越慢也越贵，
- *  而我们只需要知道"画面里有哪几个人、长什么样"。 */
-const VISION_FRAMES = 3;
+// ★ 「看几帧」原来是这里一个写死的 `VISION_FRAMES = 3`。2026-08-15 实测：4 秒素材看 3 帧
+//   只认出 2 个人，方舟出片时看到更多人**自己编到了 3 号** —— 画面上有 3 号、角色位列表
+//   里没有第三格，套用者挂不上卡且零报错。现在帧数按时长算 / 由用户自选，规则的**唯一实现**
+//   是 services/blockoutize.visionFrameTimes（报价的 App 镜像也照抄它）。
 
 /**
  * 「看帧那一笔已经花掉且不退」这句话的**唯一措辞**（铁律六）。
@@ -235,7 +237,8 @@ const VISION_FRAMES = 3;
 const VISION_BILLED_NOTE = "看画面那一步的费用已经产生、无法退回";
 
 // ★ 限流比建模板更严：一发要打 1 次 Cloudinary Admin API（免费档全局 500 次/小时）、
-//   3 次抽帧、1 次 chat、1 次 r2v，每一发都是真金白银。
+//   3~8 次抽帧（帧数按时长算或由用户自选，见 blockout.visionFrameTimes）、1 次 chat、1 次 r2v，
+//   每一发都是真金白银。
 //   3 次/10 分钟对真人足够（框选 + 等出片本身就要几分钟）。
 const blockoutizeLimit = userRateLimit({ max: 3, windowMs: 10 * 60 * 1000, scope: "branchTemplate:blockoutize" });
 
@@ -270,7 +273,7 @@ router.post(
   async (req, res, next) => {
     try {
       const userId = String(req.user._id);
-      const { startSec, durSec, crop, title, intro, coverUrl, videoTier, aspect, note } = req.body;
+      const { startSec, durSec, crop, title, intro, coverUrl, videoTier, aspect, note, frameTimes } = req.body;
 
       // ── ① 归属校验（判据只有 utils/templateVideoAsset 一处）────────────
       const publicId = ownTemplateVideoPublicId(req.body.publicId, userId);
@@ -372,22 +375,26 @@ router.post(
       if (!warm.ok) return fail(res, 502, warm.message, { billed: false });
 
       // ── ⑤ 先看：抽几帧问一次 chat vision，列出画面里有哪些人（F4 上半）──
-      const times = [];
-      for (let i = 0; i < VISION_FRAMES; i += 1) {
-        const t = startSec + Math.min(durSec - 1, Math.floor((durSec * i) / VISION_FRAMES));
-        if (!times.includes(t)) times.push(t);
-      }
+      // ★★ 「看几帧」只问 blockout.visionFrameTimes（唯一实现）：自动模式按时长算
+      //   （每 1.5s 一帧、下限 3 上限 8），传了 frameTimes 就用用户自己标的那些 ——
+      //   但**服务端自己再验一遍**（越界丢弃/去重/排序/截断），不信客户端报的数。
+      //   它回的是**片段内的相对秒数**，加上 startSec 才是原片上的绝对时刻（帧地址切的是原片）。
+      const times = blockout.visionFrameTimes(durSec, frameTimes).map((t) => startSec + t);
       const images = [];
       for (const atSec of times) {
         const url = buildFrameUrl(publicId, { atSec, crop }, resource.version);
         const got = await blockout.fetchFrameDataUrl(url);
-        // 单帧取不到不算失败（3 帧取到 1 帧也认得出人）；一帧都没有才拒
+        // 单帧取不到不算失败（8 帧取到 1 帧也认得出人）；一帧都没有才拒
         if (got.ok) images.push(got.dataUrl);
         else console.warn(`[blockoutize] 抽帧失败 ${publicId}@${atSec}s: ${got.reason}`);
       }
       if (!images.length) {
         return fail(res, 502, "没能从这段视频里取到画面（云端还没准备好），本次没有开始生成、也没有扣费，请稍后重试。", { billed: false });
       }
+      // ★★ 「实际用了几帧」= **真正喂进模型的那几张**（取不到的帧不算）。App 拿它对账报价：
+      //   报价按计划帧数算、这里可能更少 —— 方向永远是「报价 ≥ 实收」，那是安全的一侧。
+      //   报计划数就会出现"报价 3 帧、实际只看了 1 帧、却按 3 帧对上账"，把一次降级藏起来。
+      const visionFrames = images.length;
 
       const visionOut = await chargedArkCall({
         user: req.user,
@@ -438,8 +445,10 @@ router.post(
           res,
           400,
           // 措辞走同一个常量：三处"看帧这笔已经花了"分开写就会各自漂（铁律六）
-          `AI 没能在这段画面里认出任何人物，所以做不出可以挂角色卡的白模模板。出片那一笔一分钱没动，但${VISION_BILLED_NOTE}。请换一段人物更清晰、更靠近镜头的素材再试。`,
-          { billed: true },
+          `AI 没能在这段画面里认出任何人物，所以做不出可以挂角色卡的白模模板。出片那一笔一分钱没动，但${VISION_BILLED_NOTE}（这一发看了 ${visionFrames} 帧）。请换一段人物更清晰、更靠近镜头的素材再试，或者在编辑页自己多标几帧。`,
+          // ★ 不变量：**凡是 `billed:true` 的回包都带 visionFrames**（那一位就是"看帧这笔花了"，
+          //   而这个数就是那笔花在几帧上）。反过来 billed:false 的一律不带 —— 没花钱就没有账要对。
+          { billed: true, visionFrames },
         );
       }
 
@@ -481,6 +490,7 @@ router.post(
           ...taskOut.body,
           message: `${why}。出片那一笔一分钱没动，但${VISION_BILLED_NOTE}。`,
           billed: true,
+          visionFrames,
         });
       }
       if (!taskOut.accepted) {
@@ -496,7 +506,7 @@ router.post(
           res,
           502,
           `AI 没有受理这次白模生成${why ? `（${why}）` : ""}。出片那一笔的费用已原路退回，但${VISION_BILLED_NOTE}。本次没有产生任何模板。`,
-          { billed: true },
+          { billed: true, visionFrames },
         );
       }
       let taskId = "";
@@ -508,7 +518,7 @@ router.post(
       if (!taskId) {
         // 已受理却读不到任务 id：钱已经花出去了，只能照实说（不退是事实，不许粉饰）
         console.error("[blockoutize] r2v 任务受理但响应里没有任务 id");
-        return fail(res, 502, "AI 已经开始生成，但我们没能拿到任务编号，无法跟进这一发的结果。这一发的费用已经产生、无法退回。", { billed: true });
+        return fail(res, 502, "AI 已经开始生成，但我们没能拿到任务编号，无法跟进这一发的结果。这一发的费用已经产生、无法退回。", { billed: true, visionFrames });
       }
 
       // ── ⑦ 落取件凭据：**两阶段的分界线就在这里** ──────────────────────
@@ -530,6 +540,10 @@ router.post(
           //   roles 是套用者挂卡的唯一依据（重报 = 让提交方自己写"1 号位是谁"）。
           source: { publicId, startSec, durSec, crop },
           roles,
+          // ★ 存下来只为**回执能重放**：阶段一重试撞上既有凭据时走的是 startedPayload(exist)，
+          //   不存的话那条路回出来的帧数是空的，而 App 拿它对账 —— 一条路对得上、另一条对不上，
+          //   两边看着都没错（这正是"同一件事两处各说各的"的形状）。
+          visionFrames,
           title,
           intro,
           coverUrl,
@@ -551,7 +565,7 @@ router.post(
           res,
           500,
           `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生、无法退回。请把这个任务编号发给我们：${taskId}`,
-          { billed: true, taskId },
+          { billed: true, taskId, visionFrames },
         );
       }
 
@@ -568,8 +582,16 @@ router.post(
 /** 阶段一的受理回执 —— **一处实现**（首次受理与"撞上既有凭据"两条路共用）。
  *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经花了、失败也不退（F11）。
  *    这一位在阶段一是"钱花了没有"，在阶段二是"这一次调用花钱了没有"（恒 false），
- *    两边的措辞都要写满，别让 App 自己去猜。 */
+ *    两边的措辞都要写满，别让 App 自己去猜。
+ *
+ *  ★★ `visionFrames` = **这一发实际喂进视觉模型的帧数**（App 拿它对账报价的前一半）。
+ *    帧数不再是写死的 3：自动模式按时长算（每 1.5s 一帧、下限 3 上限 8），用户也可以
+ *    在编辑页自己标（`frameTimes`）。报价与抽帧共用 blockout.visionFrameTimes 一处规则，
+ *    但**中间可能有帧取不到** —— 所以真值只能由服务端回，不能让 App 照自己那半边算完就当真。
+ *  ★ 存量凭据（这个字段之前落库的那些）没有这一位，于是**没有就不出**：
+ *    回一个 0 会被 App 读成"这一发一帧都没看"，那是句假话。客户端判它一律用存在性。 */
 function startedPayload(job) {
+  const frames = Number(job.visionFrames);
   return {
     ok: true,
     state: "accepted",
@@ -579,6 +601,7 @@ function startedPayload(job) {
     roles: rolesPayload(job.roles),
     expiresAt: job.expiresAt,
     billed: true,
+    ...(Number.isFinite(frames) && frames > 0 ? { visionFrames: frames } : {}),
     message:
       "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 受理之后失败也不退费）。" +
       `出片之后回来点「取回结果」才会建成模板；产物只保 ${BlockoutJob.TTL_HOURS} 小时，过期这一发就没法挽回了。`,

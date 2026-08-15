@@ -124,6 +124,16 @@ const blockoutJobSchema = new mongoose.Schema(
     // ── 建模板需要的一切（finish 不许再让客户端重报一遍）──────────────
     source: { type: jobSourceSchema, required: true },
     roles: { type: [roleDraftSchema], required: true },
+    /**
+     * 这一发**实际喂进视觉模型的帧数**（"看帧那一笔"花在几帧上）。
+     *
+     * ★ 存它不是为了 finish（建模板一点用不上），是为了**受理回执能重放**：阶段一重试
+     *   撞上既有凭据时走的是同一个 startedPayload，现算不出来 —— 不存的话那条路回出来
+     *   的帧数是空的，而 App 拿它对账报价，于是"第一次对得上、重试对不上"，两边都不报错。
+     * ★ 默认 0 = 这个字段上线**之前**落的存量凭据。回执里按存在性出（0 不出）：
+     *   回 0 会被读成"一帧都没看"，那是句假话。
+     */
+    visionFrames: { type: Number, default: 0, min: 0 },
     title: { type: String, required: true, trim: true, maxlength: 120 },
     intro: { type: String, default: "", trim: true, maxlength: 2000 },
     coverUrl: { type: String, default: "", trim: true, maxlength: 2000 },

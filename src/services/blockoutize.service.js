@@ -1,6 +1,7 @@
 // src/services/blockoutize.service.js
-// 白模化（任意视频 → 带编号的白模视频）的三件"只能有一处"的东西：
+// 白模化（任意视频 → 带编号的白模视频）的四件"只能有一处"的东西：
 //   ① Cloudinary 变换的**预热**（F9）
+//   ①b **看几帧**（visionFrameTimes）—— 报价（App 镜像）与真正抽帧都只准问它
 //   ② 两段提示词（"先看"的视觉清单 + "点名"的白模化）
 //   ③ 方舟任务状态的**一次性核实**与产物转存
 // 路由（routes/branchTemplate.js 的 /templates/blockoutize 与 …/finish）只负责编排与整句报错。
@@ -103,6 +104,119 @@ async function fetchFrameDataUrl(url, timeoutMs = 30_000) {
   return { ok: true, dataUrl: `data:${mime};base64,${buf.toString("base64")}` };
 }
 
+// ── ①b 看几帧（唯一实现）────────────────────────────────────────────
+//
+// ══ 为什么这一段单独存在（2026-08-15 真机实测）══════════════════════════
+// 白模化的第一步是"先看"：抽几帧问一次 chat vision，列出画面里有哪些人，再按这份清单
+// **点名**写进白模化提示词。此前帧数写死 3 帧（老常量 `VISION_FRAMES`）。
+// 实测撞上的形状：一段 **4 秒**的素材，前半段 2 个人、后半段是围坐群戏人更多 ——
+// 3 帧只认出 2 个人，于是登记的角色位是 1、2；而方舟出片时看到的人更多，**自己往下编到了 3**。
+// 结果画面上有个 3 号，角色位列表里却没有第三格 —— 套用者看得见它却挂不上卡，
+// 只会以为功能坏了，而全程**零报错**（没有任何一层知道"画面上的号比列表多"）。
+//
+// 于是帧数改成两种来源，规则都收在 `visionFrameTimes` 一处：
+//   · 自动（默认）：每 1.5 秒一帧，下限 3、上限 8。一帧几百 token 很便宜，
+//     换的是"人别漏"—— 4 秒看 3 帧太稀，越长的素材越稀。
+//   · 自己挑：用户在编辑页拖时间轴逐帧标记（**给"画面里人数会变"的素材用**：
+//     他看得见哪里入场哪里离场，就在变化前后各标一帧）。上限同样 8。
+//
+// ★★ 这个函数是「看几帧」的**唯一实现**（铁律六）：报价（App 侧 `economy.blockoutizeCost`
+//   的前一半，靠跨仓镜像同一条公式）与真正抽帧都只准问它。两处各算各的表现是
+//   "页面按 3 帧报价、服务端按 8 帧扣钱"，两个方向都不报错 —— 本仓头号事故形状。
+// ★ 上限 `VISION_FRAMES_MAX` 同时是 zod schema 的数组上限（schemas 从这里 import），
+//   别在那边再抄一个 8：CLAUDE.md 里「最多出几张卡的上限自己抄一份」就是这条坑。
+
+/** 自动模式：每多少秒看一帧。1.5s 是"够密到看得见入场/离场 + 一帧几百 token 很便宜"的折中 */
+const VISION_SEC_PER_FRAME = 1.5;
+/** 帧数下限。短素材（4s）也至少看 3 帧 —— 少于这个数连"前中后"都盖不住 */
+const VISION_FRAMES_MIN = 3;
+/**
+ * 帧数上限（自动与自选共用）。
+ * ★ 8 是"再多也换不来更多人名、却每一帧都真花钱与时间"的止损点；
+ *   它也是 schema 里 `frameTimes` 数组的上限（同一个常量，见文件头 ★）。
+ */
+const VISION_FRAMES_MAX = 8;
+/**
+ * 时刻的取整粒度（秒）。
+ * ★ 为什么要取整：帧地址是 `so_<秒>`，不取整会拼出 `so_2.6666666666666665` 这种串 ——
+ *   既拿不到 CDN 缓存复用，去重也永远去不掉（两个肉眼同一帧的时刻差在小数第 15 位）。
+ *   0.5s 对"认出画面里有谁"绰绰有余（人不会在半秒里换一个）。
+ */
+const FRAME_QUANT_SEC = 0.5;
+
+/** 取整到 FRAME_QUANT_SEC 的倍数。★ 0.5 的倍数在二进制里是精确值，不会攒出浮点毛刺 */
+function quantSec(t) {
+  return Math.round(t / FRAME_QUANT_SEC) * FRAME_QUANT_SEC;
+}
+
+/** 自动模式的帧数：clamp(ceil(durSec / 1.5), 3, 8)。★ 报价镜像照抄的就是这一行 */
+function autoFrameCount(durSec) {
+  const n = Math.ceil(durSec / VISION_SEC_PER_FRAME);
+  return Math.min(VISION_FRAMES_MAX, Math.max(VISION_FRAMES_MIN, Number.isFinite(n) ? n : VISION_FRAMES_MIN));
+}
+
+/** 取整 → 夹进 [0, maxT] → 去重 → 升序。★ 自动与自选走同一条，免得两边的去重口径分家 */
+function normalizeTimes(list, maxT) {
+  const out = [];
+  for (const t of list) {
+    const v = Math.min(maxT, Math.max(0, quantSec(t)));
+    if (!out.includes(v)) out.push(v);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/**
+ * 「这一段看哪几个时刻的帧」—— 返回**片段内的相对秒数**（调用方自己加 `startSec`
+ * 换成原片上的绝对时刻）。
+ *
+ * @param {number} durSec 选中那一段的时长（秒）
+ * @param {number[]} [picked] 用户在编辑页自己标的时刻（**相对片段起点**）。缺省 = 自动
+ * @returns {number[]} 至少一个时刻，最多 `VISION_FRAMES_MAX` 个，升序去重
+ *
+ * ★★ `picked` **服务端自己再验一遍**（不信客户端报的数，与 `durSec` 不收客户端同一条理由）：
+ *   越界的**丢掉并 console.warn**，不整条拒 —— 用户已经付过上传与框选的时间成本，
+ *   少看一帧不影响认人，为一个坏数把他打回起点才是真的损失。
+ * ★ 全被丢光（或传了个空数组）→ **退回自动**，绝不返回空：返回空的表现是
+ *   "一帧都没抽 → 视觉认不出人 → 整条白模化在 roles 为空那里被拒"，
+ *   而用户看到的理由会是"AI 没认出人"，与真正的原因（他标的时刻全越界）完全对不上。
+ */
+function visionFrameTimes(durSec, picked) {
+  const dur = Number(durSec);
+  if (!Number.isFinite(dur) || dur <= 0) {
+    // 调用方本该先过四组数校验；真走到这里是上游漏了一道，响亮记一笔再退单帧（铁律八）
+    console.warn(`[blockoutize] 片段时长不可用（${durSec}），看帧退回单帧 0s`);
+    return [0];
+  }
+  // 最后一个还落在片段**内**的时刻（`[0, durSec)` 的右端是开的）
+  const maxT = Math.max(0, quantSec(Math.max(0, dur - FRAME_QUANT_SEC)));
+
+  if (Array.isArray(picked) && picked.length) {
+    const kept = [];
+    for (const raw of picked) {
+      const v = Number(raw);
+      if (!Number.isFinite(v) || v < 0 || v >= dur) {
+        console.warn(`[blockoutize] 自选看帧时刻 ${raw} 不在 [0, ${dur}) 内，已丢弃`);
+        continue;
+      }
+      kept.push(v);
+    }
+    const all = normalizeTimes(kept, maxT);
+    if (all.length > VISION_FRAMES_MAX) {
+      console.warn(`[blockoutize] 自选看帧 ${all.length} 个超过上限 ${VISION_FRAMES_MAX}，只看最靠前的 ${VISION_FRAMES_MAX} 个`);
+    }
+    const times = all.slice(0, VISION_FRAMES_MAX);
+    if (times.length) return times;
+    console.warn(`[blockoutize] 自选看帧时刻一个都不可用（共 ${picked.length} 个），退回自动取帧`);
+  }
+
+  const n = autoFrameCount(dur);
+  // 在 [0, durSec) 上均匀取。去重只可能让它变少（不会超上限），所以这里不再警告
+  return normalizeTimes(
+    Array.from({ length: n }, (_, i) => (dur * i) / n),
+    maxT,
+  );
+}
+
 // ── ② 提示词（唯一实现）─────────────────────────────────────────────
 
 /** "先看"：让视觉逐个列出画面里的人物与外观特征。
@@ -185,6 +299,15 @@ function blockoutPrompt(roles) {
     `每个人偶胸口用醒目的黑色阿拉伯数字编号，**从 1 开始按 1、2、3 的顺序依次编到 ${roles.length}**，`,
     "只用这些数字本身：不要用多位数、不要用 0 开头、不要画成运动员号码牌或队服号码的样式。",
     "同一个人偶全程编号不变，不同人偶的编号不许重复。",
+    // ★★ 清单之外的人：**照样白模化，但不给编号**（2026-08-15 实测出来的坑）。
+    //   我们只看几帧，画面里的人却会中途入场/离场 —— 那一发 4 秒素材看 3 帧只认出 2 个人，
+    //   而方舟出片时看到更多人，**自己往下编了个 3 号**。于是画面上有 3 号，
+    //   角色位列表里只有 1、2：套用者看得见它却挂不上卡，只会以为功能坏了，且全程零报错。
+    // ★★ 宁可让它**没号**也不要一个列表里没有的号：没号的人偶就是一个"保持白模原样"的
+    //   路人（与"挂不上卡的角色位"表现一致、也说得通），而多出来的号是一句我们自己
+    //   兑现不了的承诺。帧数上调（visionFrameTimes）是让它少发生，这一句是让它发生了也不伤人。
+    "如果画面里还出现了上面没有点名的其他人物（例如中途才入场的、被前景挡住又露出来的），",
+    "同样把他们替换成一模一样的纯白色人偶，但**不要给他们任何编号**，胸口保持完全空白。",
     "所有人的动作、姿态、站位、前后层次、运镜、背景、道具与光影保持原样不变。",
   ].join("");
 }
@@ -297,6 +420,11 @@ module.exports = {
   PREWARM_TRIES,
   prewarm,
   fetchFrameDataUrl,
+  VISION_SEC_PER_FRAME,
+  VISION_FRAMES_MIN,
+  VISION_FRAMES_MAX,
+  FRAME_QUANT_SEC,
+  visionFrameTimes,
   VISION_SYSTEM,
   visionPrompt,
   parseRoles,

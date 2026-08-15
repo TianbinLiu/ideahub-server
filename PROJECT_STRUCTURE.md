@@ -1635,7 +1635,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
-- `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
+- `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、**看几帧**（`visionFrameTimes`）、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
 
 > ⚠️ 本节曾长期只列 5 个服务而实际远多于此；新增服务请在这里补一行。
 > 白模模板（`routes/branchTemplate.routes.js`）与方舟代理（`routes/ark.routes.js`）
@@ -1649,6 +1649,16 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 > 转存、建模板；幂等；这一步不花钱）。掉线兜底是
 > `GET /api/branch/templates/blockoutize/pending`（列出还没取回的凭据）——
 > **少了它两阶段就白拆了**：App 进程被回收之后 jobId 也没了，用户手里什么都不剩。
+>
+> ★★ 「白模化那一步看几帧」的**唯一实现**是 `services/blockoutize.visionFrameTimes`
+> （2026-08-15 之前是路由里写死的 `VISION_FRAMES = 3`）。自动模式按时长算 ——
+> 每 1.5 秒一帧、**下限 3 上限 8**；用户也可以在编辑页自己标（阶段一 body 的
+> 可选 `frameTimes: number[]`，**相对选段起点**的秒数，服务端会再验一遍：
+> 越界丢弃 + `console.warn`、去重排序、最多 8 个，全丢光就退回自动）。
+> 改帧数上限只准改 `VISION_FRAMES_MAX` 一处（zod schema 的数组上限从那里 import），
+> 且 App 侧的报价镜像要同一次改 —— 帧数是报价的输入，两边分叉不报错、只会报价 ≠ 实收。
+> 阶段一回执带 `visionFrames`（**实际喂进模型的帧数**）供 App 对账；凡是 `billed:true`
+> 的回包都带它，`billed:false` 的一律不带（没花钱就没有账要对）。
 
 ---
 

@@ -922,6 +922,109 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(text).toContain("每个人偶胸口");
   });
 
+  // ── 看几帧（自动按时长 / 用户自选）───────────────────────────────────
+  //
+  // ★★ 2026-08-15 真机实测的坑：帧数写死 3 帧时，一段 4 秒素材（前半段 2 人、后半段围坐
+  //   群戏人更多）只认出 2 个人 —— 登记的角色位是 1、2，而方舟出片时看到更多人
+  //   **自己往下编到了 3**。画面上有 3 号、列表里没有第三格，套用者挂不上卡且**零报错**。
+  //   现在帧数由 blockout.visionFrameTimes 一处说了算（自动 3~8 帧 / 用户自选），
+  //   下面这一组把"帧数真的随时长变、自选真的进得来、坏值真的被服务端自己丢掉"逐条钉住。
+  // ★ 用**真正打出去的抽帧请求**做断言（不是只看回包里的数）：两者对不上就是
+  //   "回执说看了 8 帧、其实只抽了 3 帧"，而 App 拿回执对账 —— 那是在账上撒谎。
+  /** 这一发实际抽了哪几个时刻的帧（原片上的绝对秒数，从 so_ 里读回来） */
+  const frameSecs = () =>
+    net.calls
+      .filter((c) => c.url.endsWith(".jpg"))
+      .map((c) => Number(/\/so_([\d.]+),c_crop/.exec(c.url)[1]));
+
+  test.each([
+    ["4 秒 → 下限 3 帧（写死 3 帧时正是这种素材漏了人）", 4, 3],
+    ["8 秒 → 每 1.5 秒一帧 = 6 帧", 8, 6],
+    ["12 秒 → 8 帧封顶（ceil(12/1.5)=8）", 12, 8],
+    ["30 秒 → 仍是 8 帧（再长也不多看）", 30, 8],
+  ])("自动模式：%s", async (_label, durSec, want) => {
+    const started = await post(baseBody({ startSec: 0, durSec }));
+    expect(started.status).toBe(202);
+    // 回执里的数 = 真正喂进模型的帧数（App 拿它对账报价的前一半）
+    expect(started.body.visionFrames).toBe(want);
+    const secs = frameSecs();
+    expect(secs).toHaveLength(want);
+    // 升序、去重、都落在这一段**里面**（右端是开的）
+    expect([...secs].sort((a, b) => a - b)).toEqual(secs);
+    expect(new Set(secs).size).toBe(secs.length);
+    for (const s of secs) expect(s).toBeGreaterThanOrEqual(0);
+    for (const s of secs) expect(s).toBeLessThan(durSec);
+  });
+
+  test("自动模式抽的时刻是**原片上的绝对秒**（相对片段的偏移要加上 startSec）", async () => {
+    // ★ 帧地址切的是**原片**（`so_` 是原片上的时刻），而 visionFrameTimes 回的是片段内的
+    //   相对秒。漏加 startSec 的话，AI 看的是这一段**之前**的画面 —— 人对不上、零报错。
+    const started = await post(baseBody({ startSec: 20, durSec: 8 }));
+    expect(started.status).toBe(202);
+    const secs = frameSecs();
+    expect(secs[0]).toBe(20); // 片段第一帧
+    for (const s of secs) {
+      expect(s).toBeGreaterThanOrEqual(20);
+      expect(s).toBeLessThan(28);
+    }
+  });
+
+  test("★ frameTimes 真的进得来（schema 里不显式声明就会被 zod strip，全程零报错）", async () => {
+    // ★★ 这条钉的是 zod strip 那个坑本身：不声明的表现是"客户端发了、服务端 202 了、
+    //   AI 照样只看自动那几帧" —— 用户在编辑页辛辛苦苦标的入场/离场帧一个都没生效，
+    //   而两边都不报错。所以要用一组**与自动模式明显不同**的时刻来钉（自动是 6 帧）。
+    const started = await post(baseBody({ startSec: 2, durSec: 8, frameTimes: [0, 3, 7] }));
+    expect(started.status).toBe(202);
+    expect(started.body.visionFrames).toBe(3);
+    expect(frameSecs()).toEqual([2, 5, 9]); // startSec + 相对秒
+  });
+
+  test("自选：越界的**丢掉**、剩下的照用（不整条拒 —— 用户已经付过上传与框选的时间成本）", async () => {
+    const started = await post(baseBody({ startSec: 2, durSec: 8, frameTimes: [2, 1, 8, 30] }));
+    expect(started.status).toBe(202);
+    // 8 与 30 都 ≥ durSec（右端开）→ 丢掉；剩下的去重排序
+    expect(started.body.visionFrames).toBe(2);
+    expect(frameSecs()).toEqual([3, 4]);
+  });
+
+  test("自选：空数组 → **退回自动**（不是「一帧都不看」）", async () => {
+    // ★ 返回空的表现是"没抽帧 → 视觉认不出人 → 在 roles 为空那里被拒"，
+    //   而用户看到的理由会是"AI 没认出人"，与真正原因完全对不上。
+    const started = await post(baseBody({ startSec: 0, durSec: 8, frameTimes: [] }));
+    expect(started.status).toBe(202);
+    expect(started.body.visionFrames).toBe(6);
+  });
+
+  test("自选：全部越界 → 同样退回自动，绝不空手去看", async () => {
+    const started = await post(baseBody({ startSec: 0, durSec: 8, frameTimes: [8, 9, 40] }));
+    expect(started.status).toBe(202);
+    expect(started.body.visionFrames).toBe(6);
+  });
+
+  test("自选超过上限（9 个）→ 400，且**一分钱不花**（连 Cloudinary 都不查）", async () => {
+    // ★ 上限只有 blockout.VISION_FRAMES_MAX 一处，schema 从那里 import ——
+    //   这里 400 是好事：还没花钱就说清楚，比截断之后让用户以为"我标的都看了"诚实。
+    const before = await walletSvc.getWallet(owner.id);
+    const res = await post(baseBody({ startSec: 0, durSec: 20, frameTimes: [0, 1, 2, 3, 4, 5, 6, 7, 8] }));
+    expect(res.status).toBe(400);
+    expect(resourceSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await walletSvc.getWallet(owner.id);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+  });
+
+  test("★ 提示词兜底：清单之外的人也白模化，但**不给编号**", async () => {
+    // ★★ 我们只看几帧，而画面里的人会中途入场/离场 —— 清单之外的人一定会有。
+    //   宁可让它**没号**（挂不上卡、保持白模原样）也不要一个列表里没有的号：
+    //   多出来的号是一句我们兑现不了的承诺，用户看得见却挂不上，只会以为坏了。
+    await post(baseBody());
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text).toMatch(/没有点名的其他人物/);
+    expect(text).toMatch(/不要给他们任何编号/);
+    expect(text).toMatch(/胸口保持完全空白/);
+  });
+
   test("计价：钱**全在阶段一**花掉（看帧 chat + 按 durSec 算的 r2v），取回结果一分不加", async () => {
     const TokenLedger = require("../src/models/TokenLedger");
     const before = await walletSvc.getWallet(owner.id);
@@ -1446,4 +1549,109 @@ describe("两套验收窗口（单元）—— 各自的唯一实现，名字必
     expect(templateRefIssue({ width: 720, height: 1280 })).toMatch(/没有返回/);
     expect(templateRefIssue(null)).toMatch(/没有返回/);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("看几帧（单元）—— visionFrameTimes 是这条规则的唯一实现", () => {
+  // ★★ 这个函数同时是**报价的锚点**（App 侧 economy.blockoutizeCost 的前一半按同一条公式
+  //   镜像）和**真正抽帧的依据**。两处分家的表现是"页面按 3 帧报价、服务端按 8 帧扣钱"，
+  //   两个方向都不报错 —— 本仓头号事故形状。所以公式本身要在单元层面钉死。
+  // ★ 走 HTTP 的那一组（「看几帧」）钉的是"真的抽了那几帧"；这一组钉的是"算得对"。
+  //   两层都要：只测函数会漏掉路由忘了加 startSec，只测 HTTP 会漏掉 >8 截断这种走不到的分支。
+  const blockout = require("../src/services/blockoutize.service");
+  const { blockoutizeBody } = require("../src/schemas/branchTemplate.schemas");
+
+  let warnSpy;
+  beforeEach(() => {
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warnSpy.mockRestore());
+
+  test("自动帧数 = clamp(ceil(durSec / 1.5), 3, 8)", () => {
+    // 4s→3（下限兜住；写死 3 帧那一版正是在这里漏了人）、12s→8（封顶）、30s→仍 8
+    expect(blockout.visionFrameTimes(4)).toHaveLength(3);
+    expect(blockout.visionFrameTimes(6)).toHaveLength(4);
+    expect(blockout.visionFrameTimes(8)).toHaveLength(6);
+    expect(blockout.visionFrameTimes(12)).toHaveLength(8);
+    expect(blockout.visionFrameTimes(30)).toHaveLength(8);
+    expect(blockout.VISION_FRAMES_MIN).toBe(3);
+    expect(blockout.VISION_FRAMES_MAX).toBe(8);
+    expect(blockout.VISION_SEC_PER_FRAME).toBe(1.5);
+  });
+
+  test("自动取的时刻：升序、去重、落在 [0, durSec)、取整到 0.5 秒", () => {
+    // ★ 不取整的话会拼出 so_2.6666666666666665 —— 拿不到 CDN 缓存，去重也永远去不掉
+    expect(blockout.visionFrameTimes(4)).toEqual([0, 1.5, 2.5]);
+    expect(blockout.visionFrameTimes(12)).toEqual([0, 1.5, 3, 4.5, 6, 7.5, 9, 10.5]);
+    for (const dur of [4, 5, 7, 11, 17, 23, 30]) {
+      const t = blockout.visionFrameTimes(dur);
+      expect([...t].sort((a, b) => a - b)).toEqual(t);
+      expect(new Set(t).size).toBe(t.length);
+      for (const v of t) {
+        expect(v).toBeGreaterThanOrEqual(0);
+        expect(v).toBeLessThan(dur); // 右端是开的：durSec 那一刻已经不在这一段里
+        expect(v * 2).toBe(Math.round(v * 2)); // 0.5 的整数倍
+      }
+    }
+  });
+
+  test("自选：原样用（去重 + 排序 + 取整），不擅自加帧也不擅自减帧", () => {
+    expect(blockout.visionFrameTimes(8, [3, 1, 3, 6.4])).toEqual([1, 3, 6.5]);
+  });
+
+  test("★ 自选越界：丢掉那一个并 console.warn，其余照用（不整条拒）", () => {
+    // ★ 整条拒 = 用户已经付过上传与框选的时间成本，为一个坏数把他打回起点。
+    //   但丢弃必须**响亮**（铁律八）：静默丢的话，"我标了 5 帧怎么只看了 3 帧"永远查不出来。
+    expect(blockout.visionFrameTimes(8, [1, 8, 20, -3])).toEqual([1]);
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/不在 \[0, 8\) 内，已丢弃/);
+  });
+
+  test("★ 自选超过 8 个 → 截断到 8（函数这一层的最后兜底，与 schema 共用同一个上限常量）", () => {
+    // ★★ 上限只能有一处：schema 的数组上限就是从 blockout.VISION_FRAMES_MAX import 的。
+    //   在两边各写一个 8 就是 CLAUDE.md「最多出几张卡的上限自己抄一份」那条坑 ——
+    //   改上限时改一处漏一处**没有任何症状**，只会变成报价与实收不等。
+    const picked = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    expect(blockout.visionFrameTimes(20, picked)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/超过上限 8/);
+    // schema 的上限与它是同一个数（谁改了另一边都会红）
+    expect(blockoutizeBody.safeParse({ ...unitBody(), frameTimes: picked }).success).toBe(false);
+    expect(blockoutizeBody.safeParse({ ...unitBody(), frameTimes: picked.slice(0, 8) }).success).toBe(true);
+  });
+
+  test("自选全被丢光 / 空数组 → 退回自动，**绝不返回空**", () => {
+    // ★ 返回空 → 一帧都不抽 → 视觉认不出人 → 在 roles 为空那里被拒，
+    //   而用户看到的理由是"AI 没认出人"，与真正原因（他标的时刻全越界）完全对不上。
+    expect(blockout.visionFrameTimes(8, [])).toHaveLength(6);
+    expect(blockout.visionFrameTimes(8, [8, 99])).toHaveLength(6);
+    expect(blockout.visionFrameTimes(8, [NaN])).toHaveLength(6);
+  });
+
+  test("durSec 本身坏了 → 退单帧并 console.warn（上游漏了一道校验，不许静默）", () => {
+    expect(blockout.visionFrameTimes(0)).toEqual([0]);
+    expect(blockout.visionFrameTimes(undefined)).toEqual([0]);
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  test("★ frameTimes 在 schema 里**显式声明**了（不声明就被 zod strip，全程零报错）", () => {
+    const parsed = blockoutizeBody.parse({ ...unitBody(), frameTimes: [0, 2.5] });
+    expect(parsed.frameTimes).toEqual([0, 2.5]);
+    // 不传就是"自动模式"：不给默认值，判据一律用存在性
+    expect(blockoutizeBody.parse(unitBody()).frameTimes).toBeUndefined();
+    // 形状上不可能对的一律拒（负数 / 非数 / 超 600s）
+    for (const bad of [[-1], ["2"], [601], [Infinity], [NaN]]) {
+      expect(blockoutizeBody.safeParse({ ...unitBody(), frameTimes: bad }).success).toBe(false);
+    }
+  });
+
+  /** schema 单测用的最小合法 body（四组数的真正验收在路由里，这里只要过得了形状） */
+  function unitBody() {
+    return {
+      publicId: "ideahub/template-videos/abc-1",
+      startSec: 0,
+      durSec: 8,
+      crop: { x: 0, y: 0, w: 900, h: 512 },
+      title: "t",
+    };
+  }
 });
