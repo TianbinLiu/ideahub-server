@@ -364,6 +364,17 @@ async function resolveR2v(req, res, next) {
     if (ratio !== undefined && ratio !== "adaptive") {
       return deny("白模出片的画幅跟随模板视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
     }
+    // ★ generate_audio 同样要钉：2026-08-15 零成本探针实测，**方舟在 r2v edit 路上真收
+    //   这个参数**（给非法值报的是 "parameter `generate_audio` is not valid"，param 精确
+    //   指向它；给 true 通过 schema）。而 r2vTokens 的公式里没有任何音频项 —— 不钉的话，
+    //   改一行客户端就能按无声价买到有声产出，差额全进我们的方舟账单且零症状
+    //   （与上面四个参数同一条理由：计价假设必须由服务端把住，不能只靠客户端自觉）。
+    //   ★ 这也是「这一版不开方舟音频」的**代码表达**：真要开，是「放开这一条 + tokens.js
+    //   加音频系数」同一个提交里的事，绝不能一边悄悄开着一边按无声价收。
+    const genAudio = req.body?.generate_audio;
+    if (genAudio !== undefined && genAudio !== false) {
+      return deny("白模出片暂不支持生成音频——当前请求未被受理，也没有扣费。");
+    }
 
     req.r2v = {
       templateId: String(tpl._id),

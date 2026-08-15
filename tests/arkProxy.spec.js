@@ -467,6 +467,8 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     ["duration=30（[4,30] 合法区间也不行）", (b) => { b.duration = 30; }],
     ["resolution=1080p", (b) => { b.resolution = "1080p"; }],
     ["ratio=16:9（钉 adaptive）", (b) => { b.ratio = "16:9"; }],
+    // 方舟在 r2v edit 路真收 generate_audio（2026-08-15 探针实测），而 r2vTokens 没有音频项
+    ["generate_audio=true（无声价买有声产出）", (b) => { b.generate_audio = true; }],
   ])("r2v 生成参数越出计价假设（%s）→ 400，不出网不扣费", async (_name, mutate) => {
     const body = r2vBody(publishedTpl.refVideo.url);
     mutate(body);
