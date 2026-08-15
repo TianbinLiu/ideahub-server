@@ -919,7 +919,28 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const text = body.content.find((c) => c.type === "text").text;
     expect(text).toContain("包括");
     expect(text).toContain("白发");
-    expect(text).toContain("每个人偶胸口");
+    expect(text).toContain("头部的四面");
+  });
+
+  test("★ 编号印在**头部四面**、四处是**同一个数字**（胸口那个转身就看不见了）", async () => {
+    // ★★ 2026-08-15 实测：胸口那个号本身清晰稳定、跨帧不串号，但人物一转身/背对镜头/
+    //   换机位就**看不见** —— 而编号是"点这个人偶挂这张卡"的唯一连接键，看不见的那几帧
+    //   对套用侧就等于"这个人没有号"。所以要四面都印。
+    // ★ 措辞里"**同一个数字**"这半句必须在：只说"头部四面各印一个编号"时，
+    //   模型完全可能给同一个人偶印四个不同的号 —— 那比印在胸口还糟（作者核对时
+    //   看哪一面都对不上，而列表里那格看着毫无问题）。
+    await post(baseBody());
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text).toMatch(/头部的四面/);
+    expect(text).toMatch(/前额、后脑、左侧太阳穴、右侧太阳穴/);
+    expect(text).toMatch(/同一个数字/);
+    // 「取值范围钉死」那条老规矩没被这次改动带走（不写的话实测印出 115/116 这种号码牌）
+    expect(text).toMatch(/依次编到 2/);
+    expect(text).toMatch(/不要用多位数/);
+    // ★ 胸口那一处是**故意去掉**的：同一个号印在五个地方 = 五次各自印错的机会，
+    //   而两处数字不一样时没有任何人能判哪个对（作者核对看哪个？套用者看哪个？）。
+    expect(text).toMatch(/不要出现任何数字或文字/);
   });
 
   // ── 看几帧（自动按时长 / 用户自选）───────────────────────────────────
@@ -1022,7 +1043,31 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
     expect(text).toMatch(/没有点名的其他人物/);
     expect(text).toMatch(/不要给他们任何编号/);
-    expect(text).toMatch(/胸口保持完全空白/);
+    expect(text).toMatch(/头部与身上保持完全空白/);
+  });
+
+  test("★ 视觉认出 12 个 → 只登记 9 个角色位，label 恒为连续的 1..9", async () => {
+    // ★★ 上限 9 的两头都是实测（见 blockout.BLOCKOUT_ROLE_MAX 的注释）：
+    //   上界是参考图预算（9 × 每张人物卡 2~3 张图 = 18~27，仍在方舟 2.5 的 30 张之内），
+    //   下界是人眼（12 个时编号照样印得出来，但画面上人能稳定认出的只有 4~5 个）。
+    // ★★ 截断必须发生在**编号之前**：先编号再截断会留下 1、2、4… 这种断号，
+    //   而提示词里说的还是"依次编到 N" —— 画面上的号与列表里的号从此系统性错位，
+    //   两边都不报错（labelConfirmed 那道闸只是兜底，不是让编号一开始就对的办法）。
+    net.visionText = Array.from({ length: 12 }, (_, i) => `${i + 1}|位置${i + 1}|第 ${i + 1} 个人的样子`).join("\n");
+    const started = await post(baseBody());
+    expect(started.status).toBe(202);
+    expect(started.body.roles.map((r) => r.label)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    // 提示词里的"编到 N"跟着截断后的个数走（不是视觉认出的 12）
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text).toMatch(/依次编到 9/);
+    expect(text).toMatch(/共 9 人/);
+    expect(text).not.toMatch(/第 10 个人的样子/); // 被丢掉的那几个一个字都不该进提示词
+    // 落库那份也是 9 条（取回结果这一步不许把丢掉的补回来）
+    const finished = await finish(started.body.jobId);
+    expect(finished.status).toBe(201);
+    expect(finished.body.template.roles).toHaveLength(9);
+    expect(finished.body.template.roles.map((r) => r.label)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   });
 
   test("计价：钱**全在阶段一**花掉（看帧 chat + 按 durSec 算的 r2v），取回结果一分不加", async () => {
@@ -1654,4 +1699,98 @@ describe("看几帧（单元）—— visionFrameTimes 是这条规则的唯一�
       title: "t",
     };
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的唯一实现", () => {
+  // ★★ 这个数有三个消费方（parseRoles 的截断、提示词里的"编到 N"、schema 的数组上限），
+  //   任何一处自己抄一份都**没有症状**：只会变成"白模化登记 9 格、作者能核对成 12 格"，
+  //   多出来那几格挂的卡在出片时因为参考图预算超了被悄悄丢掉 —— 钱照扣、零报错
+  //   （CLAUDE.md「最多出几张卡的上限自己抄一份」那条坑的同族）。
+  const blockout = require("../src/services/blockoutize.service");
+  const { patchRolesBody } = require("../src/schemas/branchTemplate.schemas");
+
+  let warnSpy;
+  beforeEach(() => {
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warnSpy.mockRestore());
+
+  /** 造 n 行视觉清单（就是 chat vision 那一步吐出来的形状） */
+  const visionLines = (n) => Array.from({ length: n }, (_, i) => `${i + 1}|位置${i + 1}|第 ${i + 1} 个人`).join("\n");
+
+  test("上限是 9，且 schema 的数组上限就是同一个数（谁改了另一边都会红）", () => {
+    // ★ 9 的来历：上界是参考图预算（9 × 每张人物卡 2~3 张图 = 18~27 ≤ 方舟 2.5 的 30 张），
+    //   下界是人眼（实测 12 个时编号印得出来，但画面上能稳定认出的只有 4~5 个）。
+    expect(blockout.BLOCKOUT_ROLE_MAX).toBe(9);
+    const many = (n) => Array.from({ length: n }, (_, i) => ({ label: String(i + 1), desc: `第 ${i + 1} 个` }));
+    expect(patchRolesBody.safeParse({ roles: many(blockout.BLOCKOUT_ROLE_MAX) }).success).toBe(true);
+    expect(patchRolesBody.safeParse({ roles: many(blockout.BLOCKOUT_ROLE_MAX + 1) }).success).toBe(false);
+  });
+
+  test("★ 认出 12 个 → 截断到 9，且截断发生在**编号之前**（label 恒为连续的 1..9）", () => {
+    const roles = blockout.parseRoles(visionLines(12));
+    expect(roles).toHaveLength(9);
+    expect(roles.map((r) => r.label)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    // 留下的是**最靠前的** 9 个（视觉清单按画面主次列，靠前的更可能是真主角）
+    expect(roles[8].desc).toContain("第 9 个");
+    // ★★ 而"靠前 = 戏份重"这件事必须由**视觉提示词**保证，否则截断就是在赌运气：
+    //   模型若按从左到右或入场先后列，被截掉的可能正是主角，且零报错。
+    expect(blockout.visionPrompt()).toMatch(/按重要程度从高到低排列/);
+    expect(roles.every((r) => r.labelConfirmed === false)).toBe(true);
+  });
+
+  test("★ 丢掉的那几个要**响亮**记一笔（静默丢 = 没人知道画面里第 10 个人去哪了）", () => {
+    blockout.parseRoles(visionLines(12));
+    expect(warnSpy).toHaveBeenCalled();
+    const said = warnSpy.mock.calls.flat().join(" ");
+    expect(said).toMatch(/认出 12 个人物/);
+    expect(said).toMatch(/上限 9/);
+    // 说清楚被丢掉的人**没有消失**：提示词里"清单之外的人照样白模化但不编号"管着他们
+    expect(said).toMatch(/不给编号/);
+  });
+
+  test("没超上限时不警告（别把正常那一路也吵成噪音，否则真出事时没人看日志）", () => {
+    expect(blockout.parseRoles(visionLines(9))).toHaveLength(9);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  test("★ 提示词里那个 N 跟着**截断后**的个数走（说 12 而只印 9 个号 = 画面上凭空多出三个号）", () => {
+    const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(12)));
+    expect(text).toMatch(/共 9 人/);
+    expect(text).toMatch(/依次编到 9/);
+    expect(text).not.toContain("第 10 个");
+    // 点名段是**一人一行的短句**（`编号=原来的样子`）：9 个人时长串会把要害那几句挤到尾巴上
+    expect(text).toContain("\n1=位置1，第 1 个人\n");
+    expect(text).toContain("\n9=位置9，第 9 个人\n");
+  });
+
+  test("★ 点名段的描述切到 60 字，**落库那份不动**（两者不是同一条规则）", () => {
+    // ★★ 落库那份是给**人**读的（套用者挂卡只看它，作者还能改写），提示词那份是给
+    //   **模型**认人用的。不切的话，模型某一发多话吐 9 条 300 字描述，点名段两千多字，
+    //   把后面那几句要害（编号印哪儿、编到几、清单外不编号）稀释到读不出来 ——
+    //   而结果只是"编号又乱了"，没有任何一层会报错。
+    const long = "甲".repeat(400);
+    const roles = blockout.parseRoles(`1|${long}`);
+    expect(roles[0].desc).toHaveLength(300); // 落库上限（与 mongoose roleSchema 的 300 对齐）
+    const text = blockout.blockoutPrompt(roles);
+    expect(text).toContain(`1=${"甲".repeat(60)}\n`);
+    expect(text).not.toContain("甲".repeat(61));
+  });
+
+  test("★ 头部四面 + 同一个数字 + 清单外不编号 —— 三句都在（少一句就有一种挂错卡的路子）", () => {
+    const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
+    // ① 四面：胸口那个一转身就看不见，而编号是挂卡的唯一连接键
+    expect(text).toMatch(/头部的四面/);
+    expect(text).toMatch(/前额、后脑、左侧太阳穴、右侧太阳穴/);
+    // ② 同一个数字：不说死的话，同一个人偶四面印四个不同的号，比印在胸口还糟
+    expect(text).toMatch(/同一个数字/);
+    // ③ 清单外的人白模化但不编号：画面上多一个列表里没有的号 = 一句我们兑现不了的承诺
+    expect(text).toMatch(/没有点名的其他人物/);
+    expect(text).toMatch(/不要给他们任何编号/);
+    expect(text).toMatch(/头部与身上保持完全空白/);
+    // ④ F4 的要害（"包括…在内" + 主角那一句）没被这次压缩措辞带走
+    expect(text).toContain("包括");
+    expect(text).toMatch(/看起来像主角的那一个/);
+  });
 });

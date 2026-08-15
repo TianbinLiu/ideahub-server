@@ -26,7 +26,10 @@ const { z } = require("../middleware/validate");
 //   下面 frameTimes 的数组上限从那里 import，不在这儿抄一个 8。
 //   抄一份的表现是改上限时改一处漏一处，而两处都不报错 —— 只会变成
 //   "schema 放进来 10 个、真正抽帧只看 8 个、报价按 10 个算"（CLAUDE.md「上限自己抄一份」坑）。
-const { VISION_FRAMES_MAX } = require("../services/blockoutize.service");
+// ★ 「最多几个角色位」同理只有那一处（BLOCKOUT_ROLE_MAX）：这里抄一个 9 的话，
+//   改上限时改一处漏一处**没有任何症状** —— 只会变成"白模化只登记 9 格、作者却能
+//   核对成 12 格"，多出来那几格挂上的卡在出片时因为参考图预算超了被悄悄丢掉，钱照扣。
+const { VISION_FRAMES_MAX, BLOCKOUT_ROLE_MAX } = require("../services/blockoutize.service");
 
 // coverUrl 只收 https（或空串=暂无封面）。dataURL 一律拒：一张封面几百 KB 的 base64，
 // shared 列表一次回包就是几十 MB（BranchDeck.cover 转存 Cloudinary 是同一条教训）。
@@ -145,7 +148,7 @@ const finishBlockoutizeBody = z.object({
 // ── PATCH /api/branch/templates/:id/roles（编号由作者确认）──────────────
 //
 // ★★ 上面刚说过「roles 由服务端写、客户端提交一律不收」，这里却收 —— 不矛盾，
-//   因为这一发提交的东西**只有人做得出来**：作者把成片放出来，看人偶胸口的数字，
+//   因为这一发提交的东西**只有人做得出来**：作者把成片放出来，看人偶头上的数字，
 //   把它抄进对应的角色位。落库那份 label 是服务端按视觉清单顺序编的**猜测**，
 //   而 F5 实测编号稳定但**不连续**（实出 1/2/4/5）—— 猜错的后果是套用者把卡挂到
 //   别人身上，钱照扣、零报错。所以这条路收的不是"数据"，是**作者的确认**。
@@ -153,11 +156,13 @@ const finishBlockoutizeBody = z.object({
 //   计价链路（r2vTokens 的输入时长）与它完全无关。路由再加两道：仅作者、仅 pending。
 //
 // ★ label 收**字符串**，且**不校"是数字""连续""与原来的个数相同"**：
-//   · 不校数字 —— 编号是人偶胸口画的东西，实测是阿拉伯数字，但校验它没有任何好处：
+//   · 不校数字 —— 编号是画在人偶头上的东西，实测是阿拉伯数字，但校验它没有任何好处：
 //     真出现 "1a" 这种，作者原样抄进来才对得上画面，我们替他"规整"就是把卡挂错人；
 //   · 不校连续 —— 1/2/4/5 是**实测的正常输出**，校连续等于把正确的确认判成非法；
 //     · 不锁个数 —— 视觉可能少认一个人（画面里 5 个只列了 4 个），作者补一条比
-//     "只能确认 AI 认出的那些"诚实。上限 12 与 parseRoles 的截断同一个数。
+//     "只能确认 AI 认出的那些"诚实。**但个数的上限锁住**：它与 parseRoles 的截断
+//     必须是同一个数（BLOCKOUT_ROLE_MAX），否则作者能从这条路把角色位加到 10 个以上，
+//     而套用侧的参考图预算（方舟 2.5 上限 30 张 ÷ 每张人物卡 2~3 张图）兜不住那么多。
 const roleItemBody = z.object({
   // 编号本身。maxlength 与 models/BranchTemplate.roleSchema 的 8 对齐
   label: z.string().trim().min(1).max(8),
@@ -166,7 +171,7 @@ const roleItemBody = z.object({
 });
 
 const patchRolesBody = z.object({
-  roles: z.array(roleItemBody).min(1).max(12),
+  roles: z.array(roleItemBody).min(1).max(BLOCKOUT_ROLE_MAX),
 });
 
 module.exports = { createTemplateBody, blockoutizeBody, finishBlockoutizeBody, patchRolesBody, HTTPS_RE };
