@@ -173,6 +173,19 @@ describe("videoUrl 三重白名单（host + 目录 + 归属）", () => {
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/最长 30 秒/);
   });
+
+  test("★★ 回执给小数时长（12.4s）→ 锚点 ceil 成 13，真值 12.4 另存一位", async () => {
+    // ★★ refVideo.durationSec 只有**两个**写入方（这条 V1 登记路 + V2 的 finish），
+    //   两边必须用同一个取法，否则就是"两种模板两套报价"。
+    // ★ 为什么必须取整：App 的报价镜像**不 round 不 clamp**，服务端结算 round+clamp ——
+    //   锚点是整数时两者恒等；存小数的那一刻页面报少、钱包扣多。
+    // ★ 为什么是 ceil 不是 round：12.4 用 round 会存成 12，我们按 24s 收、方舟按 ~24.5s 计
+    //   —— **报价 < 实收**，本仓头号事故形状。ceil 把误差永久钉在安全的那一侧。
+    resourceSpy.mockImplementation(async (publicId) => fakeResource(publicId, { duration: 12.4 }));
+    const tpl = await createTemplate(2005);
+    expect(tpl.refVideo).toMatchObject({ durationSec: 13, realDurationSec: 12.4 });
+    expect(Number.isInteger(tpl.refVideo.durationSec)).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -567,6 +580,14 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
     ["太长（700s）", { duration: 700 }, /最长 600 秒/],
     ["边长不够（200×3000）", { width: 200, height: 3000 }, /边长至少 300 像素/],
     ["像素数不够（640×360）", { width: 640, height: 360 }, /分辨率太低/],
+    // ★★ 2026-08-16 新增的下限：原片短于 5 秒 → 裁出来的那一段必然也 <5 秒
+    //   （裁剪不可能比原片长），而 4 秒进方舟做白模只剩 3.7 秒 —— 那样的模板谁都套用不了。
+    //   拦在**上传之前**（App 本机读 `<video>` 元数据就够）是最早的止损点：连 100MB 都不用传。
+    ["太短（3.6s）", { duration: 3.6 }, /至少 5 秒/],
+    // ★★★ 这一条钉的是**根因本身**：老代码里 `templateVideoMeta` 对 duration 做
+    //   `Math.round`，`Math.round(4.6) === 5` 会让这段素材**顺利放行**，然后用户框选 5 秒
+    //   （超出片长）或框 4 秒撞方舟。取整一旦回来，只有这一条会红。
+    ["太短且四舍五入会放行（4.6s → 老代码读成 5）", { duration: 4.6 }, /只有约 4.6 秒/],
   ])("回执复核不过：%s → 先 destroy 再 400 整句", async (_label, over, msgRe) => {
     mockUploadReceipt(over);
     const res = await request(app)
@@ -580,7 +601,8 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
   });
 
   test.each([
-    ["3 秒（裁出来的那一段才要 ≥4s）", { duration: 3 }],
+    // ★ 5 秒是**白模输入下限**（BLOCKOUT_MIN_INPUT_SEC），不是方舟的窗口 —— 端点上要收得下
+    ["5 秒（刚好够白模输入的下限）", { duration: 5 }],
     ["3 分钟长片（V2 的素材本来就长）", { duration: 180 }],
     ["细长比例 500×1500（比例正是裁剪框能修的那一项）", { width: 500, height: 1500 }],
   ])("原始素材窗口放宽后：%s → 200 放行，且不回收", async (_label, over) => {
@@ -779,13 +801,20 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       bytes: 30_000_000,
       version: 1712000000,
     }));
-    // 转存回执：合格的白模产物（900×512 / 8s）
+    // 转存回执：合格的白模产物（900×512 / **7.712s**）
+    // ★★★ 这个小数是本组最重要的一个数（2026-08-16 补）。在它之前这里写的是整数 8，
+    //   而**整仓没有一处**用小数 duration 的回执做过测试 —— 那就是「产物短于方舟下限」
+    //   那个 bug 隐身的全部原因：`templateVideoMeta` 当年对 duration 做 `Math.round`，
+    //   喂整数进去 round 是恒等的，于是产物窗口那道闸门看着有、实际被喂假数。
+    //   方舟 edit 的产出**本来就比输入短**（实测 4.0→3.712、5.0→4.736、14.04→13.67），
+    //   回执里给的一直是小数。把这里改回整数，下面所有关于 ceil 锚点与产物验收的钉子
+    //   会一起变成走过场。
     lastUpload = null;
     uploadSpy = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (_url, opts) => {
       lastUpload = {
         public_id: `${opts.folder}/${opts.public_id}`,
         secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
-        duration: 8,
+        duration: 7.712,
         width: 900,
         height: 512,
         bytes: 3_000_000,
@@ -861,7 +890,15 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(JSON.stringify(res.body)).not.toContain(body.publicId);
     // refVideo 是**转存后**的地址（F12：方舟那条 TOS 地址 24h 就过期）
     expect(tpl.refVideo.url).toBe(lastUpload.secure_url);
-    expect(tpl.refVideo).toMatchObject({ durationSec: 8, width: 900, height: 512 });
+    // ★★ 两个时长是**两件事**，都要出：
+    //   · durationSec = 计价锚点，恒为 [4,30] 内的**整数**，由真实秒数 `Math.ceil` 而来。
+    //     为什么必须是整数：App 的报价公式不 round 不 clamp，服务端的 round+clamp ——
+    //     锚点是整数时两者恒等，存小数的那一刻就是"页面报少、钱包扣多"（本仓头号事故形状）。
+    //   · realDurationSec = 云端回执里的**真实小数**，只诊断/展示，不参与任何计价。
+    //     不存它的话，"这个模板到底够不够方舟的 4 秒下限"在库里无从判断（锚点是向上取整的，
+    //     一段 3.712s 的坏产物在那里写着 4）。
+    expect(tpl.refVideo).toMatchObject({ durationSec: 8, realDurationSec: 7.712, width: 900, height: 512 });
+    expect(Number.isInteger(tpl.refVideo.durationSec)).toBe(true);
     expect(uploadSpy).toHaveBeenCalledWith("https://x.volces.com/out.mp4", expect.objectContaining({ resource_type: "video" }));
 
     // 库里存了 source（溯源与重做要用），只是不回给客户端
@@ -993,7 +1030,10 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       .map((c) => Number(/\/so_([\d.]+),c_crop/.exec(c.url)[1]));
 
   test.each([
-    ["4 秒 → 下限 3 帧（写死 3 帧时正是这种素材漏了人）", 4, 3],
+    // ★ 2026-08-16 起白模输入下限是 5 秒（见 BLOCKOUT_MIN_INPUT_SEC），所以这条走 HTTP 的
+    //   最短样本从 4 改成 5。「clamp 的下限 3 帧」现在从这条路走不到了（ceil(5/1.5)=4），
+    //   它归下面那组**单元**测试钉（visionFrameTimes(4) 仍然是 3 帧）—— 两层各钉各的。
+    ["5 秒 → ceil(5/1.5) = 4 帧（白模输入的最短合法样本）", 5, 4],
     ["8 秒 → 每 1.5 秒一帧 = 6 帧", 8, 6],
     ["12 秒 → 8 帧封顶（ceil(12/1.5)=8）", 12, 8],
     ["30 秒 → 仍是 8 帧（再长也不多看）", 30, 8],
@@ -1179,7 +1219,13 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     ["裁剪框超出画面", { crop: { x: 1500, y: 0, w: 900, h: 512 } }, /裁剪框超出/],
     ["选段超出片长", { startSec: 55, durSec: 8 }, /超出了视频长度/],
     ["裁后像素不够（640×636 = 407,040）", { crop: { x: 0, y: 0, w: 640, h: 636 } }, /分辨率太低/],
-    ["这一段太短（3s < 方舟 edit 的 4s 下限）", { durSec: 3 }, /至少要 4 秒/],
+    // ★★ 4 秒**方舟自己收得下**（它的窗口是 [4,30]），但白模这条路不行：产出只有 3.7 秒，
+    //   低于方舟自己的下限，建出来的模板谁都套用不了 —— 而作者已经付过钱了。
+    //   所以阶段一走的是 blockoutInputIssue（下限 5），不是 templateRefIssue（下限 4）。
+    ["这一段刚好 4s —— 方舟收得下，但白模产出只剩 3.7s", { durSec: 4 }, /至少 5 秒/],
+    // ★ 3 秒也要指向**真正的下限 5**，不能委托出去说成"至少要 4 秒"：
+    //   用户照做改成 4 秒，回来又被拒一次 —— 一句指错数字的解释和一个坏功能长得一模一样。
+    ["这一段太短（3s）", { durSec: 3 }, /至少 5 秒/],
     ["这一段太长（31s > 30s 上限）", { durSec: 31, startSec: 0 }, /最长 30 秒/],
     ["裁后比例过细长（400×1040）", { crop: { x: 0, y: 0, w: 400, h: 1040 } }, /宽高比/],
   ])("四组数校验：%s → 400 整句，且一分钱不花", async (_label, over, msgRe) => {
@@ -1347,6 +1393,135 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(destroySpy).toHaveBeenCalled(); // 不回收就是永久占配额，零症状
     expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
     expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("failed");
+  });
+
+  // ── ★★★ 产物验收：本次事故的可执行定义（2026-08-16）────────────────────
+  //
+  // 背景（都是实测，不是假设）：方舟 edit 的**产出比输入短** ——
+  //   4.0s → 3.712s、5.0s → 4.736s、14.04s → 13.67s。
+  // 而方舟自己要求输入 ∈ [4,30]。合起来就是：**用 4 秒素材做出来的模板是 3.712 秒，
+  // 低于方舟自己的下限，谁都套用不了**。线上 6 个模板有 3 个是这个状态。
+  //
+  // 这道门在代码里一直"存在"，只是被 `Math.round(3.712) === 4` 喂了假数。
+  // 下面这两条就是它的可执行定义：在修复之前，第一条必然失败。
+  test("★★ 产物只有 3.712 秒（4 秒素材的真实产出）→ 取件那一步照实拒，不留一颗可发布的哑弹", async () => {
+    uploadSpy.mockImplementation(async (_url, opts) => ({
+      public_id: `${opts.folder}/${opts.public_id}`,
+      secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+      duration: 3.712, // ← 老代码在这里 Math.round 成 4，于是坏模板一路绿灯落库
+      width: 900,
+      height: 512,
+      bytes: 1_000_000,
+    }));
+    const pid = `ideahub/template-videos/${owner.id}-8031`;
+    const started = await post(baseBody({ publicId: pid, durSec: 5, startSec: 0 }));
+    expect(started.status).toBe(202);
+    const res = await finish(started.body.jobId);
+
+    expect(res.status).toBe(502);
+    expect(res.body.state).toBe("failed"); // 确定性失败：再取一百次也是同一段产物
+    expect(res.body.lost).toBe(true);
+    // ★ 整句人话，且必须说到三件事：产出多短、钱回不来、下次怎么做（至少框 5 秒）
+    expect(res.body.message).toMatch(/约 3\.7 秒/);
+    expect(res.body.message).toMatch(/4 秒下限/);
+    expect(res.body.message).toMatch(/费用已经产生/);
+    expect(res.body.message).toMatch(/5 秒/);
+    // ★★ **绝不落库**：落一个建成但发不出去的模板，作者只会对着"请先成功出一段片"
+    //   反复撞方舟的英文 400，而那不是真正的原因。
+    expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
+    expect(destroySpy).toHaveBeenCalled(); // 不合格产物要回收，不然永久占配额（零症状）
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).status).toBe("failed");
+  });
+
+  test("★★ 产物 4.736 秒（5 秒素材的真实产出）→ 照常建成，锚点 ceil 成 5、真值如实存下", async () => {
+    // ★★★ 这一条与上一条是**一对**：只钉"坏的拒掉"是不够的 —— 把产物窗口顺手抬到 5
+    //   （"给裁短量留余量"这种想当然的改法）会把唯一正确的用法也封死，而上一条照样绿。
+    uploadSpy.mockImplementation(async (_url, opts) => ({
+      public_id: `${opts.folder}/${opts.public_id}`,
+      secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+      duration: 4.736,
+      width: 900,
+      height: 512,
+      bytes: 1_000_000,
+    }));
+    const pid = `ideahub/template-videos/${owner.id}-8032`;
+    const started = await post(baseBody({ publicId: pid, durSec: 5, startSec: 0 }));
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(201);
+    // ceil(4.736) = 5：与 round 在这个样本上同为 5，但 ceil 把误差**永久钉在安全一侧**
+    //（round 会把真实 12.4 存成 12，我们按 24s 收、方舟按 ~24.5s 计 —— 报价 < 实收）
+    expect(res.body.template.refVideo).toMatchObject({ durationSec: 5, realDurationSec: 4.736 });
+  });
+
+  test("★ 不变量：落库的 durationSec 恒为 [4,30] 内的整数（「报价 = 实收」仍然成立的全部论证）", async () => {
+    // ★★ 服务端的 r2vTokens 是 round + clamp[4,30]，App 的报价镜像**不 round 不 clamp**。
+    //   两者恒等的充要条件就是这一条不变量。它一旦破了（比如有人把 realDurationSec 直接
+    //   拿去当锚点），页面报 449,004、钱包扣 483,840 —— 两个方向都不报错。
+    for (const [real, wantAnchor] of [[4.0, 4], [4.736, 5], [7.712, 8], [29.2, 30]]) {
+      uploadSpy.mockImplementation(async (_url, opts) => ({
+        public_id: `${opts.folder}/${opts.public_id}`,
+        secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+        duration: real,
+        width: 900,
+        height: 512,
+        bytes: 1_000_000,
+      }));
+      const started = await post(baseBody({ durSec: 30, startSec: 0 }));
+      const res = await finish(started.body.jobId);
+      expect(res.status).toBe(201);
+      const anchor = res.body.template.refVideo.durationSec;
+      expect({ real, anchor }).toEqual({ real, anchor: wantAnchor });
+      expect(Number.isInteger(anchor)).toBe(true);
+      expect(anchor).toBeGreaterThanOrEqual(4);
+      expect(anchor).toBeLessThanOrEqual(30);
+      // 服务端计价那一步的 round+clamp 对这个数是**恒等操作** —— 这就是两仓相等的理由
+      expect(Math.max(4, Math.min(30, Math.round(anchor)))).toBe(anchor);
+    }
+  });
+
+  test("★ 回执缺 duration → 走 Admin API 兜底重读；兜底也拿不到 → 终局 + 整句说明", async () => {
+    // ★ 主源是 Upload API 回执（它对视频**本来就带 duration 且是小数**，
+    //   `media_metadata: true` 是 Admin API 专用的补丁，这条路不需要）。
+    //   回执万一缺了，用产物的 public_id 重读一次 —— 只在异常路径发一次，
+    //   不吃免费档 Admin API 500 次/小时的额度。
+    uploadSpy.mockImplementation(async (_url, opts) => ({
+      public_id: `${opts.folder}/${opts.public_id}`,
+      secure_url: `${CLOUD_PREFIX}/${opts.folder}/${opts.public_id}.mp4`,
+      // duration 缺失
+      width: 900,
+      height: 512,
+      bytes: 1_000_000,
+    }));
+    // ① 兜底读得到 → 照常建成（且用的是兜底那个真值）
+    const outPid = () => resourceSpy.mock.calls.map((c) => c[0]).slice(-1)[0];
+    resourceSpy.mockImplementation(async (publicId) =>
+      publicId.includes("-out")
+        ? { public_id: publicId, duration: 6.4, width: 900, height: 512, bytes: 1_000_000 }
+        : { public_id: publicId, secure_url: `${CLOUD_PREFIX}/${publicId}.mp4`, duration: 60, width: 1920, height: 1080, bytes: 30_000_000, version: 1712000000 },
+    );
+    const okStarted = await post(baseBody({ durSec: 8, startSec: 0 }));
+    // 产物 public_id 由凭据在阶段一定死；这里把它改成带 -out 的，好让上面的 mock 认出来
+    await BlockoutJob().updateOne({ _id: okStarted.body.jobId }, { $set: { outPublicId: `${owner.id}-out-1` } });
+    const okRes = await finish(okStarted.body.jobId);
+    expect(okRes.status).toBe(201);
+    expect(okRes.body.template.refVideo).toMatchObject({ durationSec: 7, realDurationSec: 6.4 });
+    expect(outPid()).toContain("-out-1"); // 兜底真的发生了（Admin API 被问了产物那一条）
+
+    // ② 兜底也拿不到 → **终局**（元数据是计价锚点，缺了就没法定价，重取一百次也一样）
+    resourceSpy.mockImplementation(async (publicId) =>
+      publicId.includes("-out")
+        ? { public_id: publicId, width: 900, height: 512, bytes: 1_000_000 }
+        : { public_id: publicId, secure_url: `${CLOUD_PREFIX}/${publicId}.mp4`, duration: 60, width: 1920, height: 1080, bytes: 30_000_000, version: 1712000000 },
+    );
+    const badStarted = await post(baseBody({ durSec: 8, startSec: 0 }));
+    await BlockoutJob().updateOne({ _id: badStarted.body.jobId }, { $set: { outPublicId: `${owner.id}-out-2` } });
+    const badRes = await finish(badStarted.body.jobId);
+    expect(badRes.status).toBe(502);
+    expect(badRes.body.state).toBe("failed");
+    expect(badRes.body.lost).toBe(true);
+    expect(badRes.body.message).toMatch(/没有返回/);
+    expect(badRes.body.message).toMatch(/费用已经产生/);
+    expect((await BlockoutJob().findById(badStarted.body.jobId).lean()).status).toBe("failed");
   });
 
   // ── 钱的门禁前置 ────────────────────────────────────────────────────
@@ -1570,17 +1745,82 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
 });
 
 // ─────────────────────────────────────────────────────────────────────
-describe("两套验收窗口（单元）—— 各自的唯一实现，名字必须分得开", () => {
-  // ★★ 白模 V2 起窗口分成两件事，混用哪一个都不报错、只会静默出事：
-  //   · templateSourceIssue —— 用户传上来的**原始素材**（放宽：(0,600]s、不校比例）
-  //   · templateRefIssue    —— 真正喂给方舟的**那一段**（F1 [4,30]s + F3 像素/边长/比例）
+describe("存量坏模板的两道门（发布闸 / 套用闸）—— 说的是真正的原因", () => {
+  // ★★ 线上那 3 个模板（refVideo.durationSec = 4、真实 3.712s）的处境：
+  //   作者反复试炼、反复撞方舟的英文 400，于是 provenAt 永远为空 ——
+  //   他撞上的是试炼闸那句「请先成功出一段片」，**而那不是真正的原因**。
+  //   这一组钉的就是"拒绝的理由指对方向"，以及**存量老模板不被误判**（判否定）。
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+
+  /** 给一个已建好的模板落上真实时长（模拟回填脚本跑完之后的样子） */
+  async function setReal(id, realSec) {
+    await BranchTemplate().updateOne({ _id: id }, { $set: { "refVideo.realDurationSec": realSec } });
+  }
+
+  test("★ 回填出真实时长 3.712s 的坏模板：发布闸拒，且理由是时长不是试炼", async () => {
+    const tpl = await createTemplate(6501);
+    // 试炼闸先满足，把时长这道门单独露出来（不这么做的话两道门的拒绝分不开）
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { provenAt: new Date() } });
+    await setReal(tpl.id, 3.712);
+    const res = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/约 3\.7 秒/);
+    expect(res.body.message).toMatch(/4 秒下限/);
+    expect(res.body.message).toMatch(/每一个套用它的人都会失败/);
+    expect(res.body.message).not.toMatch(/先用这个模板成功出一段片/); // 指错方向的那句
+    expect((await BranchTemplate().findById(tpl.id).lean()).status).toBe("pending");
+  });
+
+  test("★★ 存量老模板（**没有** realDurationSec 这一位）照常发布 —— 后加的字段判否定", async () => {
+    // ★★ 这条防的是"用肯定式判新字段"：`realDurationSec >= 4` 之类的写法会把所有
+    //   存量模板（那一位是 undefined）整批判成坏的 —— 老模板突然发布不了了，且不报错。
+    const tpl = await createTemplate(6502);
+    // $unset 造出真正的"存量形状"：这一位是 2026-08-16 才加的，之前建的模板都没有它
+    await BranchTemplate().updateOne(
+      { _id: tpl.id },
+      { $set: { provenAt: new Date() }, $unset: { "refVideo.realDurationSec": "" } },
+    );
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.refVideo.realDurationSec).toBeUndefined(); // 前提：它真的没有这一位
+    const res = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(res.status).toBe(200);
+    expect(res.body.template.status).toBe("published");
+    // 响应里也不该凭空出一个 0 —— 那会让客户端把"没有这个字段"读成"真的是 0 秒"
+    expect(res.body.template.refVideo.realDurationSec).toBeUndefined();
+  });
+
+  test("真实时长合格（4.736s）的模板照常发布，且真值原样出到响应里", async () => {
+    const tpl = await createTemplate(6503);
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { provenAt: new Date() } });
+    await setReal(tpl.id, 4.736);
+    const res = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
+    expect(res.status).toBe(200);
+    expect(res.body.template.refVideo.realDurationSec).toBe(4.736);
+    // 计价锚点一个字没动（这是已发布模板的报价，改它就是改价）
+    expect(res.body.template.refVideo.durationSec).toBe(10);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("三套验收窗口（单元）—— 各自的唯一实现，名字必须分得开", () => {
+  // ★★ 白模 V2 起窗口分成三件事，混用哪一个都不报错、只会静默出事：
+  //   · templateSourceIssue —— 用户传上来的**原始素材**（[5,600]s、不校比例）
+  //   · templateRefIssue    —— 真正喂给方舟的那一段 / **白模化的产物**（F1 [4,30]s + F3）
+  //   · blockoutInputIssue  —— **白模化的输入**（= ref 那套，时长下限抬到 5）
   //   把 ref 那套用在上传口 = 长素材连传都传不上来；
-  //   把 source 那套用在建模板 = 一段 300s 的片被登记成模板，套用者在付费那一步撞 400（不退费）。
+  //   把 source 那套用在建模板 = 一段 300s 的片被登记成模板，套用者在付费那一步撞 400（不退费）；
+  //   把 blockout 那套用在**产物**上 = 一段合法的 5s 输入产出 4.736s，被自己的门拒掉，
+  //   等于把唯一正确的用法也封死。
   const {
     templateSourceIssue,
     templateRefIssue,
+    templateRefDurationIssue,
+    blockoutInputIssue,
+    templateVideoMeta,
     TEMPLATE_SOURCE_RULES,
     TEMPLATE_REF_RULES,
+    BLOCKOUT_INPUT_RULES,
+    BLOCKOUT_MIN_INPUT_SEC,
   } = require("../src/middleware/upload");
 
   test("参考视频窗口：合格样本 → null", () => {
@@ -1589,11 +1829,61 @@ describe("两套验收窗口（单元）—— 各自的唯一实现，名字必
     expect(templateRefIssue({ duration: 30, width: 720, height: 1280 })).toBeNull(); // 上界含端点
   });
 
-  test("参考视频窗口是 [4,30] 秒（F1 实测：方舟 edit 的硬窗口）", () => {
+  test("参考视频窗口是 [4,30] 秒（F1 实测：方舟 edit 的硬窗口）—— **一个字都不许改**", () => {
+    // ★★ 这条窗口是方舟自己的，不是我们的自我约束。想给"白模产出会被截短"留余量时，
+    //   动这里是**致命**的：finish 那道产物闸门读的就是它，抬到 5 会把一段合法的 5s 输入
+    //   产出（4.736s）判成不合格 —— 唯一正确的用法被自己封死。余量归 BLOCKOUT_INPUT_RULES。
     expect(TEMPLATE_REF_RULES.minSec).toBe(4);
     expect(TEMPLATE_REF_RULES.maxSec).toBe(30);
     expect(templateRefIssue({ duration: 3, width: 720, height: 1280 })).toMatch(/至少要 4 秒/);
     expect(templateRefIssue({ duration: 31, width: 720, height: 1280 })).toMatch(/最长 30 秒/);
+    // 产物的两个真实观测值：4.736s 合格（5s 输入的正常产出）、3.712s 不合格（4s 输入的产出）
+    expect(templateRefIssue({ duration: 4.736, width: 900, height: 512 })).toBeNull();
+    expect(templateRefIssue({ duration: 3.712, width: 900, height: 512 })).toMatch(/至少要 4 秒/);
+  });
+
+  test("白模化**输入**窗口：下限 5，其余六条原样委托给参考视频窗口", () => {
+    // 下限是这条规则**多出来的那一条**，理由：edit 的产出比输入短（实测最坏 0.37s），
+    // 4 秒进去只剩 3.7 秒 —— 低于方舟自己的 4 秒下限，谁都套用不了。
+    expect(BLOCKOUT_MIN_INPUT_SEC).toBe(5);
+    expect(BLOCKOUT_INPUT_RULES.minSec).toBe(5);
+    expect(blockoutInputIssue({ duration: 4, width: 900, height: 512 })).toMatch(/至少 5 秒/);
+    expect(blockoutInputIssue({ duration: 5, width: 900, height: 512 })).toBeNull();
+    // ★ 其余六条**不是抄的**：上限/像素/边长/比例/元数据缺失全走 templateRefIssue 那一份。
+    //   抄一份的话，哪天 F3 的像素门变了只改得动一处，而另一处没有任何症状。
+    expect(BLOCKOUT_INPUT_RULES.maxSec).toBe(TEMPLATE_REF_RULES.maxSec);
+    expect(BLOCKOUT_INPUT_RULES.minPixels).toBe(TEMPLATE_REF_RULES.minPixels);
+    expect(blockoutInputIssue({ duration: 31, width: 900, height: 512 })).toMatch(/最长 30 秒/);
+    expect(blockoutInputIssue({ duration: 10, width: 640, height: 636 })).toMatch(/分辨率太低/);
+    expect(blockoutInputIssue({ duration: 10, width: 500, height: 1500 })).toMatch(/宽高比/);
+    expect(blockoutInputIssue({ width: 720, height: 1280 })).toMatch(/没有返回/);
+  });
+
+  test("★ templateVideoMeta 的 duration **保留小数**（那个 Math.round 是本次事故的单点根因）", () => {
+    // ★★ 取整一旦回来，`Math.round(3.712) === 4` 会让一段 3.712s 的白模产物通过
+    //   `duration < 4` 那道唯一的产物闸门 —— 坏模板照建、作者付了钱、每个套用者都失败。
+    //   同一行还会把 3.6s 的原片读成 4s 放行（同源的第二条活 bug）。
+    expect(templateVideoMeta({ duration: 3.712, width: 900, height: 512, bytes: 1 }).duration).toBe(3.712);
+    expect(templateVideoMeta({ duration: 4.736, width: 900, height: 512, bytes: 1 }).duration).toBe(4.736);
+    // 像素与字节继续取整：它们天然是整数，回执给浮点只是表示问题
+    expect(templateVideoMeta({ duration: 8, width: 900.4, height: 512.6, bytes: 3.2 })).toMatchObject({
+      width: 900,
+      height: 513,
+      bytes: 3,
+    });
+  });
+
+  test("★ 只判时长那一半（发布闸/套用闸用）：**缺字段一律当好**，别把存量整批误判", () => {
+    // ★★ 后加的字段一律判否定：老模板没有 realDurationSec，读到 undefined/null 时
+    //   必须当"无从判断 = 合格"。用肯定式判会把所有存量模板判成坏的，且不报错。
+    expect(templateRefDurationIssue(undefined)).toBeNull();
+    expect(templateRefDurationIssue(null)).toBeNull();
+    expect(templateRefDurationIssue(NaN)).toBeNull();
+    expect(templateRefDurationIssue(0)).toBeNull();
+    expect(templateRefDurationIssue(10)).toBeNull();
+    expect(templateRefDurationIssue(3.712, "这个模板的白模视频")).toMatch(/至少要 4 秒/);
+    // 小数写进句子时留一位：印出 "约 3.7119999 秒" 的话，用户第一反应是"这系统坏了"
+    expect(templateRefDurationIssue(3.712)).toMatch(/约 3\.7 秒/);
   });
 
   test("像素数硬门是 407,696（A2 探针实测值，改它必须两仓一起改）", () => {
@@ -1609,8 +1899,12 @@ describe("两套验收窗口（单元）—— 各自的唯一实现，名字必
   });
 
   test("原始素材窗口：放宽了哪几项（改回去的话用户根本没法开始）", () => {
-    // 时长：只要 (0,600]，短到 1 秒、长到 10 分钟都收（真正的 [4,30] 是裁后那一段的事）
-    expect(templateSourceIssue({ duration: 1, width: 1920, height: 1080 })).toBeNull();
+    // 时长：[5,600]。★ 上限 10 分钟只封上传成本，与方舟无关；
+    //   下限 5 = BLOCKOUT_MIN_INPUT_SEC —— 裁出来的那一段不可能比原片长，
+    //   所以"原片 <5s"是"框选段 <5s"的**必要条件**，在本机预检就能拦（省一次 100MB 白传）。
+    expect(TEMPLATE_SOURCE_RULES.minSec).toBe(BLOCKOUT_MIN_INPUT_SEC);
+    expect(templateSourceIssue({ duration: 5, width: 1920, height: 1080 })).toBeNull();
+    expect(templateSourceIssue({ duration: 4.6, width: 1920, height: 1080 })).toMatch(/至少 5 秒/);
     expect(templateSourceIssue({ duration: 600, width: 1920, height: 1080 })).toBeNull();
     expect(templateSourceIssue({ duration: 601, width: 1920, height: 1080 })).toMatch(/最长 600 秒/);
     // 比例：**不校** —— 比例正是裁剪框能修的那一项

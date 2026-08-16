@@ -21,9 +21,30 @@ const refVideoSchema = new mongoose.Schema(
      *  才真能挡住「同一段视频挂两个模板」——客户端只要往 URL 里塞一段无害的
      *  transformation 就能绕开按原串去重。 */
     url: { type: String, required: true, trim: true, maxlength: 2000 },
-    /** r2v 结算的输入时长（秒，整数）。参考视频窗口 [4,30]（middleware/upload.js 的
-     *  templateRefIssue 是这条窗口的唯一实现），min/max 只是模型层的最后兜底 */
+    /** r2v 结算的输入时长（秒，**整数**）。参考视频窗口 [4,30]（middleware/upload.js 的
+     *  templateRefIssue 是这条窗口的唯一实现），min/max 只是模型层的最后兜底。
+     *
+     *  ★★ 含义 2026-08-16 一个字没变，仍然是**计价锚点**、仍然是整数 —— 变的只有
+     *    产生方式：`Math.round(真实秒数)` → `Math.ceil(真实秒数)`（见 routes 里 finish
+     *    那一步的 ★★）。为什么不改成小数：App 的 r2vTokens（economy.ts）**不 round
+     *    不 clamp**，服务端的（config/tokens.js）round+clamp —— 存整数时两者恒等，
+     *    存小数的那一刻起就是"页面报少、钱包扣多"，本仓头号事故形状。 */
     durationSec: { type: Number, required: true, min: 1, max: 60 },
+    /**
+     * 云端回执里那个**真实时长**（小数，秒）。**只读、只由服务端写、不参与任何计价**。
+     *
+     * ★★ 为什么要新增一个字段而不是把 durationSec 改成小数：见上面那条 ★★。
+     *   这一位存在的意义是**诊断与如实展示** —— 白模产出比输入短（2026-08-16 实测
+     *   4.0→3.712），锚点是 ceil 出来的整数，两者本来就不等；不存真值的话，
+     *   "这个模板到底能不能用"（产物是否 ≥ 方舟的 4 秒下限）在库里就无从判断，
+     *   只能等每一个套用者去撞方舟的英文 400。
+     * ★ **不给 required、不给 default**：存量模板（V1 与老 V2）天然没有这一项，
+     *   读它一律用存在性 + 否定式（`typeof x === "number" && x < 4` 才算坏），
+     *   缺失一律当好 —— 用肯定式判会把存量整批误判，且不报错。
+     * ★ 客户端永远不许发它：zod body schema 里刻意没有这个字段（z.object 默认 strip），
+     *   与 durationSec/width/height 同一条理由。
+     */
+    realDurationSec: { type: Number, min: 0 },
     width: { type: Number, required: true, min: 1 },
     height: { type: Number, required: true, min: 1 },
     bytes: { type: Number, required: true, min: 0 },
@@ -169,6 +190,28 @@ const branchTemplateSchema = new mongoose.Schema(
   },
   { timestamps: true, versionKey: false }
 );
+
+/**
+ * 「判这个模板的视频合不合方舟窗口时，该拿哪个秒数」—— **这条口径的唯一实现**（铁律六）。
+ *
+ * 消费方三处，必须读同一个数，否则会出现"发布闸放行、套用闸拒绝"这种自相矛盾：
+ *   · 发布闸（routes/branchTemplate 的 PATCH /publish）
+ *   · 套用闸（routes/ark 的 resolveR2v 分支一）
+ *   · 迁移/巡检脚本
+ *
+ * ★★ 优先 realDurationSec（真实小数），退回 durationSec（ceil 出来的计价锚点）。
+ *   为什么不能只看 durationSec：它是**向上取整**的，一段 3.712s 的坏产物在那里写着 4，
+ *   光看那个数**看不出坏** —— 线上那 3 个废模板就是这么隐身的。
+ * ★ 后加的字段判**存在性**：老模板没有 realDurationSec，退回锚点当好数用，
+ *   绝不因为"没有这一项"就判成坏的（判否定，本仓 visibility 那条坑的同一条规则）。
+ * @returns {number|null} 有效秒数；两个都拿不到（理论上不可能，refVideo 必填）时 null
+ */
+branchTemplateSchema.statics.refVideoSec = function refVideoSec(refVideo) {
+  const real = Number(refVideo?.realDurationSec);
+  if (Number.isFinite(real) && real > 0) return real;
+  const anchor = Number(refVideo?.durationSec);
+  return Number.isFinite(anchor) && anchor > 0 ? anchor : null;
+};
 
 /**
  * 「这个模板的角色位编号还等着作者核对吗」—— **这条判据的唯一实现**（铁律六）。

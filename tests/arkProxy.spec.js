@@ -599,6 +599,45 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     }
   });
 
+  // ── 套用闸：模板视频自己得过方舟窗口（2026-08-16 补的结构性缺口）────────
+  //
+  // ★★ 在此之前，命中已登记模板的这条分支**完全不复核时长**（未登记素材那条分支反而有），
+  //   于是一段 3.712s 的坏模板在我们这边一路绿灯，撞的是方舟那句英文
+  //   `InvalidParameter.TaskTypeConstraint … 4 to 30 seconds`。钱这一侧本来就安全
+  //   （W2 会退未受理的那一笔），但用户看到的是一句天书，而且他根本不知道该换个模板。
+  test("★★ 已登记模板的**真实时长** 3.712s → deny，一分钱不动（别让套用者去撞方舟的英文 400）", async () => {
+    const walletSvc2 = require("../src/services/tokenWallet.service");
+    const bad = await seedTemplate(paidUserId, "1099", "published");
+    // 回填脚本跑完之后的样子：锚点还是 10（那是已发布模板的报价，不许动），真值是 3.712
+    await BranchTemplate.updateOne({ _id: bad._id }, { $set: { "refVideo.realDurationSec": 3.712 } });
+
+    const before = await walletSvc2.getWallet(paidUserId);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(bad.refVideo.url));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(res.body.message).toMatch(/约 3\.7 秒/);
+    expect(res.body.message).toMatch(/没有扣费/);
+    const after = await walletSvc2.getWallet(paidUserId);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+    expect(fetchSpy).not.toHaveBeenCalled(); // 拒在扣费与转发之前
+  });
+
+  test("★★ 存量模板（**没有** realDurationSec 这一位）照常放行 —— 后加的字段判否定", async () => {
+    // ★★ 这条防的是"用肯定式判新字段"：那会把所有存量模板（那一位是 undefined）
+    //   整批判成坏的 —— 全站白模模板突然都用不了了，而且理由是一句关于时长的话，
+    //   谁都对不上号。publishedTpl 就是这种老形状（只有 durationSec: 10）。
+    const doc = await BranchTemplate.findById(publishedTpl._id).lean();
+    expect(doc.refVideo.realDurationSec).toBeUndefined(); // 前提：它真的没有这一位
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(r2vBody(publishedTpl.refVideo.url));
+    expect(res.status).toBe(501); // 501 = 闸门与扣费都过了，只是没配 key
+  });
+
   // ── 音频钉子：从「必须 false」改成「与该模型的支持情况一致」──────────
   // ★ 为什么改：2026-08-15 费用中心逐行核对 —— 同素材有声/无声两发的用量与单价
   //   **逐位相同**（各 209.71 千 tokens × ¥0.042/千），计费单元里也没有给音频单列的
@@ -771,8 +810,14 @@ describe("r2v 第二条分支：本账号刚传、尚未登记的素材（白模
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  test("du_ 越出方舟 edit 的 [4,30] → 400 整句（F1 实测硬窗口）", async () => {
-    for (const du of [3, 31]) {
+  test("du_ 越出**白模输入**窗口 [5,30] → 400 整句", async () => {
+    // ★★ 这条分支上的素材**就是白模化的输入**，所以判的是 blockoutInputIssue（下限 5），
+    //   不是参考视频窗口（下限 4）。2026-08-16 起 du=4 也要拒：方舟收得下 4 秒，
+    //   但它的产出只有 3.7 秒 —— 建出来的模板短于方舟自己的 4 秒下限，谁都套用不了，
+    //   而作者已经付过钱了。
+    // ★★★ 这两道门（阶段一与这里）**必须是同一个函数**：差一秒的话，一个老客户端
+    //   就能从 /api/ark 这条路把 4 秒的白模化发出去，绕开编辑页那道墙再造一个废模板。
+    for (const du of [3, 4, 31]) {
       const res = await request(app)
         .post("/api/ark/contents/generations/tasks")
         .set(asPaid())

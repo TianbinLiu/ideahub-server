@@ -27,7 +27,18 @@ const BranchTemplate = require("../models/BranchTemplate");
 // 白模 V2 的**取件凭据**（两阶段的分界线）。为什么非拆不可见该文件的文件头
 const BlockoutJob = require("../models/BlockoutJob");
 const { cloudinary } = require("../config/cloudinary");
-const { templateVideoMeta, templateRefIssue } = require("../middleware/upload");
+const {
+  templateVideoMeta,
+  templateRefIssue,
+  templateRefDurationIssue,
+  // ★ 白模化**输入**的窗口（= 参考视频那套 + 时长下限抬到 5）。与 templateRefIssue 是
+  //   两件事：输入门与产出门站在同一次裁短的两侧，天然不能是同一个数（见 upload.js）
+  blockoutInputIssue,
+  metaMissingIssue,
+  secText,
+  TEMPLATE_REF_RULES,
+  BLOCKOUT_MIN_INPUT_SEC,
+} = require("../middleware/upload");
 const { forbidden, notFound, invalidId, badRequest } = require("../utils/http");
 // ★ 归属与地址形状的判据**只有 utils/templateVideoAsset 一处**（铁律六）——
 //   此前这里、uploads.routes、以及 V2 要加的 resolveR2v 各写一份，松一份就有一条绕行路
@@ -87,6 +98,12 @@ function toTemplatePayload(doc, viewer) {
       width: Number(doc.refVideo?.width || 0),
       height: Number(doc.refVideo?.height || 0),
       bytes: Number(doc.refVideo?.bytes || 0),
+      // ★★ 真实时长**只在真有的时候出**，绝不写成 `Number(x || 0)` —— 那会把
+      //   「老模板没有这个字段」和「真的是 0 秒」压成同一个值，客户端再也分不开：
+      //   前者要当好数放行，后者是坏数据。存量 V1 与老 V2 都缺这一位（判存在性）。
+      ...(Number.isFinite(Number(doc.refVideo?.realDurationSec))
+        ? { realDurationSec: Number(doc.refVideo.realDurationSec) }
+        : {}),
     },
     // 角色位（白模 V2）。★ **只在真有的时候出这个字段**：V1 老模板一个角色位都没有，
     //   回一个空数组会让客户端分不清"这是老模板"和"新模板但一个人都没认出来"
@@ -162,7 +179,18 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
           //   unique 索引与 r2v 结算反查都按这个字符串等值匹配，
           //   存原串的话塞一段 transformation 就能绕开去重
           url: resource.secure_url,
-          durationSec: meta.duration,
+          // ★★ 计价锚点 = `Math.ceil(真实秒数)`。**这条路与 V2 finish 必须用同一个取法** ——
+          //   refVideo.durationSec 只有这两个写入方，形状分家就等于"两种模板两套报价"。
+          //   为什么要显式取整：2026-08-16 起 templateVideoMeta 不再 round，meta.duration
+          //   是小数；直接存进去的话，App 那份**不 round 不 clamp**的报价镜像会算出比
+          //   服务端实扣更小的数 —— 页面报少、钱包扣多（本仓头号事故形状）。
+          //   ceil 而不是 round：误差永久钉在"我们多收"那一侧（round 会让真实 12.4
+          //   被按 12 收，而方舟按 ~12.4 计 = 报价 < 实收）。
+          //   不变量：上面 templateRefIssue 已经证明 real ∈ [4,30] ⇒ ceil(real) 也在 [4,30]。
+          durationSec: Math.ceil(meta.duration),
+          // 真实时长如实存一份（只诊断/展示，不参与计价）。V1 这条路上它等于文件本身的
+          // 时长（没有经过 edit 截短），但字段含义与 V2 完全一致 —— 发布闸与套用闸读的是同一位
+          realDurationSec: meta.duration,
           width: meta.width,
           height: meta.height,
           bytes: meta.bytes,
@@ -355,12 +383,15 @@ router.post(
         return fail(res, 400, `裁剪框超出了画面（原片 ${src.width}×${src.height}），请重新框选。`, { billed: false });
       }
       if (startSec + durSec > src.duration) {
-        return fail(res, 400, `选的这一段超出了视频长度（原片约 ${src.duration} 秒），请重新框选。`, { billed: false });
+        return fail(res, 400, `选的这一段超出了视频长度（原片约 ${secText(src.duration)} 秒），请重新框选。`, { billed: false });
       }
-      // 裁后那一段必须满足方舟 edit 的硬约束（时长 [4,30]、像素/边长/比例）。
-      // 窗口的唯一实现在 middleware/upload.js —— 这里只是把同一份规则用在裁后的数上。
-      const clipIssue = templateRefIssue({ duration: durSec, width: crop.w, height: crop.h }, "选中的这一段");
-      if (clipIssue) return fail(res, 400, clipIssue, { billed: false });
+      // 裁后那一段必须满足**白模化输入**的窗口：方舟 edit 的硬约束（像素/边长/比例、
+      // 时长上限 30）+ 时长下限抬到 5。规则的唯一实现在 middleware/upload.js。
+      // ★★ 这里用 blockoutInputIssue 而不是 templateRefIssue：4 秒的选段方舟收得下，
+      //   但它的**产出**只有 3.7 秒，低于方舟自己的 4 秒下限 —— 建出来的模板谁都套用不了，
+      //   而作者已经付了钱且永远不知道为什么（2026-08-16 线上 6 个模板废了 3 个）。
+      const clipIssue = blockoutInputIssue({ duration: durSec, width: crop.w, height: crop.h }, "选中的这一段");
+      if (clipIssue) return fail(res, 400, `${clipIssue}（这一步没有开始生成，也没有扣费。）`, { billed: false });
 
       // ── ② 服务端自己拼变换 URL（客户端永远碰不到）──────────────────
       const clip = { startSec, durSec, crop };
@@ -793,17 +824,100 @@ router.post(
         return fail(res, 502, moved.message, { billed: false, state: "retry" });
       }
 
-      const outMeta = templateVideoMeta(moved.receipt);
+      // ── ⑧b 产物验收 —— **承重的那一层** ─────────────────────────────────
+      //
+      // ★★★ 为什么"验产出"比"抬输入下限"更要紧（2026-08-16 事故的结论）：
+      //   抬输入下限（BLOCKOUT_MIN_INPUT_SEC = 5）依赖的是**观测值** ——「edit 大约裁短
+      //   0.26~0.37 秒」。方舟哪天多裁一点，那道门就静默失效，而失效**没有任何症状**：
+      //   作者照样付钱、模板照样建出来、能核对能发布，只有每一个想套用它的人会撞方舟的
+      //   英文 400，作者永远不知道为什么。
+      //   这一道门只依赖方舟自己公布的窗口 [4,30]，**不会失效**。它是"坏模板绝不落库"
+      //   的唯一保证；上面那条 5 秒下限只是让作者别走到这一步（省钱、省时间）。
+      //   ⚠ 今天线上那 3 个废模板正是因为这道门**看着存在、实际失效**：
+      //   templateVideoMeta 当年对 duration 做了 `Math.round`，`Math.round(3.712) === 4`，
+      //   于是它被喂了一个假数。根因已经在 middleware/upload.js 那一行修掉了。
+      let outMeta = templateVideoMeta(moved.receipt);
+      // 主源是转存回执（Upload API 对视频**本来就带 duration 且是小数**——
+      // `media_metadata: true` 是 Admin API 专用的补丁，这条路不需要它）。
+      // ★ 兜底：回执万一缺了，用产物的 public_id 走一次 Admin API 重读。只在异常路径发一次，
+      //   不吃免费档 500 次/小时的额度 —— 而元数据是计价锚点，缺了就没法定价。
+      if (metaMissingIssue(outMeta, "生成出来的白模视频")) {
+        try {
+          const again = await cloudinary.api.resource(moved.receipt.public_id, {
+            resource_type: "video",
+            media_metadata: true,
+          });
+          outMeta = templateVideoMeta(again);
+        } catch (e) {
+          console.error(`[blockoutize] 产物元数据重读失败 public_id=${moved.receipt.public_id}:`, e?.error?.message || e.message);
+        }
+      }
+      const missing = metaMissingIssue(outMeta, "生成出来的白模视频");
+      if (missing) {
+        // 主源与兜底都没拿到 —— **终局**：元数据是计价锚点，重取一百次也是同一句。
+        await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 元数据缺失的产物");
+        const msg =
+          "云端没有返回生成出来的白模视频的时长或尺寸，没法确认它能不能用来出片，模板没有建出来。" +
+          "这一发的费用已经产生、无法退回，请把这句话反馈给我们。";
+        console.error(
+          `[blockoutize:meta-missing] job=${claimed._id} task=${claimed.taskId} publicId=${moved.receipt.public_id}`,
+        );
+        await failJob(claimed._id, msg);
+        return fail(res, 502, msg, { billed: false, lost: true, state: "failed" });
+      }
+
+      const inSec = Number(claimed.source?.durSec);
+      const trimmed = Number.isFinite(inSec) ? inSec - outMeta.duration : NaN;
       const outIssue = templateRefIssue(outMeta, "生成出来的白模视频");
       if (outIssue) {
         // 产物本身过不了下一发的输入窗口 —— 落库了也是个谁都用不了的模板。
         // 这是**确定性**的失败（再取一百次也是同一段产物），所以钉成 failed 而不是放回 pending。
+        // ★ 不选"建成一个不可发布的模板"：那会多出第四种状态，市场列表 / 我的模板 / 详情页 /
+        //   flowStore.applyTemplate / resolveR2v 五处都得认识它，漏一处就是"界面上摆一个
+        //   永远点不动的选项"（本仓明令禁止的形状）；而一段带编号的白人偶除了当我们管线里的
+        //   参考视频之外没有任何用途，留着它不是补偿。
         // 回收掉再拒（不回收就是永久占配额，零症状）
         await destroyQuietly(moved.receipt.public_id, "video", "[blockoutize] 不合格产物");
-        const msg = `${outIssue}（这一发的费用已经产生、无法挽回，请换一段素材重做。）`;
+        const tooShort = outMeta.duration < TEMPLATE_REF_RULES.minSec;
+        const msg = tooShort
+          ? // ★ 主文案：**说清楚是谁把它变短的**，否则作者只会以为"我明明选了 4 秒"是我们算错了。
+            //   括号里那个差值是**现算**的（durSec − 真实秒），绝不写死 0.29 —— 那是观测值不是协议。
+            `这一发的白模视频生成出来只有约 ${secText(outMeta.duration)} 秒，短于 AI 出片引擎要求的 ` +
+            `${TEMPLATE_REF_RULES.minSec} 秒下限——AI 在换白模时会把成片截短一点点` +
+            `${Number.isFinite(trimmed) && trimmed > 0 ? `（这次少了约 ${trimmed.toFixed(1)} 秒）` : ""}，` +
+            `所以这段产物没法当模板用，模板没有建出来。这一发的费用已经产生、无法退回，非常抱歉。` +
+            `重做时请至少框选 ${BLOCKOUT_MIN_INPUT_SEC} 秒（编辑页已经按 ${BLOCKOUT_MIN_INPUT_SEC} 秒起步），留出被截短的余量。`
+          : `${outIssue}（这一发的费用已经产生、无法挽回，请换一段素材重做。）`;
+        // ★★ 结构化告警：修完之后这条分支**只可能在"方舟改了裁短行为"时触发** ——
+        //   它是一个需要人工补偿并重新校准 BLOCKOUT_MIN_INPUT_SEC 的信号，不是日常事件。
+        //   （钱维持"不退"，与 blockoutize.service 里 F11 真人脸那条同一口径：方舟受理并
+        //   交付了算力，成本真实发生。要不要改成自动退费是产品决策，wallet.credit 是现成的、
+        //   幂等靠 failJob 那个条件原子更新抢占 —— 工程上这里就是那个挂点。）
+        console.error(
+          `[blockoutize:bad-output] job=${claimed._id} task=${claimed.taskId} inputSec=${inSec} ` +
+            `outSec=${outMeta.duration} trimmed=${Number.isFinite(trimmed) ? trimmed.toFixed(3) : "?"} reason=${outIssue}`,
+        );
         await failJob(claimed._id, msg);
         return fail(res, 502, msg, { billed: false, lost: true, state: "failed" });
       }
+
+      // ★★ 计价锚点：`Math.ceil(真实秒)`，不是 round，也不是存小数。
+      //   · 为什么仍是整数：App 的 r2vTokens 不 round 不 clamp，服务端的 round+clamp ——
+      //     锚点是 [4,30] 内的整数时两者恒等（服务端的取整与夹取都成了恒等操作），
+      //     这就是"报价 = 实收"在这次改动之后**仍然成立**的完整论证。存小数的那一刻，
+      //     3.712s 的模板会变成 App 报 449,004 / 服务端扣 483,840。
+      //   · 为什么 ceil 而不是 round：round 有一个已经存在、只是还没撞上的缺口 ——
+      //     真实 12.4 会被存成 12，我们按 24s 收、方舟按 ~24.5s 计，**报价 < 实收**。
+      //     ceil 把误差永久钉在安全一侧，代价是最多多收 0.5s。
+      //   · 对存量零影响：现有 6 条模板的裁短量都 < 0.5s，ceil 与 round 结果逐条相同。
+      //   · 不变量（上面那道闸门已经证明 real ∈ [4,30]）：ceil(real) 也 ∈ [4,30] 且为整数。
+      const anchorSec = Math.ceil(outMeta.duration);
+      // 每一次成功也记一行：今天定这个 5 只有三个观测点，攒一个月的真实分布之后
+      // 才谈得上"用数据调下限"。差值是**观测量**，不是常量（别把它写进代码里当规则）。
+      console.log(
+        `[blockoutize:output] job=${claimed._id} task=${claimed.taskId} inputSec=${inSec} ` +
+          `outSec=${outMeta.duration} trimmed=${Number.isFinite(trimmed) ? trimmed.toFixed(3) : "?"} anchorSec=${anchorSec}`,
+      );
 
       // ── ⑨ 建模板（pending，试炼闸照旧）────────────────────────────────
       let doc;
@@ -817,15 +931,20 @@ router.post(
           recipe: {
             styleHint: "",
             beats: [],
-            // 经典降级路的镜像时长：白模路的真实时长以 refVideo.durationSec 为准
-            durationSec: Math.max(3, Math.min(30, outMeta.duration)),
+            // 经典降级路的镜像时长：白模路的真实时长以 refVideo.durationSec 为准。
+            // ★ 喂**整数锚点**，不喂 outMeta.duration —— 那是小数，而 zod 的
+            //   recipeBody.durationSec 是 `.int()`：V2 写库这条路不过 zod 所以不会当场炸，
+            //   但任何"读回来再 POST"的客户端路径会开始莫名其妙 400。
+            durationSec: Math.max(3, Math.min(30, anchorSec)),
             videoTier: claimed.videoTier,
             ...(claimed.aspect ? { aspect: claimed.aspect } : {}),
             framePrompt: "",
           },
           refVideo: {
             url: moved.receipt.secure_url,
-            durationSec: outMeta.duration,
+            durationSec: anchorSec,
+            // 真实时长如实存一份（只诊断/展示，不参与计价）—— 见 model 里那条 ★★
+            realDurationSec: outMeta.duration,
             width: outMeta.width,
             height: outMeta.height,
             bytes: outMeta.bytes,
@@ -990,6 +1109,22 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
     if (String(doc.ownerId) !== String(req.user._id)) forbidden("Forbidden");
     if (doc.status === "blocked") {
       badRequest("这个模板已被平台下架，不能重新发布。如有疑问请联系平台。");
+    }
+    // ★★ 模板视频自己过不过方舟窗口 —— 排在**试炼闸之前**（2026-08-16 补）。
+    //   为什么要有这一道，以及为什么必须排在前面：线上那 3 个 3.712s 的废模板，
+    //   作者反复试炼、反复撞方舟的英文 400，于是 provenAt 永远为空 ——
+    //   他撞上的是试炼闸那句「请先成功出一段片」，**而那不是真正的原因**。
+    //   一句指错方向的解释和一个坏功能长得一模一样（铁律八要的是"响且说得清"）。
+    //   判据读 BranchTemplate.refVideoSec（realDurationSec ?? durationSec，缺失当好）。
+    const pubSec = BranchTemplate.refVideoSec(doc.refVideo);
+    const pubIssue = templateRefDurationIssue(pubSec, "这个模板的白模视频");
+    if (pubIssue) {
+      badRequest(
+        pubSec < TEMPLATE_REF_RULES.minSec
+          ? `这个模板的白模视频只有约 ${secText(pubSec)} 秒，短于 AI 出片引擎要求的 ${TEMPLATE_REF_RULES.minSec} 秒下限` +
+              `——发布出去，每一个套用它的人都会失败。请重新做一个模板：框选时至少选 ${BLOCKOUT_MIN_INPUT_SEC} 秒。`
+          : pubIssue,
+      );
     }
     // ★★ 试炼闸：provenAt 由服务端在「作者本人的 r2v 任务真实出片成功」时写入
     //   （ark.routes.js 的轮询追踪），这里只认它非空。为什么必须有这道门：

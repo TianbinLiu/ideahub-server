@@ -38,7 +38,15 @@ const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const { cloudinary } = require("../config/cloudinary");
 // 归属与「裁剪变换 URL」的形状判据只有一处（铁律六）
 const { parseOwnClipUrl } = require("../utils/templateVideoAsset");
-const { templateVideoMeta, templateRefIssue } = require("../middleware/upload");
+const {
+  templateVideoMeta,
+  templateRefDurationIssue,
+  // ★ 分支二判的是**白模化的输入**（下限 5），不是参考视频窗口（下限 4）——
+  //   两处差一秒就等于留了一条绕行路：老客户端可以从 /api/ark 这条路把 4 秒的白模化发出去
+  blockoutInputIssue,
+  secText,
+  TEMPLATE_REF_RULES,
+} = require("../middleware/upload");
 // ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
 const { callArk, chargedArkCall, arkConfigured, T_CREATE, T_POLL } = require("../services/arkGateway.service");
@@ -240,7 +248,11 @@ async function resolveR2v(req, res, next) {
     // ── 分支一：已登记的白模模板（套用出片 / 作者试炼）───────────────
     // 反查登记（refVideo.url 是 unique 索引，等值匹配服务端规范化过的 secure_url）
     const tpl = url
-      ? await BranchTemplate.findOne({ "refVideo.url": url }).select("_id ownerId status refVideo.durationSec").lean()
+      ? await BranchTemplate.findOne({ "refVideo.url": url })
+          // ★ realDurationSec 一起取：光看 durationSec（ceil 出来的计价锚点）**看不出坏** ——
+          //   一段 3.712s 的产物在那个字段里写着 4（2026-08-16 线上 3 个废模板就是这么隐身的）
+          .select("_id ownerId status refVideo.durationSec refVideo.realDurationSec")
+          .lean()
       : null;
 
     /** 计价结论（下面两条分支各自填一份，参数钉子对两者一视同仁） */
@@ -255,6 +267,23 @@ async function resolveR2v(req, res, next) {
       // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现
       if (tpl.status !== "published" && String(tpl.ownerId) !== String(req.user._id)) {
         return deny("这个白模模板还没有发布，暂时不能用它出片——当前请求未被受理，也没有扣费。");
+      }
+      // ★★ 模板视频自己过不过方舟窗口 —— 2026-08-16 补上的结构性缺口。
+      //   在此之前这条分支**完全不复核时长**（分支二反而有），于是一个 3.712s 的坏模板
+      //   在我们这边一路绿灯，撞的是方舟那句英文 `InvalidParameter.TaskTypeConstraint`。
+      //   钱这一侧本来就是安全的（W2 会退未受理的那一笔），但用户看到的是一句天书。
+      //   成本只是一次比较，保护的是"万一有坏模板真的到了 published"的每一个套用者。
+      // ★ 判据与发布闸同一处（BranchTemplate.refVideoSec：realDurationSec ?? durationSec，
+      //   缺失当好）—— 两边分家就会出现"发布闸放行、套用闸拒绝"这种自相矛盾。
+      const tplSec = BranchTemplate.refVideoSec(tpl.refVideo);
+      const tplIssue = templateRefDurationIssue(tplSec, "这个白模模板的视频");
+      if (tplIssue) {
+        return deny(
+          tplSec < TEMPLATE_REF_RULES.minSec
+            ? `这个白模模板的视频只有约 ${secText(tplSec)} 秒，短于 AI 出片引擎要求的 ${TEMPLATE_REF_RULES.minSec} 秒下限，` +
+                "用它出片一定会失败——当前请求未被受理，也没有扣费。"
+            : `${tplIssue}（当前请求未被受理，也没有扣费。）`,
+        );
       }
       verdict = {
         templateId: String(tpl._id),
@@ -289,9 +318,11 @@ async function resolveR2v(req, res, next) {
       if (registered) {
         return deny("这段视频已经登记过白模模板了，请直接用模板出片——当前请求未被受理，也没有扣费。");
       }
-      // 时长必须落在方舟 edit 的硬窗口里（F1 [4,30]，实测错误原文）。
-      // 窗口的唯一实现在 middleware/upload.js —— 这里只是把同一份规则用在"裁后那一段"上。
-      const issue = templateRefIssue(
+      // 这条分支上的素材**就是白模化的输入**，所以判的是白模化那套窗口
+      // （方舟 edit 的 F1/F3 + 时长下限抬到 5）。规则的唯一实现在 middleware/upload.js。
+      // ★★ 必须与阶段一用同一个函数：两道门差一秒的话，一个老客户端就能从这条路
+      //   把 4 秒的白模化发出去，产出 3.7 秒，又造一个谁都套用不了的模板。
+      const issue = blockoutInputIssue(
         { duration: clip.durSec, width: clip.crop.w, height: clip.crop.h },
         "这一段",
       );
@@ -408,7 +439,9 @@ function clipOutOfBounds(clip, src) {
     return `裁剪框超出了画面（原片 ${src.width}×${src.height}，裁剪到 ${clip.crop.x + clip.crop.w}×${clip.crop.y + clip.crop.h}）`;
   }
   if (clip.startSec + clip.durSec > src.duration) {
-    return `选的这一段超出了视频长度（原片约 ${src.duration} 秒，选到第 ${clip.startSec + clip.durSec} 秒）`;
+    // ★ src.duration 现在是**小数**（templateVideoMeta 不再取整）——直接插值会印出
+    //   "原片约 59.9666 秒" 这种机器味的数，用 secText 收口显示形态
+    return `选的这一段超出了视频长度（原片约 ${secText(src.duration)} 秒，选到第 ${clip.startSec + clip.durSec} 秒）`;
   }
   return null;
 }
