@@ -195,7 +195,10 @@ describe("/api/ark 的扣费闸门", () => {
     const spentStd = FREE - (await balanceOf(u1));
     const spentFast = FREE - (await balanceOf(u2));
     expect(spentStd).toBe(108_000); // 5×1280×720×24/1024
-    expect(spentFast).toBe(Math.round(108_000 * 0.3));
+    // ⚠ 2026-08-16 按 8 月账单把极速档从 0.3 改成 4.2/15（账单 ¥0.0042/千token）：
+    //   30,240 而不是 32,400。**这个数字要跟着账单走**，别看到红就改回 0.3 ——
+    //   0.3 比真实成本高 7%，方向是多收用户。系数的出处写在 config/tokens.js 的 VIDEO_MULT。
+    expect(spentFast).toBe(Math.round(108_000 * (4.2 / 15)));
   });
 
   test("W2 上游 400（敏感词）→ 原路退回，余额不变，流水一扣一退", async () => {

@@ -297,10 +297,10 @@ describe("角色位编号由作者确认（PATCH /templates/:id/roles + 发布�
   //   画面上的 3 号（另一个人）—— **钱照扣、零报错**，没有任何一层会喊。
   //   所以编号只能由**看得见画面的人**确认，且未确认的模板不许上市场。
   //
-  // ★★★ 2026-08-16 换代之后，这一整组变成了**存量模板的回归组**：这里造的模板一律
-  //   没有 `markColors`（就是线上那两个好模板的形状），因此必须被判成**编号方案** ——
-  //   端点行为、措辞、数字 label 全部与换代前逐字相同。哪天有人把判据写反
-  //   （`!== "color"` → 颜色路），这一组会整片红，而线上那两个模板会当场作废。
+  // ★★★ 两次换代（编号 → 一位一色 → 全白+序数）之后，这一整组变成了**存量模板的回归组**：
+  //   这里造的模板一律没有 `markSlots`（就是线上那 6 个存量模板的形状），因此必须被判成
+  //   **编号方案** —— 端点行为、措辞、数字 label 全部与换代前逐字相同。哪天有人把判据
+  //   写反（`!== "ordinal"` → 序数路），这一组会整片红，而线上那几个模板会当场作废。
   const BranchTemplate = () => require("../src/models/BranchTemplate");
 
   const twoRoles = () => [
@@ -337,26 +337,31 @@ describe("角色位编号由作者确认（PATCH /templates/:id/roles + 发布�
     expect((await BranchTemplate().findById(tpl.id).lean()).status).toBe("pending");
   });
 
-  test("★★ 存量模板（没有 markColors）恒判**编号方案**：详情里连这个键都不出，措辞也不换", async () => {
-    // ★★★ 本次换代的头号红线。线上那两个能用的模板（「都市主角群舞转场」「宗主垫脚舞」）
-    //   就是这个形状 —— 人偶通体白色、头上印数字、库里没有 markColors 这一位。
-    //   判据一旦写成肯定式（"不是 color 就走颜色路"），它们会被整批翻面：套用侧写出
-    //   "把绿色人偶替换为…"，而画面上根本没有绿色人偶，**钱花完拿到一段没换人的片子**。
+  test("★★ 存量模板（没有 markSlots）恒判**编号方案**：详情里连这个键都不出，措辞也不换", async () => {
+    // ★★★ 本次换代的头号红线。线上那 6 个存量模板（其中两个是好的、还在被人用的）
+    //   就是这个形状 —— 人偶通体白色、头上印数字、库里没有 markSlots 这一位。
+    //   判据一旦写成肯定式（"不是 ordinal 就走序数路"），它们会被整批翻面：套用侧写出
+    //   "把从左数第 3 个白色人偶替换为…"，而那段视频上的人偶头上印的是数字、画面里
+    //   还有一堆没登记的路人，**钱花完拿到一段换错人的片子**。
     const tpl = await v2Template(6016);
     const doc = await BranchTemplate().findById(tpl.id).lean();
-    expect(doc.markColors).toBeUndefined();
-    expect(BranchTemplate().isColorMark(doc)).toBe(false);
-    // ★ 空数组、null 也一律往安全那一侧退（"这一位被写坏了"不该被当成颜色方案）
-    expect(BranchTemplate().isColorMark({ markColors: [] })).toBe(false);
-    expect(BranchTemplate().isColorMark({ markColors: null })).toBe(false);
-    expect(BranchTemplate().isColorMark(null)).toBe(false);
+    expect(doc.markSlots).toBeUndefined();
+    expect(BranchTemplate().isOrdinalMark(doc)).toBe(false);
+    // ★ 空数组、null 也一律往安全那一侧退（"这一位被写坏了"不该被当成序数方案）
+    expect(BranchTemplate().isOrdinalMark({ markSlots: [] })).toBe(false);
+    expect(BranchTemplate().isOrdinalMark({ markSlots: null })).toBe(false);
+    expect(BranchTemplate().isOrdinalMark(null)).toBe(false);
+    // ★ 上一代那个字段名（markColors）现在什么都不是：哪怕库里真有残留，也不许把它
+    //   当成"新方案"—— 颜色那一套线上产出为 0，删掉之后它只是个不参与判断的多余键
+    expect(BranchTemplate().isOrdinalMark({ markColors: ["绿色", "黑色"] })).toBe(false);
     // 详情里**连这个键都不出**：空数组和"老模板"在下游会被压成同一个值，而处置相反
     const detail = await request(app).get(`/api/branch/templates/${tpl.id}`).set(asOwner());
     expect(detail.status).toBe(200);
-    expect(detail.body.template.markColors).toBeUndefined();
+    expect(detail.body.template.markSlots).toBeUndefined();
     expect(detail.body.template.roles.map((r) => r.label)).toEqual(["1", "2"]);
-    // 措辞也一个字不换（说"核对颜色"的话，作者会盯着一个白色人偶找颜色）
+    // 措辞也一个字不换（说"从左往右数"的话，作者会放着头上明明白白的数字不看）
     expect(BranchTemplate().rolesConfirmHint(doc)).toMatch(/编号/);
+    expect(BranchTemplate().rolesConfirmHint(doc)).not.toMatch(/从左/);
     expect(BranchTemplate().rolesConfirmHint(doc)).not.toMatch(/颜色/);
     // ★ 但那句**过时的指路**要改成实话：⑦ 已经证实「头部四面都是同一个数」从来没有
     //   被执行过（每发只印一面且哪一面不可控）。作者照着老措辞转一圈找不到号，
@@ -740,7 +745,11 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     net = {
       headBytes: [4_000_000, 4_000_000], // 连续两次相同 = 预热完成
       frameOk: true,
-      visionText: "1|画面正中央|白发、黑金色长袍的少年\n2|左侧靠前|红发红甲的女武士",
+      // ★★ 视觉那一步的输出格式是 `序号|横向位置|位置|外观特征`。这个 fixture 刻意让
+      //   **重要度序与左右序不同**（主角在中央 x=50，配角在左边 x=15）：两者混成一个的
+      //   表现是截断按左右砍人、或者序数按戏份排，两个方向都零报错。
+      //   ⇒ 所以下面所有断言里，`最左边` 是那个红发女武士（不是排在第一行的主角）。
+      visionText: "1|50|画面正中央|白发、黑金色长袍的少年\n2|15|左侧靠前|红发红甲的女武士",
       taskAccepted: true,
       taskStatus: "succeeded",
       calls: [],
@@ -903,16 +912,20 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(ttlH).toBeGreaterThan(23.5);
     expect(ttlH).toBeLessThanOrEqual(24);
     // 角色位草案随受理回执一起给（App 要马上显示"AI 在这段里认出了谁"）。
-    // ★ label **就是标记 token 本身**：2026-08-16 起是色名（编号那套已经整条放弃，
-    //   理由见 blockoutPrompt 函数头）。全仓只有一个连接键 —— 没有"数字 + 另一个颜色字段"。
-    expect(started.body.roles.map((r) => r.label)).toEqual(["绿色", "黑色"]);
-    // ★★ 方案位随受理回执一起下发：模板还没建出来，但核对面板此刻就要知道该画色块
-    //   还是画数字输入框。swatch 是服务端按色名现查 MARK_PALETTE 派生的 ——
-    //   **App 仓里一个 hex 都不许有**，两边"相等"这件事因此在结构上不可能不等。
-    expect(started.body.markColors).toEqual([
-      { label: "绿色", swatch: "#22C55E" },
-      { label: "黑色", swatch: "#111111" },
+    // ★ label **就是标记 token 本身**：2026-08-17 起是位置措辞（编号与一位一色两套都已
+    //   整条放弃，理由见 blockoutPrompt 函数头）。全仓只有一个连接键 ——
+    //   没有"序位数字 + 另一个 pos 字段"。
+    // ★★ 顺序是**画面从左到右**，不是视觉那一步的重要度序：fixture 里主角 x=50、
+    //   配角 x=15，所以配角是「最左边」。这一条同时钉住"名次真的按横向位置算"。
+    expect(started.body.roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
+    expect(started.body.roles.map((r) => r.desc)).toEqual([
+      expect.stringContaining("红发"),
+      expect.stringContaining("白发"),
     ]);
+    // ★★ 方案位随受理回执一起下发：模板还没建出来，但核对面板此刻就要知道该画位置
+    //   选择器还是数字输入框。出的就是库里那份纯字符串数组，**没有任何派生** ——
+    //   App 仓里一个序数措辞常量都不许有，两边"相等"因此在结构上不可能不等。
+    expect(started.body.markSlots).toEqual(["最左边", "最右边"]);
 
     expect(res.status).toBe(201);
     expect(res.body.state).toBe("done");
@@ -923,18 +936,15 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(tpl.status).toBe("pending"); // 试炼闸照旧：作者自己跑通一次才能发布
     expect(tpl.provenAt).toBeNull();
     // 角色位来自视觉清单；label 是**字符串**（标记 token 本身，别假设它是数字）。
-    // ★ labelConfirmed 出生就是 false：这份颜色是服务端按顺序发的猜测（实测命中率
-    //   只有 ~57%），作者点头之前不许当真。
+    // ★ labelConfirmed 出生就是 false：这份序数是服务端按视觉估的横向位置排出来的猜测，
+    //   作者点头之前不许当真。
     expect(tpl.roles).toEqual([
-      { label: "绿色", desc: expect.stringContaining("白发"), labelConfirmed: false },
-      { label: "黑色", desc: expect.stringContaining("红发"), labelConfirmed: false },
+      { label: "最左边", desc: expect.stringContaining("红发"), labelConfirmed: false },
+      { label: "最右边", desc: expect.stringContaining("白发"), labelConfirmed: false },
     ]);
     // ★★ 方案位落进模板并出在详情里 —— 套用侧**全靠它分支**（缺 = 编号方案 = 老提示词）
-    expect(tpl.markColors).toEqual([
-      { label: "绿色", swatch: "#22C55E" },
-      { label: "黑色", swatch: "#111111" },
-    ]);
-    expect(BranchTemplate().isColorMark(await BranchTemplate().findById(tpl.id).lean())).toBe(true);
+    expect(tpl.markSlots).toEqual(["最左边", "最右边"]);
+    expect(BranchTemplate().isOrdinalMark(await BranchTemplate().findById(tpl.id).lean())).toBe(true);
     // ★ source **不出公开响应**：它指向作者自己上传的原始素材（可能有版权）
     expect(tpl.source).toBeUndefined();
     expect(JSON.stringify(res.body)).not.toContain(body.publicId);
@@ -961,7 +971,7 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     });
   });
 
-  test("★ 端到端：白模化刚做出来的模板发布不了 —— 编号还等着作者核对", async () => {
+  test("★ 端到端：白模化刚做出来的模板发布不了 —— 位置还等着作者核对", async () => {
     // ★ 这条与「角色位编号由作者确认」那一组是两回事：那组测的是闸门本身（模板是造的），
     //   这条测的是**真走完九步**的产物身上也带着这道门 —— 中间任何一处顺手把
     //   labelConfirmed 填成 true（比如为了"少一步"），只有这条会红。
@@ -973,23 +983,28 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const denied = await request(app).patch(`/api/branch/templates/${id}/publish`).set(asOwner());
     expect(denied.status).toBe(400);
     expect(denied.body.message).toMatch(/核对/);
-    // ★ 拦路那句说的必须是**颜色**（这是个颜色模板）：说成"核对编号"的话，作者会盯着
-    //   一个通体纯色、身上一个数字都没有的人偶找号，然后以为是生成坏了
-    expect(denied.body.message).toMatch(/颜色/);
+    // ★ 拦路那句说的必须是**位置**（这是个序数模板）：说成"核对编号"的话，作者会盯着
+    //   一个通体纯白、身上一个记号都没有的人偶找号，然后以为是生成坏了
+    expect(denied.body.message).toMatch(/从左/);
     expect(denied.body.message).not.toMatch(/编号/);
+    // ★★ 序数方案独有的那一句必须在：删掉一个位子会让它右边的位子整体挪一位。
+    //   这条前两代都不存在（标记印在人身上，删一行不影响别人），不说就是静默错位。
+    expect(denied.body.message).toMatch(/往左挪一位/);
     // 作者核对完（这一发是唯一收客户端 roles 的路）→ 才发得出去。
-    // ★ 作者把两行的颜色**对调**（实测第二常见的错法），提交的那一份逐字原样存下来
+    // ★ 作者把两行**对调**（序数方案最常见的错法），提交的那一份逐字原样存下来
     await request(app)
       .patch(`/api/branch/templates/${id}/roles`)
       .set(asOwner())
-      .send({ roles: [{ label: "黑色", desc: "白发少年" }, { label: "绿色", desc: "红发女武士" }] })
+      .send({ roles: [{ label: "最右边", desc: "白发少年" }, { label: "最左边", desc: "红发女武士" }] })
       .expect(200);
     const ok = await request(app).patch(`/api/branch/templates/${id}/publish`).set(asOwner());
     expect(ok.status).toBe(200);
-    expect(ok.body.template.roles.map((r) => r.label)).toEqual(["黑色", "绿色"]); // 顺序也不许被排回去
-    // ★★ 核对**不许碰方案位**：作者一按「核对无误」就把 markColors 擦掉的话，套用侧
-    //   当场从颜色路退回编号路（输入框里冒出 `编号绿色=凛`），而没有任何一处会报错
-    expect(ok.body.template.markColors.map((c) => c.label)).toEqual(["绿色", "黑色"]);
+    expect(ok.body.template.roles.map((r) => r.label)).toEqual(["最右边", "最左边"]); // 顺序也不许被排回去
+    // ★★ 核对**不许碰方案位**：作者一按「核对无误」就把 markSlots 擦掉的话，套用侧
+    //   当场从序数路退回编号路（输入框里冒出 `编号最左边=凛`），而没有任何一处会报错。
+    //   ★ 也正因为 label 存的是**措辞**而不是序位数字，那种漏搬一眼就看得见；
+    //     存 "1"/"2" 的话，漏搬之后写出来的是 `编号1=凛`，与存量编号模板完全同形。
+    expect(ok.body.template.markSlots).toEqual(["最左边", "最右边"]);
   });
 
   test("★ 变换 URL 由服务端拼、原样进方舟（客户端一个 URL 都没给过）", async () => {
@@ -1014,68 +1029,80 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const text = body.content.find((c) => c.type === "text").text;
     expect(text).toContain("包括");
     expect(text).toContain("白发");
-    expect(text).toContain("通体一色");
+    expect(text).toContain("完全相同");
   });
 
-  test("★ 标记是**颜色**不是编号：一人一色、通体一色、只出现这 N 种色", async () => {
-    // ══ 为什么整条换掉（2026-08-15/16 对照实测）════════════════════════
+  test("★★ 白模化提示词是**全白版**：所有人偶完全相同，一个颜色/编号措辞都没有", async () => {
+    // ══ 为什么两代都被换掉（2026-08-15/16/17 十几发付费对照实测）════════════
     //   编号那套的三条死结：① 5 个角色位**从来没有一发 5/5 全对**（实出过 2/2/1/1/5、
     //   3/1/1/4/5、1/1/2/3/4）；② 「头部四面同一个数」**从没被执行过**（每发只印一面，
     //   改成"转到哪面印哪面"之后同一个人偶正面 1/1/3、背面 2/3/3，**没人能仲裁**）；
-    //   ③ 编号会被原样复刻进成片（换上去的角色后脑顶着「1」），要靠额外一句擦除才修得掉。
-    //   根因：模型把数字当"贴在这一帧上的二维贴纸"，**不维持跨帧对象恒等性**。
-    //   换成颜色（材质）之后，②③ 一次消失，命中率从"从没全对过"到 4/7 全对。
-    // ★ 所以这里反向钉住：提示词里**一个"编号"都不许再出现**。哪天有人"顺手加回来
-    //   保险一点"，画面上就会同时出现颜色和数字 —— 一个角色位两个身份，没人能仲裁。
+    //   ③ 编号会被原样复刻进成片（换上去的角色后脑顶着「1」）。
+    //   一位一色（只上线一天、线上产出 0 个模板）解决了 ②③，但命中率只有 ~57% ——
+    //   因为它要模型在白模化那一步**同时维持 M 组"人↔颜色"绑定**。
+    //   全白把"做出区分"换成"**不要有任何区分**"：一组绑定都不用维持，实测是所有版本里
+    //   抹得最干净的一版。"谁是谁"整个搬到套用侧用序数指认。
+    // ★ 所以这里**反向钉两条**：提示词里一个"编号"、一个色名都不许再出现。
+    //   哪天有人"顺手加回来保险一点"，画面上就会同时出现记号和白模 ——
+    //   一个角色位两个身份，没人能仲裁，而全程零报错。
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
     expect(text).not.toMatch(/编号/);
     expect(text).not.toMatch(/头部前后左右四面/);
-    // ① 点名清单的键是颜色（`颜色=这个人原来的样子`）
-    expect(text).toMatch(/点名清单（颜色=这个人原来的样子，共 2 人）/);
-    // ② **通体一色**要说死：只说"上色"的话模型会只染局部（一件彩色上衣），
-    //    而"只染局部"在转身/遮挡时又退回"看不见记号"的老问题
-    expect(text).toMatch(/从头到脚通体一色/);
-    // ③ 取值范围钉死 —— 编号版那句"只用 1 到 N、不要多位数"的同位替代
-    expect(text).toMatch(/这一段里只出现这 2 种颜色的人偶：绿色、黑色/);
-    expect(text).toMatch(/同一个人偶全程不变色，不同人偶不许同色/);
-    // ④ 明说"不要出现任何数字或文字"：不写的话模型会自作主张再补一套号，
-    //    那就是同一个角色位有两个身份（正是被推翻的"胸口 + 头部两处印号"的形状）
-    expect(text).toMatch(/人偶身上不要出现任何数字或文字/);
+    // 上一代的色名与上色措辞，一个都不许剩
+    for (const gone of ["绿色", "黑色", "蓝色", "紫色", "红色", "黄色", "粉色", "橙色", "棕色"]) {
+      expect(text).not.toContain(gone);
+    }
+    expect(text).not.toMatch(/上色|通体一色|不许同色/);
+    // ★★ 序数措辞**也不许进白模化提示词**（复盘 ⑥：那一发实出 1/1/2/3/2，比不塞更差）。
+    //   序数只出现在**套用侧** —— 白模化这一步的全部任务就是"不要有任何区分"。
+    for (const gone of ["最左边", "最右边", "从左数第"]) expect(text).not.toContain(gone);
+    // ① 全白 + 完全相同，这一版的全部机制
+    expect(text).toMatch(/全部替换成完全相同的纯白色人偶模特/);
+    expect(text).toMatch(/所有人偶必须\*\*完全相同\*\*：同一种纯白色、同一种材质/);
+    // ② 堵死"自作主张再补一套记号"这条路（编号会被复刻进成片是实拍过的）
+    expect(text).toMatch(/身上不要有任何颜色、数字、文字或记号/);
+    // ③ 「站位、前后层次」在序数方案下是**承重**的：序数就是站位
+    expect(text).toMatch(/站位、前后层次/);
   });
 
-  test("★ 颜色是**从点名清单抄**的，不是让模型自己配（自己配会重号又漏号）", async () => {
-    // ★★ 这条规矩是从编号时代逐字继承过来的（2026-08-15 实测）：措辞写成
-    //   「给每个人偶编上 1 到 N 的编号」时，等于把"谁是几号"当成一件**独立的分配活儿**
-    //   交给模型 —— 5 人素材实出 2/2/1/1/5，三帧稳定复现、零报错。
-    //   颜色版的同位写法是"清单写什么颜色，这个人偶就是什么颜色"：清单里
-    //   `绿色=画面正中央…` 本来就把色与人绑好了，让它照抄既省注意力、又没有自由发挥余地。
+  test("★★ 点名清单仍然**逐个点名**（F4 的立身之本，泛指会把主角原样留下）", async () => {
+    // ★★ 2026-08-15 两发对照实测：泛指「所有人物角色」时配角全被换成白模、**主角原封
+    //   不动**（edit 子任务的立身之本就是"保住主体"，泛指等于逆着它的本能走）；
+    //   把每个人的外观特征逐条点名写进去，主角才被完全白模化。
+    //   ⇒ 换了两次机制，这半句话一个字都没动过，也不许简化掉。
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(/清单写什么颜色，这个人偶就是什么颜色/);
-    // ★★ 反向钉一条（编号时代 ⑤ 的教训，机制换了但陷阱同形）：**不许**再加
-    //   "正好 N 个／每个各出现一次"那种总量自查。看着更严谨，实测反而让模型去
-    //   "凑一整套"——按画面从左到右重新分配，而那是**整份映射全错**，比重号严重得多。
-    expect(text).not.toMatch(/各出现一次/);
+    expect(text).toContain("包括下面点名清单里的每一个人在内");
+    // 清单头把人数说准（这个数是**截断后**的 roles.length，见下面 12→9 那条）
+    expect(text).toMatch(/点名清单（画面里有这 2 个人）：/);
+    // 一人一行、逐个点到：两个人的外观特征都必须在正文里
+    expect(text).toContain("\n1. 左侧靠前，红发红甲的女武士\n");
+    expect(text).toContain("\n2. 画面正中央，白发、黑金色长袍的少年\n");
+    // ★ 行首那个 `1.` `2.` 只是列表编号（清单本身按画面从左到右排），
+    //   不是要印在人偶身上的东西 —— 整段话里**一个"印"字都没有**，这就是它的边界
+    expect(text).not.toMatch(/印/);
   });
 
-  test("★ 提示词总长度有预算：上色段不许再膨胀（膨胀就是拿「抹掉外观」去换）", async () => {
+  test("★ 提示词总长度有预算：全白版买回来的字不许又花掉", async () => {
     // ★★ 这一条不是洁癖，是 2026-08-15 三发对照实测的结论（编号时代量出来的，
-    //   但它量的是**总长度**这条预算本身，换成颜色之后照样成立）：
+    //   但它量的是**总长度**这条预算本身，两次换代之后照样成立）：
     //   标记段六行（全长 ~700 字）那一发，标记完全正确，**衣服和头发却原封不动**
     //   —— 做出来是"穿着原衣服的球关节人偶"；同素材同参数把标记段压到两行
     //   （全长 ~594 字）复跑，衣服头发被抹得干干净净。开头那三句
     //   "没有头发/没有服装/不许保留原有的发型发色面部或衣服"一个字没动、位置也还在
     //   最强的开头 —— 它们顶不住的是**总长度**。**594 字通过、605 字就开始垮**。
-    // ★ 所以这里钉的是"别再让它长回去"。真要加句子，就在别处还回来。
-    //   ⚠ 它随角色位数量增长（每人一行点名 + 每人一个色名进枚举句），
-    //   所以按 2 人这个固定 fixture 量；9 人那一档另有一条单元测试专门量（见下方）。
+    // ★★ 全白版把固定部分从颜色版的 ~590 字压到 **406 字**（删掉上色两行 + 清单外纯白
+    //   那一行 + 点名段每人少一个色名）：这一版**同时**换了机制并买回了预算。
+    //   这条断言钉的就是"别把买回来的字又花掉"。真要加句子，先想从哪儿还回来。
+    //   ⚠ 它随角色位数量增长（每人一行点名），所以按 2 人这个固定 fixture 量；
+    //   9 人那一档另有一条单元测试专门量（见下方）。
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text.length).toBeLessThan(500); // 实测这一份 464 字
+    expect(text.length).toBeLessThan(320); // 实测这一份 271 字（颜色版同 fixture 是 464）
   });
 
   // ── 看几帧（自动按时长 / 用户自选）───────────────────────────────────
@@ -1172,46 +1199,66 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(after.plan + after.addon).toBe(before.plan + before.addon);
   });
 
-  test("★ 提示词兜底：清单之外的人也人偶化，但一律**纯白色**", async () => {
+  test("★ 提示词兜底：清单之外的人**也被白模化**，靠开头那句「每一个人物」管着", async () => {
     // ★★ 我们只看几帧，而画面里的人会中途入场/离场 —— 清单之外的人一定会有。
-    //   宁可让它**没颜色**（挂不上卡、保持人偶原样）也不要一个列表里没有的颜色：
-    //   多出来的记号是一句我们兑现不了的承诺，用户看得见却挂不上，只会以为坏了。
-    // ★★ 这也正是**纯白绝不进调色板**的理由（MARK_PALETTE 选色规则②）：白已经被
-    //   "路人"占用，调色板里再出现白，"路人"和"某个角色位"在画面上就长得一样，
-    //   而没有任何人能仲裁 —— 与被推翻的"两处印号"是同一个形状。
+    //   颜色时代靠单独一行「清单之外的人一律纯白」管他们；全白之后那一行是同义反复
+    //   （所有人本来就一样白），被**合并进开头第一句**，所以这里改成钉那一句。
+    // ⚠ 全白顺带认下一笔债：路人和角色位在画面上完全一样，而且**他会改变别人的序数**。
+    //   这一笔不在提示词里还，在产品里还（核对闸从"读标记"变成"数位置"）。
     await post(baseBody());
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(/清单之外若还出现别的人物/);
-    expect(text).toMatch(/一律是\*\*纯白色\*\*/);
-    expect(text).toMatch(/不给任何颜色/);
+    expect(text).toMatch(/把这段视频里的每一个人物/);
+    expect(text).toMatch(/全部替换成完全相同的纯白色人偶模特/);
+    // 反过来：那句已经作废的兜底不许还留着（留着 = 一段话里两条规则，且互相矛盾）
+    expect(text).not.toMatch(/清单之外/);
   });
 
-  test("★ 视觉认出 12 个 → 只登记 9 个角色位，label 恒为调色板最前面那 9 种色", async () => {
+  test("★ 视觉认出 12 个 → 只登记 9 个角色位，且序数在**全部 12 个人**里算", async () => {
     // ★★ 上限 9 的两头都是实测（见 blockout.BLOCKOUT_ROLE_MAX 的注释）：
     //   上界是参考图预算（9 × 每张人物卡 2~3 张图 = 18~27，仍在方舟 2.5 的 30 张之内），
     //   下界是人眼（12 个时标记照样画得出来，但画面上人能稳定认出的只有 4~5 个）。
-    // ★★ 截断必须发生在**发色之前**：先发色再截断会在列表里留下一种画面上根本没有的
-    //   颜色，而枚举句说的还是另一套 —— 画面上的颜色与列表里的颜色从此系统性错位，
-    //   两边都不报错（labelConfirmed 那道闸只是兜底，不是让颜色一开始就对的办法）。
-    net.visionText = Array.from({ length: 12 }, (_, i) => `${i + 1}|位置${i + 1}|第 ${i + 1} 个人的样子`).join("\n");
+    // ★★★ 序数方案独有的一条：名次必须在**全部 M 个人**里算，不是在活下来的 9 个人里算。
+    //   被截掉的是"戏份最轻"的人，他们**照样被人偶化、照样站在画面里、照样占一个位置**——
+    //   套用者从左边数的时候没人替他跳过那几个。在幸存者里算名次会让所有人的序数集体
+    //   左移，而那是**零报错的整份错位**。
+    //   这里把重要度序与左右序**刻意做成相反的**（第 i 个人 x = 100-i）来钉住它：
+    //   截断留下的是重要度前 9（第 1~9 个人），他们在 12 个人里的横向名次是 4~12，
+    //   所以 label 必须是「从左数第4个」…「最右边」，而**不是**「最左边」开头。
+    net.visionText = Array.from(
+      { length: 12 },
+      (_, i) => `${i + 1}|${100 - i}|位置${i + 1}|第 ${i + 1} 个人的样子`,
+    ).join("\n");
     const started = await post(baseBody());
     expect(started.status).toBe(202);
-    const PALETTE9 = ["绿色", "黑色", "蓝色", "紫色", "红色", "黄色", "粉色", "橙色", "棕色"];
-    expect(started.body.roles.map((r) => r.label)).toEqual(PALETTE9);
-    // 提示词里那句"只出现这 N 种颜色"跟着截断后的个数走（不是视觉认出的 12）
+    // 落库按**画面从左到右**：活下来的 9 个人在 12 人里的横向名次是 4~12
+    const WANT = [
+      "从左数第4个", // 第 9 个人（重要度最低的幸存者），x=92
+      "从左数第5个",
+      "从左数第6个",
+      "从左数第7个",
+      "从左数第8个",
+      "从左数第9个",
+      "从左数第10个",
+      "从左数第11个",
+      "最右边", // 第 1 个人（主角），x=100
+    ];
+    expect(started.body.roles.map((r) => r.label)).toEqual(WANT);
+    // 被截掉的第 10~12 个人（x=91/90/89，也就是画面上最左的三个）没有登记，
+    // 所以「最左边」这一句在这份清单里**根本不该出现** —— 它属于一个挂不上卡的路人
+    expect(started.body.roles.map((r) => r.label)).not.toContain("最左边");
+    // 提示词里那个人数跟着截断后的个数走（不是视觉认出的 12）
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    expect(text).toMatch(new RegExp(`这一段里只出现这 9 种颜色的人偶：${PALETTE9.join("、")}`));
-    expect(text).toMatch(/共 9 人/);
+    expect(text).toMatch(/点名清单（画面里有这 9 个人）：/);
     expect(text).not.toMatch(/第 10 个人的样子/); // 被丢掉的那几个一个字都不该进提示词
     // 落库那份也是 9 条（取回结果这一步不许把丢掉的补回来）
     const finished = await finish(started.body.jobId);
     expect(finished.status).toBe(201);
     expect(finished.body.template.roles).toHaveLength(9);
-    expect(finished.body.template.roles.map((r) => r.label)).toEqual(PALETTE9);
-    // ★ 方案位记的是**真正发出去的那一套**，所以也是截断后的 9 种，不是全调色板
-    expect(finished.body.template.markColors.map((c) => c.label)).toEqual(PALETTE9);
+    expect(finished.body.template.roles.map((r) => r.label)).toEqual(WANT);
+    // ★ 方案位记的是**真正登记出来的那一套**（截断后的 9 个位置），不是 ordinalSlots(12)
+    expect(finished.body.template.markSlots).toEqual(WANT);
   });
 
   test("计价：钱**全在阶段一**花掉（看帧 chat + 按 durSec 算的 r2v），取回结果一分不加", async () => {
@@ -1742,8 +1789,8 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const res = await finish(started.body.jobId, asOwner, {
       durSec: 30,
       title: "偷偷改掉的标题",
-      roles: [{ label: "红色", desc: "客户端自己编的" }],
-      markColors: ["红色", "黄色", "橙色"],
+      roles: [{ label: "从左数第7个", desc: "客户端自己编的" }],
+      markSlots: ["从左数第7个", "从左数第8个", "从左数第9个"],
       publicId: `ideahub/template-videos/${other.id}-1`,
       taskId: "cgt-别人的任务",
       status: "succeeded",
@@ -1753,20 +1800,20 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(doc.title).toBe("白模跑酷 V2"); // 凭据里那份
     expect(doc.source.durSec).toBe(8); // 不是客户端报的 30
     expect(doc.source.publicId).toBe(pid); // 不是别人的素材
-    expect(doc.roles.map((r) => r.label)).toEqual(["绿色", "黑色"]); // 视觉那一步的清单
-    // ★★ 方案位同样只认凭据里那一份：收客户端报的 markColors = 让他把一个颜色模板
-    //   标成别的样子，套用侧照着画面上根本没有的颜色写提示词，钱花完人没换对、零报错
-    expect(doc.markColors).toEqual(["绿色", "黑色"]);
+    expect(doc.roles.map((r) => r.label)).toEqual(["最左边", "最右边"]); // 视觉那一步的清单
+    // ★★ 方案位同样只认凭据里那一份：收客户端报的 markSlots = 让他把一个序数模板
+    //   标成别的样子，套用侧照着画面上根本没有的位置写提示词，钱花完人没换对、零报错
+    expect(doc.markSlots).toEqual(["最左边", "最右边"]);
   });
 
   // ── 标记方案按模板记住（本次换代的头号约束）────────────────────────────
   //
-  // ★★★ 线上已经存在的模板，人偶身上印的是**数字**、身体是白色的，其中两个是好的、
-  //   能用的（「都市主角群舞转场」「宗主垫脚舞」）。套用侧一刀切改成"把绿色人偶替换为…"
-  //   的话，这些模板**当场作废**（画面上根本没有绿色人偶）。所以方案必须**按模板记住**，
-  //   而判据只能是**判否定**：只有明确带着非空 markColors 才算颜色方案。
-  //   下面这几条就是那条红线的行为钉子。
-  test("★ 方案位在**阶段一**就落进取件凭据（与 roles 同一批），逐字是真正发出去的那一套", async () => {
+  // ★★★ 线上已经存在的 6 个模板，人偶身上印的是**数字**、身体是白色的，其中两个是好的、
+  //   还在被人用的。套用侧一刀切改成"把从左数第 3 个白色人偶替换为…"的话，这些模板
+  //   **当场作废**（那段视频上的人偶头上印的是数字，画面里还有一堆没登记的路人）。
+  //   所以方案必须**按模板记住**，而判据只能是**判否定**：只有明确带着非空 markSlots
+  //   才算序数方案。下面这几条就是那条红线的行为钉子。
+  test("★ 方案位在**阶段一**就落进取件凭据（与 roles 同一批），逐字是那一发真正做出来的那几个位置", async () => {
     // ★★ 为什么非在阶段一存不可：白模化提示词在阶段一就发出去了，模板要到 finish 才建，
     //   而凭据 TTL 是 24 小时 —— **发版正好夹在两阶段之间**时，只有"凭据里记着当初发的
     //   是哪一套"才能保证 finish 出来的模板与那段视频真正的样子一致。
@@ -1775,41 +1822,44 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const started = await post(baseBody({ publicId: pid }));
     expect(started.status).toBe(202);
     const job = await BlockoutJob().findById(started.body.jobId).lean();
-    expect(job.markColors).toEqual(["绿色", "黑色"]);
-    // 逐字 = 真正写进那段话里的那一套（不是"调色板前两种"这种第二处实现）
+    // 逐字 = `roles.map(r => r.label)`，按画面从左到右（不是 `ordinalSlots(2)` 这种第二处实现）
+    expect(job.markSlots).toEqual(job.roles.map((r) => r.label));
+    expect(job.markSlots).toEqual(["最左边", "最右边"]);
+    // ★★ 反过来钉一条：这几句措辞**一个字都不该出现在白模化提示词里**（复盘 ⑥）——
+    //   序数只属于套用侧，白模化那一步的任务是"不要有任何区分"
     const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
     const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
-    for (const color of job.markColors) expect(text).toContain(color);
+    for (const slot of job.markSlots) expect(text).not.toContain(slot);
   });
 
-  test("★★ 在途的老凭据（没有 markColors）→ finish 出来的是**编号方案**模板，一个字不误判", async () => {
+  test("★★ 在途的老凭据（没有 markSlots）→ finish 出来的是**编号方案**模板，一个字不误判", async () => {
     // ★★ 这就是那个 24 小时窗口：发版夹在两阶段之间时，凭据是换代**之前**落的 ——
     //   它的白模视频上印的确实是数字，所以 finish 建出编号方案模板才是**正确**的。
-    //   这里用原生驱动把 markColors 整个 unset，模拟那种存量凭据。
+    //   这里用原生驱动把 markSlots 整个 unset，模拟那种存量凭据。
     const pid = `ideahub/template-videos/${owner.id}-8042`;
     const started = await post(baseBody({ publicId: pid }));
     await BlockoutJob().collection.updateOne(
       { _id: new mongoose.Types.ObjectId(started.body.jobId) },
-      { $unset: { markColors: "" }, $set: { roles: [{ label: "1", desc: "白发少年", labelConfirmed: false }] } },
+      { $unset: { markSlots: "" }, $set: { roles: [{ label: "1", desc: "白发少年", labelConfirmed: false }] } },
     );
     const res = await finish(started.body.jobId);
     expect(res.status).toBe(201);
     // 连这个键都不该出：空数组会被下游压成"老模板"之外的第三种东西，而处置正好相反
-    expect(res.body.template.markColors).toBeUndefined();
+    expect(res.body.template.markSlots).toBeUndefined();
     const doc = await BranchTemplate().findById(res.body.template.id).lean();
-    expect(doc.markColors).toBeUndefined();
-    expect(BranchTemplate().isColorMark(doc)).toBe(false);
+    expect(doc.markSlots).toBeUndefined();
+    expect(BranchTemplate().isOrdinalMark(doc)).toBe(false);
     // 判成编号方案 → 发布拦路那句说的就是"编号"（作者去找的是数字，而画面上确实是数字）
     await BranchTemplate().updateOne({ _id: doc._id }, { $set: { provenAt: new Date() } });
     const denied = await request(app).patch(`/api/branch/templates/${doc._id}/publish`).set(asOwner());
     expect(denied.status).toBe(400);
     expect(denied.body.message).toMatch(/编号/);
-    expect(denied.body.message).not.toMatch(/颜色/);
+    expect(denied.body.message).not.toMatch(/从左/);
   });
 
   test("★★ 作者核对（PATCH /roles）之后方案位**一个字没变** —— 最容易漏且零报错的一处", async () => {
-    // ★★ 核对是整份替换 `doc.roles`，顺手把 markColors 也一起重写/清掉的话：
-    //   套用侧当场从颜色路退回编号路（输入框里冒出 `编号绿色=凛`），而库里、日志里、
+    // ★★ 核对是整份替换 `doc.roles`，顺手把 markSlots 也一起重写/清掉的话：
+    //   套用侧当场从序数路退回编号路（输入框里冒出 `编号最左边=凛`），而库里、日志里、
     //   回包里**没有任何一处会报错**。所以这一位是历史事实，不是作者的意见。
     const pid = `ideahub/template-videos/${owner.id}-8043`;
     const { finished } = await run(baseBody({ publicId: pid }));
@@ -1818,19 +1868,19 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       .patch(`/api/branch/templates/${id}/roles`)
       .set(asOwner())
       .send({
-        roles: [{ label: "黑色", desc: "白发少年" }], // 改色 + 删位一次做完
-        // ★ 顺带钉住 zod strip：客户端塞方案位也进不来（收了 = 让他把颜色模板标成编号模板）
-        markColors: ["紫色", "橙色", "棕色"],
+        roles: [{ label: "最右边", desc: "白发少年" }], // 改位置 + 删位一次做完
+        // ★ 顺带钉住 zod strip：客户端塞方案位也进不来（收了 = 让他把序数模板标成编号模板）
+        markSlots: ["从左数第7个", "从左数第8个"],
       });
     expect(patched.status).toBe(200);
-    expect(patched.body.template.roles.map((r) => r.label)).toEqual(["黑色"]);
-    // 删掉的那个位子还能加回来 —— 靠的正是 markColors 保存了**原始**那份清单
-    expect(patched.body.template.markColors.map((c) => c.label)).toEqual(["绿色", "黑色"]);
+    expect(patched.body.template.roles.map((r) => r.label)).toEqual(["最右边"]);
+    // 删掉的那个位子还能加回来 —— 靠的正是 markSlots 保存了**原始**那份清单
+    expect(patched.body.template.markSlots).toEqual(["最左边", "最右边"]);
     const doc = await BranchTemplate().findById(id).lean();
-    expect(doc.markColors).toEqual(["绿色", "黑色"]);
+    expect(doc.markSlots).toEqual(["最左边", "最右边"]);
   });
 
-  test("★ 颜色模板撞重号闸时，那句话说的是**颜色**不是编号（说错了作者会去找数字）", async () => {
+  test("★ 序数模板撞重复闸时，那句话说的是**位置**不是编号（说错了作者会去找数字）", async () => {
     const pid = `ideahub/template-videos/${owner.id}-8044`;
     const { finished } = await run(baseBody({ publicId: pid }));
     const id = finished.body.template.id;
@@ -1839,17 +1889,17 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       .set(asOwner())
       .send({
         roles: [
-          { label: "绿色", desc: "甲" },
-          { label: "绿色", desc: "乙" },
+          { label: "最左边", desc: "甲" },
+          { label: "最左边", desc: "乙" },
         ],
       });
     expect(denied.status).toBe(400);
-    expect(denied.body.message).toMatch(/颜色「绿色」出现了两次/);
+    expect(denied.body.message).toMatch(/位置「最左边」出现了两次/);
     expect(denied.body.message).toMatch(/删掉/); // 只说"不许重复"等于把人堵在原地
     expect(denied.body.message).not.toMatch(/编号/);
-    // ★ 重号判据仍然只有服务端这一处（label 装的就是标记 token，所以它**自动**
-    //   就是颜色重号闸，一行代码都不用加）—— 库里一个字没动
-    expect((await BranchTemplate().findById(id).lean()).roles.map((r) => r.label)).toEqual(["绿色", "黑色"]);
+    // ★ 重复判据仍然只有服务端这一处（label 装的就是标记 token，所以它**自动**
+    //   就是位置重复闸，一行代码都不用加）—— 库里一个字没动
+    expect((await BranchTemplate().findById(id).lean()).roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
   });
 
   test("jobId 是编的 / 形状不对 → 404 整句（不泄露任何凭据的存在性）", async () => {
@@ -1876,13 +1926,10 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       expect(row.title).toBe("掉线也找得回来");
       expect(row.taskId).toBe(started.body.taskId); // App 拿它接着轮询
       expect(row.durSec).toBe(8);
-      expect(row.roles.map((r) => r.label)).toEqual(["绿色", "黑色"]);
+      expect(row.roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
       // ★ 列表行也要带方案位：用户可能直接在这里看到"这一发认出了谁"，
-      //   而该画色块还是画数字取决于它（真有才出，与模板详情同一条规则）
-      expect(row.markColors).toEqual([
-        { label: "绿色", swatch: "#22C55E" },
-        { label: "黑色", swatch: "#111111" },
-      ]);
+      //   而该画位置选择器还是数字输入框取决于它（真有才出，与模板详情同一条规则）
+      expect(row.markSlots).toEqual(["最左边", "最右边"]);
       expect(row.remainingSec).toBeGreaterThan(23 * 3600);
       expect(typeof row.remainingText).toBe("string");
       expect(row.message).toMatch(/24 小时|过期/); // 别让用户以为随时能回来取
@@ -2217,8 +2264,11 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
   });
   afterEach(() => warnSpy.mockRestore());
 
-  /** 造 n 行视觉清单（就是 chat vision 那一步吐出来的形状） */
-  const visionLines = (n) => Array.from({ length: n }, (_, i) => `${i + 1}|位置${i + 1}|第 ${i + 1} 个人`).join("\n");
+  /** 造 n 行视觉清单（就是 chat vision 那一步吐出来的形状：`序号|横向位置|位置|外观特征`）。
+   *  ★ 横向位置刻意与重要度**同序**（第 i 个人 x = i×10），这样这一组的断言只关心截断，
+   *    不用同时想左右序；"两个序不是同一个序"由上面走 HTTP 的那条 12→9 用例专门钉。 */
+  const visionLines = (n) =>
+    Array.from({ length: n }, (_, i) => `${i + 1}|${i * 10}|位置${i + 1}|第 ${i + 1} 个人`).join("\n");
 
   test("上限是 9，且 schema 的数组上限就是同一个数（谁改了另一边都会红）", () => {
     // ★ 9 的来历：上界是参考图预算（9 × 每张人物卡 2~3 张图 = 18~27 ≤ 方舟 2.5 的 30 张），
@@ -2229,15 +2279,26 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     expect(patchRolesBody.safeParse({ roles: many(blockout.BLOCKOUT_ROLE_MAX + 1) }).success).toBe(false);
   });
 
-  test("★ 认出 12 个 → 截断到 9，且截断发生在**发色之前**（label 恒为调色板前 9 种）", () => {
+  test("★ 认出 12 个 → 截断到 9，且截断发生在**发标记之前**（序数按 12 个人算）", () => {
     const roles = blockout.parseRoles(visionLines(12));
     expect(roles).toHaveLength(9);
-    expect(roles.map((r) => r.label)).toEqual(blockout.MARK_PALETTE.map((c) => c.label));
     // 留下的是**最靠前的** 9 个（视觉清单按画面主次列，靠前的更可能是真主角）
-    expect(roles[8].desc).toContain("第 9 个");
+    expect(roles.map((r) => r.desc.replace(/^位置\d+，/, ""))).toEqual(
+      Array.from({ length: 9 }, (_, i) => `第 ${i + 1} 个人`),
+    );
+    // ★★ 措辞表照**总人数 12** 生成，不是照活下来的 9：被截掉的第 10~12 个人照样站在
+    //   画面上、照样占位置，套用者从左边数时没人替他跳过他们。所以幸存者里**没有
+    //   「最右边」**（那句属于第 12 个人），而这正是"名次在全体里算"的可观察证据。
+    expect(roles.map((r) => r.label)).toEqual([
+      "最左边",
+      ...Array.from({ length: 8 }, (_, i) => `从左数第${i + 2}个`),
+    ]);
+    expect(roles.map((r) => r.label)).not.toContain("最右边");
     // ★★ 而"靠前 = 戏份重"这件事必须由**视觉提示词**保证，否则截断就是在赌运气：
     //   模型若按从左到右或入场先后列，被截掉的可能正是主角，且零报错。
     expect(blockout.visionPrompt()).toMatch(/按重要程度从高到低排列/);
+    // ★ 而"横向位置"是**另一列**、另一个序 —— 两句都在，且都在视觉提示词里
+    expect(blockout.visionPrompt()).toMatch(/序号\|横向位置\|位置\|外观特征/);
     expect(roles.every((r) => r.labelConfirmed === false)).toBe(true);
   });
 
@@ -2247,8 +2308,22 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     const said = warnSpy.mock.calls.flat().join(" ");
     expect(said).toMatch(/认出 12 个人物/);
     expect(said).toMatch(/上限 9/);
-    // 说清楚被丢掉的人**没有消失**：提示词里"清单之外的人照样人偶化但一律纯白"管着他们
-    expect(said).toMatch(/不给颜色/);
+    // 说清楚被丢掉的人**没有消失**：白模化提示词开头那句"每一个人物"管着他们，
+    //   他们照样变成一模一样的白人偶，只是挂不上卡
+    expect(said).toMatch(/挂不了卡/);
+  });
+
+  test("★ 视觉没给横向位置（老格式）→ 退回按重要度序，且**响亮**记一笔", () => {
+    // ★★ 这条钉的是"整体退化"：绝不"有的按 x、剩下的按原序" —— 混着排出来的名次
+    //   没有任何一层能解释，而它零报错。退化本身不是降级（序数从来就是猜测），
+    //   但"视觉换了个模型、从此不吐横向位置"这件事必须有人喊。
+    const old = ["1|画面正中央|白发少年", "2|左侧靠前|红发女武士", "3|右后方|黑衣人"].join("\n");
+    const roles = blockout.parseRoles(old);
+    expect(roles.map((r) => r.label)).toEqual(["最左边", "从左数第2个", "最右边"]);
+    // ★ 第二列是**位置描述**不是坐标，必须原样留在 desc 里（吞掉它 = 套用者挂卡时
+    //   少看见半句认人的依据，而那正是他唯一的依据）
+    expect(roles[0].desc).toBe("画面正中央，白发少年");
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/没有给全横向位置/);
   });
 
   test("没超上限时不警告（别把正常那一路也吵成噪音，否则真出事时没人看日志）", () => {
@@ -2256,96 +2331,109 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  test("★ 提示词里那个 N 跟着**截断后**的个数走（说 12 而只上 9 种色 = 画面上凭空多出三种色）", () => {
+  test("★ 提示词里那个人数跟着**截断后**的个数走（说 12 而只点名 9 个 = 一句兑现不了的话）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(12)));
-    expect(text).toMatch(/共 9 人/);
-    expect(text).toMatch(/这一段里只出现这 9 种颜色的人偶：绿色、黑色、蓝色、紫色、红色、黄色、粉色、橙色、棕色/);
+    expect(text).toMatch(/点名清单（画面里有这 9 个人）：/);
     expect(text).not.toContain("第 10 个");
-    // 点名段是**一人一行的短句**（`颜色=原来的样子`）：9 个人时长串会把要害那几句挤到尾巴上
-    expect(text).toContain("\n绿色=位置1，第 1 个人\n");
-    expect(text).toContain("\n棕色=位置9，第 9 个人\n");
+    // 点名段是**一人一行的短句**：9 个人时长串会把要害那几句挤到尾巴上。
+    // ★ 行首编号按 roles 的顺序（= 画面从左到右）排，与 label 无关 ——
+    //   白模化提示词里**一个序数措辞都没有**（复盘 ⑥）。
+    expect(text).toContain("\n1. 位置1，第 1 个人\n");
+    expect(text).toContain("\n9. 位置9，第 9 个人\n");
   });
 
   test("★ 点名段的描述切到 60 字，**落库那份不动**（两者不是同一条规则）", () => {
     // ★★ 落库那份是给**人**读的（套用者挂卡只看它，作者还能改写），提示词那份是给
     //   **模型**认人用的。不切的话，模型某一发多话吐 9 条 300 字描述，点名段两千多字，
-    //   把后面那几句要害（怎么上色、只出现哪几种色、清单外纯白）稀释到读不出来 ——
-    //   而结果只是"颜色又乱了"，没有任何一层会报错。
+    //   把后面那几句要害（所有人偶必须完全相同、保持站位）稀释到读不出来 ——
+    //   而结果只是"又有人没被抹干净"，没有任何一层会报错。
     const long = "甲".repeat(400);
     const roles = blockout.parseRoles(`1|${long}`);
     expect(roles[0].desc).toHaveLength(300); // 落库上限（与 mongoose roleSchema 的 300 对齐）
     const text = blockout.blockoutPrompt(roles);
-    expect(text).toContain(`绿色=${"甲".repeat(60)}\n`);
+    expect(text).toContain(`1. ${"甲".repeat(60)}\n`);
     expect(text).not.toContain("甲".repeat(61));
   });
 
-  test("★ 通体一色 + 只出现这 N 种色 + 清单外纯白 —— 三句都在（少一句就有一种挂错卡的路子）", () => {
+  test("★★ 全白版的四句要害都在（少一句就有一种挂错卡的路子）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
-    // ① 通体一色：只染局部的人偶一转身/被挡住就又读不到记号了（编号时代的老毛病）
-    expect(text).toMatch(/从头到脚通体一色/);
-    // ② 色**从清单抄**，不让模型自己配（自己配的实测教训见编号时代的 2/2/1/1/5）
-    expect(text).toMatch(/清单写什么颜色，这个人偶就是什么颜色/);
-    // ②' 取值范围钉死 + 不许两个人偶同色（同色 = 一张卡把两个人一起换掉）
-    expect(text).toMatch(/这一段里只出现这 2 种颜色的人偶：绿色、黑色/);
-    expect(text).toMatch(/不同人偶不许同色/);
-    // ③ 清单外的人一律纯白：画面上多一种列表里没有的颜色 = 一句我们兑现不了的承诺
-    expect(text).toMatch(/清单之外若还出现别的人物/);
-    expect(text).toMatch(/一律是\*\*纯白色\*\*/);
-    expect(text).toMatch(/不给任何颜色/);
-    // ④ F4 的要害（"包括…在内" + 主角那一句）没被换代带走 —— 颜色方案下 3 次失败里
-    //    3 次都是"正中央那个最像主角的没被人偶化"，这句话删掉只会更糟
-    expect(text).toContain("包括");
-    expect(text).toMatch(/看起来像主角的那一个/);
+    // ① 全白 + **完全相同**：这一版的全部机制就是"不要有任何区分"，不需要维持任何绑定
+    expect(text).toMatch(/全部替换成完全相同的纯白色人偶模特/);
+    expect(text).toMatch(/所有人偶必须\*\*完全相同\*\*：同一种纯白色、同一种材质/);
+    // ② 堵死"自作主张再补一套记号"（编号被复刻进成片是实拍过的）
+    expect(text).toMatch(/身上不要有任何颜色、数字、文字或记号/);
+    // ③ 抹外观那三句仍在**最强的开头**（③ 那条实测：预算被顶穿时它们最先垮）
+    expect(text).toMatch(/没有头发、没有五官、没有表情、没有服装与花纹/);
+    expect(text).toMatch(/任何一个人物都不许保留原有的发型、发色、面部或衣服/);
+    // ④ 「站位、前后层次」在序数方案下是**承重**的：序数就是站位
+    expect(text).toMatch(/站位、前后层次/);
+    // ⑤ F4 的立身之本（"包括…在内" + 逐个点名）没被换代带走
+    expect(text).toContain("包括下面点名清单里的每一个人在内");
+    expect(text).toContain("\n1. 位置1，第 1 个人\n");
+    expect(text).toContain("\n2. 位置2，第 2 个人\n");
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────
-describe("角色位调色板（单元）—— MARK_PALETTE 是这条规则的唯一实现", () => {
-  // ★★ 「第 i 个角色位在画面上是什么颜色」这条规则**只准有一处实现**（铁律六）。
-  //   它同时是**跨仓**的：App 仓里一个颜色常量、一个 hex、一个 `Record<色名,颜色>`
-  //   都不许有 —— 色名随 `roles[].label` 下发、色块随 `markColors[].swatch` 下发。
-  //   两边各存一份的表现是：核对面板画着紫块、提示词里写的是蓝色，**零报错**。
+describe("角色位的序数措辞（单元）—— ordinalSlots 是这条规则的唯一实现", () => {
+  // ★★ 「画面上从左数第 k 个人那句话怎么说」这条规则**只准有一处实现**（铁律六）。
+  //   它同时是**跨仓**的：App 仓里一个序数措辞常量、一个"第 k 个怎么说"的函数都不许有
+  //   —— 措辞随 `roles[].label` 与 `markSlots` 下发，App 只做原样显示与原样写进提示词。
+  //   两边各写一份的表现是：核对面板上写着「左二」、提示词里写的是「从左数第2个」，
+  //   而 App 侧那道 `hasLabel` 校验在正文里找不到自己那一份 → **零报错的误判**。
   const blockout = require("../src/services/blockoutize.service");
   const { patchRolesBody } = require("../src/schemas/branchTemplate.schemas");
 
-  test("★ 位数与角色位上限相等（少一种色 = 第 9 个位子拿到 undefined，落库是空 label）", () => {
-    // ★★ 少一色的故障链全程无声：`MARK_PALETTE[8]` 是 undefined → 取 `.label` 直接抛，
-    //   而它抛在**看帧那一笔已经花完之后** —— 用户付了钱看到一句 500。
-    //   多一色则更阴：第 10 种色永远发不出去，没有任何症状。
-    expect(blockout.MARK_PALETTE).toHaveLength(blockout.BLOCKOUT_ROLE_MAX);
+  test("★ 措辞表：最左/最右用「最」，中间用「从左数第 k 个」", () => {
+    // ★★ 这几行就是那 12 组零错误实测用的措辞，换一个词、换一次结构，之前所有实测数据
+    //   全部作废，而**没人会发现** —— 准确率的变化只能靠再花几发钱才看得出来。
+    expect(blockout.ordinalSlots(1)).toEqual(["最左边"]);
+    expect(blockout.ordinalSlots(2)).toEqual(["最左边", "最右边"]);
+    expect(blockout.ordinalSlots(3)).toEqual(["最左边", "从左数第2个", "最右边"]);
+    expect(blockout.ordinalSlots(5)).toEqual([
+      "最左边",
+      "从左数第2个",
+      "从左数第3个",
+      "从左数第4个",
+      "最右边",
+    ]);
   });
 
-  test("★ 跨仓：上限这个数在 app 仓、schema、调色板三处必须是同一个 9", () => {
+  test("★ M=1 也叫「最左边」，不叫「唯一那个」（「唯一」是一句会变假的话）", () => {
+    // ★★ 中途入场一个路人，"唯一那个"当场失效，而「最左边」仍然指向我们那一个。
+    //   顺带省掉一个特例分支 —— 一张表胜过一张表加一个 if。
+    expect(blockout.ordinalSlots(1)).toEqual(["最左边"]);
+    expect(blockout.ordinalSlots(1)[0]).not.toMatch(/唯一/);
+  });
+
+  test("★★ 措辞表照**总人数**生成：「最右边」只发给真正排在最后那一位", () => {
+    // ★★ 截断（BLOCKOUT_ROLE_MAX=9）之后活下来的第 9 个**不一定**是画面上最右的那个。
+    //   若措辞表按活下来的个数生成，我们就会亲手编一句假话（"最右边"指到画面中间某个人），
+    //   而套用者照着它挂卡 —— 换错人、钱照扣、零报错。
+    const s12 = blockout.ordinalSlots(12);
+    expect(s12).toHaveLength(12);
+    expect(s12[0]).toBe("最左边");
+    expect(s12[11]).toBe("最右边");
+    expect(s12[8]).toBe("从左数第9个"); // 第 9 个人只是"从左数第 9 个"，不是最右
+    expect(s12.filter((s) => s === "最右边")).toHaveLength(1);
+  });
+
+  test("★ 跨仓：上限这个数在 app 仓、schema、服务端三处必须是同一个 9", () => {
     // 抄自 app/src/data/templates.ts 的 `BLOCKOUT_MAX_ROLES`（为什么抄不 fs 读：
     // server 独立部署，会自己跳过的用例是静默失败 —— 与 arkProxy.spec 那几组跨仓
     // 价目断言逐字相同的理由）。
     const APP_BLOCKOUT_MAX_ROLES = 9;
     expect(blockout.BLOCKOUT_ROLE_MAX).toBe(APP_BLOCKOUT_MAX_ROLES);
-    expect(blockout.MARK_PALETTE).toHaveLength(APP_BLOCKOUT_MAX_ROLES);
     const many = (n) => Array.from({ length: n }, (_, i) => ({ label: `位${i}`, desc: "x" }));
     expect(patchRolesBody.safeParse({ roles: many(APP_BLOCKOUT_MAX_ROLES) }).success).toBe(true);
     expect(patchRolesBody.safeParse({ roles: many(APP_BLOCKOUT_MAX_ROLES + 1) }).success).toBe(false);
   });
 
-  test("★ 实测锚点不许被动：前 5 种逐字是 绿/黑/蓝/紫/红，顺序也不许换", () => {
-    // ★★ 2026-08-15/16 那 7 发对照实验用的就是这五个词这个顺序（`绿色` 落在主角位）。
-    //   换一个词、换一次顺序，之前所有实测数据全部作废，而**没人会发现** ——
-    //   命中率的变化只能靠再跑 7 发才看得出来。
-    expect(blockout.MARK_PALETTE.slice(0, 5).map((c) => c.label)).toEqual(["绿色", "黑色", "蓝色", "紫色", "红色"]);
-  });
-
-  test("★ 纯白被保留给「清单之外的路人」，调色板里绝不许出现白", () => {
-    // ★★ 提示词最后一句把 `纯白色` 派给了没被点名的人。调色板里再出现白 = 路人和
-    //   某个角色位在画面上长得一样，而**没有任何人能仲裁** —— 这正是被推翻的
-    //   "胸口 + 头部两处印号"那个坑的同一个形状。
-    for (const c of blockout.MARK_PALETTE) expect(c.label).not.toMatch(/白/);
-  });
-
-  test("★ 任何一个色名都不是另一个的子串（App 侧要在提示词正文里把它找回来）", () => {
-    // ★★ App 校验合成结果时要在正文里找回 `绿色`。若调色板里同时有 `绿色` 和 `深绿色`，
-    //   `深绿色` 会把 `绿色` 的检查蒙混过去 —— 于是我们**以为**核对过了，
-    //   比不核对更坏。所以是 `粉色` 不是 `粉红色`、`蓝色` 不是 `天蓝色`。
-    const labels = blockout.MARK_PALETTE.map((c) => c.label);
+  test("★ 任何一句措辞都不是另一句的子串（App 侧要在提示词正文里把它找回来）", () => {
+    // ★★ App 校验合成结果时要在正文里找回 `最左边`。若某两句互为子串，外层那句会把
+    //   内层那句的检查蒙混过去 —— 于是我们**以为**核对过了，比不核对更坏。
+    //   （上一代同一条规则的说法是"色名不许互为子串"，理由逐字相同。）
+    const labels = blockout.ordinalSlots(blockout.BLOCKOUT_ROLE_MAX);
     for (const a of labels) {
       for (const b of labels) {
         if (a === b) continue;
@@ -2354,61 +2442,127 @@ describe("角色位调色板（单元）—— MARK_PALETTE 是这条规则的�
     }
   });
 
-  test("★ 色名长度 ≤ 8（与 mongoose roleSchema / zod roleItemBody 的 maxlength 同口径）", () => {
-    // ★ 这就是"换颜色时那三处 maxlength 一个都不用改"的全部依据。加一个更长的色名
-    //   （比如「亮橙色」还行，「淡紫罗兰色」就不行）会让落库直接被 mongoose 拒，
-    //   而那发生在**看帧的钱花完之后**。
-    for (const c of blockout.MARK_PALETTE) {
-      expect(c.label.length).toBeLessThanOrEqual(8);
-      expect(patchRolesBody.safeParse({ roles: [{ label: c.label, desc: "x" }] }).success).toBe(true);
+  test("★ 措辞里不含「人偶」二字（套用侧拼出来的是「XX 的人偶」，带了就会自我匹配）", () => {
+    for (const s of blockout.ordinalSlots(blockout.BLOCKOUT_ROLE_MAX)) {
+      expect(s).not.toContain("人偶");
     }
   });
 
-  test("swatch 都是 #rrggbb；swatchOf 查不到时回空串（**绝不编一个 hex**）", () => {
-    // ★★ 编一个的表现是核对面板上画着一个画面里根本没有的颜色，而作者会照着它去找人 ——
-    //   比没有色块糟得多。App 侧的约定是拿不到就画中性灰块 + 纯文字，永远不猜。
-    for (const c of blockout.MARK_PALETTE) {
-      expect(c.swatch).toMatch(/^#[0-9A-F]{6}$/);
-      expect(blockout.swatchOf(c.label)).toBe(c.swatch);
+  test("★ 措辞长度 ≤ 8（与 mongoose roleSchema / zod roleItemBody 的 maxlength 同口径）", () => {
+    // ★ 这就是"两次换代那三处 maxlength 一个都不用改"的全部依据。措辞再长一点
+    //   （比如「画面上从左数第9个」）会让落库直接被 mongoose 拒，而那发生在
+    //   **看帧的钱花完之后**。上界很宽：999 位也只有 8 字，而视觉那一发 max_tokens=1200
+    //   根本吐不出 1000 行。
+    for (const s of [...blockout.ordinalSlots(blockout.BLOCKOUT_ROLE_MAX), ...blockout.ordinalSlots(999).slice(-2)]) {
+      expect(s.length).toBeLessThanOrEqual(8);
+      expect(patchRolesBody.safeParse({ roles: [{ label: s, desc: "x" }] }).success).toBe(true);
     }
-    expect(blockout.swatchOf("青色")).toBe("");
-    expect(blockout.swatchOf("")).toBe("");
   });
 
-  test("★ 枚举句与点名清单**同源**：提示词里那串颜色 === roles 的 label，N 也相等", () => {
-    // ★★ 枚举句若写成 `MARK_PALETTE.slice(0, N)`，就是同一条规则的第二处实现 ——
-    //   作者删过位之后 roles 少了一条，切片却还是原来那几种色，于是提示词里出现一种
-    //   点名清单里没有的颜色，**零症状**。
+  test("★★ 措辞**一个字都不许进白模化提示词**（复盘 ⑥：塞进去反而更差）", () => {
+    // ★★ 2026-08-16 那一发把序数塞进白模化提示词，实出 1/1/2/3/2，比不塞更差 ——
+    //   因为那时每条点名带两个数字，锚点没多、干扰多了。全白版的机制就是
+    //   "**不要有任何区分**"，白模化这一步一个记号都不印；序数只属于套用侧。
     const roles = blockout.parseRoles(
-      Array.from({ length: 4 }, (_, i) => `${i + 1}|位置${i + 1}|第 ${i + 1} 个人`).join("\n"),
+      Array.from({ length: 4 }, (_, i) => `${i + 1}|${i * 10}|位置${i + 1}|第 ${i + 1} 个人`).join("\n"),
     );
     const text = blockout.blockoutPrompt(roles);
-    const labels = roles.map((r) => r.label);
-    expect(text).toContain(`共 ${labels.length} 人`);
-    expect(text).toContain(`这一段里只出现这 ${labels.length} 种颜色的人偶：${labels.join("、")}；`);
-    // 反过来：调色板里没被这一发用上的颜色，一个字都不该出现在提示词里
-    for (const c of blockout.MARK_PALETTE.slice(labels.length)) expect(text).not.toContain(c.label);
+    expect(roles.map((r) => r.label)).toEqual(["最左边", "从左数第2个", "从左数第3个", "最右边"]);
+    for (const label of roles.map((r) => r.label)) expect(text).not.toContain(label);
+    expect(text).not.toContain("从左数第");
+    // 正过来：清单里的人一个都不能少（F4），人数也要说准
+    expect(text).toContain("点名清单（画面里有这 4 个人）：");
+    for (let i = 1; i <= 4; i += 1) expect(text).toContain(`\n${i}. 位置${i}，第 ${i} 个人\n`);
   });
 
-  test("★ 9 人时提示词的长度：已经在实测出问题的区间之上（这个数是给下一个人看的）", () => {
+  test("★ 9 人时提示词的长度：全白版把预算买回来了，别又花掉", () => {
     // ══ 本次改动里最该被下一个人看到的数字 ══════════════════════════════
     //   ③ 那条实测的线是 **594 字通过、605 字就开始顶穿预算**（抹外观那几句先垮，
-    //   做出来是"穿着原衣服的人偶"）。而颜色方案下：
-    //     · 5 人 ≈ 505 字（测试用的短描述）/ 真实描述约 577 字 —— 还在线内；
-    //     · 9 人 + 真实长度描述（每人约 33 字）≈ **780 字**；
-    //     · 9 人 + desc 吃满 ROSTER_DESC_MAX(60) ≈ **1023 字**。
-    //   ⇒ **6 人以上已经在出过问题的长度区间里，9 人远远超出**。
-    //   本期不动 BLOCKOUT_ROLE_MAX（那是另一次跨仓决策，两头各有自己的依据），
-    //   改用这条断言把数摆在明面上：谁再往提示词里加句子，先在这里看见代价。
+    //   做出来是"穿着原衣服的人偶"）。颜色方案下 9 人 + 真实长度描述 ≈ **780 字**，
+    //   远在出过问题的区间之上；全白版把固定部分从 ~590 压到 406 字，点名段每人也少
+    //   一个色名，同样的 9 人只剩下面这个数。
+    //   ⇒ 这条断言钉的是"别把买回来的字又花掉"：谁再往提示词里加句子，先在这里看见代价。
     const real = (n) =>
-      Array.from({ length: n }, (_, i) => `${i + 1}|画面左数第${i + 1}位|${"甲".repeat(25)}`).join("\n");
+      Array.from({ length: n }, (_, i) => `${i + 1}|${i * 10}|画面左数第${i + 1}位|${"甲".repeat(25)}`).join("\n");
     const len9 = blockout.blockoutPrompt(blockout.parseRoles(real(9))).length;
-    expect(len9).toBeLessThan(800); // 实测 780。⚠ 605 是出过问题的线，这个数已经在它上方
+    expect(len9).toBeLessThan(605); // ⚠ 605 是实测出过问题的线，这一版整个在它下方
     // 固定部分（与人数无关的那些句子）自己不许再长：9 人减 5 人 = 4 个人的增量
     const len5 = blockout.blockoutPrompt(blockout.parseRoles(real(5))).length;
-    // 实测 160：每人 40 字（点名一行 `色名=描述` + 枚举句里多一个 `、色名`）。
-    // ⚠ 这个"每人多少字"就是上限 9 之所以危险的斜率 —— 它不许再涨。
+    // ⚠ 这个"每人多少字"就是上限 9 之所以要紧的斜率 —— 它不许再涨。
     expect(len9 - len5).toBeLessThan(170);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("画面位置框（单元）—— 拖到画面上挂卡的全部输入", () => {
+  // ★★ 这一组的每一条都在守同一件事：**框只在"整份可信"时才存在**。
+  //   少一个、越界一个、不知道量自第几秒 —— 任何一条不满足就整份不要，App 那层退回
+  //   点列表。局部可拖比整层关掉更坏：用户会以为"这个人拖不了 = 坏了"，
+  //   而拖得动的那几个已经在悄悄挂错人（挂错人零报错，本仓头号故障形状）。
+  const blockout = require("../src/services/blockoutize.service");
+  const { buildOutFrameUrl } = require("../src/utils/templateVideoAsset");
+
+  /** 实测那一发（nring2 产物 2.5s 帧）的真实回包，逐字照抄 —— 别改成手编的整数 */
+  const REAL_REPLY = [
+    "1|186|596|130|804",
+    "2|351|577|152|836",
+    "3|510|582|154|886",
+    "4|686|563|148|876",
+    "5|854|596|146|864",
+  ].join("\n");
+
+  test("★ 量在正中间那一帧：4.736s 的产物取 2.5s（= 实测那一发用的帧）", () => {
+    expect(blockout.boxFrameSec(4.736)).toBe(2.5);
+    expect(blockout.boxFrameSec(14)).toBe(7);
+    // 右端开区间：1s 的片子不许取到 1.0（那一刻已经不在片子里了）
+    expect(blockout.boxFrameSec(1)).toBe(0.5);
+    // 时长不可用 → 退 0 而不是 NaN（NaN 拼进 so_ 会得到一个 404 的地址，且零报错）
+    expect(blockout.boxFrameSec(0)).toBe(0);
+    expect(blockout.boxFrameSec(undefined)).toBe(0);
+  });
+
+  test("★ 解析：数目正好才回，多一个少一个都整份丢", () => {
+    expect(blockout.parseBoxes(REAL_REPLY, 5)).toHaveLength(5);
+    expect(blockout.parseBoxes(REAL_REPLY, 6)).toEqual([]);
+    expect(blockout.parseBoxes(REAL_REPLY, 4)).toEqual([]);
+    expect(blockout.parseBoxes("", 5)).toEqual([]);
+    expect(blockout.parseBoxes(REAL_REPLY, 0)).toEqual([]);
+  });
+
+  test("★★ 排序由我们做，不指望模型真按左到右吐（下标错位 = 挂错人）", () => {
+    const shuffled = ["1|854|500|100|800", "2|186|500|100|800", "3|510|500|100|800"].join("\n");
+    expect(blockout.parseBoxes(shuffled, 3).map((b) => b.cx)).toEqual([186, 510, 854]);
+  });
+
+  test("★★ 一行长得像框却是坏的 → 整份不可信（不是「挑掉坏的、剩下的接着数」）", () => {
+    // 越界（>1000）、零宽 —— 两种都会变成一个用户看不见却拖不中的框
+    const bad = ["1|1200|500|100|800", "2|186|500|100|800", "3|510|500|0|800"].join("\n");
+    expect(blockout.parseBoxes(bad, 3)).toEqual([]);
+    // ★★ 这一条才是这个测试存在的理由：只数幸存者的话，"模型看见 3 个人、2 行坏、
+    //   而这个模板恰好只有 1 个角色位"会被判**通过** —— 幸存 1 个、要 1 个。
+    //   可它明明在画面里看见了 3 个人，那份框与我们的角色位根本不是同一回事。
+    expect(blockout.parseBoxes(bad, 1)).toEqual([]);
+    // 反过来：不像框的行是噪声不是坏框（模型偶尔会加一句"好的，以下是…"），照常放行
+    expect(blockout.parseBoxes(`好的，以下是结果：\n1|186|500|100|800\n2|510|500|100|800`, 2)).toHaveLength(2);
+  });
+
+  test("★ 提示词把总数说出来（成败判据就是数目对得上）", () => {
+    const p = blockout.boxPrompt(5);
+    expect(p).toContain("一共有 5 个");
+    expect(p).toContain("序号|cx|cy|w|h");
+    // 坐标口径与 App 的 MarkBox 逐字对齐：千分比 + 中心点 + 宽高。改一处就要两仓一起改
+    expect(p).toContain("0~1000");
+    expect(p).toContain("中心点");
+  });
+
+  test("★★ 产物帧地址**不带裁剪**：那组 crop 是相对原视频的，套上去全体框整体偏移", () => {
+    const url = buildOutFrameUrl("ideahub/template-videos/abc", 2.5, 123);
+    expect(url).toContain("so_2.5");
+    expect(url).toContain("v123/");
+    expect(url).toMatch(/\.jpg$/);
+    expect(url).not.toContain("c_crop");
+    // 1024 是实测那一发的宽度；768（认人那条路的宽度）没验过位置精度
+    expect(url).toContain("c_scale,w_1024");
   });
 });
 

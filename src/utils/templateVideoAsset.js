@@ -137,6 +137,24 @@ function buildFrameUrl(publicId, { atSec, crop }, version) {
 }
 
 /**
+ * 抽**产物**的一帧（给「量框」那一发用，见 blockoutize.service 的 ①e）。
+ *
+ * ★ 与上面那条的两处区别，都不是风格问题：
+ *   ① **不裁剪** —— 产物已经是最终画面，再套一次原片的 crop 会切错地方（那组 x/y/w/h
+ *      是相对**原视频**的坐标）；而框的坐标是相对"用户在 App 里看到的那一帧"归一化的，
+ *      两者必须是同一个画面，差一次裁剪就是全体框整体偏移。
+ *   ② 缩到 **1024** 而不是 768：768 是"认出画面里有谁"够用的宽度，而这一发要的是
+ *      **位置精度**。1024 是 2026-08-17 实测那一发用的量级（回包 5 个框横向逐个压中），
+ *      往下调没验过 —— 而框偏了不会报错，只会让用户拖到隔壁那个人身上。
+ */
+function buildOutFrameUrl(publicId, atSec, version) {
+  const cloud = cloudinary.config().cloud_name;
+  if (!cloud) return null;
+  const v = version ? `v${version}/` : "";
+  return `https://res.cloudinary.com/${cloud}/video/upload/so_${atSec},c_scale,w_1024/${v}${publicId}.jpg`;
+}
+
+/**
  * 把一条裁剪变换地址解回来 —— **只认服务端自己拼得出的那一种形状**。
  *
  * ★★ 这是 resolveR2v 第二条分支（白模化那一发）的计价锚点：`du_` 那个数就是方舟
@@ -180,6 +198,7 @@ module.exports = {
   ownedCloudinaryAsset,
   clipTransform,
   buildClipUrl,
+  buildOutFrameUrl,
   buildFrameUrl,
   parseOwnClipUrl,
 };

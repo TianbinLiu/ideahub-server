@@ -48,8 +48,9 @@ const {
   ownTemplateVideoPublicId,
   buildClipUrl,
   buildFrameUrl,
+  buildOutFrameUrl,
 } = require("../utils/templateVideoAsset");
-const { chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
+const { callArk, chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
 const blockout = require("../services/blockoutize.service");
 const { SEEDANCE_2_5, VIDEO_MULT_R2V, paidOnlyDenial } = require("../config/tokens");
 const wallet = require("../services/tokenWallet.service");
@@ -76,24 +77,38 @@ function rolesPayload(roles) {
 /**
  * 标记方案怎么出到响应里 —— **一处实现**（模板详情 / 受理回执 / 待取回列表共用）。
  *
- * 出的是**派生**形态 `[{ label, swatch }]`：库里只存色名字符串，色块是出响应时去
- * `MARK_PALETTE` 现查的。
+ * 出的就是库里那份 `string[]`（`["最左边","从左数第2个","最右边"]`），**没有任何派生**。
+ * 上一代（一位一色）在这里派生过一个 `swatch`；全白之后没有色块可画，那层整个删掉了。
  *
- * ★★ 这样 App 仓里**一个颜色常量、一个 hex、一个 `Record<色名,颜色>` 都不存在** ——
- *   色名来自 `roles[].label`，色块来自这里。两边"相等"这件事从"靠约定"变成
- *   **结构上不可能不等**（比 BLOCKOUT_MAX_ROLES 那种镜像强一档：那一个只有注释在管）。
- * ★ 查不到 swatch 就**只出色名、不编一个 hex**（作者手改过 label 的历史遗留、
- *   或者以后调色板动过都会走到这里）。编一个的表现是核对面板上画着一个画面里根本
- *   没有的颜色，而作者会照着它去找人 —— 比没有色块糟得多。App 侧的约定是
- *   拿不到就画中性灰块 + 纯文字，**永远不猜**。
- * @returns {Array<{label:string, swatch?:string}>}
+ * ★★ 这样 App 仓里**一个序数措辞常量、一个"第 k 个怎么说"的函数都不存在** ——
+ *   措辞来自 `roles[].label` 与这一份，App 只做原样显示与原样写进提示词。
+ *   两边"相等"这件事从"靠约定"变成**结构上不可能不等**（比 BLOCKOUT_MAX_ROLES
+ *   那种镜像强一档：那一个只有注释在管）。
+ * @returns {string[]}
  */
-function markColorsPayload(list) {
-  return (Array.isArray(list) ? list : []).map((c) => {
-    const label = String(c || "");
-    const swatch = blockout.swatchOf(label);
-    return { label, ...(swatch ? { swatch } : {}) };
-  });
+function markSlotsPayload(list) {
+  return (Array.isArray(list) ? list : []).map((s) => String(s || ""));
+}
+
+/**
+ * 画面位置框那**一对**字段的响应片段 —— 回 `{}` 表示"这个模板没有可用的框"。
+ *
+ * ★★ 返回的是**要展开的对象**而不是数组，就是为了让"框"和"量自第几秒"在语法上
+ *   没法分开出（`...markBoxesPayload(doc)` 一次带走两位）。分成两个函数的话，
+ *   将来有人加个字段只记得改一处，出来就是"有框没秒数"——客户端只能猜是哪一帧。
+ * ★ 长度对不上就整份不出：库里本不该有这种数据（写入那一头已经挡过），但出口再挡
+ *   一次的成本是一行，而放出去的后果是 App 那边按下标错位挂卡、零报错。
+ */
+function markBoxesPayload(doc) {
+  const boxes = Array.isArray(doc?.markBoxes) ? doc.markBoxes : null;
+  const atSec = Number(doc?.markBoxAtSec);
+  const slots = Array.isArray(doc?.markSlots) ? doc.markSlots.length : 0;
+  if (!boxes || !boxes.length || boxes.length !== slots) return {};
+  if (!Number.isFinite(atSec) || atSec < 0) return {};
+  return {
+    markBoxes: boxes.map((b) => ({ cx: Number(b.cx), cy: Number(b.cy), w: Number(b.w), h: Number(b.h) })),
+    markBoxAtSec: atSec,
+  };
 }
 
 /** 响应形状。cloudinaryPublicId 刻意不出（纯内部回收记账，客户端拿它没有正当用途） */
@@ -133,11 +148,16 @@ function toTemplatePayload(doc, viewer) {
     //   （后者根本建不出来 —— 见 blockoutize 的「roles 为空整句拒」）。
     //   客户端判它一律用存在性（`roles?.length`），别用等值。
     ...(Array.isArray(doc.roles) && doc.roles.length ? { roles: rolesPayload(doc.roles) } : {}),
-    // 标记方案（颜色 / 编号）。★★ **真有才出这个键，绝不 `|| []` 兜底** —— 空数组和
+    // 标记方案（序数 / 编号）。★★ **真有才出这个键，绝不 `|| []` 兜底** —— 空数组和
     //   "老模板"在下游会被压成同一个值，而两者的处置正好相反（前者是写坏了、后者要走
     //   老提示词）。套用侧全靠这一位分支：缺它 = 编号方案 = 与今天逐字相同的行为，
-    //   所以线上那两个好模板一个字都不受影响。判据只有 BranchTemplate.isColorMark 一处。
-    ...(BranchTemplate.isColorMark(doc) ? { markColors: markColorsPayload(doc.markColors) } : {}),
+    //   所以线上那 6 个存量模板一个字都不受影响。判据只有 BranchTemplate.isOrdinalMark 一处。
+    ...(BranchTemplate.isOrdinalMark(doc) ? { markSlots: markSlotsPayload(doc.markSlots) } : {}),
+    // 画面位置框（拖到画面上挂卡）。★★ 与 markSlots 同一条纪律：**真有才出**，且
+    //   `markBoxes` 与 `markBoxAtSec` 是**一对，要么都出要么都不出** —— 只出框不出秒数，
+    //   客户端就得自己猜是哪一帧，而猜错的表现是"框画在那儿、人已经走开了"。
+    //   长度校验在 markBoxesPayload 里（服务端出口再兜一次，理由见 model 的 ★★）。
+    ...markBoxesPayload(doc),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
     status: doc.status,
@@ -599,14 +619,15 @@ router.post(
           //   roles 是套用者挂卡的唯一依据（重报 = 让提交方自己写"1 号位是谁"）。
           source: { publicId, startSec, durSec, crop },
           roles,
-          // ★★ 与 roles **同一批写入**：这份就是上面 blockoutPrompt 真正写进那段话的
-          //   那套颜色（`roles.map(r => r.label)`，逐字、按序）。不在这里另取一遍
-          //   MARK_PALETTE.slice(0, N) —— 那是同一条规则的第二处实现。
+          // ★★ 与 roles **同一批写入**：这份就是这一发白模化真正产出的那几个可寻址位置
+          //   （`roles.map(r => r.label)`，逐字、按画面从左到右）。不在这里另取一遍
+          //   `ordinalSlots(N)` —— 那是同一条规则的第二处实现，而两边错位时零症状
+          //   （视觉认出 12 个截断到 9 时尤其：措辞表是照 12 生成的，切片却按 9 取）。
           // ★★ 为什么非在阶段一存不可：提示词在这一步就发出去了，模板要到 finish 才建，
           //   而凭据 TTL 24 小时。发版正好夹在两阶段之间时，只有"凭据里记着当初发的是
           //   哪一套"才能保证 finish 出来的模板与那段视频真正的样子一致（见 BlockoutJob
-          //   的 markColors 注释）。在途的老 job 没有这一位 → finish 出编号方案模板 → 正确。
-          markColors: roles.map((r) => r.label),
+          //   的 markSlots 注释）。在途的老 job 没有这一位 → finish 出编号方案模板 → 正确。
+          markSlots: roles.map((r) => r.label),
           // ★ 存下来只为**回执能重放**：阶段一重试撞上既有凭据时走的是 startedPayload(exist)，
           //   不存的话那条路回出来的帧数是空的，而 App 拿它对账 —— 一条路对得上、另一条对不上，
           //   两边看着都没错（这正是"同一件事两处各说各的"的形状）。
@@ -666,9 +687,9 @@ function startedPayload(job) {
     taskId: job.taskId,
     durSec: job.source.durSec,
     roles: rolesPayload(job.roles),
-    // ★ 模板还没建出来，但核对面板此刻就要知道该显示"颜色"还是"编号"（它拿受理回执
+    // ★ 模板还没建出来，但核对面板此刻就要知道该显示"位置"还是"编号"（它拿受理回执
     //   直接开画）。真有才出，与 toTemplatePayload 同一条规则。
-    ...(BranchTemplate.isColorMark(job) ? { markColors: markColorsPayload(job.markColors) } : {}),
+    ...(BranchTemplate.isOrdinalMark(job) ? { markSlots: markSlotsPayload(job.markSlots) } : {}),
     expiresAt: job.expiresAt,
     billed: true,
     ...(Number.isFinite(frames) && frames > 0 ? { visionFrames: frames } : {}),
@@ -958,6 +979,70 @@ router.post(
           `outSec=${outMeta.duration} trimmed=${Number.isFinite(trimmed) ? trimmed.toFixed(3) : "?"} anchorSec=${anchorSec}`,
       );
 
+      // ── ⑧b 量框：产物的正中间那一帧上，每个人偶在画面哪儿（**尽力而为**）──────
+      //
+      // ★★ 这一段的每一条错误路径都必须 **continue，不许 return**：钱在阶段一就花掉了，
+      //   产物也已经转存成功，此刻整个失败等于"用户付了钱、视频好好的、模板没了"。
+      //   量不出框只是少一条挂卡路径（点列表照常用），与"这一发白模化失败"差着量级。
+      //   所以下面既没有 `fail(res,...)`，也没有 throw —— 全部 `console.warn` 后带着
+      //   空的 boxPatch 往下走（铁律八：响亮地记，但别把一次降级升格成一次失败）。
+      // ★ 只对**序数方案**跑：编号方案的人偶身上印着数字，套用侧靠号找人，框对它没用；
+      //   而 markBoxesPayload 也会因为 markSlots 为空整份不出 —— 跑了就是白花钱。
+      //
+      // ★★★ 这一发走 `callArk`（**不计费**），不是 `chargedArkCall` —— 这是本段最要紧的
+      //   一处取舍，别"顺手改回去统一一下"：
+      //   ① 「**钱全在阶段一花掉，取回结果一分不加**」是这条链路已经钉死的承诺
+      //      （tests 里有同名用例）。它不是洁癖：finish 是一条**可以重来**的路
+      //      （转存失败、用户点两次、两台实例同时收到），一旦它会花钱，"重试取件"
+      //      就变成了一件用户不敢做的事，而卡在中间的人只能眼看着自己付过费的视频拿不回来。
+      //   ② 这一发实测约 1.6k token（真实账目里是 **400 token**），而同一次白模化的总账是
+      //      3,760 万 token —— 占 **0.001%**。为它破一条清晰的承诺、在报价里多一行、
+      //      在编辑页多一句文案，是笔糟糕的交易。我们自己吃掉。
+      //   ③ 于是它也**不进报价**（App 的 blockoutizeCost 一个字不用改）：报价里没有它、
+      //      账单上也没有它，两边一致。反过来"报了却不一定收"才是本仓最忌的那种含糊。
+      //   ⚠ 不计费 ≠ 不设边界：model 在这里是**写死的常量**（用户碰不到），
+      //   且这一发严格 1:1 挂在一次已经付过费的 finish 上，没有被放大的路径。
+      let boxPatch = {};
+      if (BranchTemplate.isOrdinalMark(claimed)) {
+        try {
+          const atSec = blockout.boxFrameSec(outMeta.duration);
+          const frameUrl = buildOutFrameUrl(moved.receipt.public_id, atSec, moved.receipt.version);
+          const got = frameUrl ? await blockout.fetchFrameDataUrl(frameUrl) : { ok: false, reason: "no-cloud" };
+          if (!got.ok) {
+            console.warn(`[blockoutize] 量框抽帧失败 ${moved.receipt.public_id}@${atSec}s: ${got.reason}`);
+          } else {
+            const boxOut = await callArk({
+              path: "/chat/completions",
+              body: {
+                model: VISION_MODEL,
+                // ★ 本仓实测：chat 必须显式关 thinking，否则回包结构与耗时都变
+                thinking: { type: "disabled" },
+                max_tokens: 600,
+                messages: [
+                  { role: "system", content: blockout.BOX_VISION_SYSTEM },
+                  {
+                    role: "user",
+                    content: [
+                      { type: "text", text: blockout.boxPrompt(claimed.markSlots.length) },
+                      { type: "image_url", image_url: { url: got.dataUrl } },
+                    ],
+                  },
+                ],
+              },
+            });
+            if (boxOut.status < 200 || boxOut.status >= 300) {
+              console.warn(`[blockoutize] 量框调用失败 HTTP ${boxOut.status}，拖拽层不开`);
+            } else {
+              const parsed = JSON.parse(boxOut.text || "{}");
+              const boxes = blockout.parseBoxes(parsed?.choices?.[0]?.message?.content ?? "", claimed.markSlots.length);
+              if (boxes.length) boxPatch = { markBoxes: boxes, markBoxAtSec: atSec };
+            }
+          }
+        } catch (e) {
+          console.warn(`[blockoutize] 量框整段出错，拖拽层不开：${String(e?.message || e).slice(0, 160)}`);
+        }
+      }
+
       // ── ⑨ 建模板（pending，试炼闸照旧）────────────────────────────────
       let doc;
       try {
@@ -989,14 +1074,16 @@ router.post(
             bytes: outMeta.bytes,
             cloudinaryPublicId: moved.receipt.public_id,
           },
-          // ★ roles / source / markColors 全部来自**凭据**，不是客户端这一发的 body
-          //   （body 里只有 jobId）。markColors 尤其：它记的是**阶段一真正发出去的那套**，
+          // ★ roles / source / markSlots 全部来自**凭据**，不是客户端这一发的 body
+          //   （body 里只有 jobId）。markSlots 尤其：它记的是**阶段一真正发出去的那套**，
           //   在这里重新推断的话，推断结果与那段视频实际的样子可能不一致，且零报错。
           roles: claimed.roles,
           source: claimed.source,
           // ★ 在途的老凭据没有这一位 → 这里也不写 → 建出编号方案模板 → **正确**
           //   （它的白模视频上印的确实是数字）。所以用存在性展开，绝不 `|| []`。
-          ...(BranchTemplate.isColorMark(claimed) ? { markColors: claimed.markColors } : {}),
+          ...(BranchTemplate.isOrdinalMark(claimed) ? { markSlots: claimed.markSlots } : {}),
+          // 画面位置框（⑧b 量出来才有；量不出来就整份没有 → 拖拽层关着，点列表照常）
+          ...boxPatch,
           blockoutJobId: claimed._id,
           status: "pending",
           provenAt: null,
@@ -1082,8 +1169,8 @@ router.get("/templates/blockoutize/pending", requireAuth, blockoutPendingLimit, 
           durSec: Number(d.source?.durSec || 0),
           roles: rolesPayload(d.roles),
           // ★ 待取回列表里也要出：用户可能在这里直接看到"这一发认出了谁"，
-          //   而该显示色块还是数字取决于这一位（真有才出，同 toTemplatePayload）
-          ...(BranchTemplate.isColorMark(d) ? { markColors: markColorsPayload(d.markColors) } : {}),
+          //   而该显示位置措辞还是数字取决于这一位（真有才出，同 toTemplatePayload）
+          ...(BranchTemplate.isOrdinalMark(d) ? { markSlots: markSlotsPayload(d.markSlots) } : {}),
           createdAt: d.createdAt,
           expiresAt: d.expiresAt,
           // 剩余时间两种形态都给：App 要画倒计时（秒），也要直接显示一句人话
@@ -1183,9 +1270,9 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
     // ★★ 标记核对闸（白模 V2）：与上面的试炼闸是**两道独立的门**，别合并、别互相代替。
     //   试炼闸问的是「这个模板能不能出片」，这道门问的是「列表里的标记与画面上人偶身上
     //   的标记对得上吗」—— 试炼那一发作者自己可以一张卡都不挂，跑通了也说明不了标记对。
-    //   标记错的后果没有任何报错：套用者给"绿色位"挂上张三，模型老老实实换了画面上的
-    //   绿色人偶（那可能是别人），钱照扣。判据只有 rolesNeedConfirm 一处（V1 天然为 false）。
-    // ★ 措辞按方案分支（rolesConfirmHint 一处实现）：颜色模板说"核对颜色"、老模板说
+    //   标记错的后果没有任何报错：套用者给"从左数第3个"挂上张三，模型老老实实换了画面上
+    //   从左数第 3 个人偶（那可能是别人），钱照扣。判据只有 rolesNeedConfirm 一处（V1 天然为 false）。
+    // ★ 措辞按方案分支（rolesConfirmHint 一处实现）：序数模板说"从左往右数"、老模板说
     //   "核对编号"。两代各有各的指路，说错了作者会盯着一个空白的部位找不到东西。
     if (BranchTemplate.rolesNeedConfirm(doc)) {
       badRequest(BranchTemplate.rolesConfirmHint(doc));
@@ -1222,26 +1309,29 @@ router.patch("/templates/:id/unpublish", requireAuth, async (req, res, next) => 
 //
 // PATCH /api/branch/templates/:id/roles   body: { roles: [{ label, desc }] }
 //
-// ★★ 为什么要有这条端点：白模化落库那一刻的 label 是**服务端按视觉清单顺序发的猜测**
-//   （编号时代是 1..N，颜色时代是调色板前 N 种），而成片上人偶身上的标记不保证与它
-//   逐一对应 —— 编号实测稳定但不连续（一发四人实出 1/2/4/5）、还会重号；颜色实测
-//   命中率只有 **~57%**（7 发里 4 发全对）。两者错位时，套用者给"第三个位子"挂上张三，
-//   模型会老老实实换掉画面上那个标记对应的人（另一个人），**钱照扣、零报错**。
+// ★★ 为什么要有这条端点：白模化落库那一刻的 label 是**服务端按视觉那一步的清单发的猜测**
+//   （编号时代是 1..N，序数时代是按视觉估的横向位置排出来的名次），而成片上那几个人偶
+//   不保证与它逐一对应 —— 编号实测稳定但不连续（一发四人实出 1/2/4/5）、还会重号；
+//   序数则要看视觉估的横向位置准不准，以及有没有中途入场的路人把后面所有人挤走一位。
+//   错位时套用者给"从左数第3个"挂上张三，模型会老老实实换掉画面上那个位置的人
+//   （另一个人），**钱照扣、零报错**。
 //   所以标记必须由**看得见画面的人**确认：这条端点收的不是数据，是作者的确认。
 // ★ 它收得起客户端提交的 roles（与"建模板/白模化一律不收"不矛盾），因为这份输入
 //   **碰不到钱**：refVideo/source/durSec 一个都不经它，r2v 的计价输入时长与它无关。
-//   ⚠ 但它**不收 markColors**（方案位）：那是历史事实不是作者的意见，收了就等于让他
-//   把一个颜色模板标成编号模板，套用侧当场整份错且零报错（zod 那边刻意没声明它）。
+//   ⚠ 但它**不收 markSlots**（方案位）：那是历史事实不是作者的意见，收了就等于让他
+//   把一个序数模板标成编号模板，套用侧当场整份错且零报错（zod 那边刻意没声明它）。
 // ★ 三道门：仅作者（身份只认 ownerId）、仅 **pending**、仅**已有角色位**的模板。
 //
 // ★★ 「删掉一个角色位」是这条端点的**一等操作**，不是副作用（2026-08-15 明确，
-//   换成颜色之后**更重要**了 —— 命中率只有 ~57%，删位是唯一不用再花钱的修复）：
-//   编号时代同一段 5 人素材实出过 2/2/1/1/5（两组重号）与 3/1/1/4/5；颜色时代最常见的
-//   两种错是"画面正中央那个最像主角的人根本没被换成人偶"（那个颜色在画面上是空的）
-//   与"相邻两个颜色互换"。也就是说**画面上可能有两个人偶带着同一个标记，或者某个
-//   登记了的标记在画面上根本不存在**。作者对着画面能做的唯一修复就是：把找得到的
-//   改对，把**找不到的那几个位子删掉**（5 个位退成 3~4 个能用的）。
-//   没有这条路，作者面对两个「绿色」时只剩"再花一次钱重炼整段"。
+//   两次换代之后都还成立 —— 删位是唯一不用再花钱的修复）：
+//   编号时代同一段 5 人素材实出过 2/2/1/1/5（两组重号）与 3/1/1/4/5；序数时代对应的
+//   两种错是"视觉登记了一个人、白模化那一发却没把他做出来"（那个位子在画面上是空的）
+//   与"相邻两位对调"。也就是说**某个登记了的位子在画面上可能根本不存在**。
+//   作者对着画面能做的唯一修复就是：把找得到的改对，把**找不到的那几个位子删掉**。
+//   没有这条路，作者只剩"再花一次钱重炼整段"。
+// ⚠⚠ 序数时代**多一条前两代没有的后果**：删掉一个位子之后，画面上如果确实少了那个
+//   人偶，它右边所有位子的序数都要往左挪一位。这句话由 rolesConfirmHint 与 App 侧
+//   核对面板负责说出来；这里只负责**原样收下作者提交的那一份**，绝不替他重排。
 // ★★ 而"改号"与"删位"必须**同一次提交**，这直接决定了不新开 DELETE 端点：
 //   要把库里的 1,2,3,4,5 改成画面真实的 2,1,5，任何"先改后删"的中间态都会撞下面
 //   那道重号闸（把 1 号位改成 "2" 时库里已经有 "2"）；而"先删后改"是两次写，
@@ -1312,18 +1402,19 @@ router.patch(
       // ★ 这句话必须带**下一步**：撞上它的作者多半正是遇到了"画面上两个人偶都印着
       //   同一个号"（实测 2/2/1/1/5），而他手上真正能做的事是删掉其中一个位子。
       //   只说"不许重复"等于把人堵在原地，他会以为唯一出路是重炼（再花一次钱）。
-      // ★ label 装的就是标记 token（颜色模板是色名、老模板是数字），所以这道闸
-      //   **自动就是颜色重号闸**，一行代码都不用加 —— 这正是"一个角色位只有一个身份"
-      //   换来的好处（若 label 留数字、另设 color，就得在这里再写一条颜色重号闸）。
+      // ★ label 装的就是标记 token（序数模板是位置措辞、老模板是数字），所以这道闸
+      //   **自动就是位置重复闸**，一行代码都不用加 —— 这正是"一个角色位只有一个身份"
+      //   换来的好处（若 label 留数字、另设 pos，就得在这里再写一条位置重复闸）。
       const seen = new Set();
       const dup = roles.find((r) => (seen.has(r.label) ? true : (seen.add(r.label), false)));
       if (dup) {
-        // 措辞按方案分支：老模板说"编号…都印着 X"，颜色模板说"颜色…都是 X 色"。
-        // 说错了的表现是作者盯着彩色人偶找数字（或反过来），而那与功能坏了长得一样。
+        // 措辞按方案分支：老模板说"编号…都印着 X"，序数模板说"位置…指到同一个人偶"。
+        // 说错了的表现是作者盯着一个没有任何记号的白人偶找数字（或反过来），
+        // 而那与功能坏了长得一样。
         badRequest(
-          BranchTemplate.isColorMark(doc)
-            ? `颜色「${dup.label}」出现了两次。每个角色位的颜色必须各不相同，否则套用你模板的人给它们挂卡时会互相覆盖。` +
-                `如果画面上真的有两个人偶都是「${dup.label}」，请把其中一个位子删掉——留下的那个照样能挂卡，但挂上的卡可能会把这两个人一起换掉。`
+          BranchTemplate.isOrdinalMark(doc)
+            ? `位置「${dup.label}」出现了两次。每个角色位必须指向画面上不同的人偶，否则套用你模板的人给它们挂卡时会互相覆盖。` +
+                `请把其中一个位子改成它真正的位置，或者直接删掉——留下的那个照样能挂卡。`
             : `编号「${dup.label}」出现了两次。每个角色位的编号必须各不相同，否则套用你模板的人给它们挂卡时会互相覆盖。` +
                 `如果画面上真的有两个人偶都印着「${dup.label}」，请把其中一个位子删掉——留下的那个照样能挂卡，但挂上的卡可能会把这两个人一起换掉。`,
         );
@@ -1334,12 +1425,16 @@ router.patch(
       //   这种最常见的修正根本表达不出来。**"少给一条"就是删除的唯一表达形式。**
       //
       // ★★ 剩下的 label 一个字都不许动 —— 不排序、不补号、不重编、不改顺序：
-      //   · label **就是画面上印在人偶头上的那个数字**，它是"把卡挂到这个人偶身上"的
-      //     唯一连接键（roleSchema 连 _id 都没有，label 就是这个位子的全部身份）。
+      //   · label **就是画面上那个标记本身**（老模板是人偶头上的数字，序数模板是
+      //     "从左数第几个"这句话），它是"把卡挂到这个人偶身上"的唯一连接键
+      //     （roleSchema 连 _id 都没有，label 就是这个位子的全部身份）。
       //     删掉 3 号之后把 5 号顺手改成 4，等于把套用者挂给 5 号的卡换到另一个人身上，
-      //     **而两边都不会报错** —— 模型不会拒绝一个"合法但指错人"的编号，钱照扣。
-      //   · 实测编号本来就**不连续**（1/2/4/5 是正常输出，不是 bug）。删位之后剩下
-      //     1/2/4/5 里的 1/4/5 完全正常，"看着不连续"不是要修的东西。
+      //     **而两边都不会报错** —— 模型不会拒绝一个"合法但指错人"的标记，钱照扣。
+      //   · 实测编号本来就**不连续**（1/2/4/5 是正常输出，不是 bug）；序数同理，
+      //     删掉中间一位之后剩下 `最左边 / 从左数第4个` 完全正常。
+      //     ⚠ 序数方案下"该不该往左挪"是**只有作者看得见画面才答得出**的问题
+      //     （挪 = 那个人偶确实不存在；不挪 = 人偶在、只是不打算给它挂卡）。
+      //     服务端替他猜的话，猜错就是整份错位且零报错 —— 所以我们不猜，只如实收下。
       //   · **顺序也不许动**：App 侧按 roles 原序落参考图（materials），这个顺序决定
       //     参考图预算不够时谁先被挤掉，也是编辑页挂卡列表的显示顺序。
       //   所以这里只做 map，绝不 sort、绝不按下标重新赋 label。测试里用**数组相等**
@@ -1349,10 +1444,11 @@ router.patch(
       //   那就是确认动作本身，不该再要求他单独按一次"确认"。
       // ★ **不清 provenAt**：试炼证明的是"这个模板出得了片"，与角色位个数无关。
       //   顺手清掉 = 让作者为了删一个画面上根本不存在的号，再付一次 r2v 的钱。
-      // ★★ **只写 doc.roles，绝不碰 doc.markColors**：那一位记的是"当初那段视频上
-      //   究竟印了什么"，是历史事实，不是作者的意见。作者一按「核对无误」就把方案位
-      //   擦掉的话，套用侧当场从颜色路退回编号路（输入框里冒出 `编号绿色=凛`），
-      //   而库里、日志里、回包里**没有任何一处会报错**。zod 那边同样刻意不收它。
+      // ★★ **只写 doc.roles，绝不碰 doc.markSlots**：那一位记的是"当初那段视频上
+      //   究竟做出了哪几个位置"，是历史事实，不是作者的意见。作者一按「核对无误」就把
+      //   方案位擦掉的话，套用侧当场从序数路退回编号路（输入框里冒出
+      //   `编号从左数第3个=凛`），而库里、日志里、回包里**没有任何一处会报错**。
+      //   zod 那边同样刻意不收它。
       doc.roles = roles.map((r) => ({ ...r, labelConfirmed: true }));
       await doc.save();
       res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });

@@ -222,10 +222,12 @@ describe("跨仓档位系数一致性（app 的报价 vs 服务端的结算）",
   //   的 mult 却没改这边，测试照样全绿，用户看到的是"报价 216k、扣了 1,015,200"。
   //   抄一份的代价是改价时要动两个仓，但那正是我们想要的提醒（payOrder.spec.js
   //   末尾的价目表用的是同一招）。
+  // ⚠ 2026-08-16 按 8 月账单改过 fast 与 hd（0.3→4.2/15、1.6→23/15）。**分数形态要照抄**：
+  //   写成 0.28 / 1.5333 的话这条 toEqual 会因为浮点尾数红，而那与"两仓不一致"长得一模一样。
   const APP_VIDEO_TIERS = [
-    { id: "fast", model: "doubao-seedance-1-0-pro-fast-251015", mult: 0.3 },
+    { id: "fast", model: "doubao-seedance-1-0-pro-fast-251015", mult: 4.2 / 15 },
     { id: "std", model: "doubao-seedance-1-0-pro-250528", mult: 1 },
-    { id: "hd", model: "doubao-seedance-2-0-mini-260615", mult: 1.6 },
+    { id: "hd", model: "doubao-seedance-2-0-mini-260615", mult: 23 / 15 },
     { id: "ultra", model: "doubao-seedance-2-5-260628", mult: 4.7 },
   ];
 

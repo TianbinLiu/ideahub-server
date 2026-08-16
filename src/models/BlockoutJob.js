@@ -125,8 +125,9 @@ const blockoutJobSchema = new mongoose.Schema(
     source: { type: jobSourceSchema, required: true },
     roles: { type: [roleDraftSchema], required: true },
     /**
-     * 阶段一发白模化提示词时**真正写进那段话的那份颜色清单**（逐字、按序）。
-     * 存在且非空 = 这一发是**颜色方案**；缺失 = 编号方案（判否定，见 BranchTemplate.isColorMark）。
+     * 这一发白模化产物里**一共有哪几个可寻址的位置**（逐字、按画面从左到右），
+     * 就是阶段一 `roles.map(r => r.label)`。
+     * 存在且非空 = 这一发是**序数方案**；缺失 = 编号方案（判否定，见 BranchTemplate.isOrdinalMark）。
      *
      * ★★ 为什么非在**阶段一**存不可（这是本字段存在的全部理由）：白模化提示词在阶段一
      *   就发出去了，模板却要到阶段二 finish 才建出来，而凭据 TTL 是 24 小时 ——
@@ -137,7 +138,7 @@ const blockoutJobSchema = new mongoose.Schema(
      * ★ 在途的老 job 天然没有这一位 → finish 出编号方案模板 → **正确**
      *   （它的视频上印的确实是数字）。所以 `default: undefined`，绝不给空数组默认值。
      */
-    markColors: { type: [String], default: undefined },
+    markSlots: { type: [String], default: undefined },
     /**
      * 这一发**实际喂进视觉模型的帧数**（"看帧那一笔"花在几帧上）。
      *
