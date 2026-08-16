@@ -125,6 +125,20 @@ const blockoutJobSchema = new mongoose.Schema(
     source: { type: jobSourceSchema, required: true },
     roles: { type: [roleDraftSchema], required: true },
     /**
+     * 阶段一发白模化提示词时**真正写进那段话的那份颜色清单**（逐字、按序）。
+     * 存在且非空 = 这一发是**颜色方案**；缺失 = 编号方案（判否定，见 BranchTemplate.isColorMark）。
+     *
+     * ★★ 为什么非在**阶段一**存不可（这是本字段存在的全部理由）：白模化提示词在阶段一
+     *   就发出去了，模板却要到阶段二 finish 才建出来，而凭据 TTL 是 24 小时 ——
+     *   **发版正好夹在两阶段之间**时，只有"凭据里记着当初发的是哪一套"才能保证
+     *   finish 出来的模板与那段视频真正的样子一致。让 finish 去"推断"的话，
+     *   推断结果与实际发出去的提示词可能不一致，而**零报错**：套用侧照着错的那套
+     *   写提示词，画面上根本没有那种记号，钱花完拿到一段没换人的片子。
+     * ★ 在途的老 job 天然没有这一位 → finish 出编号方案模板 → **正确**
+     *   （它的视频上印的确实是数字）。所以 `default: undefined`，绝不给空数组默认值。
+     */
+    markColors: { type: [String], default: undefined },
+    /**
      * 这一发**实际喂进视觉模型的帧数**（"看帧那一笔"花在几帧上）。
      *
      * ★ 存它不是为了 finish（建模板一点用不上），是为了**受理回执能重放**：阶段一重试
