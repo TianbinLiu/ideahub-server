@@ -18,6 +18,9 @@
 //   "有的模板主角没被白模化"，而那要真花一次钱才看得见。
 const { cloudinary } = require("../config/cloudinary");
 const { callArk, T_POLL } = require("./arkGateway.service");
+// ★ 抽帧地址的拼法只有 utils/templateVideoAsset 一处（铁律六）。这里 require 它不成环：
+//   那个模块只依赖 config/cloudinary。
+const { buildOutFrameUrl } = require("../utils/templateVideoAsset");
 
 // ── ① 预热（F9）─────────────────────────────────────────────────────
 //
@@ -363,6 +366,37 @@ function boxFrameSec(realDurSec) {
   // 右端开区间：`dur` 那一刻已经不在片子里了
   return Math.min(quantSec(dur / 2), quantSec(Math.max(0, dur - FRAME_QUANT_SEC)));
 }
+
+/**
+ * 量框的**候选帧**（按先后试，第一个能给出正好 M 个框的那一帧胜出）。
+ *
+ * ★★★ 为什么必须有候选而不是只看正中间那一帧（2026-08-17 实跑逼出来的）：
+ *   量框成立的前提是"这一帧里**所有人都在画面里**"。而人是会入场、离场、被挡住的 ——
+ *   作者那段群舞素材就是：认人（看 8 帧）认出 7 个，正中间那一帧只站着 5 个，
+ *   于是 `parseBoxes` 判「要 7 个、解析出 5 个」整份丢弃，拖拽层白白关掉。
+ *   闸门没判错 —— **错的是我们只给了它一次机会**。
+ * ★ 顺序是「中间 → 前三分之一 → 后三分之一」：中间最可能人齐（离两端的入场/离场最远），
+ *   不中再往两边找。三个够了 —— 再多是拿钱换一个越来越小的概率，而这一发是要计费的。
+ * ★ 量化 + 去重 + 掐在片内：三个候选可能在短片子上撞成同一个数（4 秒的片子），
+ *   撞了就只试一次，别把同一帧问三遍。
+ * ⚠ 谁改这里的**个数**，就要同步 App 的报价（`economy.blockoutTemplateCost` 那一侧
+ *   按"最多几发 chat"报）——报价与实收逐条相等是本仓头号纪律。
+ */
+function boxFrameCandidates(realDurSec) {
+  const dur = Number(realDurSec);
+  if (!Number.isFinite(dur) || dur <= 0) return [0];
+  const maxT = quantSec(Math.max(0, dur - FRAME_QUANT_SEC));
+  const out = [];
+  for (const frac of [1 / 2, 1 / 3, 2 / 3]) {
+    const t = Math.min(quantSec(dur * frac), maxT);
+    if (!out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
+/** 量框最多试几帧 —— **报价的依据**（App 侧按它算"最多几发 chat"）。
+ *  ★ 与 `boxFrameCandidates` 的长度是同一件事，所以从它取，别另写一个 3。 */
+const BOX_FRAME_TRIES = boxFrameCandidates(60).length;
 
 /** 量框那一发的系统提示词。★ 与 VISION_SYSTEM 分开：那一发要的是"这些人长什么样"，
  *  这一发要的是"他们在画面的哪儿"，混成一个会让模型两件事都做得含糊。 */
@@ -949,6 +983,90 @@ async function transferToCloudinary(remoteUrl, publicId) {
   }
 }
 
+/**
+ * 量框整段 —— **唯一实现**，V1（作者自带参考视频）与 V2（白模化产物）共用。
+ *
+ * ★★★ 提成一处的理由不是整洁：这段逻辑有五个各自带着理由的细节（帧宽 1024、
+ *   按**全部 M 个人**问、三道解析闸、`allSlots.indexOf` 挑框、换帧重试），
+ *   而它原来在两条路上各抄了一份。抄两份的下场在本仓已经有前科 ——
+ *   改一处漏一处**没有任何症状**，只是其中一条路的框开始悄悄错位。
+ *
+ * @param {object} o
+ * @param {string} o.publicId      要量的那段视频（产物 / 作者自带的参考视频）
+ * @param {string|number} [o.version]
+ * @param {number} o.durSec        **真实**时长（小数）。别喂计价锚点 —— ceil 之后
+ *                                 候选帧可能落到片尾之外
+ * @param {string[]} o.allSlots    视觉认出的**全部 M 个人**的措辞表（截断之前）
+ * @param {string[]} o.labels      真正要挂卡的那几个位子（`markSlots`）
+ * @param {string} o.model         打哪个模型。**由调用方给**：白名单（modelAllowed）读的是
+ *                                 调用点那个常量，在 service 里抄第二份就等于两处各说各的
+ * @param {(body:object)=>Promise<{ok:boolean,accepted?:boolean,status?:number,text?:string}>} o.send
+ *        发这一发的方式。**由调用方决定计不计费**：V2 挂在一次已付费的 finish 上走 callArk，
+ *        V1 没有任何付费调用可挂，必须走 chargedArkCall（理由见两处调用点）。
+ * @returns {Promise<{ boxes: object[], atSec: number, tries: number, why: string }>}
+ *          `boxes` 为空 = 这次量不出来（调用方退回点列表，并照实说一句）
+ */
+async function measureBoxes({ publicId, version, durSec, allSlots, labels, model, send }) {
+  const cands = boxFrameCandidates(durSec);
+  let why = "";
+  let tries = 0;
+  for (const atSec of cands) {
+    const url = buildOutFrameUrl(publicId, atSec, version);
+    const got = url ? await fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
+    if (!got.ok) {
+      why = `抽帧失败(${got.reason})`;
+      console.warn(`[blockoutize] 量框抽帧失败 ${publicId}@${atSec}s: ${got.reason}`);
+      continue;
+    }
+    tries += 1;
+    const out = await send({
+      model,
+      // ★ 本仓实测：chat 必须显式关 thinking，否则回包结构与耗时都变
+      thinking: { type: "disabled" },
+      max_tokens: 600,
+      messages: [
+        { role: "system", content: BOX_VISION_SYSTEM },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: boxPrompt(allSlots.length) },
+            { type: "image_url", image_url: { url: got.dataUrl } },
+          ],
+        },
+      ],
+    });
+    // ★★ `ok` 与 `accepted` 是两件事，两道都要判：只判 ok 的话，上游非 2xx 会带着一段
+    //   错误 JSON 走进 parseBoxes，结果是"数目对不上"—— 一句假话（2026-08-17 撞过）
+    if (!out.ok || out.accepted === false) {
+      why = `调用失败(status=${out.status})`;
+      console.warn(`[blockoutize] 量框第 ${tries} 帧调用失败：status=${out.status} ${String(out.text ?? "").slice(0, 160)}`);
+      continue;
+    }
+    let all = [];
+    try {
+      const parsed = JSON.parse(out.text || "{}");
+      all = parseBoxes(parsed?.choices?.[0]?.message?.content ?? "", allSlots.length);
+    } catch {
+      why = "回包不是 JSON";
+      continue;
+    }
+    if (!all.length) {
+      // parseBoxes 自己已经把原因 warn 出来了（坏行 / 数目不符 / 相邻框套一起）
+      why = `第 ${atSec}s 那一帧没量成`;
+      continue;
+    }
+    // ★ 从 M 个框里挑出角色位对应的那几个。indexOf 找不到 = 这份凭据自相矛盾，整份不要
+    const picked = labels.map((l) => all[allSlots.indexOf(l)] ?? null);
+    if (!picked.every(Boolean)) {
+      console.warn(`[blockoutize] 量框：${all.length} 个框里挑不齐 ${labels.length} 个角色位，整份丢弃`);
+      why = "措辞表与角色位对不上";
+      continue;
+    }
+    return { boxes: picked, atSec, tries, why: "" };
+  }
+  return { boxes: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧" };
+}
+
 module.exports = {
   PREWARM_TRIES,
   prewarm,
@@ -961,6 +1079,9 @@ module.exports = {
   BLOCKOUT_ROLE_MAX,
   ordinalSlots,
   boxFrameSec,
+  boxFrameCandidates,
+  BOX_FRAME_TRIES,
+  measureBoxes,
   BOX_VISION_SYSTEM,
   boxPrompt,
   parseBoxes,

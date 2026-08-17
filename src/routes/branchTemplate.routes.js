@@ -305,56 +305,35 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
           if (!roles.length) {
             rolesNote = "AI 没在这段视频里认出人物，所以这个模板没有可挂卡的角色位（套用时用一句话描述要换谁）。";
           } else if (allSlots) {
-            // ★ 量框与 V2 的 ⑧b 逐字同构：按**全部 M 个人**问、按 indexOf 挑出角色位那几个
-            const atSec = blockout.boxFrameSec(meta.duration);
-            const frameUrl = buildOutFrameUrl(own.publicId, atSec, resource.version);
-            const got = frameUrl ? await blockout.fetchFrameDataUrl(frameUrl) : { ok: false, reason: "no-cloud" };
-            if (!got.ok) {
-              console.warn(`[branchTemplate] V1 量框抽帧失败 ${own.publicId}@${atSec}s: ${got.reason}`);
-            } else {
-              const boxOut = await chargedArkCall({
-                user: req.user,
-                modelAllowed: (m) => m === VISION_MODEL,
-                kind: "chat",
-                path: "/chat/completions",
-                body: {
-                  model: VISION_MODEL,
-                  thinking: { type: "disabled" },
-                  max_tokens: 600,
-                  messages: [
-                    { role: "system", content: blockout.BOX_VISION_SYSTEM },
-                    {
-                      role: "user",
-                      content: [
-                        { type: "text", text: blockout.boxPrompt(allSlots.length) },
-                        { type: "image_url", image_url: { url: got.dataUrl } },
-                      ],
-                    },
-                  ],
-                },
-              });
-              // 同上：`ok` 与 `accepted` 两道都要判（只判 ok 的话，上游非 2xx 会带着
-              // 一段错误 JSON 走进 parseBoxes，结果是"数目对不上"—— 又一句假话）
-              if (!boxOut.ok || !boxOut.accepted) {
-                console.warn(
-                  `[branchTemplate] V1 量框失败：ok=${boxOut.ok} accepted=${boxOut.accepted} ` +
-                    `status=${boxOut.status} body=${String(boxOut.text ?? "").slice(0, 200)}`,
-                );
-              } else {
-                const bp = JSON.parse(boxOut.text || "{}");
-                const all = blockout.parseBoxes(bp?.choices?.[0]?.message?.content ?? "", allSlots.length);
-                const labels = roles.map((r) => r.label);
-                const picked = all.length ? labels.map((l) => all[allSlots.indexOf(l)] ?? null) : [];
-                if (picked.length && picked.every(Boolean)) {
-                  boxPatch = { markSlots: labels, markBoxes: picked, markBoxAtSec: atSec };
-                }
-              }
-            }
+            // ★ 量框整段走 `blockout.measureBoxes`（V1/V2 唯一实现，自带换帧重试）。
+            //   ★★ 这条路必须走 **chargedArkCall**：V2 的量框能不计费，是因为它 1:1 挂在
+            //   一次已经付过 r2v 的 finish 上；V1 一分钱付费调用都没有，照抄"我们自己吃掉"
+            //   等于给一个免费端点接上打上游的能力，而账单上没有一行解释得了它。
+            const labels = roles.map((r) => r.label);
+            const m = await blockout.measureBoxes({
+              publicId: own.publicId,
+              version: resource.version,
+              durSec: meta.duration,
+              allSlots,
+              labels,
+              model: VISION_MODEL,
+              send: (body) =>
+                chargedArkCall({
+                  user: req.user,
+                  modelAllowed: (x) => x === VISION_MODEL,
+                  kind: "chat",
+                  path: "/chat/completions",
+                  body,
+                }),
+            });
+            boxPatch = m.boxes.length
+              ? { markSlots: labels, markBoxes: m.boxes, markBoxAtSec: m.atSec }
+              : { markSlots: labels };
             // 有角色位、没框 → 也要说一句：拖拽层不开是**设计**，不是坏了
-            if (!boxPatch.markBoxes) {
-              boxPatch = { markSlots: roles.map((r) => r.label) };
+            if (!m.boxes.length) {
               rolesNote =
-                `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置，` +
+                `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置` +
+                `（试了 ${m.tries} 帧：${m.why}），` +
                 "所以挂卡时不能直接拖到画面上（在下面的列表里点着挂一样能用）。";
             }
           }
@@ -1189,51 +1168,32 @@ router.post(
       const allSlots = Array.isArray(claimed.visionSlots) ? claimed.visionSlots : null;
       if (BranchTemplate.isOrdinalMark(claimed) && allSlots && allSlots.length >= claimed.markSlots.length) {
         try {
-          const atSec = blockout.boxFrameSec(outMeta.duration);
-          const frameUrl = buildOutFrameUrl(moved.receipt.public_id, atSec, moved.receipt.version);
-          const got = frameUrl ? await blockout.fetchFrameDataUrl(frameUrl) : { ok: false, reason: "no-cloud" };
-          if (!got.ok) {
-            console.warn(`[blockoutize] 量框抽帧失败 ${moved.receipt.public_id}@${atSec}s: ${got.reason}`);
-          } else {
-            const boxOut = await callArk({
-              path: "/chat/completions",
-              body: {
-                model: VISION_MODEL,
-                // ★ 本仓实测：chat 必须显式关 thinking，否则回包结构与耗时都变
-                thinking: { type: "disabled" },
-                max_tokens: 600,
-                messages: [
-                  { role: "system", content: blockout.BOX_VISION_SYSTEM },
-                  {
-                    role: "user",
-                    content: [
-                      { type: "text", text: blockout.boxPrompt(allSlots.length) },
-                      { type: "image_url", image_url: { url: got.dataUrl } },
-                    ],
-                  },
-                ],
-              },
-            });
-            if (boxOut.status < 200 || boxOut.status >= 300) {
-              console.warn(`[blockoutize] 量框调用失败 HTTP ${boxOut.status}，拖拽层不开`);
-            } else {
-              const parsed = JSON.parse(boxOut.text || "{}");
-              const all = blockout.parseBoxes(parsed?.choices?.[0]?.message?.content ?? "", allSlots.length);
-              // ★ 从 M 个框里挑出角色位对应的那几个。`indexOf` 找不到（label 与措辞表
-              //   对不上，说明这张凭据自相矛盾）→ 整份不要，绝不塞个 undefined 进去
-              const picked = all.length
-                ? claimed.markSlots.map((label) => all[allSlots.indexOf(label)] ?? null)
-                : [];
-              const boxes = picked.length && picked.every(Boolean) ? picked : [];
-              if (!boxes.length && all.length) {
-                console.warn(
-                  `[blockoutize] 量框：${all.length} 个框里挑不齐 ${claimed.markSlots.length} 个角色位` +
-                    `（措辞表与 markSlots 对不上），整份丢弃（拖拽层不开）`,
-                );
-              }
-              if (boxes.length) boxPatch = { markBoxes: boxes, markBoxAtSec: atSec };
-            }
-          }
+          // ★ 量框整段走 `blockout.measureBoxes`（V1/V2 唯一实现，自带换帧重试）——
+          //   在此之前这段在两条路上各抄了一份，而它有五个各自带着理由的细节，
+          //   抄两份改一处漏一处**没有任何症状**，只是其中一条路的框开始悄悄错位。
+          const m = await blockout.measureBoxes({
+            publicId: moved.receipt.public_id,
+            version: moved.receipt.version,
+            durSec: outMeta.duration,
+            allSlots,
+            labels: claimed.markSlots,
+            model: VISION_MODEL,
+            // ★★★ 这一路**不计费**（callArk 而非 chargedArkCall）：它 1:1 挂在一次已经
+            //   付过 r2v 的 finish 上，而「钱全在阶段一花掉、取回结果一分不加」是这条
+            //   链路已经钉死的承诺 —— finish 是可以重来的路，一旦它会花钱，
+            //   "重试取件"就成了用户不敢做的事。理由与取舍写在 App 的 economy.ts 里。
+            //   ⚠ `callArk` 只回 {status,text}，没有 ok/accepted 那两位（它是裸出网）。
+            //   这里按状态码补出来，形状与 chargedArkCall 对齐 —— 不补的话上游非 2xx
+            //   会被 measureBoxes 当成"这一帧没量成"接着试下一帧，日志里说的是错的原因。
+            send: (body) =>
+              callArk({ path: "/chat/completions", body }).then((r) => ({
+                ...r,
+                ok: true,
+                accepted: r.status >= 200 && r.status < 300,
+              })),
+          });
+          if (m.boxes.length) boxPatch = { markBoxes: m.boxes, markBoxAtSec: m.atSec };
+          else console.warn(`[blockoutize] 量框没成（试了 ${m.tries} 帧：${m.why}），拖拽层不开`);
         } catch (e) {
           console.warn(`[blockoutize] 量框整段出错，拖拽层不开：${String(e?.message || e).slice(0, 160)}`);
         }
