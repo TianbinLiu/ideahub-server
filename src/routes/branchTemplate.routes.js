@@ -1471,6 +1471,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     let boxAtSec = 0;
     let why = "";
     let tries = 0;
+    let verified = 0;
     try {
       const m = await blockout.measureRosterBoxes({
         publicId,
@@ -1493,6 +1494,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       boxAtSec = m.atSec;
       tries = m.tries;
       why = m.why;
+      verified = m.verified;
     } catch (e) {
       why = String(e?.message || e).slice(0, 160);
       console.warn(`[branchTemplate] detect-roles 整段出错 ${id}：${why}`);
@@ -1517,15 +1519,25 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
 
     // ★ 三档结果都要说清楚：全成 / 有角色位没框 / 一个都没认出来。
     //   不说的话作者只能靠"面板怎么不出现"去猜，而那与"功能坏了"长得一模一样。
-    const note = roles.length
-      ? ""
-      : `这次没认出画面里的人物（试了 ${tries} 帧：${why || "原因不明"}）。模板还在，可以再点一次重试。`;
+    // ★★ 第四档（2026-08-17 加）：认出来了、框也有，但**描述没通过唯一性自证**。
+    //   验不过的那几条只留下颜色（见 measureRosterBoxes 里的取舍），而颜色在全白素材上
+    //   等于没有信息 —— 套用时那个位子仍然只能靠序数指认，也就是 #46 那六发实拍里
+    //   会被"主角效应"压过去的那一档。作者必须当场知道自己拿到的是哪一档：不说的话，
+    //   他看到的只是几行"纯白"，与"这段素材本来就没什么可描述的"完全无法区分。
+    const note = !roles.length
+      ? `这次没认出画面里的人物（试了 ${tries} 帧：${why || "原因不明"}）。模板还在，可以再点一次重试。`
+      : verified < roles.length
+        ? `认出 ${roles.length} 个人偶，其中 ${verified} 个有能把他和别人区分开的描述（动作、和景物的位置关系），` +
+          `另外 ${roles.length - verified} 个只认出颜色 —— 那几个位子在套用时只能靠「从左数第几个」指认，` +
+          `画面里如果有一个特别显眼的人，可能会被换错。建议你在核对面板里给它们补一句认得出来的外形或动作。`
+        : "";
 
     res.json({
       ok: true,
       template: toTemplatePayload(saved, req.user),
       detected: roles.length,
       boxed: boxes.length,
+      verified,
       ...(note ? { note } : {}),
     });
   } catch (err) {

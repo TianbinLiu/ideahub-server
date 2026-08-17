@@ -1149,10 +1149,20 @@ const ROSTER_FRAMES_MAX = 5;
  *      来区分谁是谁），与这里要解决的问题不是一回事。
  *
  * ★ 序数措辞由 `ordinalSlots(M)` 生成、按 cx 升序发 —— 与另外两条路同一处实现。
- * ★ `desc` 取模型给的外观特征。全白人偶时它多半是"白色关节人偶"之类的同义句，
- *   那不是缺陷：这条路的指认全靠**位置**，desc 只是给作者核对时看的。
  *
- * @returns {Promise<{ roles: object[], boxes: object[], atSec: number, tries: number, why: string }>}
+ * ══ `desc` 现在是**多维、且验过的**（2026-08-17 改）══════════════════════════════
+ * 老版 `desc` 取模型给的一句「外观特征」，在白模素材上必然退化成 N 行一模一样的
+ * 「全白关节人偶」——那时的理由是"这条路的指认全靠位置，desc 只给作者看"。
+ * 而 #46 六发付费实拍证伪了那个前提：**素材里有一个读起来像主角的人时，序数会被压过去**
+ * （点名一个白模、被换掉的是那个红色的中央人物，两发都是）。位置一个人扛不住。
+ * ⇒ 现在这一步产出的是 `颜色、动作、与具体景物的位置关系`（生成见 rosterBoxPrompt），
+ *   并且**逐条自证过**（verifyRosterDescs）；验不过的那条退回只剩颜色。
+ * ★ 这一步只管**造出可用的描述**。它到底能不能在出片时压过"主角效应"，是 r2v 那一头的事
+ *   —— 那一发要花 ¥8.8，结论落地前别把这里的实测成绩（12/12 自证）说成"指认成功率"，
+ *   两者不是同一件事。
+ *
+ * @returns {Promise<{ roles: object[], boxes: object[], atSec: number, tries: number, why: string,
+ *   verified: number }>} `verified` = 这批里有几条描述通过了唯一性自证（其余只剩颜色）
  */
 /**
  * @param {number[]} [atSecs] 用户自己在编辑页标的帧（绝对秒）。给了就**按他的顺序**依次试，
@@ -1218,27 +1228,164 @@ async function measureRosterBoxes({ publicId, version, durSec, model, send, time
           `只登记最左边的 ${BLOCKOUT_ROLE_MAX} 个（其余挂不了卡）`,
       );
     }
+    // ★★ 唯一性自证（多花一发 chat，**就这一发**：只有胜出的那一帧才验，试错的那几帧不验）。
+    //   报价那头不用动 —— App 的 `ownRefTemplateCost` 按 ROSTER_TRIES(2)+BOX_TRIES(5)=7 发报，
+    //   而这条路实收最多是 BOX_FRAME_TRIES(5) 发认人 + 1 发自证 = 6 发，仍在报价之内。
+    //   ⚠ 余量只剩 1 发了：谁再往这条路上加一次调用，**先回去把报价加上**（本仓头号纪律
+    //   是报价 ≥ 实收，而漏加的表现是页面报 7 发、账单收 8 发，两个方向都不报错）。
+    const v = await verifyRosterDescs({ rows: kept, dataUrl: got.dataUrl, model, send, timeoutMs });
+    if (!v.ok && v.why) console.warn(`[blockoutize] 描述自证没跑成（${v.why}）—— 这一批只保留颜色`);
     const slots = ordinalSlots(kept.length);
     const roles = kept.map((r, k) => ({
       label: slots[k],
-      desc: String(r.desc || "").slice(0, ROSTER_DESC_MAX),
+      // ★★ **验过的才带动作与位置关系**，没验过的只留颜色。这不是保守，是这条链路上
+      //   唯一说得通的取舍：一条**指错人**的描述比没有描述坏得多 —— 它会在套用时
+      //   把卡换到别人身上，而画面照出、钱照收、零报错（#41 实测：歧义描述有 1/3
+      //   会塌缩成一个自信的错答）。作者在核对面板里能看见、能自己改写得更好。
+      desc: v.verified[k] ? composeRosterDesc(r) : String(r.color || "").slice(0, ROSTER_DESC_MAX),
       labelConfirmed: false,
     }));
     const boxes = kept.map((r) => ({ cx: r.cx, cy: r.cy, w: r.w, h: r.h }));
-    return { roles, boxes, atSec, tries, why: "" };
+    return { roles, boxes, atSec, tries, why: "", verified: v.verified.filter(Boolean).length };
   }
-  return { roles: [], boxes: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧" };
+  return { roles: [], boxes: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧", verified: 0 };
 }
 
-/** 「一帧里把人认全 + 量出框」的提示词。★ 坐标口径与 boxPrompt 逐字相同（千分比中心点+宽高） */
+/**
+ * 「一帧里把人认全 + 量出框」的提示词。★ 坐标口径与 boxPrompt 逐字相同（千分比中心点+宽高）
+ *
+ * ══ 2026-08-17：外观特征拆成**三项**（颜色 / 动作 / 与场景的位置关系）══════════════
+ * 原来只要一句「外观特征」，在白模素材上必然退化成七行一模一样的「全白关节人偶」——
+ * 那既帮不了作者核对，更帮不了套用时指认。实测（几分钱的一发，两段素材共 12 个人偶）：
+ *   · 群舞（6 白 + 1 红）：**颜色只能区分 3/7**、动作 7/7、位置关系 6/7
+ *   · 公园（5 个一模一样的全白）：**颜色 1/5**、动作 4/5、位置关系 5/5
+ * ⇒ 颜色在纯白素材上几乎不携带信息，但**必须照样问**：用户完全可以传一段"人偶不同色"
+ *   的白模视频（那正是这条上传路的用意），那时颜色是最省字的区分手段。真正扛事的是
+ *   **动作**与**与具体景物的位置关系**——两者合起来把 12/12 都能唯一定位（见下面
+ *   `rosterVerifyPrompt` 那一发自证）。
+ * ★★ 「不许拿人和人比」是硬要求，不是客气话：#41 实测过，比较级描述（「最高的那个」）
+ *   在换一个镜头后就不成立，而**看的人无从核对** —— 模型会带着十足的自信答错。
+ *   说景物可以（「最右那盏路灯」说的是灯不是人），这条边界要写清楚，否则它连
+ *   「站在最右那根柱子旁」都不敢写了。
+ * ★ 每项 12 字：三项 + 分隔符 ≈ 38 字，正好在落库上限 ROSTER_DESC_MAX(60) 之内，
+ *   也够套用提示词那头再切一刀（那头的预算是按 9 个角色位算的）。
+ */
 function rosterBoxPrompt() {
   return [
     "看这一帧。把画面里**每一个人物**（人偶、模特、真人都算）按**从左到右**的顺序列出来，",
-    "每人一行，格式严格为：`序号|cx|cy|w|h|外观特征`。",
+    "每人一行，格式严格为：`序号|cx|cy|w|h|颜色|动作|位置关系`。",
     "cx cy 是这个人**包围盒中心点**的坐标，w h 是包围盒的宽和高；四个数都写 0~1000 的整数，",
     "表示相对画面宽/高的千分比，画面左上角是 (0,0)、右下角是 (1000,1000)。包围盒要框住全身（含头顶与脚）。",
-    "外观特征写颜色、服装、明显道具，控制在 20 字内；认不出细节就写看得见的（如「全白关节人偶」）。",
+    "后三项各控制在 12 字内，合起来要**能把他和画面里其他人区分开**：",
+    "颜色：他整体是什么颜色（如「纯白」「浅灰」「红色」）。所有人都同一个颜色时照实写，不要编。",
+    "动作：他此刻在做什么（如「弓步前倾、双手下垂」）。不要写「站着」这种谁都符合的。",
+    "位置关系：他相对画面里**具体的东西**在哪（如「在最右那盏路灯正下方」「贴着中间那根柱子」）。",
+    "  画面里找不到可参照的东西就写「无参照物」——**不要编**。",
+    "⚠ 三项都不许拿这个人**和其他人**比（「最高的」「比别人靠前」「体型最大」都不行）：",
+    "  换个镜头就不成立。说画面里的**东西**不受这条限制（「最右那盏路灯」说的是灯，不是人）。",
     "只输出这些行，不要标题、不要解释、不要 Markdown 代码块。画面里一个人都没有就只输出一行：NONE",
+  ].join("\n");
+}
+
+/** 「无参照物」这一档：模型照要求写的原话，出现即表示这一项**没有信息**，不进描述。
+ *  ★ 收成一处：生成侧（提示词里那句）与消费侧（composeRosterDesc）判的必须是同一个词。 */
+const NO_ANCHOR_RE = /无参照/;
+
+/**
+ * 三项属性 → 落库的那一句 `desc`。
+ *
+ * ★★ 为什么合成一个字符串而不是给 `roles[]` 加三个字段：本仓那条「服务端加字段，本机库
+ *   那几跳必须一起搬」的坑（`apiToTemplate` / `NewTemplate` / `adoptBlockoutTemplate` /
+ *   `refreshRemoteTemplate` 的 mine 与 shared 两份）——加三个字段就是四处 × 三次机会漏，
+ *   而漏了**零报错**。`desc` 是这条链路上**已经**端到端通着的那一位（服务端 → App →
+ *   模板 → 挂卡面板 → 套用提示词），用它一个字都不用改形状。
+ * ★ 顺序是 颜色 → 动作 → 位置关系：从"最省字但常常没用"排到"最贵但最扛事"，
+ *   套用那头按字数切时先掉的是最不值钱的一截。
+ */
+function composeRosterDesc({ color, act, where }) {
+  const parts = [];
+  if (color) parts.push(color);
+  if (act) parts.push(act);
+  if (where && !NO_ANCHOR_RE.test(where)) parts.push(where);
+  return parts.join("、").slice(0, ROSTER_DESC_MAX);
+}
+
+/**
+ * **唯一性自证**：把上一发合成出来的每条描述拿回**同一帧**去定位，看它落不落回本人。
+ *
+ * ══ 为什么必须有这一发（而不是"生成得丰富就够了"）════════════════════════════
+ * #41 实测：**歧义描述会 1/3 塌缩成一个自信的错答** —— 模型不会说"我分不清"，
+ * 它会挑一个。而这条链路上"描述指错了人"的后果是**套用时把卡换到别人身上**，
+ * 画面照出、钱照收、零报错。所以这一发要的不是"更好的描述"，是**一个能拒绝的判据**。
+ * 实测这一发的成绩：群舞 7/7、公园 5/5，**12/12 且零拒绝**（`-1` 一次都没出现）。
+ *
+ * ★★ 「多个人都符合、或一个都不符合就写 -1」这句是整发的要害：不给它一个体面的
+ *   "说不准"选项，它就只会猜 —— 而猜出来的答案与真答案在回包里长得一模一样。
+ * ★ 判定阈值 = 半个平均间距：M 个人均分 1000，落在自己 ±(1000/M/2) 之内算认到本人。
+ *   与 `parseRosterBoxes` 那条 `minGap = 1000/M/3` 是**两件事**（那条判"两个框是不是
+ *   同一个人"，这条判"回答落没落回本人"），别互相抄。
+ *
+ * @returns {Promise<{ ok: boolean, verified: boolean[], why: string }>}
+ *   `ok=false` = 这一发本身没跑成（超时/回包不对）。★ 那时**一条都不算通过** ——
+ *   宁可整批退回只剩颜色，也不要把没验过的描述当验过的发出去（本仓铁律：静默的错
+ *   比响亮的降级坏得多）。
+ */
+async function verifyRosterDescs({ rows, dataUrl, model, send, timeoutMs }) {
+  const descs = rows.map((r) => composeRosterDesc(r));
+  const none = { ok: false, verified: rows.map(() => false), why: "" };
+  // 一条描述都合成不出来（三项全空）时没什么可验的 —— 不发这一次，省一笔钱
+  if (!descs.some((d) => d)) return { ...none, why: "没有可验的描述" };
+  const out = await send(
+    {
+      model,
+      thinking: { type: "disabled" },
+      max_tokens: 400,
+      messages: [
+        { role: "system", content: BOX_VISION_SYSTEM },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: rosterVerifyPrompt(descs) },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        },
+      ],
+    },
+    timeoutMs,
+  );
+  if (!out.ok || out.accepted === false) return { ...none, why: `自证调用失败(status=${out.status})` };
+  let content = "";
+  try {
+    content = JSON.parse(out.text || "{}")?.choices?.[0]?.message?.content ?? "";
+  } catch {
+    return { ...none, why: "自证回包不是 JSON" };
+  }
+  const got = new Map();
+  for (const rawLine of String(content).split(/\r?\n/)) {
+    const m = rawLine.trim().match(/^(\d+)\s*[|｜]\s*(-?\d+)/);
+    if (m) got.set(Number(m[1]), Number(m[2]));
+  }
+  if (!got.size) return { ...none, why: "自证回包解析不出任何一行" };
+  const half = 1000 / rows.length / 2;
+  const verified = rows.map((r, i) => {
+    if (!descs[i]) return false;
+    const cx = got.get(i + 1);
+    // 没答这一行 = 没验过（不是"验过了不通过"，但对我们是同一个动作：不用它）
+    if (cx === undefined || cx < 0) return false;
+    return Math.abs(cx - r.cx) <= half;
+  });
+  return { ok: true, verified, why: "" };
+}
+
+/** 唯一性自证那一发的提示词。★ 措辞逐字来自实测通过的那一版（12/12），改之前先重跑一次 */
+function rosterVerifyPrompt(descs) {
+  return [
+    "看这一帧。下面每一行是对画面里某一个人的描述。",
+    "对每一行，回答「符合这条描述的那个人」的包围盒中心横坐标 cx（0~1000 的整数）。",
+    "**如果有多个人都符合、或者一个都不符合，cx 就写 -1** —— 这一条比猜一个更重要。",
+    "每行输出 `序号|cx`，不要解释。",
+    "",
+    ...descs.map((d, i) => `${i + 1}. ${d || "（没有描述）"}`),
   ].join("\n");
 }
 
@@ -1262,7 +1409,21 @@ function parseRosterBoxes(text) {
       bad += 1;
       continue;
     }
-    out.push({ cx, cy, w, h, desc: m[6].trim() });
+    // ★★ 后三项（颜色|动作|位置关系）**缺项不算坏行**：它们是描述，不是判据 ——
+    //   少一项只是这个人少一个区分维度（自证那一发会照实判它过不过），而把整行
+    //   否决掉会让"框也没了"，代价与收益完全不成比例。数值那四项才是硬闸（上面那道）。
+    // ★ 只切前三段、剩下的**并回位置关系**：模型偶尔在位置关系里自己用了 `|`
+    //   （「在柱子左边|靠近门」）。丢掉尾巴等于悄悄截断一句描述，而合并读起来一样通。
+    const rest = m[6].split(/[|｜]/).map((s) => s.trim());
+    out.push({
+      cx,
+      cy,
+      w,
+      h,
+      color: rest[0] || "",
+      act: rest[1] || "",
+      where: rest.slice(2).join("、") || "",
+    });
   }
   if (bad > 0) {
     console.warn(`[blockoutize] 认人+量框：${bad} 行数值不合法，整份丢弃`);
@@ -1363,6 +1524,9 @@ module.exports = {
   measureRosterBoxes,
   rosterBoxPrompt,
   parseRosterBoxes,
+  composeRosterDesc,
+  verifyRosterDescs,
+  rosterVerifyPrompt,
   ROSTER_FRAMES_MAX,
   BOX_FRAME_TRIES,
   measureBoxes,

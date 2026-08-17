@@ -2903,3 +2903,127 @@ describe("★ 删角色位：整份替换里「少给一条」就是删除（白
     expect(doc.refVideo.durationSec).toBe(10); // Cloudinary 的登记值，不是客户端报的 1
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+describe("人偶多维描述（单元）—— 三项属性 + 唯一性自证", () => {
+  // ★★ 这一组钉的是**「描述指错人」这件事只能靠自证挡住**。
+  //   #46 六发付费实拍：素材里有一个读起来像主角的人时，「从左数第 N 个」会被压过去
+  //   （点名一个白模、被换掉的是那个红色的中央人物）。多维描述是为了补上这一刀。
+  //   而 #41 又实测过：**歧义描述会 1/3 塌缩成一个自信的错答** —— 所以"生成得丰富"
+  //   完全不够，必须有一个能拒绝的判据。这里钉的就是那个判据的边界。
+  const blockout = require("../src/services/blockoutize.service");
+
+  let warnSpy;
+  beforeEach(() => {
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warnSpy.mockRestore());
+
+  const line = (i, cx, cy, w, h, c, a, p) => `${i}|${cx}|${cy}|${w}|${h}|${c}|${a}|${p}`;
+
+  test("解析：八列拆成 color/act/where，并按 cx 升序", () => {
+    const rows = blockout.parseRosterBoxes(
+      [line(1, 700, 500, 100, 400, "红色", "双手上举", "在中间那根柱子右侧"), line(2, 200, 500, 100, 400, "纯白", "弓步前倾", "在最右那盏路灯下")].join("\n"),
+    );
+    expect(rows.map((r) => r.cx)).toEqual([200, 700]);
+    expect(rows[0]).toMatchObject({ color: "纯白", act: "弓步前倾", where: "在最右那盏路灯下" });
+    expect(rows[1]).toMatchObject({ color: "红色", act: "双手上举" });
+  });
+
+  test("★ 后三项缺项不算坏行（描述少一维 ≠ 框也不要了）", () => {
+    // ★ 数值那四列才是硬闸。把整行否决掉会连框一起丢 —— 代价与收益完全不成比例
+    const rows = blockout.parseRosterBoxes(`1|200|500|100|400|纯白\n2|700|500|100|400|红色|挥手`);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ color: "纯白", act: "", where: "" });
+    expect(rows[1]).toMatchObject({ color: "红色", act: "挥手", where: "" });
+  });
+
+  test("★ 位置关系里自己带了竖线 → 并回去，不截断", () => {
+    const rows = blockout.parseRosterBoxes(`1|200|500|100|400|纯白|挥手|在柱子左边|靠近门`);
+    expect(rows[0].where).toBe("在柱子左边、靠近门");
+  });
+
+  test("数值坏行仍然整份丢弃（这一条没放松）", () => {
+    expect(blockout.parseRosterBoxes(`1|200|500|100|400|纯白|挥手|在门口\n2|9999|500|100|400|红|跳|在窗边`)).toEqual([]);
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/数值不合法/);
+  });
+
+  test("合成描述：顺序固定、「无参照物」整项丢掉、超长切到 60 字", () => {
+    expect(blockout.composeRosterDesc({ color: "纯白", act: "弓步前倾", where: "在最右那盏路灯下" })).toBe(
+      "纯白、弓步前倾、在最右那盏路灯下",
+    );
+    // ★ 「无参照物」是模型照提示词写的原话 = 这一项没有信息，不该进描述（进了是编的）
+    expect(blockout.composeRosterDesc({ color: "纯白", act: "挥手", where: "无参照物" })).toBe("纯白、挥手");
+    expect(blockout.composeRosterDesc({ color: "", act: "", where: "" })).toBe("");
+    expect(blockout.composeRosterDesc({ color: "白".repeat(80), act: "挥手", where: "" })).toHaveLength(60);
+  });
+
+  const rows3 = [
+    { cx: 150, color: "纯白", act: "弓步前倾", where: "在最左那盏路灯下" },
+    { cx: 500, color: "红色", act: "双手上举", where: "在中间那根柱子旁" },
+    { cx: 850, color: "纯白", act: "单膝跪地", where: "在最右那扇门前" },
+  ];
+  /** 假的 send：回什么由 `reply` 决定。★ 同时记下发了几次，用来钉"只发一发" */
+  const fakeSend = (reply, calls = []) => {
+    const fn = async (body) => {
+      calls.push(body);
+      return { ok: true, accepted: true, status: 200, text: JSON.stringify({ choices: [{ message: { content: reply } }] }) };
+    };
+    fn.calls = calls;
+    return fn;
+  };
+
+  test("自证：落回本人 → 通过；落到别人身上 → 不通过", async () => {
+    // 第 2 条故意答成 150（那是第 1 个人的位置）—— 这正是"自信的错答"那一档
+    const send = fakeSend("1|150\n2|150\n3|860");
+    const v = await blockout.verifyRosterDescs({ rows: rows3, dataUrl: "data:,", model: "m", send });
+    expect(v.ok).toBe(true);
+    expect(v.verified).toEqual([true, false, true]);
+  });
+
+  test("★ 自证：模型自己说 -1（分不清 / 一个都不符合）→ 不通过", async () => {
+    // ★★ 给它一个体面的"说不准"选项是整发的要害：不给，它就只会猜，
+    //   而猜出来的答案与真答案在回包里长得一模一样
+    const v = await blockout.verifyRosterDescs({ rows: rows3, dataUrl: "data:,", model: "m", send: fakeSend("1|-1\n2|500\n3|850") });
+    expect(v.verified).toEqual([false, true, true]);
+  });
+
+  test("★ 自证那一发本身没跑成 → **一条都不算通过**（不是「就当验过了」）", async () => {
+    const dead = async () => ({ ok: false, accepted: true, status: 504, text: "" });
+    const v = await blockout.verifyRosterDescs({ rows: rows3, dataUrl: "data:,", model: "m", send: dead });
+    expect(v.ok).toBe(false);
+    expect(v.verified).toEqual([false, false, false]);
+    expect(v.why).toMatch(/504/);
+    // 回包解析不出任何一行 —— 同一个方向
+    const junk = await blockout.verifyRosterDescs({ rows: rows3, dataUrl: "data:,", model: "m", send: fakeSend("好的，我看到三个人。") });
+    expect(junk.verified).toEqual([false, false, false]);
+  });
+
+  test("★ 一条描述都合成不出来时不发这一次（省一笔钱，也没什么可验的）", async () => {
+    const calls = [];
+    const send = fakeSend("1|150", calls);
+    const v = await blockout.verifyRosterDescs({
+      rows: [{ cx: 150, color: "", act: "", where: "无参照物" }],
+      dataUrl: "data:,",
+      model: "m",
+      send,
+    });
+    expect(calls).toHaveLength(0);
+    expect(v.verified).toEqual([false]);
+  });
+
+  test("自证提示词里每条描述都在，且带着「多个都符合就写 -1」那句", () => {
+    const p = blockout.rosterVerifyPrompt(["纯白、弓步前倾", "红色、双手上举"]);
+    expect(p).toContain("1. 纯白、弓步前倾");
+    expect(p).toContain("2. 红色、双手上举");
+    expect(p).toMatch(/-1/);
+  });
+
+  test("★ 认人提示词：三项都要、且明令不许拿人和人比", () => {
+    const p = blockout.rosterBoxPrompt();
+    expect(p).toContain("颜色|动作|位置关系");
+    // ★★ 比较级是 #41 验出来的坑：换个镜头就不成立，而看的人无从核对
+    expect(p).toMatch(/不许拿这个人\*\*和其他人\*\*比/);
+    expect(p).toContain("无参照物");
+  });
+});
