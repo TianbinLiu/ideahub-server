@@ -137,22 +137,37 @@ function buildFrameUrl(publicId, { atSec, crop }, version) {
 }
 
 /**
- * 抽**产物**的一帧（给「量框」那一发用，见 blockoutize.service 的 ①e）。
- *
- * ★ 与上面那条的两处区别，都不是风格问题：
- *   ① **不裁剪** —— 产物已经是最终画面，再套一次原片的 crop 会切错地方（那组 x/y/w/h
- *      是相对**原视频**的坐标）；而框的坐标是相对"用户在 App 里看到的那一帧"归一化的，
- *      两者必须是同一个画面，差一次裁剪就是全体框整体偏移。
- *   ② 缩到 **1024** 而不是 768：768 是"认出画面里有谁"够用的宽度，而这一发要的是
- *      **位置精度**。1024 是 2026-08-17 实测那一发用的量级（回包 5 个框横向逐个压中），
- *      往下调没验过 —— 而框偏了不会报错，只会让用户拖到隔壁那个人身上。
+ * 抽帧宽度**两档，别混用**（2026-08-17 混用当场撞上 504）：
+ *  · `OUT_FRAME_W_BOX` = 1024 —— 「量框」那一发。它要的是**位置精度**，而且只有**一帧**。
+ *    1024 是实测过的宽度（回包 5 个框横向逐个压中）；往下调没验过，框偏了不报错，
+ *    只会让用户拖到隔壁那个人身上。
+ *  · `OUT_FRAME_W_ROSTER` = 768 —— 「认人」那一发。它要的是"画面里有谁"，768 够用，
+ *    而且它一次要喂**最多 8 帧**。
+ * ⚠ 认人那一发照 1024 喂 8 帧的话，token 量是 768 的约 1.8 倍，实测直接把上游打到
+ *   **504 ark upstream TimeoutError**（T_CREATE = 150s 都没撑住）。而失败之后
+ *   `parseRoles("")` 回 0，表现是一句假话：「AI 没在这段视频里认出人物」。
+ *   ⇒ 两档各有各的理由，谁都别去"统一"成一个数。
  */
-function buildOutFrameUrl(publicId, atSec, version) {
+const OUT_FRAME_W_BOX = 1024;
+const OUT_FRAME_W_ROSTER = 768;
+
+/**
+ * 抽**产物 / 作者自带参考视频**的一帧。
+ *
+ * ★ 与 `buildFrameUrl` 的区别不是风格：这条**不裁剪**。产物已经是最终画面，
+ *   再套一次原片的 crop 会切错地方（那组 x/y/w/h 是相对**原视频**的坐标）；
+ *   而框的坐标是相对"用户在 App 里看到的那一帧"归一化的，两者必须是同一个画面，
+ *   差一次裁剪就是全体框整体偏移。
+ * ★ `width` 默认给量框那一档（1024）—— 认人那一发**必须显式传 OUT_FRAME_W_ROSTER**。
+ */
+function buildOutFrameUrl(publicId, atSec, version, width = OUT_FRAME_W_BOX) {
   const cloud = cloudinary.config().cloud_name;
   if (!cloud) return null;
   const v = version ? `v${version}/` : "";
-  return `https://res.cloudinary.com/${cloud}/video/upload/so_${atSec},c_scale,w_1024/${v}${publicId}.jpg`;
+  return `https://res.cloudinary.com/${cloud}/video/upload/so_${atSec},c_scale,w_${width}/${v}${publicId}.jpg`;
 }
+
+
 
 /**
  * 把一条裁剪变换地址解回来 —— **只认服务端自己拼得出的那一种形状**。
@@ -199,6 +214,8 @@ module.exports = {
   clipTransform,
   buildClipUrl,
   buildOutFrameUrl,
+  OUT_FRAME_W_BOX,
+  OUT_FRAME_W_ROSTER,
   buildFrameUrl,
   parseOwnClipUrl,
 };

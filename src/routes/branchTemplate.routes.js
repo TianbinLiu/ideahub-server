@@ -49,6 +49,7 @@ const {
   buildClipUrl,
   buildFrameUrl,
   buildOutFrameUrl,
+  OUT_FRAME_W_ROSTER,
 } = require("../utils/templateVideoAsset");
 const { callArk, chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
 const blockout = require("../services/blockoutize.service");
@@ -253,7 +254,9 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
       const times = blockout.visionFrameTimes(meta.duration, null);
       const images = [];
       for (const atSec of times) {
-        const url = buildOutFrameUrl(own.publicId, atSec, resource.version);
+        // ★ 认人这一发**必须传 768**（OUT_FRAME_W_ROSTER）：它一次要喂最多 8 帧，
+        //   照量框那档的 1024 喂会把上游打到 504（2026-08-17 实测撞上，见那两个常量的 ⚠）
+        const url = buildOutFrameUrl(own.publicId, atSec, resource.version, OUT_FRAME_W_ROSTER);
         const got = url ? await blockout.fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
         if (got.ok) images.push(got.dataUrl);
         else console.warn(`[branchTemplate] V1 抽帧失败 ${own.publicId}@${atSec}s: ${got.reason}`);
