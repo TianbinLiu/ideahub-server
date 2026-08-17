@@ -11,13 +11,15 @@ const {
   MAX_TEMPLATE_VIDEO_BYTES,
   templateVideoMeta,
   templateSourceIssue,
+  templateRefIssue,
+  TEMPLATE_REF_RULES,
 } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const BranchTemplate = require("../models/BranchTemplate");
 // 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
 const BlockoutJob = require("../models/BlockoutJob");
 // 归属判据只有一处（utils/templateVideoAsset），此前这里手写过一份 startsWith 前缀
-const { ownTemplateVideoPublicId } = require("../utils/templateVideoAsset");
+const { ownTemplateVideoPublicId, buildClipUrl } = require("../utils/templateVideoAsset");
 
 // ★ 上传此前**一个限流器都没有**（2026-08-14 复查发现）：每一发都真实占用
 //   Cloudinary 配额与出网带宽，且上传即永久留存（全服务端目前零 destroy 调用）——
@@ -94,6 +96,106 @@ router.post("/media", requireAuth, uploadLimit, uploadMedia.single("media"), asy
 //   分钟桶挡手滑连点，天桶挡"整晚慢慢灌"——只有分钟桶的话，一晚上能灌 4000 发。
 const tplVideoMinuteLimit = userRateLimit({ max: 3, windowMs: 60 * 1000, scope: "uploads:tplVideoMin" });
 const tplVideoDailyLimit = userRateLimit({ max: 10, windowMs: 24 * 60 * 60 * 1000, scope: "uploads:tplVideoDay" });
+
+// ── POST /api/uploads/template-video/derive ─────────────────────────────
+//
+// 「把我刚传的那段素材，按框选裁出一段（不够清晰就顺带放大），落成一个新素材」。
+//
+// ══ 为什么必须有这一步（2026-08-17 加，作者自带参考视频那条路的缺口）══════════
+//   V1 登记（POST /templates）把**整段原片**直接当参考视频用，所以它必须满足方舟
+//   edit 的硬约束：时长 ∈[4,30]、宽×高 ≥407,696、边长与比例也有窗口。而用户手上的
+//   素材多半不满足 —— 实测作者那段 34.167s、836×480 = 401,280 像素，两条都差一点点：
+//     · 超长那条 V2 有 BlockoutTrimmer 解决，**V1 没有对应的落地步骤**；
+//     · 像素那条上传口会当场拒（拒得对），但**不给任何出路** —— 用户只能回去自己转码。
+//   于是这条路在产品里事实上传不进任何一段真实素材。
+//
+// ★★ 变换由**服务端自己拼**（buildClipUrl / clipTransform，唯一实现），客户端只交
+//   四组整数。与 V2 同一条纪律：能让客户端拼 URL，就等于让用户自己决定"方舟拿到多长"。
+//   这里虽然不直接计价，但这段视频会成为**别人套用时的 r2v 输入时长**（segmentCost 读
+//   refVideo.durationSec）—— 一样是钱。
+// ★★ 放大只在**不够**时做，并且只放大到刚过线：放大不会凭空变清楚，它解决的是
+//   "引擎拒收这个尺寸"。过度放大只是让文件更大、上传更慢。
+// ★ 裁后**必须用参考视频那套严窗口复核**（templateRefIssue）：裁出来的这一段就是
+//   将来喂给方舟的那一段，这里不卡住，就要等别人付费套用时才 400。
+// ★ 新素材是一个正规形态的 `template-videos/<userId>-<ts>`（归属判据才认得），
+//   与用户自己传上来的那种一模一样 —— 登记那条路一个字都不用改。
+router.post("/template-video/derive", requireAuth, tplVideoMinuteLimit, tplVideoDailyLimit, async (req, res, next) => {
+  try {
+    const publicId = ownTemplateVideoPublicId(String(req.body?.publicId || ""), req.user._id);
+    if (!publicId) {
+      return res.status(400).json({ ok: false, message: "素材地址无效：只能裁你本人刚通过「上传视频」传到本站的素材。" });
+    }
+    const startSec = Math.max(0, Math.floor(Number(req.body?.startSec)));
+    const durSec = Math.floor(Number(req.body?.durSec));
+    const crop = req.body?.crop || {};
+    const box = {
+      x: Math.max(0, Math.floor(Number(crop.x) || 0)),
+      y: Math.max(0, Math.floor(Number(crop.y) || 0)),
+      w: Math.floor(Number(crop.w)),
+      h: Math.floor(Number(crop.h)),
+    };
+    if (!Number.isFinite(startSec) || !Number.isFinite(durSec) || durSec <= 0 || !(box.w > 0) || !(box.h > 0)) {
+      return res.status(400).json({ ok: false, message: "框选参数不完整（需要起点、时长与裁剪框）。" });
+    }
+
+    let src;
+    try {
+      src = await cloudinary.api.resource(publicId, { resource_type: "video", media_metadata: true });
+    } catch {
+      return res.status(400).json({ ok: false, message: "找不到这段素材（可能未上传成功或已被回收），请重新上传。" });
+    }
+
+    // ★ 放大倍数：只在裁后像素**不够**时才算，且只放到刚过线（留 2% 余量防取整掉下来）
+    const cutPixels = box.w * box.h;
+    const need = TEMPLATE_REF_RULES.minPixels;
+    let scaleW = 0;
+    if (cutPixels < need) {
+      const k = Math.sqrt((need * 1.02) / cutPixels);
+      scaleW = Math.min(TEMPLATE_REF_RULES.maxEdge, Math.round((box.w * k) / 2) * 2);
+    }
+
+    const url = buildClipUrl(publicId, { startSec, durSec, crop: box }, src.version);
+    if (!url) {
+      return res.status(502).json({ ok: false, message: "云存储没配好，暂时裁不了这段素材。" });
+    }
+    const finalUrl = scaleW ? url.replace("/video/upload/", `/video/upload/c_scale,w_${scaleW}/`) : url;
+
+    const newId = `ideahub/template-videos/${req.user._id.toString()}-${Date.now()}`;
+    let receipt;
+    try {
+      receipt = await cloudinary.uploader.upload(finalUrl, { resource_type: "video", public_id: newId });
+    } catch (e) {
+      console.error(`[uploads] 裁剪落库失败 ${publicId} -> ${newId}:`, e?.error?.message || e.message);
+      return res.status(502).json({ ok: false, message: "裁这一段的时候云端出错了，请稍后重试。" });
+    }
+
+    // ★★ 裁后用**参考视频**那套严窗口复核（不是上传口那套松的）：这一段就是将来喂给
+    //   方舟的那一段。不过就先回收再拒 —— 不回收的话每一次失败都永久占着配额。
+    const meta = templateVideoMeta(receipt);
+    const issue = templateRefIssue(meta);
+    if (issue) {
+      try {
+        await cloudinary.uploader.destroy(receipt.public_id, { resource_type: "video" });
+      } catch (e) {
+        console.error(`[uploads] 裁后不合格、回收失败 public_id=${receipt.public_id}:`, e.message);
+      }
+      return res.status(400).json({ ok: false, message: issue });
+    }
+
+    res.json({
+      ok: true,
+      publicId: receipt.public_id,
+      url: receipt.secure_url,
+      durationSec: meta.duration,
+      width: meta.width,
+      height: meta.height,
+      bytes: meta.bytes,
+      ...(scaleW ? { upscaledTo: scaleW } : {}),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post(
   "/template-video",
