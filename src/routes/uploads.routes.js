@@ -19,7 +19,7 @@ const BranchTemplate = require("../models/BranchTemplate");
 // 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
 const BlockoutJob = require("../models/BlockoutJob");
 // 归属判据只有一处（utils/templateVideoAsset），此前这里手写过一份 startsWith 前缀
-const { ownTemplateVideoPublicId, buildClipUrl } = require("../utils/templateVideoAsset");
+const { ownTemplateVideoPublicId, buildClipUrl, clipTransform } = require("../utils/templateVideoAsset");
 
 // ★ 上传此前**一个限流器都没有**（2026-08-14 复查发现）：每一发都真实占用
 //   Cloudinary 配额与出网带宽，且上传即永久留存（全服务端目前零 destroy 调用）——
@@ -154,11 +154,16 @@ router.post("/template-video/derive", requireAuth, tplVideoMinuteLimit, tplVideo
       scaleW = Math.min(TEMPLATE_REF_RULES.maxEdge, Math.round((box.w * k) / 2) * 2);
     }
 
+    const clip = clipTransform({ startSec, durSec, crop: box });
     const url = buildClipUrl(publicId, { startSec, durSec, crop: box }, src.version);
     if (!url) {
       return res.status(502).json({ ok: false, message: "云存储没配好，暂时裁不了这段素材。" });
     }
-    const finalUrl = scaleW ? url.replace("/video/upload/", `/video/upload/c_scale,w_${scaleW}/`) : url;
+    // ★★★ 缩放必须**接在裁剪之后**（`.../<clip>/c_scale,w_N/...`），不是插在最前面。
+    //   Cloudinary 的链式变换**按书写顺序依次应用** —— 放在前面就是"先放大、再按原尺寸
+    //   裁一块出来"，结果又变回原来的大小。2026-08-17 第一版就是这么写的，
+    //   表现是"放大了但尺寸没变、裁后复核照旧拒"，而两条变换单独看都对。
+    const finalUrl = scaleW ? url.replace(`/${clip}/`, `/${clip}/c_scale,w_${scaleW}/`) : url;
 
     const newId = `ideahub/template-videos/${req.user._id.toString()}-${Date.now()}`;
     let receipt;
