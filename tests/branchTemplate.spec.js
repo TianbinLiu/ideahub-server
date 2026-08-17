@@ -618,7 +618,11 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
   test.each([
     ["太长（700s）", { duration: 700 }, /最长 600 秒/],
     ["边长不够（200×3000）", { width: 200, height: 3000 }, /边长至少 300 像素/],
-    ["像素数不够（640×360）", { width: 640, height: 360 }, /分辨率太低/],
+    // ★★ 2026-08-17：原来这里是「像素数不够（640×360）→ 分辨率太低」。**像素门从上传口
+    //   去掉了**（它是方舟对参考视频的约束，而 derive 现在能在裁完之后放大到刚过线），
+    //   640×360 于是应当**放行** —— 下面「上传口不再卡像素」那条正着钉它。
+    //   这里换成仍然该拒的那一种：**边长**不够。边长补不出来（放大只是把马赛克放大）。
+    ["边长不够（200×120）", { width: 200, height: 120 }, /边长至少 300/],
     // ★★ 2026-08-16 新增的下限：原片短于 5 秒 → 裁出来的那一段必然也 <5 秒
     //   （裁剪不可能比原片长），而 4 秒进方舟做白模只剩 3.7 秒 —— 那样的模板谁都套用不了。
     //   拦在**上传之前**（App 本机读 `<video>` 元数据就够）是最早的止损点：连 100MB 都不用传。
@@ -2108,7 +2112,13 @@ describe("三套验收窗口（单元）—— 各自的唯一实现，名字必
 
   test("像素数硬门是 407,696（A2 探针实测值，改它必须两仓一起改）", () => {
     expect(TEMPLATE_REF_RULES.minPixels).toBe(407_696);
-    expect(TEMPLATE_SOURCE_RULES.minPixels).toBe(407_696); // 裁剪面积 ≤ 原片面积 ⇒ 这是必要条件
+    // ★★★ 2026-08-17：**原始素材窗口不再有这一项**（原来抄了同一个数，理由是
+    //   "裁剪面积 ≤ 原片面积"）。那个前提被 `POST /uploads/template-video/derive` 打破了 ——
+    //   它能在裁完之后按需放大到刚过线。不去掉的话，一段 836×480 = 401,280 像素
+    //   （只差 1.6%）的真实素材连传都传不上来，而它裁一段放大之后完全合格。
+    //   ⇒ 源片够不够格改由**边长**判（像素能放大补出来，边长补不出来）。
+    //   ⚠ 这一位是**跨仓镜像**：App 的 `TEMPLATE_UPLOAD_RULES` 也去掉了，两边同进同退。
+    expect(TEMPLATE_SOURCE_RULES.minPixels).toBeUndefined();
     // 640×636 = 407,040 < 门；640×640 = 409,600 ≥ 门
     expect(templateRefIssue({ duration: 10, width: 640, height: 636 })).toMatch(/分辨率太低/);
     expect(templateRefIssue({ duration: 10, width: 640, height: 640 })).toBeNull();
@@ -2131,9 +2141,16 @@ describe("三套验收窗口（单元）—— 各自的唯一实现，名字必
     expect(templateSourceIssue({ duration: 10, width: 500, height: 1500 })).toBeNull();
     // 边长上限：**不设** —— 4K/8K 原片没问题，裁出来那块 ≤6000 即可
     expect(templateSourceIssue({ duration: 10, width: 7680, height: 4320 })).toBeNull();
-    // 但边长下限与像素门保留：它们是"裁出来那块能合格"的必要条件，早拒省一次 100MB 白传
+    // 边长下限保留：它是"裁出来那块能合格"的必要条件，且**放大补不出来**
     expect(templateSourceIssue({ duration: 10, width: 299, height: 3000 })).toMatch(/边长至少 300 像素/);
-    expect(templateSourceIssue({ duration: 10, width: 640, height: 360 })).toMatch(/分辨率太低/);
+    // ★★★ 像素门**不再卡在这里**（2026-08-17）：640×360 = 230,400 远低于 407,696，
+    //   但边长够，derive 能把裁出来的那一段放大到过线 —— 所以上传口要放行。
+    //   这条正着钉住那次放宽；反着的那一半在上面「像素数硬门」里（参考窗口仍然卡）。
+    expect(templateSourceIssue({ duration: 10, width: 640, height: 360 })).toBeNull();
+    // 作者手上那段真实素材：836×480 = 401,280，只差 1.6% —— 正是这次放宽要救的那一类
+    expect(templateSourceIssue({ duration: 34.1, width: 836, height: 480 })).toBeNull();
+    // 而它裁出来的那一段若不放大，参考窗口仍然照拒（严窗口一点没松）
+    expect(templateRefIssue({ duration: 15, width: 836, height: 480 })).toMatch(/分辨率太低/);
   });
 
   test("缺元数据（回执没给 duration）→ 两套窗口都整句拒，不放行", () => {

@@ -83,7 +83,17 @@ const TEMPLATE_SOURCE_RULES = Object.freeze({
   minSec: BLOCKOUT_MIN_INPUT_SEC,
   maxSec: 600,
   minEdge: 300,
-  minPixels: 407_696,
+  // ★★★ 2026-08-17 起这里**没有 minPixels**（原来是 407,696，与参考视频那套同一个数）。
+  //   那个像素门是**方舟对参考视频**的约束，不是对"用户手上这段原始素材"的约束。
+  //   把它抄到上传口，当时的理由是"裁剪只会更小"—— 那句话在
+  //   `POST /uploads/template-video/derive` 存在之前成立，**现在不成立了**：
+  //   derive 能在裁完之后按需放大到刚过线。
+  //   ⇒ 结果是一段 836×480 = 401,280 像素（只差 1.6%）的真实素材**连传都传不上来**，
+  //     而它裁一段放大之后完全合格 —— 那正是作者手上那段片子。
+  // ★ 那"够不够格"由谁判？**边长**（minEdge 300）：像素可以靠放大补出来，边长补不出来。
+  //   一段 200×120 的素材放大到 700×420 只是把马赛克放大，那种才该在上传口就拒。
+  // ★ 严窗口一点没松：裁出来的那一段仍然要过 `templateRefIssue`（含像素门），
+  //   V2 的框选也仍然由 arkVideoRules.selectionIssue 当场判 —— 用户不会等到付费才撞墙。
 });
 
 /**
@@ -233,7 +243,10 @@ function templateSourceIssue(meta) {
   if (width < R.minEdge || height < R.minEdge) {
     return `视频边长至少 ${R.minEdge} 像素（当前 ${width}×${height}）：裁剪框不可能比原片更大，这样的素材裁出来也过不了 AI 引擎的尺寸下限。`;
   }
-  if (width * height < R.minPixels) {
+  // ★ 判存在性：`TEMPLATE_SOURCE_RULES` 从 2026-08-17 起**不带这一条**（理由写在那边），
+  //   而这个函数是两套窗口共用的形状，所以这里按"规则里有没有这一项"跳过，
+  //   不是在调用点分叉（分叉之后两套窗口就有两条代码路径了）
+  if (R.minPixels && width * height < R.minPixels) {
     return `视频分辨率太低：宽×高至少要 ${R.minPixels.toLocaleString("en-US")} 像素（当前 ${width}×${height} = ${(width * height).toLocaleString("en-US")}），裁剪只会更小，AI 引擎会拒绝这样的输入。`;
   }
   // ★ 刻意不校宽高比：比例正是裁剪框能修的那一项（见 TEMPLATE_SOURCE_RULES 的说明）
