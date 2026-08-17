@@ -415,7 +415,11 @@ function parseBoxes(text, expected) {
   const out = [];
   let bad = 0;
   for (const rawLine of String(text || "").split(/\r?\n/)) {
-    const m = rawLine.trim().match(/^(\d+)\s*[|｜]\s*(\d+)\s*[|｜]\s*(\d+)\s*[|｜]\s*(\d+)\s*[|｜]\s*(\d+)\s*$/);
+    // ★ 数字那四组写成 `-?\d+`（**允许负号**）不是笔误：负数是**坏框**，不是噪声。
+    //   只认 `\d+` 的话，`2|-5|500|100|800` 连正则都匹配不上，于是被当成"模型闲聊的一行"
+    //   静默跳过 —— 而模型多吐一行时（要 5 个吐了 6 行、其中一行带负数），剩下 5 行正好
+    //   凑够数目，整份被判过。范围校验在下面把它挡成 bad，才是这条纪律该有的样子。
+    const m = rawLine.trim().match(/^(\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*$/);
     // 不像框的行直接跳过（模型偶尔会加一句"好的，以下是…"）—— 那是噪声，不是坏框
     if (!m) continue;
     const [cx, cy, w, h] = [Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])];
@@ -521,7 +525,7 @@ function visionPrompt(note) {
  *   ④ 措辞表 = ordinalSlots(M)
  *   ⑤ label = 措辞表[k-1]，并按 k 升序落库
  */
-function parseRoles(text) {
+function parseRoles(text, meta) {
   // ★★ 先只收**描述与横向位置**，标记留到名次算完再发（见下面那条 ★★）。
   const rows = [];
   for (const rawLine of String(text || "").split(/\r?\n/)) {
@@ -588,6 +592,21 @@ function parseRoles(text) {
 
   // ④ 措辞表照**总人数 M** 生成（不是照活下来的个数），理由见 ordinalSlots 措辞规则③
   const slots = ordinalSlots(M);
+
+  // ★★★ 把**完整措辞表**交回给调用方（`meta.allSlots`，长度 = 画面里的总人数 M）。
+  //   为什么非有这个回填口不可：②那一步截断之后，返回的 `roles` 就**再也说不出
+  //   "画面里到底有几个人偶"** —— 而被截掉的那几个照样站在画面上（本函数上方 ★★）。
+  //   下游真的需要这个数：量框那一步（routes 的 ⑧b）要对着产物问"一共有几个"，
+  //   拿 `roles.length` 去问就是对着 11 个人偶说"一共有 9 个"。模型会老实吐 9 行、
+  //   数目"对得上"、相邻框也不套 —— 三道闸全过，然后 markBoxes[i] 与 markSlots[i]
+  //   **整份错位**，套用者拖谁都换成别人，零报错、r2v 钱照扣。（2026-08-17 审查抓到。）
+  // ★ 做成可选的**回填口**而不是改返回值：`parseRoles` 有十几处调用（多在测试里），
+  //   改签名的churn 远大于收益，而这一位只有一个消费方。
+  // ★ 给的是**整张表**而不是一个数字 M：下游要做的事是「把 markSlots[i] 映射到
+  //   全部 M 个框里的第几个」，而那正是 `allSlots.indexOf(label)` —— 与 App 侧
+  //   `markSlots.indexOf(label)` 同构，两边都不解析中文。给数字的话下游就得自己
+  //   照 ordinalSlots 的规则再拼一次表，那是同一条规则的第二处实现。
+  if (meta && typeof meta === "object") meta.allSlots = slots;
 
   // ★★ 截断发生在**发标记之前**（②在③④⑤之前）：这条不变量从编号时代（"截断在编号
   //   之前"）经颜色时代一路继承下来，一个字都没松。反过来（先发标记再截断）留下的是

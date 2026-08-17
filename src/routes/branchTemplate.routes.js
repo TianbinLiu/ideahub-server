@@ -510,9 +510,12 @@ router.post(
         return fail(res, 502, "看画面这一步失败了，本次没有开始生成，费用已原路退回，请稍后重试。", { billed: false });
       }
       let roles = [];
+      // ★★ `allSlots` = 视觉认出的**全部** M 个人的措辞表（截断之前）。roles 被截到 9 条之后
+      //   就再也说不出"画面里到底有几个人偶"了，而量框那一步必须知道（见 BlockoutJob.visionSlots）
+      const roleMeta = {};
       try {
         const parsed = JSON.parse(visionOut.text || "{}");
-        roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "");
+        roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "", roleMeta);
       } catch (e) {
         console.error("[blockoutize] 视觉回包解析失败:", e.message);
       }
@@ -628,6 +631,10 @@ router.post(
           //   哪一套"才能保证 finish 出来的模板与那段视频真正的样子一致（见 BlockoutJob
           //   的 markSlots 注释）。在途的老 job 没有这一位 → finish 出编号方案模板 → 正确。
           markSlots: roles.map((r) => r.label),
+          // 全部 M 个人的措辞表（截断之前）—— 只给量框那一步用，不出任何响应
+          ...(Array.isArray(roleMeta.allSlots) && roleMeta.allSlots.length
+            ? { visionSlots: roleMeta.allSlots }
+            : {}),
           // ★ 存下来只为**回执能重放**：阶段一重试撞上既有凭据时走的是 startedPayload(exist)，
           //   不存的话那条路回出来的帧数是空的，而 App 拿它对账 —— 一条路对得上、另一条对不上，
           //   两边看着都没错（这正是"同一件事两处各说各的"的形状）。
@@ -1002,8 +1009,19 @@ router.post(
       //      账单上也没有它，两边一致。反过来"报了却不一定收"才是本仓最忌的那种含糊。
       //   ⚠ 不计费 ≠ 不设边界：model 在这里是**写死的常量**（用户碰不到），
       //   且这一发严格 1:1 挂在一次已经付过费的 finish 上，没有被放大的路径。
+      //
+      // ★★★ 问的是**全部 M 个人偶**（`claimed.visionSlots`），不是可挂卡的那 9 个
+      //   （`claimed.markSlots`）。视觉认出 12 个人时 roles 被截到 9 条，而画面上站着 12 个
+      //   一模一样的白人偶 —— 拿 9 去问就是对着 12 个人说"一共有 9 个"，模型老实吐 9 行、
+      //   数目"对得上"、相邻框也不套，三道闸全过，然后 markBoxes[i] 与 markSlots[i]
+      //   **整份错位**：套用者拖谁都换成别人，零报错、r2v 钱照扣。
+      //   拿到 M 个框之后，用 `visionSlots.indexOf(label)` 挑出角色位对应的那几个 ——
+      //   与 App 侧 `markSlots.indexOf(label)` 同构，两边都不解析中文措辞。
+      // ★ 在途的老凭据没有 `visionSlots` → 整段跳过（拖拽层不开，点列表照常）。
+      //   判存在性、绝不 `|| claimed.markSlots` 兜底 —— 那个兜底就是上面那条错位。
       let boxPatch = {};
-      if (BranchTemplate.isOrdinalMark(claimed)) {
+      const allSlots = Array.isArray(claimed.visionSlots) ? claimed.visionSlots : null;
+      if (BranchTemplate.isOrdinalMark(claimed) && allSlots && allSlots.length >= claimed.markSlots.length) {
         try {
           const atSec = blockout.boxFrameSec(outMeta.duration);
           const frameUrl = buildOutFrameUrl(moved.receipt.public_id, atSec, moved.receipt.version);
@@ -1023,7 +1041,7 @@ router.post(
                   {
                     role: "user",
                     content: [
-                      { type: "text", text: blockout.boxPrompt(claimed.markSlots.length) },
+                      { type: "text", text: blockout.boxPrompt(allSlots.length) },
                       { type: "image_url", image_url: { url: got.dataUrl } },
                     ],
                   },
@@ -1034,7 +1052,19 @@ router.post(
               console.warn(`[blockoutize] 量框调用失败 HTTP ${boxOut.status}，拖拽层不开`);
             } else {
               const parsed = JSON.parse(boxOut.text || "{}");
-              const boxes = blockout.parseBoxes(parsed?.choices?.[0]?.message?.content ?? "", claimed.markSlots.length);
+              const all = blockout.parseBoxes(parsed?.choices?.[0]?.message?.content ?? "", allSlots.length);
+              // ★ 从 M 个框里挑出角色位对应的那几个。`indexOf` 找不到（label 与措辞表
+              //   对不上，说明这张凭据自相矛盾）→ 整份不要，绝不塞个 undefined 进去
+              const picked = all.length
+                ? claimed.markSlots.map((label) => all[allSlots.indexOf(label)] ?? null)
+                : [];
+              const boxes = picked.length && picked.every(Boolean) ? picked : [];
+              if (!boxes.length && all.length) {
+                console.warn(
+                  `[blockoutize] 量框：${all.length} 个框里挑不齐 ${claimed.markSlots.length} 个角色位` +
+                    `（措辞表与 markSlots 对不上），整份丢弃（拖拽层不开）`,
+                );
+              }
               if (boxes.length) boxPatch = { markBoxes: boxes, markBoxAtSec: atSec };
             }
           }

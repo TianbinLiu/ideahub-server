@@ -2569,6 +2569,30 @@ describe("画面位置框（单元）—— 拖到画面上挂卡的全部输入
     expect(blockout.parseBoxes(sideBySide, 5).map((b) => b.cx)).toEqual([188, 349, 521, 687, 859]);
   });
 
+  test("★★★ 截断之后 roles 说不出「画面里几个人」——parseRoles 必须把完整措辞表交回来", () => {
+    // ⚠ 这一条守的是 2026-08-17 审查抓到的那个洞：视觉认出 12 个人时 roles 被截到 9 条，
+    //   而画面上站着 12 个一模一样的白人偶。量框那一步若拿 roles.length 去问"一共有几个"，
+    //   模型老实吐 9 行、数目"对得上"、相邻框也不套 —— 三道闸全过，然后框与角色位
+    //   **整份错位**，套用者拖谁都换成别人，零报错、r2v 钱照扣。
+    const lines = Array.from({ length: 12 }, (_, i) => `${i + 1}|${i * 8}|位置${i}|外观${i}`).join("\n");
+    const meta = {};
+    const roles = blockout.parseRoles(lines, meta);
+    expect(roles).toHaveLength(9); // 截断照旧
+    expect(meta.allSlots).toHaveLength(12); // 但总人数没丢
+    expect(meta.allSlots).toEqual(blockout.ordinalSlots(12));
+    // 每个角色位的 label 都能在完整表里查到下标 —— 这正是 ⑧b 挑框用的那一跳
+    for (const r of roles) expect(meta.allSlots.indexOf(r.label)).toBeGreaterThanOrEqual(0);
+    // 不传 meta 也不许炸（十几处既有调用方一个字没改）
+    expect(blockout.parseRoles(lines)).toHaveLength(9);
+  });
+
+  test("★ 负数坐标是**坏框**不是噪声：多吐一行带负数时不许蒙混过关", () => {
+    // 要 2 个、模型吐 3 行（其中一行 cx 为负）。只认 `\\d+` 的旧正则会让那行连匹配都不匹配，
+    // 被当成"模型闲聊"跳过，剩下 2 行正好凑够数目 → 整份被判过。现在它计入 bad、整份丢弃。
+    const withNeg = ["1|-5|500|100|800", "2|186|500|100|800", "3|510|500|100|800"].join("\n");
+    expect(blockout.parseBoxes(withNeg, 2)).toEqual([]);
+  });
+
   test("★ 提示词把总数说出来（成败判据就是数目对得上）", () => {
     const p = blockout.boxPrompt(5);
     expect(p).toContain("一共有 5 个");
