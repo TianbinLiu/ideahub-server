@@ -264,25 +264,40 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
       if (!images.length) {
         rolesNote = "没能从这段视频里取到画面，这次没有认出可挂卡的角色位（模板已经建好，套用时用一句话描述要换谁）。";
       } else {
-        const visionOut = await chargedArkCall({
-          user: req.user,
-          modelAllowed: (m) => m === VISION_MODEL,
-          kind: "chat",
-          path: "/chat/completions",
-          body: {
-            model: VISION_MODEL,
-            messages: [
-              { role: "system", content: blockout.VISION_SYSTEM },
-              {
-                role: "user",
-                content: [
-                  { type: "text", text: blockout.visionPrompt("") },
-                  ...images.map((url) => ({ type: "image_url", image_url: { url } })),
-                ],
-              },
-            ],
-          },
-        });
+        // ★★ 认人这一发**允许重试一次**（2026-08-17 实跑逼出来的）：8 帧的视觉调用在
+        //   上游 150s 超时线上下浮动 —— 同一段素材、同一份提示词，前一次回 7 个角色位，
+        //   后一次回 504 `ark upstream TimeoutError`。那不是素材的问题，是一次抖动。
+        //   ★ 重试**不多花钱**：网关对非 2xx 会把这一发退回（arkGateway 的 W2），
+        //     所以失败那次的 400 token 已经回到钱包里了。
+        //   ★ 只重试**一次**、且只在"没受理"时重试：受理了但回包不对（模型胡说）是
+        //     另一回事，重试解决不了，只会白花一次钱。
+        let visionOut = null;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          visionOut = await chargedArkCall({
+            user: req.user,
+            modelAllowed: (m) => m === VISION_MODEL,
+            kind: "chat",
+            path: "/chat/completions",
+            body: {
+              model: VISION_MODEL,
+              messages: [
+                { role: "system", content: blockout.VISION_SYSTEM },
+                {
+                  role: "user",
+                  content: [
+                    { type: "text", text: blockout.visionPrompt("") },
+                    ...images.map((url) => ({ type: "image_url", image_url: { url } })),
+                  ],
+                },
+              ],
+            },
+          });
+          if (!visionOut.ok || visionOut.accepted) break; // 计费层拒了就别重试（余额/套餐不会自己变）
+          console.warn(
+            `[branchTemplate] V1 认人第 ${attempt} 次没受理（status=${visionOut.status}），` +
+              (attempt < 2 ? "再试一次（上一次已退费）" : "不再重试"),
+          );
+        }
         // ★★★ `ok` 与 `accepted` 是**两件事**，两道都要判（V2 那边判了两道，我第一版
         //   只判了 ok —— 2026-08-17 实跑当场撞上）：
         //     · `ok:false`       = **计费这一层**没放行（余额/套餐/模型不在册），钱一分没动；
