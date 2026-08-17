@@ -1969,6 +1969,43 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
 });
 
 // ─────────────────────────────────────────────────────────────────────
+describe("GET /templates/mine —— 作者在服务端还有些什么（**含未发布的**）", () => {
+  // ★★ 这一屏在此之前**只读本机 IndexedDB**，而服务端唯一的列表查询是
+  //   `{status:"published"}`。两件事叠起来的后果：换设备/重装之后作者的模板一条不剩，
+  //   而未发布（pending）的那些既不在市场里、也没有任何入口知道它们的 id ——
+  //   **事实上永久失联**，却还占着服务端记录与云端资产，且只有作者本人有权删。
+  //   全程零报错：它不是"加载失败"，是压根不出现。
+  // ★ 模板在**用例内**建，不在 beforeAll：文件级的 beforeEach 才装 Cloudinary 的 spy，
+  //   而 beforeAll 跑在它之前 —— 那样 createTemplate 会真出网、回 502。
+
+  test("★★ 未发布的也列出来（那正是在此之前永久失联的那一批）", async () => {
+    const mineId = (await createTemplate(910001)).id;
+    const res = await request(app).get("/api/branch/templates/mine").set(asOwner()).expect(200);
+    const hit = res.body.templates.find((t) => t.id === mineId);
+    expect(hit).toBeTruthy();
+    expect(hit.status).toBe("pending"); // ← 不筛 status 才有的这一条
+    expect(hit.isOwner).toBe(true);
+  });
+
+  test("★ 只列自己的（身份认 ownerId，不认显示名）", async () => {
+    const mineId = (await createTemplate(910002)).id;
+    const res = await request(app).get("/api/branch/templates/mine").set(asOther()).expect(200);
+    expect(res.body.templates.map((t) => t.id)).not.toContain(mineId);
+  });
+
+  test("★★★ 路由顺序：`mine` 不许被 `/templates/:id` 吃掉", async () => {
+    // 它注册在 `:id` **之前**。顺序一反，`mine` 会被当成一个非法 ObjectId → 400/404，
+    // 而「我的模板」那一屏只会显示成"服务端上什么都没有" —— 零报错的那种坏。
+    const res = await request(app).get("/api/branch/templates/mine").set(asOwner());
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.templates)).toBe(true);
+  });
+
+  test("★ 要登录 —— 这是「我的」，没有匿名版本", async () => {
+    await request(app).get("/api/branch/templates/mine").expect(401);
+  });
+});
+
 describe("存量坏模板的两道门（发布闸 / 套用闸）—— 说的是真正的原因", () => {
   // ★★ 线上那 3 个模板（refVideo.durationSec = 4、真实 3.712s）的处境：
   //   作者反复试炼、反复撞方舟的英文 400，于是 provenAt 永远为空 ——

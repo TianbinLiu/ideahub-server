@@ -1268,6 +1268,37 @@ async function destroyQuietly(publicId, resourceType, tag) {
 // ★ /templates/shared 必须排在 /templates/:id 之前，否则会被 :id 吃掉
 //   （"shared" 当成 id → 查不到 → 市场永远是空的，而且返回 200，一点错都不报）。
 //   与 branchAsset.routes 的 /cards/shared、/decks/shared 同一条排序坑。
+// ── GET /api/branch/templates/mine ──────────────────────────────────────
+//
+// 「服务端上我自己的模板」—— **含未发布的**。
+//
+// ══ 为什么非有不可（2026-08-17 加，补一个从一开始就在的缺口）══════════════════
+//   在此之前「我的模板」那一屏**只读本机 IndexedDB**，而服务端唯一的列表查询是
+//   `{ status: "published" }`。两件事叠起来的后果是：
+//     · 换设备 / 重装 / 清应用数据之后，作者自己的模板在 App 里**一条都不剩**；
+//     · 已发布的那些还能从市场里找回来（并下架/删除），而**未发布（pending）的那些
+//       既不在市场里、也没有任何入口知道它们的 id —— 事实上永久失联**，
+//       却还占着服务端记录与 100MB 级的云端资产，且只有作者本人有权删。
+//   全程零报错：它不是"加载失败"，是压根不出现。
+//
+// ★ 列**全部状态**（pending / published / blocked），不筛 status：这一屏的用途就是
+//   "我在服务端还有些什么"，而失联最严重的恰恰是 pending 那批。blocked 也要出 ——
+//   作者有权知道自己哪条被平台下架了（详情页那枚徽章才有东西可显示）。
+// ★ 身份只认 `ownerId`，绝不拿 authorName 比（显示名会变，CLAUDE.md 那条坑）。
+// ★ 与 /shared 共用 `toTemplatePayload`：roles/markSlots/markBoxes 那几位本来就是
+//   「真有才出」，作者视角与别人视角的差别只有 isOwner 一位，不需要第二种形状。
+const mineListLimit = userRateLimit({ max: 30, windowMs: 60 * 1000, scope: "branchTemplate:mine" });
+
+router.get("/templates/mine", requireAuth, mineListLimit, async (req, res, next) => {
+  try {
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const docs = await BranchTemplate.find({ ownerId: req.user._id }).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ ok: true, templates: docs.map((d) => toTemplatePayload(d, req.user)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/templates/shared", optionalAuth, async (req, res, next) => {
   try {
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
