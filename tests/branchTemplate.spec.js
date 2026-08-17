@@ -2656,6 +2656,68 @@ describe("画面位置框（单元）—— 拖到画面上挂卡的全部输入
 });
 
 // ─────────────────────────────────────────────────────────────────────
+describe("用户自己标的分析帧（单元）—— pickedFrameCandidates 是这条规则的唯一实现", () => {
+  // ══ 为什么有这条路 ═══════════════════════════════════════════════════
+  // 自动铺法挑的是**几何位置**（1/2 → 1/4 → 3/4 → 1/8 → 7/8），对"一镜到底、人站着
+  // 不动"的素材够用。但真实素材有**分镜**：2026-08-17 实测同一段 15 秒群舞里人数在
+  // 8→7→5→6 之间跳，那个红色主舞在 1s/4s 排第 4、在 7.5s/11s 排第 3 ——「从左数第几个」
+  // 在不同镜头里指的不是同一个人。几何位置不知道分镜在哪，看得见画面的人知道。
+  const blockout = require("../src/services/blockoutize.service");
+
+  test("★★★ 上限就是 BOX_FRAME_TRIES —— 多标的截掉（报价按这个数算）", () => {
+    // 这条是**钱**的问题不是体验问题：每试一帧就是一发计费 chat，而 App 的报价
+    // （ownRefTemplateCost）按"最多几发"算。允许标更多 = 页面报价与实收当场分家，
+    // 两个方向都不报错 —— 本仓头号事故形状。
+    const many = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const got = blockout.pickedFrameCandidates(many, 30);
+    expect(got).toHaveLength(blockout.BOX_FRAME_TRIES);
+    // 截的是**尾巴**：他标的第一帧是他认为最有代表性的那一帧
+    expect(got[0]).toBe(1);
+  });
+
+  test("★★ 保持用户给的顺序，不按秒数重排", () => {
+    // 候选表的语义是"依次试、第一个能干净解析出名单的胜出"。按秒数重排 = 把他的判断扔了：
+    // 他把第 8 秒放在最前面，正是因为那一帧人最齐。
+    expect(blockout.pickedFrameCandidates([8, 2, 5], 30)).toEqual([8, 2, 5]);
+  });
+
+  test("★ 量化到与自动那条同一个栅格（0.5s 的倍数）", () => {
+    // 抽帧地址里的时间戳按这个粒度拼。不对齐的话两条路会取到不同的帧，而
+    // "为什么我标的那一帧和它分析的不是同一张"完全查不出来。
+    expect(blockout.pickedFrameCandidates([2.37], 30)).toEqual([2.5]);
+    expect(blockout.pickedFrameCandidates([2.2], 30)).toEqual([2]);
+  });
+
+  test("★ 掐在片内 + 去重（同一帧问两遍是白花一次钱）", () => {
+    // 右端开区间：4.736s 的片子不许取到 4.736（那一刻已经不在片子里了），
+    // 与 boxFrameCandidates 的 maxT 同一条
+    expect(blockout.pickedFrameCandidates([99], 4.736)).toEqual([4]);
+    expect(blockout.pickedFrameCandidates([2.4, 2.6, 2.5], 30)).toEqual([2.5]);
+  });
+
+  test("★★ 标了但全都不能用 → null（退回自动铺法，与「没标」完全同一条路径）", () => {
+    // 这一位是**判否定**：null = 没有可用的用户标记。返回空数组的话调用方
+    // `?? boxFrameCandidates(...)` 不会接手（空数组是真值），于是一帧都不试、
+    // 认人直接失败 —— 而那与"这段视频里真的没有人"完全无法区分。
+    expect(blockout.pickedFrameCandidates([], 30)).toBeNull();
+    expect(blockout.pickedFrameCandidates(undefined, 30)).toBeNull();
+    expect(blockout.pickedFrameCandidates(null, 30)).toBeNull();
+    expect(blockout.pickedFrameCandidates("2,3", 30)).toBeNull();
+    expect(blockout.pickedFrameCandidates([NaN, -1, "x", {}], 30)).toBeNull();
+  });
+
+  test("★ 混着好坏：坏的跳过，好的照用（不整份丢）", () => {
+    // 与「框」那一组的"整份可信才要"**有意不同**：那边少一个框 = 挂卡会错人，
+    // 这边只是候选表，少一个候选只是少试一帧，没有任何东西会因此指错人。
+    expect(blockout.pickedFrameCandidates([-5, 3, "x", 7], 30)).toEqual([3, 7]);
+  });
+
+  test("★ 时长不可用时全部掐到 0（NaN 拼进 so_ 会得到一个 404 地址，且零报错）", () => {
+    expect(blockout.pickedFrameCandidates([5, 9], 0)).toEqual([0]);
+    expect(blockout.pickedFrameCandidates([5], undefined)).toEqual([0]);
+  });
+});
+
 describe("★ 删角色位：整份替换里「少给一条」就是删除（白模 V2）", () => {
   // ★★ 2026-08-15 实测：方舟画编号并不可靠。同一段 5 人素材实出过
   //     2/2/1/1/5（两组重号，3 和 4 整个没出现）与 3/1/1/4/5（一组重号，2 没出现）。

@@ -402,6 +402,44 @@ function boxFrameCandidates(realDurSec) {
  *  ★ 与 `boxFrameCandidates` 的长度是同一件事，所以从它取，别另写一个 3。 */
 const BOX_FRAME_TRIES = boxFrameCandidates(60).length;
 
+/**
+ * 「用户自己在编辑页标的那几帧」→ 候选帧表。返回 null = 没标 / 标的全不能用，
+ * 调用方退回 `boxFrameCandidates` 的自动铺法。
+ *
+ * ══ 为什么要有这条（2026-08-17 加）══════════════════════════════════
+ * 自动铺法挑的是**几何位置**（中间 → 1/4 → 3/4 → 1/8 → 7/8），它对"一镜到底、
+ * 人站着不动"的素材够用。但真实素材是**有分镜的**：同一段 15 秒的群舞里实测
+ * 人数在 8→7→5→6 之间跳，而那个红色主舞在 1s/4s 排第 4、在 7.5s/11s 排第 3 ——
+ * 「从左数第几个」在不同镜头里指的**不是同一个人**。几何位置不知道分镜在哪，
+ * 而看得见画面的人知道：他能挑一帧"人最齐、最能代表这一段"的。
+ *
+ * ★★ 上限**必须**是 BOX_FRAME_TRIES，与自动那条路一模一样：这条路每试一帧就是
+ *   一发计费 chat，而 App 的报价（ownRefTemplateCost）按"最多几发"算。允许用户标
+ *   更多帧 = 页面报价与实收当场分家，两个方向都不报错 —— 本仓头号事故形状。
+ *   多标的**静默截掉**在这里不合适（用户数得出来自己标了几帧），所以 App 侧的标记
+ *   上限也用同一个数，在那边就拦住；这里的 slice 只是最后一道兜底。
+ * ★ **保持用户给的顺序**：他标的第一帧就是他认为最有代表性的那一帧，而候选表是
+ *   "依次试、第一个能干净解析出名单的胜出"。按秒数重排等于把他的判断扔了。
+ * ★ 量化到与自动那条同一个栅格（quantSec）：抽帧地址里的时间戳就是按这个粒度拼的，
+ *   不对齐的话两条路会取到不同的帧，而"为什么我标的那一帧和它分析的不是同一张"
+ *   完全查不出来。
+ * ★ 掐在片内 + 去重：与 boxFrameCandidates 同一套（同一帧问两遍是白花一次钱）。
+ */
+function pickedFrameCandidates(atSecs, realDurSec) {
+  if (!Array.isArray(atSecs) || atSecs.length === 0) return null;
+  const dur = Number(realDurSec);
+  const maxT = Number.isFinite(dur) && dur > 0 ? quantSec(Math.max(0, dur - FRAME_QUANT_SEC)) : 0;
+  const out = [];
+  for (const raw of atSecs) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) continue;
+    const t = Math.min(quantSec(n), maxT);
+    if (!out.includes(t)) out.push(t);
+    if (out.length >= BOX_FRAME_TRIES) break;
+  }
+  return out.length ? out : null;
+}
+
 /** 量框那一发的系统提示词。★ 与 VISION_SYSTEM 分开：那一发要的是"这些人长什么样"，
  *  这一发要的是"他们在画面的哪儿"，混成一个会让模型两件事都做得含糊。 */
 const BOX_VISION_SYSTEM =
@@ -1116,8 +1154,14 @@ const ROSTER_FRAMES_MAX = 5;
  *
  * @returns {Promise<{ roles: object[], boxes: object[], atSec: number, tries: number, why: string }>}
  */
-async function measureRosterBoxes({ publicId, version, durSec, model, send, timeoutMs }) {
-  const cands = boxFrameCandidates(durSec);
+/**
+ * @param {number[]} [atSecs] 用户自己在编辑页标的帧（绝对秒）。给了就**按他的顺序**依次试，
+ *   不给才走自动铺法。判据只有 `pickedFrameCandidates` 一处（含上限与量化）。
+ */
+async function measureRosterBoxes({ publicId, version, durSec, model, send, timeoutMs, atSecs }) {
+  // ★ 「用户标的」优先于「自动铺的」，但两条路产出的都是一份**候选表**、语义完全一样：
+  //   依次试，第一个能干净解析出名单+框的胜出。所以下面整段循环一个字都不用分支。
+  const cands = pickedFrameCandidates(atSecs, durSec) ?? boxFrameCandidates(durSec);
   let why = "";
   let tries = 0;
   for (const atSec of cands) {
@@ -1314,6 +1358,7 @@ module.exports = {
   ordinalSlots,
   boxFrameSec,
   boxFrameCandidates,
+  pickedFrameCandidates,
   measureRoster,
   measureRosterBoxes,
   rosterBoxPrompt,

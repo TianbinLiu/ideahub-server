@@ -1479,6 +1479,14 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
         model: VISION_MODEL,
         send,
         timeoutMs: BOX_TIMEOUT_MS,
+        // ★★ 用户自己在编辑页标的帧（可选）。判据与上限**全在**
+        //   blockout.pickedFrameCandidates 一处：量化、掐在片内、去重、保持他给的顺序、
+        //   截到 BOX_FRAME_TRIES（= 自动那条路的候选数，也就是 App 报价的依据）。
+        //   这里刻意**不做任何校验**，连"是不是数组"都不判 —— 判两遍就是两处规则，
+        //   而这条路上"多试一帧 = 多花一笔钱"，两处对上限的理解漂移会直接变成
+        //   报价与实收不等（本仓头号事故形状）。乱七八糟的输入在那一处会退成 null，
+        //   于是自动铺法接手 —— 与"没标"完全同一条路径。
+        atSecs: req.body?.atSecs,
       });
       roles = m.roles;
       boxes = m.boxes;
