@@ -278,6 +278,13 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
             modelAllowed: (m) => m === VISION_MODEL,
             kind: "chat",
             path: "/chat/completions",
+            // ★★ 显式超时，别用默认的 T_CREATE(150s)：那个数是给**建视频任务**用的。
+            //   这是一条 chat，而登记是一条**同步 HTTP 请求** —— 认人最多 2 发、
+            //   量框最多 3 发，全按 150s 算最坏要等 12 分钟，那正是 V2 当初拆成
+            //   两阶段要躲的形状（把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接上）。
+            //   90s：够 8 帧的视觉跑完（实测成功那几次都在一分钟内），
+            //   又让抖动**快速失败**、把机会让给重试。
+            timeoutMs: ROSTER_TIMEOUT_MS,
             body: {
               model: VISION_MODEL,
               messages: [
@@ -338,6 +345,8 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
                   modelAllowed: (x) => x === VISION_MODEL,
                   kind: "chat",
                   path: "/chat/completions",
+                  // 量框是**单帧**，比认人快得多；给它更短的一档，最多三帧也就一分半
+                  timeoutMs: BOX_TIMEOUT_MS,
                   body,
                 }),
             });
@@ -455,6 +464,18 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 const BLOCKOUT_MODEL = SEEDANCE_2_5;
 /** 看帧用的对话模型。与 app 的 MODELS.chat 同一个 id（看图说话走同一个模型） */
 const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
+/**
+ * 视觉调用的超时（毫秒）—— **不要用 arkGateway 的 T_CREATE(150s)**，那个数是给
+ * "建一个视频生成任务"用的。这两发都是 chat，而它们挂在一条**同步 HTTP 请求**
+ * （登记模板）里：按 150s 算，认人 2 发 + 量框 3 发最坏要等 12 分钟。
+ * ★ 认人 90s：8 帧的视觉，实测跑通那几次都在一分钟内；给 90s 是留余量，
+ *   又让抖动快速失败、把机会让给重试（重试不多花钱，非 2xx 网关会退）。
+ * ★ 量框 30s：单帧，实测十几秒。三帧全打满也就一分半。
+ * ⇒ 整条登记请求的最坏耗时 = 2×90 + 3×30 = 270s，仍然长，但**有界且可解释**。
+ *   真要再快，下一步是把认人/量框挪出这条同步请求（与 V2 拆两阶段同一条思路）。
+ */
+const ROSTER_TIMEOUT_MS = 90_000;
+const BOX_TIMEOUT_MS = 30_000;
 // ★ 「看几帧」原来是这里一个写死的 `VISION_FRAMES = 3`。2026-08-15 实测：4 秒素材看 3 帧
 //   只认出 2 个人，方舟出片时看到更多人**自己编到了 3 号** —— 画面上有 3 号、角色位列表
 //   里没有第三格，套用者挂不上卡且零报错。现在帧数按时长算 / 由用户自选，规则的**唯一实现**
