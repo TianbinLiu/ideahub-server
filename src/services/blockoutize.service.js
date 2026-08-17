@@ -20,7 +20,7 @@ const { cloudinary } = require("../config/cloudinary");
 const { callArk, T_POLL } = require("./arkGateway.service");
 // ★ 抽帧地址的拼法只有 utils/templateVideoAsset 一处（铁律六）。这里 require 它不成环：
 //   那个模块只依赖 config/cloudinary。
-const { buildOutFrameUrl } = require("../utils/templateVideoAsset");
+const { buildOutFrameUrl, OUT_FRAME_W_ROSTER } = require("../utils/templateVideoAsset");
 
 // ── ① 预热（F9）─────────────────────────────────────────────────────
 //
@@ -1017,6 +1017,84 @@ async function transferToCloudinary(remoteUrl, publicId) {
  * @returns {Promise<{ boxes: object[], atSec: number, tries: number, why: string }>}
  *          `boxes` 为空 = 这次量不出来（调用方退回点列表，并照实说一句）
  */
+/**
+ * 认人整段 —— **唯一实现**（与 `measureBoxes` 同构，供「作者自带参考视频」那条路用）。
+ *
+ * ★ 抽帧 → 一发 chat → `parseRoles`。它与"这段视频怎么来的"无关，所以 V1（作者自己传的
+ *   白模片）与将来任何需要"这段视频里有谁"的路都能用同一份。
+ *
+ * ══ 两个实测出来的数，改之前先看 ═══════════════════════════════════════
+ *  · **最多喂 5 帧**：同一段素材连着打，3/4/5 帧回 200（120~140s），**6 帧与 8 帧一律 504**。
+ *    耗时主要被上游排队主导（孤立打一发 3 图只要 6.6s），但帧数在边缘确实是道坎。
+ *    取的是 `visionFrameTimes` 那一份的前 N 个（它已经在片子里均匀铺开），
+ *    不是另算一套间隔 —— 那就成了"看几帧"的第二处实现。
+ *  · **只重试"快速失败"那一种**：上游耗时在 6.6s~140s 之间浮动，超时那一发本身已经
+ *    等满了超时 —— 再压一发只是把等待翻倍。快速失败（限流/瞬时 5xx）重试才划算。
+ *    ⚠ 重试不多花钱：网关对非 2xx 会退回这一发（arkGateway 的 W2）。
+ *
+ * @returns {Promise<{ roles: object[], allSlots: string[]|null, why: string }>}
+ *          `roles` 为空 = 这次没认出来（调用方退回"没有角色位"的老形态，并照实说一句）
+ */
+async function measureRoster({ publicId, version, durSec, note, model, send, framesMax = ROSTER_FRAMES_MAX, timeoutMs }) {
+  const times = visionFrameTimes(durSec, null).slice(0, framesMax);
+  const images = [];
+  for (const atSec of times) {
+    const url = buildOutFrameUrl(publicId, atSec, version, OUT_FRAME_W_ROSTER);
+    const got = url ? await fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
+    if (got.ok) images.push(got.dataUrl);
+    else console.warn(`[blockoutize] 认人抽帧失败 ${publicId}@${atSec}s: ${got.reason}`);
+  }
+  if (!images.length) return { roles: [], allSlots: null, why: "一帧都没取到" };
+
+  let out = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const t0 = Date.now();
+    out = await send(
+      {
+        model,
+        messages: [
+          { role: "system", content: VISION_SYSTEM },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: visionPrompt(note || "") },
+              ...images.map((url) => ({ type: "image_url", image_url: { url } })),
+            ],
+          },
+        ],
+      },
+      timeoutMs,
+    );
+    if (!out.ok || out.accepted !== false) break; // 计费层拒了别重试（余额/套餐不会自己变）
+    const spent = Date.now() - t0;
+    const slow = timeoutMs ? spent >= timeoutMs - 5_000 : false;
+    console.warn(
+      `[blockoutize] 认人第 ${attempt} 次没受理（status=${out.status}，耗时 ${(spent / 1000).toFixed(1)}s）：` +
+        (slow ? "是超时，不再压第二发" : attempt < 2 ? "快速失败，再试一次（上一次已退费）" : "不再重试"),
+    );
+    if (slow) break;
+  }
+  if (!out.ok || out.accepted === false) {
+    return { roles: [], allSlots: null, why: `AI 调用没成功（status=${out?.status ?? "?"}）` };
+  }
+  let roles = [];
+  const meta = {};
+  try {
+    const parsed = JSON.parse(out.text || "{}");
+    roles = parseRoles(parsed?.choices?.[0]?.message?.content ?? "", meta);
+  } catch {
+    return { roles: [], allSlots: null, why: "回包不是 JSON" };
+  }
+  return {
+    roles,
+    allSlots: Array.isArray(meta.allSlots) ? meta.allSlots : null,
+    why: roles.length ? "" : "AI 没在画面里认出人物",
+  };
+}
+
+/** 认人最多喂几帧 —— 见 `measureRoster` 头上那两个实测数。★ 不影响报价（这一笔按"发了几次 chat"收） */
+const ROSTER_FRAMES_MAX = 5;
+
 async function measureBoxes({ publicId, version, durSec, allSlots, labels, model, send }) {
   const cands = boxFrameCandidates(durSec);
   let why = "";
@@ -1091,6 +1169,8 @@ module.exports = {
   ordinalSlots,
   boxFrameSec,
   boxFrameCandidates,
+  measureRoster,
+  ROSTER_FRAMES_MAX,
   BOX_FRAME_TRIES,
   measureBoxes,
   BOX_VISION_SYSTEM,

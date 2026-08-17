@@ -226,162 +226,15 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
         .json({ ok: false, message: "这段视频已经登记过一个模板了，请直接使用那一个，或换一段视频。" });
     }
 
-    // ── 认人 + 量框：让**自己传的白模视频**也长出角色位与挂卡落点 ────────────────
-    //
-    // ★★★ 这条路（V1：作者自己传一段已经是白模/人偶的参考视频）与 V2（任意视频 →
-    //   付费 r2v 换成白人偶）的差别只有一个：**这里不出片**。视频已经在手上了。
-    //   所以 V2 那四步里，除了"把人换成白人偶"那一发，其余三步原样适用：
-    //     ① 看几帧（visionFrameTimes，只吃时长）
-    //     ② 认人 + 按横向位置发序数措辞（visionPrompt / parseRoles / ordinalSlots）
-    //     ③ 量框（boxFrameSec / boxPrompt / parseBoxes）
-    //   在此之前 V1 建出来的模板 roles 恒空，于是核对面板不出现、挂卡面板走空壳分支、
-    //   出片走一句泛指的「把视频里的人替换为…」—— 作者传了一段精心做好的白模片，
-    //   却只能用最粗的那条路。
-    //
-    // ★★ 花两发 chat（认人一发 + 量框一发），**都走 chargedArkCall、都进报价**。
-    //   ⚠ 别照抄 V2 ⑧b 那句「量框不计费、我们自己吃掉」：那条成立的前提是它 1:1 挂在
-    //   一次已经付过 r2v 的 finish 上。V1 一分钱的付费调用都没有，照抄等于给一个免费
-    //   端点接上打上游的能力，而账单上没有任何一行解释得了它。
-    //   App 侧报价是 `blockoutTemplateCost() * 2`（两发 chat 定额），逐条相等。
-    //
-    // ★★ **尽力而为，绝不整句拒**：认不出人 = 退回这条路在今天的老形态（没有角色位，
-    //   一句话泛指），那本来就成立；量不出框 = 有角色位但拖不了，退回点列表。
-    //   两种都要在回包里**明说**（下面的 rolesNote），不说的话作者会以为功能坏了。
-    let roles = [];
-    let boxPatch = {};
-    let rolesNote = "";
-    try {
-      // ★★ 认人**封顶 5 帧**（2026-08-17 量出来的）：同一段素材连着打五发，
-      //   3/4/5 帧都回 200（120~140s），**6 帧与 8 帧一律 504**。耗时主要被上游排队
-      //   主导（孤立打一发 3 图只要 6.6s），但帧数在边缘确实是道坎。
-      //   ★ 封顶**不影响报价**：这一笔按"发了几次 chat"收，与几帧无关（economy 那条 ★★★）。
-      //   ★ 代价说清楚：少看几帧 = 更可能漏掉中途入场/离场的人。所以取的是
-      //     `visionFrameTimes` 排好的那一份的**前 5 个**（它已经在片子里均匀铺开），
-      //     不是自己另算一套间隔 —— 那就成了"看几帧"的第二处实现。
-      const times = blockout.visionFrameTimes(meta.duration, null).slice(0, ROSTER_FRAMES_MAX);
-      const images = [];
-      for (const atSec of times) {
-        // ★ 认人这一发**必须传 768**（OUT_FRAME_W_ROSTER）：它一次要喂最多 8 帧，
-        //   照量框那档的 1024 喂会把上游打到 504（2026-08-17 实测撞上，见那两个常量的 ⚠）
-        const url = buildOutFrameUrl(own.publicId, atSec, resource.version, OUT_FRAME_W_ROSTER);
-        const got = url ? await blockout.fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
-        if (got.ok) images.push(got.dataUrl);
-        else console.warn(`[branchTemplate] V1 抽帧失败 ${own.publicId}@${atSec}s: ${got.reason}`);
-      }
-      if (!images.length) {
-        rolesNote = "没能从这段视频里取到画面，这次没有认出可挂卡的角色位（模板已经建好，套用时用一句话描述要换谁）。";
-      } else {
-        // ★★ 认人这一发**允许重试一次**（2026-08-17 实跑逼出来的）：8 帧的视觉调用在
-        //   上游 150s 超时线上下浮动 —— 同一段素材、同一份提示词，前一次回 7 个角色位，
-        //   后一次回 504 `ark upstream TimeoutError`。那不是素材的问题，是一次抖动。
-        //   ★ 重试**不多花钱**：网关对非 2xx 会把这一发退回（arkGateway 的 W2），
-        //     所以失败那次的 400 token 已经回到钱包里了。
-        //   ★ 只重试**一次**、且只在"没受理"时重试：受理了但回包不对（模型胡说）是
-        //     另一回事，重试解决不了，只会白花一次钱。
-        let visionOut = null;
-        for (let attempt = 1; attempt <= 2; attempt += 1) {
-          const t0 = Date.now();
-          visionOut = await chargedArkCall({
-            user: req.user,
-            modelAllowed: (m) => m === VISION_MODEL,
-            kind: "chat",
-            path: "/chat/completions",
-            // ★★ 显式超时，别用默认的 T_CREATE(150s)：那个数是给**建视频任务**用的。
-            //   这是一条 chat，而登记是一条**同步 HTTP 请求** —— 认人最多 2 发、
-            //   量框最多 3 发，全按 150s 算最坏要等 12 分钟，那正是 V2 当初拆成
-            //   两阶段要躲的形状（把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接上）。
-            //   90s：够 8 帧的视觉跑完（实测成功那几次都在一分钟内），
-            //   又让抖动**快速失败**、把机会让给重试。
-            timeoutMs: ROSTER_TIMEOUT_MS,
-            body: {
-              model: VISION_MODEL,
-              messages: [
-                { role: "system", content: blockout.VISION_SYSTEM },
-                {
-                  role: "user",
-                  content: [
-                    { type: "text", text: blockout.visionPrompt("") },
-                    ...images.map((url) => ({ type: "image_url", image_url: { url } })),
-                  ],
-                },
-              ],
-            },
-          });
-          if (!visionOut.ok || visionOut.accepted) break; // 计费层拒了就别重试（余额/套餐不会自己变）
-          // ★★ **只重试"快速失败"那一种**（2026-08-17 量完改的）：上游耗时在 6.6s~140s
-          //   之间浮动，超时那一发本身就已经等了 150s —— 再压一发就是让用户在一条
-          //   同步请求里干等五分钟。而快速失败（限流/瞬时 5xx）重试一次很划算。
-          //   ⚠ 重试不多花钱：网关对非 2xx 会退回这一发（arkGateway 的 W2）。
-          const slow = Date.now() - t0 >= ROSTER_TIMEOUT_MS - 5_000;
-          console.warn(
-            `[branchTemplate] V1 认人第 ${attempt} 次没受理（status=${visionOut.status}，` +
-              `耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s），` +
-              (slow ? "是超时，不再压第二发" : attempt < 2 ? "快速失败，再试一次（上一次已退费）" : "不再重试"),
-          );
-          if (slow) break;
-        }
-        // ★★★ `ok` 与 `accepted` 是**两件事**，两道都要判（V2 那边判了两道，我第一版
-        //   只判了 ok —— 2026-08-17 实跑当场撞上）：
-        //     · `ok:false`       = **计费这一层**没放行（余额/套餐/模型不在册），钱一分没动；
-        //     · `ok:true, accepted:false` = 计费过了、**方舟回了非 2xx**（钱已由网关退回）。
-        //   只判 ok 的话，第二种会带着一段错误 JSON 走进下面的 parse —— `choices` 不存在 →
-        //   `parseRoles("")` 回 0 → 被当成"AI 没认出人"。而那是**一句假话**：模型根本没看过
-        //   这段视频。作者会去怪自己的素材，真正的原因（上游 4xx/5xx）只在日志里都没有。
-        if (!visionOut.ok || !visionOut.accepted) {
-          rolesNote = "这次没能认出画面里的角色位（AI 调用没成功），模板已经建好，套用时用一句话描述要换谁。";
-          console.warn(
-            `[branchTemplate] V1 认人失败：ok=${visionOut.ok} accepted=${visionOut.accepted} ` +
-              `status=${visionOut.status} reason=${visionOut.reason ?? "-"} ` +
-              `body=${String(visionOut.text ?? JSON.stringify(visionOut.body ?? {})).slice(0, 240)}`,
-          );
-        } else {
-          const parsed = JSON.parse(visionOut.text || "{}");
-          const roleMeta = {};
-          roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "", roleMeta);
-          const allSlots = Array.isArray(roleMeta.allSlots) ? roleMeta.allSlots : null;
-          if (!roles.length) {
-            rolesNote = "AI 没在这段视频里认出人物，所以这个模板没有可挂卡的角色位（套用时用一句话描述要换谁）。";
-          } else if (allSlots) {
-            // ★ 量框整段走 `blockout.measureBoxes`（V1/V2 唯一实现，自带换帧重试）。
-            //   ★★ 这条路必须走 **chargedArkCall**：V2 的量框能不计费，是因为它 1:1 挂在
-            //   一次已经付过 r2v 的 finish 上；V1 一分钱付费调用都没有，照抄"我们自己吃掉"
-            //   等于给一个免费端点接上打上游的能力，而账单上没有一行解释得了它。
-            const labels = roles.map((r) => r.label);
-            const m = await blockout.measureBoxes({
-              publicId: own.publicId,
-              version: resource.version,
-              durSec: meta.duration,
-              allSlots,
-              labels,
-              model: VISION_MODEL,
-              send: (body) =>
-                chargedArkCall({
-                  user: req.user,
-                  modelAllowed: (x) => x === VISION_MODEL,
-                  kind: "chat",
-                  path: "/chat/completions",
-                  // 量框是**单帧**，比认人快得多；给它更短的一档，最多三帧也就一分半
-                  timeoutMs: BOX_TIMEOUT_MS,
-                  body,
-                }),
-            });
-            boxPatch = m.boxes.length
-              ? { markSlots: labels, markBoxes: m.boxes, markBoxAtSec: m.atSec }
-              : { markSlots: labels };
-            // 有角色位、没框 → 也要说一句：拖拽层不开是**设计**，不是坏了
-            if (!m.boxes.length) {
-              rolesNote =
-                `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置` +
-                `（试了 ${m.tries} 帧：${m.why}），` +
-                "所以挂卡时不能直接拖到画面上（在下面的列表里点着挂一样能用）。";
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.warn(`[branchTemplate] V1 认人/量框整段出错：${String(e?.message || e).slice(0, 160)}`);
-      rolesNote = "这次没能认出画面里的角色位（模板已经建好，套用时用一句话描述要换谁）。";
-    }
+    // ★★★ 认人与量框**不在这条请求里做**（2026-08-17 拆开的）。
+    //   它们原来就摆在这儿，结果是：登记这一条**同步 HTTP 请求**要等分钟级 ——
+    //   认人最多 2 发 ×150s、量框最多 5 发 ×60s。而上游耗时实测在 6.6s~140s 之间浮动
+    //   （连续调用会排队），于是一次抖动就让作者拿到一个**没有角色位的模板**，
+    //   而他既看不出为什么、也没有任何入口重来。
+    //   这正是白模 V2 当初拆成两阶段要躲的形状：**别把"东西建出来了"和"慢活干完了"
+    //   绑在同一个 TCP 连接的命上**。
+    //   ⇒ 登记只做"快且必然成功"的部分：校验 + 取元数据 + 建库，毫秒级返回。
+    //     角色位由 `POST /templates/:id/detect-roles` 单独去认，可重试、失败不影响模板。
 
     let doc;
     try {
@@ -415,12 +268,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
           bytes: meta.bytes,
           cloudinaryPublicId: own.publicId,
         },
-        // ★★ 角色位与位置框：**四位同批写**，写法与 V2 finish 第⑨步逐字相同（存在性展开）。
-        //   markSlots 缺失 = 判成编号方案（挂卡面板会让用户去找人偶头上的数字，而画面上
-        //   什么都没印）；markBoxes 与 markSlots 长度不等 = 出口 markBoxesPayload 整份不出。
-        //   分开写迟早漏一位，而漏一位没有任何症状。
-        ...(roles.length ? { roles } : {}),
-        ...boxPatch,
+        // ★ 角色位不在这里写：它由 detect-roles 那条路单独认（见上面 ★★★）
         status: "pending",
         provenAt: null,
       });
@@ -435,10 +283,13 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     // ★ `rolesNote` 只在"这次没拿到全套"时才出（真有才出，与 payload 里那几位同一条纪律）：
     //   认人失败 / 认不出人 / 量不出框 —— 三种都是**合法的降级**，但作者必须当场知道
     //   自己拿到的是哪一档，否则他会以为核对面板或拖拽挂卡坏了，而这两件事都零报错。
+    // ★ `needsDetect` 明说"还差一步"：客户端据此立刻去调 detect-roles。
+    //   不给这一位的话，App 只能靠"roles 是空的"去猜 —— 而那与"这段视频里真的没有人"
+    //   完全无法区分（后加的字段一律判否定，本仓那条坑）。
     res.status(201).json({
       ok: true,
       template: toTemplatePayload(doc.toObject(), req.user),
-      ...(rolesNote ? { rolesNote } : {}),
+      needsDetect: true,
     });
   } catch (err) {
     next(err);
@@ -1497,6 +1348,166 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
     await doc.save();
     res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/branch/templates/:id/detect-roles ─────────────────────────
+//
+// 「去认一遍这段视频里有哪些人，并量出他们在画面上的位置」——**作者自带参考视频那条路
+// （V1）的第二步**，与登记分开。
+//
+// ══ 为什么必须与登记分开（2026-08-17 拆的，理由与白模 V2 拆两阶段逐字相同）══════
+//   这两步慢起来是**分钟级**：认人最多 2 发 ×150s、量框最多 5 发 ×60s，而上游耗时
+//   实测在 6.6s~140s 之间浮动（连续调用会排队）。塞在登记那条同步请求里的结果是：
+//   一次抖动 → 作者拿到一个**没有角色位的模板**，既看不出为什么、也没有任何入口重来。
+//   拆开之后：登记必然成功且毫秒级；认人失败就再点一次，**模板一直好好地在**。
+//
+// ★★ 可重试是这条路存在的**全部意义**，所以它必须是**幂等且能反复调**的：
+//   · 失败不留痕（模板上什么都不写）——下一次调用面对的状态与第一次完全相同；
+//   · 成功则整份覆盖 roles/markSlots/markBoxes/markBoxAtSec（四位同批写）；
+//   · **作者已经核对过的（labelConfirmed）一律拒**：再认一遍会把他逐个改过的措辞
+//     整份冲掉，而那是他花时间对着画面做的事，没有任何东西找得回来。
+//
+// ★★ 并发用一把**原子锁**（findOneAndUpdate 抢 detectingAt），不是"先查再写"：
+//   这条路每次调用都要**花钱**（认人 + 量框都是计费的 chat）。用户手抖点两下、
+//   或 App 重试与用户手点撞在一起，先查再写会让两发都过、扣两笔钱。
+//   锁 10 分钟自动过期 —— 进程被杀/请求中断时不能把这条路永久锁死。
+const detectLimit = userRateLimit({ max: 6, windowMs: 60 * 1000, scope: "branchTemplate:detectRoles" });
+/** 认人锁的寿命。★ 比最坏耗时（2×150s + 5×60s ≈ 10 分钟）略长一点点就够 */
+const DETECT_LOCK_MS = 11 * 60 * 1000;
+
+router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) invalidId("Invalid template id");
+    const found = await BranchTemplate.findById(id).lean();
+    if (!found) notFound("Template not found");
+    if (String(found.ownerId) !== String(req.user._id)) forbidden("Forbidden");
+    if (!found.refVideo?.cloudinaryPublicId) {
+      badRequest("这个模板没有可以识别的视频（它不是「自己传参考视频」那条路建出来的）。");
+    }
+    // ★ 作者核对过就不许再认（见文件头 ★★）：覆盖会把他一个个改过的措辞整份冲掉
+    if (Array.isArray(found.roles) && found.roles.some((r) => r?.labelConfirmed === true)) {
+      badRequest("这个模板的角色位你已经核对过了，重新识别会把你改过的位置整份覆盖掉。要重认请先在核对面板里把它们删掉。");
+    }
+
+    // ★★ 原子抢锁：只有把 detectingAt 从「空或已过期」改成「现在」的那一发才继续
+    const now = new Date();
+    const claimed = await BranchTemplate.findOneAndUpdate(
+      {
+        _id: found._id,
+        $or: [{ detectingAt: { $exists: false } }, { detectingAt: null }, { detectingAt: { $lt: new Date(now - DETECT_LOCK_MS) } }],
+      },
+      { $set: { detectingAt: now } },
+      { new: true },
+    ).lean();
+    if (!claimed) {
+      return res.status(409).json({
+        ok: false,
+        message: "这个模板正在识别角色位，请等这一次跑完再试（识别要花一到几分钟）。",
+      });
+    }
+
+    const publicId = claimed.refVideo.cloudinaryPublicId;
+    const durSec = Number(claimed.refVideo.realDurationSec ?? claimed.refVideo.durationSec);
+    // Cloudinary 版本号：拼抽帧地址要带（不带可能投递到 CDN 上的旧内容）
+    let version;
+    try {
+      const r = await cloudinary.api.resource(publicId, { resource_type: "video" });
+      version = r.version;
+    } catch {
+      // 拿不到版本不致命（不带版本一样能取到帧），响亮记一笔就继续
+      console.warn(`[branchTemplate] detect-roles 读不到资源版本 ${publicId}`);
+    }
+
+    const send = (body, timeoutMs) =>
+      chargedArkCall({
+        user: req.user,
+        modelAllowed: (m) => m === VISION_MODEL,
+        kind: "chat",
+        path: "/chat/completions",
+        ...(timeoutMs ? { timeoutMs } : {}),
+        body,
+      });
+
+    let roles = [];
+    let allSlots = null;
+    let why = "";
+    let boxes = [];
+    let boxAtSec = 0;
+    let boxWhy = "";
+    try {
+      const r = await blockout.measureRoster({
+        publicId,
+        version,
+        durSec,
+        model: VISION_MODEL,
+        send,
+        timeoutMs: ROSTER_TIMEOUT_MS,
+      });
+      roles = r.roles;
+      allSlots = r.allSlots;
+      why = r.why;
+      if (roles.length && allSlots) {
+        const m = await blockout.measureBoxes({
+          publicId,
+          version,
+          durSec,
+          allSlots,
+          labels: roles.map((x) => x.label),
+          model: VISION_MODEL,
+          send: (body) => send(body, BOX_TIMEOUT_MS),
+        });
+        boxes = m.boxes;
+        boxAtSec = m.atSec;
+        boxWhy = m.boxes.length ? "" : `试了 ${m.tries} 帧：${m.why}`;
+      }
+    } catch (e) {
+      why = String(e?.message || e).slice(0, 160);
+      console.warn(`[branchTemplate] detect-roles 整段出错 ${id}：${why}`);
+    }
+
+    // ★★ 写库：**认出来才写**，认不出就只把锁放掉、模板一个字不动
+    //   （失败不留痕 —— 下一次调用面对的状态与第一次完全相同，见文件头 ★★）
+    const update = { $set: { detectingAt: null } };
+    if (roles.length) {
+      update.$set.roles = roles;
+      update.$set.markSlots = roles.map((x) => x.label);
+      if (boxes.length) {
+        update.$set.markBoxes = boxes;
+        update.$set.markBoxAtSec = boxAtSec;
+      } else {
+        // ★ 上一次可能留着一份框：这次没量出来就必须**清掉**，否则新 roles 会配着旧框。
+        //   长度还可能正好相等（人数没变），于是出口那道长度校验也放行 —— 零报错的整份错位。
+        update.$unset = { markBoxes: "", markBoxAtSec: "" };
+      }
+    }
+    const saved = await BranchTemplate.findByIdAndUpdate(found._id, update, { new: true }).lean();
+
+    // ★ 三档结果都要说清楚：全成 / 有角色位没框 / 一个都没认出来。
+    //   不说的话作者只能靠"面板怎么不出现"去猜，而那与"功能坏了"长得一模一样。
+    const note = !roles.length
+      ? `这次没认出画面里的人物（${why || "原因不明"}）。模板还在，可以再点一次重试。`
+      : boxes.length
+        ? ""
+        : `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置（${boxWhy}），` +
+          "所以挂卡时不能直接拖到画面上（在下面的列表里点着挂一样能用）。可以再点一次重试。";
+
+    res.json({
+      ok: true,
+      template: toTemplatePayload(saved, req.user),
+      detected: roles.length,
+      boxed: boxes.length,
+      ...(note ? { note } : {}),
+    });
+  } catch (err) {
+    // ★ 出错也要把锁放掉，否则这条模板要等 11 分钟才能再试
+    try {
+      await BranchTemplate.findByIdAndUpdate(req.params.id, { $set: { detectingAt: null } });
+    } catch {
+      /* 放锁失败不盖住原始错误 */
+    }
     next(err);
   }
 });

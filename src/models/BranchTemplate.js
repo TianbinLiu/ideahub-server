@@ -241,6 +241,18 @@ const branchTemplateSchema = new mongoose.Schema(
      * 而用户会照着它拖。取法的唯一实现是 blockoutize.service 的 `boxFrameSec`。
      */
     markBoxAtSec: { type: Number, default: undefined },
+    /**
+     * 「这条模板正在认角色位」的**并发锁**（`POST /templates/:id/detect-roles` 抢它）。
+     *
+     * ★★ 必须在 schema 里声明：mongoose 默认 strict，**没声明的路径在 update 里会被
+     *   静默丢掉** —— 那样这把锁写不进去、每次抢都成功，两发并发各扣一次钱，
+     *   而全程零报错（与 server 那条「zod strip 掉未声明字段」是同一个形状）。
+     * ★ 存的是**时间戳而不是布尔**：进程被杀、请求中断时布尔会把这条模板永久锁死，
+     *   而时间戳能自己过期（路由里判 `< now - DETECT_LOCK_MS`）。
+     * ★ `default: undefined` + 判存在性：这个字段上线之前的存量模板没有它，
+     *   于是第一次抢锁必然成功 —— 正确。
+     */
+    detectingAt: { type: Date, default: undefined },
     /** 白模化的来源。服务端写，且**不出公开响应** */
     source: { type: sourceSchema, default: undefined },
     /**
