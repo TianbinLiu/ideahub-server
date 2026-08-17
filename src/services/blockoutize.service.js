@@ -375,8 +375,12 @@ function boxFrameSec(realDurSec) {
  *   作者那段群舞素材就是：认人（看 8 帧）认出 7 个，正中间那一帧只站着 5 个，
  *   于是 `parseBoxes` 判「要 7 个、解析出 5 个」整份丢弃，拖拽层白白关掉。
  *   闸门没判错 —— **错的是我们只给了它一次机会**。
- * ★ 顺序是「中间 → 前三分之一 → 后三分之一」：中间最可能人齐（离两端的入场/离场最远），
- *   不中再往两边找。三个够了 —— 再多是拿钱换一个越来越小的概率，而这一发是要计费的。
+ * ★ 顺序是「中间 → 1/4 → 3/4 → 1/8 → 7/8」：中间最可能人齐（离两端的入场/离场最远），
+ *   不中就**往两头铺开**。2026-08-17 实测逼出这个铺法：原来只取 1/2、1/3、2/3
+ *   三个点，全挤在中后段 —— 而那段素材里 7 个人站得最开恰恰是在**开头**，
+ *   三次分别撞上「只给 5 个框」「1 与 2 号框套在一起」「6 与 7 号框套在一起（w=10 的碎片）」。
+ * ★ 敢试到 5 次是因为量框是**单帧**调用：实测 3s 量级、稳定（多图那一路才会排队超时）。
+ *   代价是最多 5 发 chat —— 报价里照实报上限（App 的 BLOCKOUT_BOX_TRIES）。
  * ★ 量化 + 去重 + 掐在片内：三个候选可能在短片子上撞成同一个数（4 秒的片子），
  *   撞了就只试一次，别把同一帧问三遍。
  * ⚠ 谁改这里的**个数**，就要同步 App 的报价（`economy.blockoutTemplateCost` 那一侧
@@ -387,7 +391,7 @@ function boxFrameCandidates(realDurSec) {
   if (!Number.isFinite(dur) || dur <= 0) return [0];
   const maxT = quantSec(Math.max(0, dur - FRAME_QUANT_SEC));
   const out = [];
-  for (const frac of [1 / 2, 1 / 3, 2 / 3]) {
+  for (const frac of [1 / 2, 1 / 4, 3 / 4, 1 / 8, 7 / 8]) {
     const t = Math.min(quantSec(dur * frac), maxT);
     if (!out.includes(t)) out.push(t);
   }
