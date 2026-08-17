@@ -212,6 +212,141 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     const issue = templateRefIssue(meta);
     if (issue) badRequest(issue);
 
+    // ★★ 重复登记的门要在**任何一次付费调用之前**（2026-08-17 加）。
+    //   在这之前，重复只靠 refVideo.url 的唯一索引在 create 那一刻抛 409 —— 而下面
+    //   两发 chat 的钱那时已经花掉了。用户手抖点两次就付两次，两次都"成功了一半"。
+    //   （与 blockoutize 开炼前那道 `BranchTemplate.exists` 同一条纪律、同一个理由。）
+    //   ★ 状态码与措辞**与下面那条唯一索引 409 逐字相同**：这一道只是把同一个判断
+    //     提前到花钱之前，不是一种新的失败。回 400 的话客户端就得认识两种"重复登记"，
+    //     而两者说的是同一件事（唯一索引那条仍留着 —— 它挡的是并发的第二发）。
+    if (await BranchTemplate.exists({ "refVideo.cloudinaryPublicId": own.publicId })) {
+      return res
+        .status(409)
+        .json({ ok: false, message: "这段视频已经登记过一个模板了，请直接使用那一个，或换一段视频。" });
+    }
+
+    // ── 认人 + 量框：让**自己传的白模视频**也长出角色位与挂卡落点 ────────────────
+    //
+    // ★★★ 这条路（V1：作者自己传一段已经是白模/人偶的参考视频）与 V2（任意视频 →
+    //   付费 r2v 换成白人偶）的差别只有一个：**这里不出片**。视频已经在手上了。
+    //   所以 V2 那四步里，除了"把人换成白人偶"那一发，其余三步原样适用：
+    //     ① 看几帧（visionFrameTimes，只吃时长）
+    //     ② 认人 + 按横向位置发序数措辞（visionPrompt / parseRoles / ordinalSlots）
+    //     ③ 量框（boxFrameSec / boxPrompt / parseBoxes）
+    //   在此之前 V1 建出来的模板 roles 恒空，于是核对面板不出现、挂卡面板走空壳分支、
+    //   出片走一句泛指的「把视频里的人替换为…」—— 作者传了一段精心做好的白模片，
+    //   却只能用最粗的那条路。
+    //
+    // ★★ 花两发 chat（认人一发 + 量框一发），**都走 chargedArkCall、都进报价**。
+    //   ⚠ 别照抄 V2 ⑧b 那句「量框不计费、我们自己吃掉」：那条成立的前提是它 1:1 挂在
+    //   一次已经付过 r2v 的 finish 上。V1 一分钱的付费调用都没有，照抄等于给一个免费
+    //   端点接上打上游的能力，而账单上没有任何一行解释得了它。
+    //   App 侧报价是 `blockoutTemplateCost() * 2`（两发 chat 定额），逐条相等。
+    //
+    // ★★ **尽力而为，绝不整句拒**：认不出人 = 退回这条路在今天的老形态（没有角色位，
+    //   一句话泛指），那本来就成立；量不出框 = 有角色位但拖不了，退回点列表。
+    //   两种都要在回包里**明说**（下面的 rolesNote），不说的话作者会以为功能坏了。
+    let roles = [];
+    let boxPatch = {};
+    let rolesNote = "";
+    try {
+      const times = blockout.visionFrameTimes(meta.duration, null);
+      const images = [];
+      for (const atSec of times) {
+        const url = buildOutFrameUrl(own.publicId, atSec, resource.version);
+        const got = url ? await blockout.fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
+        if (got.ok) images.push(got.dataUrl);
+        else console.warn(`[branchTemplate] V1 抽帧失败 ${own.publicId}@${atSec}s: ${got.reason}`);
+      }
+      if (!images.length) {
+        rolesNote = "没能从这段视频里取到画面，这次没有认出可挂卡的角色位（模板已经建好，套用时用一句话描述要换谁）。";
+      } else {
+        const visionOut = await chargedArkCall({
+          user: req.user,
+          modelAllowed: (m) => m === VISION_MODEL,
+          kind: "chat",
+          path: "/chat/completions",
+          body: {
+            model: VISION_MODEL,
+            messages: [
+              { role: "system", content: blockout.VISION_SYSTEM },
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: blockout.visionPrompt("") },
+                  ...images.map((url) => ({ type: "image_url", image_url: { url } })),
+                ],
+              },
+            ],
+          },
+        });
+        if (!visionOut.ok) {
+          // 余额/套餐/模型不在册 —— 都不该让登记失败：模板本身不花钱
+          rolesNote = "这次没能认出画面里的角色位（AI 调用没有成交），模板已经建好，套用时用一句话描述要换谁。";
+          console.warn(`[branchTemplate] V1 认人未成交（${visionOut.reason}）`);
+        } else {
+          const parsed = JSON.parse(visionOut.text || "{}");
+          const roleMeta = {};
+          roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "", roleMeta);
+          const allSlots = Array.isArray(roleMeta.allSlots) ? roleMeta.allSlots : null;
+          if (!roles.length) {
+            rolesNote = "AI 没在这段视频里认出人物，所以这个模板没有可挂卡的角色位（套用时用一句话描述要换谁）。";
+          } else if (allSlots) {
+            // ★ 量框与 V2 的 ⑧b 逐字同构：按**全部 M 个人**问、按 indexOf 挑出角色位那几个
+            const atSec = blockout.boxFrameSec(meta.duration);
+            const frameUrl = buildOutFrameUrl(own.publicId, atSec, resource.version);
+            const got = frameUrl ? await blockout.fetchFrameDataUrl(frameUrl) : { ok: false, reason: "no-cloud" };
+            if (!got.ok) {
+              console.warn(`[branchTemplate] V1 量框抽帧失败 ${own.publicId}@${atSec}s: ${got.reason}`);
+            } else {
+              const boxOut = await chargedArkCall({
+                user: req.user,
+                modelAllowed: (m) => m === VISION_MODEL,
+                kind: "chat",
+                path: "/chat/completions",
+                body: {
+                  model: VISION_MODEL,
+                  thinking: { type: "disabled" },
+                  max_tokens: 600,
+                  messages: [
+                    { role: "system", content: blockout.BOX_VISION_SYSTEM },
+                    {
+                      role: "user",
+                      content: [
+                        { type: "text", text: blockout.boxPrompt(allSlots.length) },
+                        { type: "image_url", image_url: { url: got.dataUrl } },
+                      ],
+                    },
+                  ],
+                },
+              });
+              if (!boxOut.ok) {
+                console.warn(`[branchTemplate] V1 量框未成交（${boxOut.reason}）`);
+              } else {
+                const bp = JSON.parse(boxOut.text || "{}");
+                const all = blockout.parseBoxes(bp?.choices?.[0]?.message?.content ?? "", allSlots.length);
+                const labels = roles.map((r) => r.label);
+                const picked = all.length ? labels.map((l) => all[allSlots.indexOf(l)] ?? null) : [];
+                if (picked.length && picked.every(Boolean)) {
+                  boxPatch = { markSlots: labels, markBoxes: picked, markBoxAtSec: atSec };
+                }
+              }
+            }
+            // 有角色位、没框 → 也要说一句：拖拽层不开是**设计**，不是坏了
+            if (!boxPatch.markBoxes) {
+              boxPatch = { markSlots: roles.map((r) => r.label) };
+              rolesNote =
+                `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置，` +
+                "所以挂卡时不能直接拖到画面上（在下面的列表里点着挂一样能用）。";
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[branchTemplate] V1 认人/量框整段出错：${String(e?.message || e).slice(0, 160)}`);
+      rolesNote = "这次没能认出画面里的角色位（模板已经建好，套用时用一句话描述要换谁）。";
+    }
+
     let doc;
     try {
       doc = await BranchTemplate.create({
@@ -244,6 +379,12 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
           bytes: meta.bytes,
           cloudinaryPublicId: own.publicId,
         },
+        // ★★ 角色位与位置框：**四位同批写**，写法与 V2 finish 第⑨步逐字相同（存在性展开）。
+        //   markSlots 缺失 = 判成编号方案（挂卡面板会让用户去找人偶头上的数字，而画面上
+        //   什么都没印）；markBoxes 与 markSlots 长度不等 = 出口 markBoxesPayload 整份不出。
+        //   分开写迟早漏一位，而漏一位没有任何症状。
+        ...(roles.length ? { roles } : {}),
+        ...boxPatch,
         status: "pending",
         provenAt: null,
       });
@@ -255,7 +396,14 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
       throw e;
     }
 
-    res.status(201).json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
+    // ★ `rolesNote` 只在"这次没拿到全套"时才出（真有才出，与 payload 里那几位同一条纪律）：
+    //   认人失败 / 认不出人 / 量不出框 —— 三种都是**合法的降级**，但作者必须当场知道
+    //   自己拿到的是哪一档，否则他会以为核对面板或拖拽挂卡坏了，而这两件事都零报错。
+    res.status(201).json({
+      ok: true,
+      template: toTemplatePayload(doc.toObject(), req.user),
+      ...(rolesNote ? { rolesNote } : {}),
+    });
   } catch (err) {
     next(err);
   }
