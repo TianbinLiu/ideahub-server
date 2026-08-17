@@ -280,10 +280,20 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
             ],
           },
         });
-        if (!visionOut.ok) {
-          // 余额/套餐/模型不在册 —— 都不该让登记失败：模板本身不花钱
-          rolesNote = "这次没能认出画面里的角色位（AI 调用没有成交），模板已经建好，套用时用一句话描述要换谁。";
-          console.warn(`[branchTemplate] V1 认人未成交（${visionOut.reason}）`);
+        // ★★★ `ok` 与 `accepted` 是**两件事**，两道都要判（V2 那边判了两道，我第一版
+        //   只判了 ok —— 2026-08-17 实跑当场撞上）：
+        //     · `ok:false`       = **计费这一层**没放行（余额/套餐/模型不在册），钱一分没动；
+        //     · `ok:true, accepted:false` = 计费过了、**方舟回了非 2xx**（钱已由网关退回）。
+        //   只判 ok 的话，第二种会带着一段错误 JSON 走进下面的 parse —— `choices` 不存在 →
+        //   `parseRoles("")` 回 0 → 被当成"AI 没认出人"。而那是**一句假话**：模型根本没看过
+        //   这段视频。作者会去怪自己的素材，真正的原因（上游 4xx/5xx）只在日志里都没有。
+        if (!visionOut.ok || !visionOut.accepted) {
+          rolesNote = "这次没能认出画面里的角色位（AI 调用没成功），模板已经建好，套用时用一句话描述要换谁。";
+          console.warn(
+            `[branchTemplate] V1 认人失败：ok=${visionOut.ok} accepted=${visionOut.accepted} ` +
+              `status=${visionOut.status} reason=${visionOut.reason ?? "-"} ` +
+              `body=${String(visionOut.text ?? JSON.stringify(visionOut.body ?? {})).slice(0, 240)}`,
+          );
         } else {
           const parsed = JSON.parse(visionOut.text || "{}");
           const roleMeta = {};
@@ -320,8 +330,13 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
                   ],
                 },
               });
-              if (!boxOut.ok) {
-                console.warn(`[branchTemplate] V1 量框未成交（${boxOut.reason}）`);
+              // 同上：`ok` 与 `accepted` 两道都要判（只判 ok 的话，上游非 2xx 会带着
+              // 一段错误 JSON 走进 parseBoxes，结果是"数目对不上"—— 又一句假话）
+              if (!boxOut.ok || !boxOut.accepted) {
+                console.warn(
+                  `[branchTemplate] V1 量框失败：ok=${boxOut.ok} accepted=${boxOut.accepted} ` +
+                    `status=${boxOut.status} body=${String(boxOut.text ?? "").slice(0, 200)}`,
+                );
               } else {
                 const bp = JSON.parse(boxOut.text || "{}");
                 const all = blockout.parseBoxes(bp?.choices?.[0]?.message?.content ?? "", allSlots.length);
