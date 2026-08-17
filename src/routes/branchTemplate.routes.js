@@ -1431,38 +1431,29 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
         body,
       });
 
+    // ★★★ 认人与量框合成**一发单图调用**（2026-08-17 量完改的，理由写在
+    //   blockoutize.measureRosterBoxes 的文件头）：这个账号上多图那一路经常整发 504
+    //   （单图 3.5s 稳、5~8 图 150s 超时），而合成一发之后 roster 与 boxes **必然来自
+    //   同一帧** —— "认出 7 个、框只有 5 个"那类不一致从结构上消失，不是靠校验挡住的。
     let roles = [];
-    let allSlots = null;
-    let why = "";
     let boxes = [];
     let boxAtSec = 0;
-    let boxWhy = "";
+    let why = "";
+    let tries = 0;
     try {
-      const r = await blockout.measureRoster({
+      const m = await blockout.measureRosterBoxes({
         publicId,
         version,
         durSec,
         model: VISION_MODEL,
         send,
-        timeoutMs: ROSTER_TIMEOUT_MS,
+        timeoutMs: BOX_TIMEOUT_MS,
       });
-      roles = r.roles;
-      allSlots = r.allSlots;
-      why = r.why;
-      if (roles.length && allSlots) {
-        const m = await blockout.measureBoxes({
-          publicId,
-          version,
-          durSec,
-          allSlots,
-          labels: roles.map((x) => x.label),
-          model: VISION_MODEL,
-          send: (body) => send(body, BOX_TIMEOUT_MS),
-        });
-        boxes = m.boxes;
-        boxAtSec = m.atSec;
-        boxWhy = m.boxes.length ? "" : `试了 ${m.tries} 帧：${m.why}`;
-      }
+      roles = m.roles;
+      boxes = m.boxes;
+      boxAtSec = m.atSec;
+      tries = m.tries;
+      why = m.why;
     } catch (e) {
       why = String(e?.message || e).slice(0, 160);
       console.warn(`[branchTemplate] detect-roles 整段出错 ${id}：${why}`);
@@ -1487,12 +1478,9 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
 
     // ★ 三档结果都要说清楚：全成 / 有角色位没框 / 一个都没认出来。
     //   不说的话作者只能靠"面板怎么不出现"去猜，而那与"功能坏了"长得一模一样。
-    const note = !roles.length
-      ? `这次没认出画面里的人物（${why || "原因不明"}）。模板还在，可以再点一次重试。`
-      : boxes.length
-        ? ""
-        : `认出了 ${roles.length} 个角色位，但没能量准他们在画面上的位置（${boxWhy}），` +
-          "所以挂卡时不能直接拖到画面上（在下面的列表里点着挂一样能用）。可以再点一次重试。";
+    const note = roles.length
+      ? ""
+      : `这次没认出画面里的人物（试了 ${tries} 帧：${why || "原因不明"}）。模板还在，可以再点一次重试。`;
 
     res.json({
       ok: true,

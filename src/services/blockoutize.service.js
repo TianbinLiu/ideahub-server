@@ -1095,6 +1095,151 @@ async function measureRoster({ publicId, version, durSec, note, model, send, fra
 /** 认人最多喂几帧 —— 见 `measureRoster` 头上那两个实测数。★ 不影响报价（这一笔按"发了几次 chat"收） */
 const ROSTER_FRAMES_MAX = 5;
 
+/**
+ * 「一帧之内，把人认全 + 把框量出来」—— **作者自带参考视频那条路（V1）的唯一一步**。
+ *
+ * ══ 为什么把认人与量框合成**一发单图调用**（2026-08-17 量完改的）═══════════════
+ *   ① **多图那一路在这个账号上不可靠**：实测纯文本 1.5s、**单图 3.5s**，而 5~8 张图
+ *      一起喂经常整发 504（150s 超时）。同一形状的调用耗时在 6.6s~140s 之间浮动。
+ *      单图快且稳，那就别去挤多图那条路。
+ *   ② **一致性是白送的**：分两发时「认人说有 7 个、量框那一帧只站着 5 个」是常态
+ *      （人会入场离场），于是框整份被丢。合成一发之后两者**必然来自同一帧**，
+ *      这类不一致从结构上消失 —— 不是靠校验挡住的，是根本不会出现。
+ *   ③ 代价说清楚：只看一帧 = **看不见这一帧里没有的人**。所以要按候选帧依次试
+ *      （`boxFrameCandidates`），并且这条路只适用于"作者自己传的、画面里人就那么几个"
+ *      的参考视频。V2 那条路不受影响 —— 它的认人看的是**原片**（真人、要外观特征
+ *      来区分谁是谁），与这里要解决的问题不是一回事。
+ *
+ * ★ 序数措辞由 `ordinalSlots(M)` 生成、按 cx 升序发 —— 与另外两条路同一处实现。
+ * ★ `desc` 取模型给的外观特征。全白人偶时它多半是"白色关节人偶"之类的同义句，
+ *   那不是缺陷：这条路的指认全靠**位置**，desc 只是给作者核对时看的。
+ *
+ * @returns {Promise<{ roles: object[], boxes: object[], atSec: number, tries: number, why: string }>}
+ */
+async function measureRosterBoxes({ publicId, version, durSec, model, send, timeoutMs }) {
+  const cands = boxFrameCandidates(durSec);
+  let why = "";
+  let tries = 0;
+  for (const atSec of cands) {
+    const url = buildOutFrameUrl(publicId, atSec, version);
+    const got = url ? await fetchFrameDataUrl(url) : { ok: false, reason: "no-cloud" };
+    if (!got.ok) {
+      why = `抽帧失败(${got.reason})`;
+      console.warn(`[blockoutize] 认人+量框抽帧失败 ${publicId}@${atSec}s: ${got.reason}`);
+      continue;
+    }
+    tries += 1;
+    const out = await send(
+      {
+        model,
+        thinking: { type: "disabled" },
+        max_tokens: 900,
+        messages: [
+          { role: "system", content: BOX_VISION_SYSTEM },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: rosterBoxPrompt() },
+              { type: "image_url", image_url: { url: got.dataUrl } },
+            ],
+          },
+        ],
+      },
+      timeoutMs,
+    );
+    if (!out.ok || out.accepted === false) {
+      why = `调用失败(status=${out.status})`;
+      console.warn(`[blockoutize] 认人+量框第 ${tries} 帧调用失败：status=${out.status}`);
+      continue;
+    }
+    let rows = [];
+    try {
+      const parsed = JSON.parse(out.text || "{}");
+      rows = parseRosterBoxes(parsed?.choices?.[0]?.message?.content ?? "");
+    } catch {
+      why = "回包不是 JSON";
+      continue;
+    }
+    if (!rows.length) {
+      why = `第 ${atSec}s 那一帧没认出人`;
+      continue;
+    }
+    // ★ 措辞表照**这一帧里的人数**生成：这条路没有"被截断的路人"那回事 ——
+    //   看到几个就是几个，序数与画面**一定**对得上（V2 那边要照总数 M 是因为
+    //   它的角色位会被 BLOCKOUT_ROLE_MAX 截断，而被截掉的人还站在画面上）
+    const kept = rows.slice(0, BLOCKOUT_ROLE_MAX);
+    if (rows.length > BLOCKOUT_ROLE_MAX) {
+      console.warn(
+        `[blockoutize] 这一帧认出 ${rows.length} 个人，超过角色位上限 ${BLOCKOUT_ROLE_MAX}，` +
+          `只登记最左边的 ${BLOCKOUT_ROLE_MAX} 个（其余挂不了卡）`,
+      );
+    }
+    const slots = ordinalSlots(kept.length);
+    const roles = kept.map((r, k) => ({
+      label: slots[k],
+      desc: String(r.desc || "").slice(0, ROSTER_DESC_MAX),
+      labelConfirmed: false,
+    }));
+    const boxes = kept.map((r) => ({ cx: r.cx, cy: r.cy, w: r.w, h: r.h }));
+    return { roles, boxes, atSec, tries, why: "" };
+  }
+  return { roles: [], boxes: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧" };
+}
+
+/** 「一帧里把人认全 + 量出框」的提示词。★ 坐标口径与 boxPrompt 逐字相同（千分比中心点+宽高） */
+function rosterBoxPrompt() {
+  return [
+    "看这一帧。把画面里**每一个人物**（人偶、模特、真人都算）按**从左到右**的顺序列出来，",
+    "每人一行，格式严格为：`序号|cx|cy|w|h|外观特征`。",
+    "cx cy 是这个人**包围盒中心点**的坐标，w h 是包围盒的宽和高；四个数都写 0~1000 的整数，",
+    "表示相对画面宽/高的千分比，画面左上角是 (0,0)、右下角是 (1000,1000)。包围盒要框住全身（含头顶与脚）。",
+    "外观特征写颜色、服装、明显道具，控制在 20 字内；认不出细节就写看得见的（如「全白关节人偶」）。",
+    "只输出这些行，不要标题、不要解释、不要 Markdown 代码块。画面里一个人都没有就只输出一行：NONE",
+  ].join("\n");
+}
+
+/**
+ * 解析「认人+量框」的回包 —— 已按 cx 升序，且过三道闸（坏行否决 / 至少一个 / 相邻不许挨太近）。
+ * ★ 三道闸与 `parseBoxes` 逐字同源，唯一区别是这里**不知道该有几个**（这一帧有几个就是几个），
+ *   所以"数目对不上"那一道天然不存在 —— 它在分两发时才有意义。
+ */
+function parseRosterBoxes(text) {
+  const out = [];
+  let bad = 0;
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^NONE$/i.test(line)) continue;
+    const m = line.match(
+      /^(\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(.+)$/,
+    );
+    if (!m) continue;
+    const [cx, cy, w, h] = [Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])];
+    if (![cx, cy, w, h].every((v) => Number.isFinite(v) && v >= 0 && v <= 1000) || w <= 0 || h <= 0) {
+      bad += 1;
+      continue;
+    }
+    out.push({ cx, cy, w, h, desc: m[6].trim() });
+  }
+  if (bad > 0) {
+    console.warn(`[blockoutize] 认人+量框：${bad} 行数值不合法，整份丢弃`);
+    return [];
+  }
+  if (!out.length) return [];
+  out.sort((a, b) => a.cx - b.cx);
+  // ★ 与 parseBoxes 同一条判据：相邻中心间距 ≥ 平均间距/3（理由写在那边）
+  const minGap = 1000 / out.length / 3;
+  for (let i = 1; i < out.length; i += 1) {
+    if (out[i].cx - out[i - 1].cx < minGap) {
+      console.warn(
+        `[blockoutize] 认人+量框：第 ${i} 与第 ${i + 1} 个中心只差 ${(out[i].cx - out[i - 1].cx).toFixed(0)}` +
+          `（${out.length} 个人时至少要差 ${minGap.toFixed(0)}），多半是同一个人被数了两遍，整份丢弃`,
+      );
+      return [];
+    }
+  }
+  return out;
+}
+
 async function measureBoxes({ publicId, version, durSec, allSlots, labels, model, send }) {
   const cands = boxFrameCandidates(durSec);
   let why = "";
@@ -1170,6 +1315,9 @@ module.exports = {
   boxFrameSec,
   boxFrameCandidates,
   measureRoster,
+  measureRosterBoxes,
+  rosterBoxPrompt,
+  parseRosterBoxes,
   ROSTER_FRAMES_MAX,
   BOX_FRAME_TRIES,
   measureBoxes,
