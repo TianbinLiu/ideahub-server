@@ -273,6 +273,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
         //     另一回事，重试解决不了，只会白花一次钱。
         let visionOut = null;
         for (let attempt = 1; attempt <= 2; attempt += 1) {
+          const t0 = Date.now();
           visionOut = await chargedArkCall({
             user: req.user,
             modelAllowed: (m) => m === VISION_MODEL,
@@ -300,10 +301,17 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
             },
           });
           if (!visionOut.ok || visionOut.accepted) break; // 计费层拒了就别重试（余额/套餐不会自己变）
+          // ★★ **只重试"快速失败"那一种**（2026-08-17 量完改的）：上游耗时在 6.6s~140s
+          //   之间浮动，超时那一发本身就已经等了 150s —— 再压一发就是让用户在一条
+          //   同步请求里干等五分钟。而快速失败（限流/瞬时 5xx）重试一次很划算。
+          //   ⚠ 重试不多花钱：网关对非 2xx 会退回这一发（arkGateway 的 W2）。
+          const slow = Date.now() - t0 >= ROSTER_TIMEOUT_MS - 5_000;
           console.warn(
-            `[branchTemplate] V1 认人第 ${attempt} 次没受理（status=${visionOut.status}），` +
-              (attempt < 2 ? "再试一次（上一次已退费）" : "不再重试"),
+            `[branchTemplate] V1 认人第 ${attempt} 次没受理（status=${visionOut.status}，` +
+              `耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s），` +
+              (slow ? "是超时，不再压第二发" : attempt < 2 ? "快速失败，再试一次（上一次已退费）" : "不再重试"),
           );
+          if (slow) break;
         }
         // ★★★ `ok` 与 `accepted` 是**两件事**，两道都要判（V2 那边判了两道，我第一版
         //   只判了 ok —— 2026-08-17 实跑当场撞上）：
@@ -465,17 +473,24 @@ const BLOCKOUT_MODEL = SEEDANCE_2_5;
 /** 看帧用的对话模型。与 app 的 MODELS.chat 同一个 id（看图说话走同一个模型） */
 const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
 /**
- * 视觉调用的超时（毫秒）—— **不要用 arkGateway 的 T_CREATE(150s)**，那个数是给
- * "建一个视频生成任务"用的。这两发都是 chat，而它们挂在一条**同步 HTTP 请求**
- * （登记模板）里：按 150s 算，认人 2 发 + 量框 3 发最坏要等 12 分钟。
- * ★ 认人 90s：8 帧的视觉，实测跑通那几次都在一分钟内；给 90s 是留余量，
- *   又让抖动快速失败、把机会让给重试（重试不多花钱，非 2xx 网关会退）。
- * ★ 量框 30s：单帧，实测十几秒。三帧全打满也就一分半。
- * ⇒ 整条登记请求的最坏耗时 = 2×90 + 3×30 = 270s，仍然长，但**有界且可解释**。
- *   真要再快，下一步是把认人/量框挪出这条同步请求（与 V2 拆两阶段同一条思路）。
+ * 视觉调用的超时（毫秒）。
+ *
+ * ══ 2026-08-17 量出来的事实，别再按"感觉"拍这个数 ═══════════════════════
+ *   同一段素材、同一份提示词、同一个宽度，**耗时在 6.6s 与 140s 之间浮动**：
+ *     · 孤立打一发：纯文本 1.8s ／ 单图 3.0s ／ 3 图 6.6s
+ *     · 连着打五发：3 图 140.5s ／ 4 图 131.5s ／ 5 图 123.6s ／ 6 图 504 ／ 8 图 504
+ *   注意耗时随帧数**递减** —— 与"图多所以慢"正好相反。所以这不是帧数的坎，
+ *   是**连续调用被排队**：孤立一发很快，连着打就堆在一起。
+ *   ⇒ 我先前按"实测都在一分钟内"把它拍成 90s，那句话是错的（我没量过），
+ *     而 90s 会把慢窗口里本来能成的那几发（120~140s）也判死。退回网关默认的 150s。
+ * ★ 量框是**单帧**（实测 3s 量级），给它 60s 已经很松 —— 它最多试三帧，
+ *   不能让它把整条同步请求拖到几分钟。
+ * ⚠⚠ 真正的解法不在这两个数里：登记是一条**同步 HTTP 请求**，而这两步慢起来是分钟级。
+ *   下一步应当把「认人 + 量框」挪出这条请求（与 V2 拆两阶段同一条思路）——
+ *   模板先建出来，角色位随后补，客户端可重试。见任务 #43。
  */
-const ROSTER_TIMEOUT_MS = 90_000;
-const BOX_TIMEOUT_MS = 30_000;
+const ROSTER_TIMEOUT_MS = T_CREATE;
+const BOX_TIMEOUT_MS = 60_000;
 // ★ 「看几帧」原来是这里一个写死的 `VISION_FRAMES = 3`。2026-08-15 实测：4 秒素材看 3 帧
 //   只认出 2 个人，方舟出片时看到更多人**自己编到了 3 号** —— 画面上有 3 号、角色位列表
 //   里没有第三格，套用者挂不上卡且零报错。现在帧数按时长算 / 由用户自选，规则的**唯一实现**
