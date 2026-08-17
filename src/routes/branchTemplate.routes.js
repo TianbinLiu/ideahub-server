@@ -251,7 +251,14 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     let boxPatch = {};
     let rolesNote = "";
     try {
-      const times = blockout.visionFrameTimes(meta.duration, null);
+      // ★★ 认人**封顶 5 帧**（2026-08-17 量出来的）：同一段素材连着打五发，
+      //   3/4/5 帧都回 200（120~140s），**6 帧与 8 帧一律 504**。耗时主要被上游排队
+      //   主导（孤立打一发 3 图只要 6.6s），但帧数在边缘确实是道坎。
+      //   ★ 封顶**不影响报价**：这一笔按"发了几次 chat"收，与几帧无关（economy 那条 ★★★）。
+      //   ★ 代价说清楚：少看几帧 = 更可能漏掉中途入场/离场的人。所以取的是
+      //     `visionFrameTimes` 排好的那一份的**前 5 个**（它已经在片子里均匀铺开），
+      //     不是自己另算一套间隔 —— 那就成了"看几帧"的第二处实现。
+      const times = blockout.visionFrameTimes(meta.duration, null).slice(0, ROSTER_FRAMES_MAX);
       const images = [];
       for (const atSec of times) {
         // ★ 认人这一发**必须传 768**（OUT_FRAME_W_ROSTER）：它一次要喂最多 8 帧，
@@ -490,6 +497,8 @@ const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
  *   模板先建出来，角色位随后补，客户端可重试。见任务 #43。
  */
 const ROSTER_TIMEOUT_MS = T_CREATE;
+/** 认人最多喂几帧 —— 见上面那段实测（6 帧起一律 504）。不影响报价 */
+const ROSTER_FRAMES_MAX = 5;
 const BOX_TIMEOUT_MS = 60_000;
 // ★ 「看几帧」原来是这里一个写死的 `VISION_FRAMES = 3`。2026-08-15 实测：4 秒素材看 3 帧
 //   只认出 2 个人，方舟出片时看到更多人**自己编到了 3 号** —— 画面上有 3 号、角色位列表
