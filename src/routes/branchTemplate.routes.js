@@ -1489,6 +1489,8 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     let tries = 0;
     let verified = 0;
     let markDescs = [];
+    let verifyWhy = "";
+    let denied = null;
     try {
       const m = await blockout.measureRosterBoxes({
         publicId,
@@ -1513,9 +1515,23 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       why = m.why;
       verified = m.verified;
       markDescs = m.markDescs;
+      verifyWhy = m.verifyWhy;
+      denied = m.denied || null;
     } catch (e) {
       why = String(e?.message || e).slice(0, 160);
       console.warn(`[branchTemplate] detect-roles 整段出错 ${id}：${why}`);
+    }
+
+    // ★★★ 钱不够（402）/ 套餐不对（403）：**原样透出，绝不伪装成“没认出人”**。
+    //   伪装的后果是那句 note 会写着“可以再点一次重试”，而重试**永远不会成功**（余额不会自己变）：
+    //   用户对着一个写着价钱的按钮反复点，而真正的下一步（充值）一个字都没有。
+    //   ★ 形状与 V2 那条路由逐字相同（`{...body, billed:false}`）：body 里带着 need/balance，
+    //     App 那边才说得出“还差多少”。`billed:false` 是因为这一发根本没扣成。
+    //   ★ 锁已经在下面那句 `$set: { detectingAt: null }` 里放—— 所以这里要**先放锁再返回**，
+    //     否则这条模板要等 11 分钟才能再试（而用户充完值就想立刻重试）。
+    if (denied) {
+      await BranchTemplate.findByIdAndUpdate(found._id, { $set: { detectingAt: null } });
+      return res.status(denied.status).json({ ...(denied.body || {}), billed: false });
     }
 
     // ★★ 写库：**认出来才写**，认不出就只把锁放掉、模板一个字不动
@@ -1549,7 +1565,13 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     //   他看到的只是几行"纯白"，与"这段素材本来就没什么可描述的"完全无法区分。
     const note = !roles.length
       ? `这次没认出画面里的人物（试了 ${tries} 帧：${why || "原因不明"}）。模板还在，可以再点一次重试。`
-      : verified < roles.length
+      : // ★★★ 自证那一发**自己挂了**时说实话（2026-08-18）。下面那句“只认出颜色、
+        //   建议你自己补一句”说的是“这段素材就这样”，而这里真正发生的是**我们的校验没跑成**——
+        //   把一个重试就能好的故障说成素材的错，作者会去手写九条描述（白干）。
+        verifyWhy
+        ? `认出了 ${roles.length} 个人偶，但这一次**核对描述没跑成**（${verifyWhy}），所以那几句描述只留下了颜色。` +
+          `这不是你的素材的问题，再点一次「识别角色位」多半就好了。`
+        : verified < roles.length
         ? `认出 ${roles.length} 个人偶，其中 ${verified} 个有能把他和别人区分开的描述（动作、和景物的位置关系），` +
           `另外 ${roles.length - verified} 个只认出颜色 —— 那几个位子在套用时只能靠「从左数第几个」指认，` +
           `画面里如果有一个特别显眼的人，可能会被换错。建议你在核对面板里给它们补一句认得出来的外形或动作。`

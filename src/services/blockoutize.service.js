@@ -1201,7 +1201,18 @@ async function measureRosterBoxes({ publicId, version, durSec, model, send, time
       },
       timeoutMs,
     );
-    if (!out.ok || out.accepted === false) {
+    // ★★★ 计费层拒了（余额不足 402 / 套餐不足 403）**当场停，不要再试下一帧**。
+    //   `accepted === false` 是“钱不够”，不是“这一帧不行”—— 余额不会自己变，
+    //   把 5 个候选帧都跑一遍只是白抽 5 次帧，最后把一个 **永远不会成功的**事
+    //   说成“这次没认出画面里的人物，可以再点一次重试”—— 用户会一直点下去，
+    //   而真正的下一步（充值）一个字都没有。这正是铁律八（失败要响亮、要带下一步）。
+    //   ★ 同文件 `measureRoster` 已经是这么写的（“计费层拒了别重试”），
+    //     V2 那条路由也把 402 的 body 整份透出—— 这一处是唯一没照做的。
+    if (out.accepted === false) {
+      console.warn(`[blockoutize] 认人+量框被计费层拒了（status=${out.status}），不再试其余候选帧`);
+      return { roles: [], boxes: [], markDescs: [], atSec, tries, why: `计费层拒绝(status=${out.status})`, verified: 0, denied: out };
+    }
+    if (!out.ok) {
       why = `调用失败(status=${out.status})`;
       console.warn(`[blockoutize] 认人+量框第 ${tries} 帧调用失败：status=${out.status}`);
       continue;
@@ -1235,7 +1246,13 @@ async function measureRosterBoxes({ publicId, version, durSec, model, send, time
     //   是报价 ≥ 实收，而漏加的表现是页面报 7 发、账单收 8 发，两个方向都不报错）。
     const v = await verifyRosterDescs({ rows: kept, dataUrl: got.dataUrl, model, send, timeoutMs });
     if (!v.ok && v.why) console.warn(`[blockoutize] 描述自证没跑成（${v.why}）—— 这一批只保留颜色`);
-    const slots = ordinalSlots(kept.length);
+    // ★★ 措辞表照**这一帧里的总人数**生成、再切到登记得下的那几个（2026-08-18 修）。
+    //   老写法是 `ordinalSlots(kept.length)`，配上一句“这条路没有被截断的路人”的注释 ——
+    //   但 `kept` 本身就是 `rows.slice(0, BLOCKOUT_ROLE_MAX)` 的产物：画面里真有 12 个人时，
+    //   `ordinalSlots(9)` 会把第 9 位贴上「最右边」—— 而他右边还站着三个人。
+    //   套用时模型按“最右边”去找，找到的是真正的最右那个（第 12 个），卡换到别人身上。
+    //   ★ `ordinalSlots` 自己的约束③就是“「最右边」只发给真正排在最后那一位”。
+    const slots = ordinalSlots(rows.length).slice(0, kept.length);
     const roles = kept.map((r, k) => ({
       label: slots[k],
       // ★★ **验过的才带动作与位置关系**，没验过的只留颜色。这不是保守，是这条链路上
@@ -1254,9 +1271,22 @@ async function measureRosterBoxes({ publicId, version, durSec, model, send, time
     //   换掉的还是那个最显眼的主角。
     //   ⚠ `roles[].desc` 那一份**保留颜色**：那是给人读的，聊胜于无；两者不是同一件事。
     const markDescs = kept.map((r, k) => (v.verified[k] ? composeRosterDesc(r) : ""));
-    return { roles, boxes, markDescs, atSec, tries, why: "", verified: v.verified.filter(Boolean).length };
+    // ★★ `verifyWhy` 必须传出去（2026-08-18）：自证那一发**自己挂了**（超时/回包不是 JSON/
+    //   一行都解析不出）时，一条都不算通过 —— 若只把计数传出去，路由那句 note 会把
+    //   “我们的校验挂了”说成“这段素材没什么可描述的、请你去核对面板补一句”——
+    //   把一个自己能重试好的故障推给用户去手写，而真原因只进了 console.warn。
+    return {
+      roles,
+      boxes,
+      markDescs,
+      atSec,
+      tries,
+      why: "",
+      verified: v.verified.filter(Boolean).length,
+      verifyWhy: v.ok ? "" : v.why,
+    };
   }
-  return { roles: [], boxes: [], markDescs: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧", verified: 0 };
+  return { roles: [], boxes: [], markDescs: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧", verified: 0, verifyWhy: "" };
 }
 
 /**
@@ -1380,7 +1410,18 @@ async function verifyRosterDescs({ rows, dataUrl, model, send, timeoutMs }) {
     const cx = got.get(i + 1);
     // 没答这一行 = 没验过（不是"验过了不通过"，但对我们是同一个动作：不用它）
     if (cx === undefined || cx < 0) return false;
-    return Math.abs(cx - r.cx) <= half;
+    // ★★★ **最近邻**才算落回本人（2026-08-18 补的第二道，头一道差点白设）：
+    //   `half = 1000/M/2` 比 parseRosterBoxes 放行的最小间距 `minGap = 1000/M/3` **还大**，
+    //   所以"落回本人"与"落到旁边那个人身上"在阈值内根本区分不开 ——
+    //   两个人 cx=480/680（间距 200，三道闸放行），答 680 时 |680-480|=200 ≤ 250，
+    //   老写法照样判"验过"。而这一发存在的全部理由就是**要一个能拒绝的判据**。
+    //   最近邻不需要挑一个魔数：回答离本人比离任何别人都近，才算认到了本人。
+    //   ★ 两道都要：最近邻挡住"认成邻居"，half 挡住"答了个离谁都远的野值"。
+    let near = i;
+    rows.forEach((o, j) => {
+      if (Math.abs(cx - o.cx) < Math.abs(cx - rows[near].cx)) near = j;
+    });
+    return near === i && Math.abs(cx - r.cx) <= half;
   });
   return { ok: true, verified, why: "" };
 }
@@ -1399,8 +1440,20 @@ function rosterVerifyPrompt(descs) {
 
 /**
  * 解析「认人+量框」的回包 —— 已按 cx 升序，且过三道闸（坏行否决 / 至少一个 / 相邻不许挨太近）。
- * ★ 三道闸与 `parseBoxes` 逐字同源，唯一区别是这里**不知道该有几个**（这一帧有几个就是几个），
- *   所以"数目对不上"那一道天然不存在 —— 它在分两发时才有意义。
+ *
+ * ★★★ 「数目对不上」那一道在这里**不是不存在，而是换了个形状**（2026-08-18 修）。
+ *   原注释写的是"这一帧有几个就是几个，所以那道闸天然不存在"—— 那句话有个致命的循环：
+ *   **"几个"正是由解析结果定义的**。一行没解析出来（模型吐了小数坐标 `3|412.5|…`、
+ *   或者那一行干脆没写描述列），老写法 `if (!m) continue` 把它**静默跳过**，
+ *   于是 `ordinalSlots(kept.length)` 把画面上第 4 个人贴成「从左数第3个」，
+ *   而 `markBoxes` 里配的又是他自己的框 —— 作者拖拽核对**完全对得上**，
+ *   出片时 r2v 按「从左数第3个」换掉画面上真正的第 3 个人。零报错、钱照扣。
+ *   `parseBoxes` 是靠 `out.length !== want` 兜住同一个漏洞的；这里把那道闸拿掉了，
+ *   却没换掉"静默跳过"的策略。
+ * ⇒ 现在：**看起来像数据行、却解析不出来的**，一律计入 bad → 整份丢弃 → 换下一帧再试。
+ *   ★ 判据是「以 `数字|` 开头」而不是「不匹配就算坏」：模型偶尔会吐一句寒暄或
+ *     ```` ``` ```` 围栏，那些**不是**数据行，把它们也算坏会让 5 个候选帧全部白花
+ *     （每帧一发计费 chat）。只否决"本该是一行人、却读不出来"的那种。
  */
 function parseRosterBoxes(text) {
   const out = [];
@@ -1411,7 +1464,15 @@ function parseRosterBoxes(text) {
     const m = line.match(
       /^(\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(-?\d+)\s*[|｜]\s*(.+)$/,
     );
-    if (!m) continue;
+    if (!m) {
+      // ★ 只有"长得像数据行"的才算坏（见上面 ★★★）：`3|412.5|…`、`3|412|500|140|820`
+      //   这种少一列的，都会走到这里；寒暄与代码围栏不会。
+      if (/^\d+\s*[|｜]/.test(line)) {
+        bad += 1;
+        console.warn(`[blockoutize] 认人+量框：这一行像人却读不出来（整份丢弃，换一帧重试）：${line.slice(0, 60)}`);
+      }
+      continue;
+    }
     const [cx, cy, w, h] = [Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5])];
     if (![cx, cy, w, h].every((v) => Number.isFinite(v) && v >= 0 && v <= 1000) || w <= 0 || h <= 0) {
       bad += 1;

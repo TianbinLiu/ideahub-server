@@ -2930,6 +2930,51 @@ describe("人偶多维描述（单元）—— 三项属性 + 唯一性自证", 
     expect(rows[1]).toMatchObject({ color: "红色", act: "双手上举" });
   });
 
+  test("★★★ 「像数据行却读不出来」→ **整份丢弃**（掉一行会把序数整片挪位）", () => {
+    // ★★★ 这是本组最要命的一条。`parseBoxes` 靠 `out.length !== want` 兑住了同一个漏洞，
+    //   而这里把那道闸拿掉了（“这一帧有几个就是几个”）—— 但“几个”正是由解析结果**定义**的。
+    //   模型吐个小数坐标、或那一行少写一列，老写法静默跳过，于是 `ordinalSlots(kept.length)`
+    //   把画面上第 4 个人贴成「从左数第3个」，而框配的又是他自己的 ——
+    //   作者拖拽核对**完全对得上**，出片时却换掉真正的第 3 个人。零报错、钱照扣。
+    expect(blockout.parseRosterBoxes(`1|200|500|100|400|纯白|抬手|在灯下
+2|412.5|500|100|400|纯白|蹲下|在门前`)).toEqual([]);
+    expect(blockout.parseRosterBoxes(`1|200|500|100|400|纯白|抬手|在灯下
+2|412|500|100|400`)).toEqual([]);
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/像人却读不出来/);
+  });
+
+  test("★ 寒暄与代码围栏**不**算坏行（否则 5 个候选帧会全白花）", () => {
+    // ★ 判据是「以 `数字|` 开头」而不是「不匹配就算坏」：每否决一帧就是一发计费 chat。
+    const rows = blockout.parseRosterBoxes(
+      [
+        "好的，我看到两个人：",
+        "```",
+        "1|200|500|100|400|纯白|抬手|在灯下",
+        "2|700|500|100|400|红色|蹲下|在门前",
+        "```",
+      ].join("\n"),
+    );
+    expect(rows).toHaveLength(2);
+  });
+
+  test("★★★ 自证要**最近邻**：落到旁边那个人身上不算验过", async () => {
+    // ★★ 阀值 half = 1000/M/2 比 parseRosterBoxes 放行的最小间距 minGap = 1000/M/3 **还大**，
+    //   所以光靠阀值时“落回本人”与“落到邻居身上”根本区分不开 ——
+    //   而这一发存在的全部理由就是要一个**能拒绝**的判据。
+    const rows2 = [
+      { cx: 480, color: "纯白", act: "抬手", where: "在灯下" },
+      { cx: 680, color: "纯白", act: "蹲下", where: "在门前" },
+    ];
+    // 第 1 条答成 680（那是第 2 个人）：|680-480|=200 ≤ half=250，老写法会判“验过”
+    const v = await blockout.verifyRosterDescs({
+      rows: rows2,
+      dataUrl: "data:,",
+      model: "m",
+      send: fakeSend(["1|680", "2|680"].join("\n")),
+    });
+    expect(v.verified).toEqual([false, true]);
+  });
+
   test("★ 后三项缺项不算坏行（描述少一维 ≠ 框也不要了）", () => {
     // ★ 数值那四列才是硬闸。把整行否决掉会连框一起丢 —— 代价与收益完全不成比例
     const rows = blockout.parseRosterBoxes(`1|200|500|100|400|纯白\n2|700|500|100|400|红色|挥手`);
