@@ -1246,9 +1246,17 @@ async function measureRosterBoxes({ publicId, version, durSec, model, send, time
       labelConfirmed: false,
     }));
     const boxes = kept.map((r) => ({ cx: r.cx, cy: r.cy, w: r.w, h: r.h }));
-    return { roles, boxes, atSec, tries, why: "", verified: v.verified.filter(Boolean).length };
+    // ★★ 写进套用提示词的那一份**在这里产出**，不让调用方从 `desc` 的字形去倒推
+    //   （"有没有顿号"那种判断就是同一条规则的第二处实现，而它还会被作者手写的描述骗到）。
+    //   验过的给整句、没验过的给**空串**：只剩颜色的那一条对指认没有任何帮助
+    //   （全白素材上 5 个人里只能区分 1 个），进提示词是纯噪音 —— 2026-08-18 一发实拍
+    //   验的就是这个：括号里塞了「白色，弯腰前倾，双手下垂」（7 个人里 6 个都符合），
+    //   换掉的还是那个最显眼的主角。
+    //   ⚠ `roles[].desc` 那一份**保留颜色**：那是给人读的，聊胜于无；两者不是同一件事。
+    const markDescs = kept.map((r, k) => (v.verified[k] ? composeRosterDesc(r) : ""));
+    return { roles, boxes, markDescs, atSec, tries, why: "", verified: v.verified.filter(Boolean).length };
   }
-  return { roles: [], boxes: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧", verified: 0 };
+  return { roles: [], boxes: [], markDescs: [], atSec: cands[0] ?? 0, tries, why: why || "没有可用的候选帧", verified: 0 };
 }
 
 /**

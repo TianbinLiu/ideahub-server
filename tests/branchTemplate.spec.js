@@ -3027,3 +3027,110 @@ describe("人偶多维描述（单元）—— 三项属性 + 唯一性自证", 
     expect(p).toContain("无参照物");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+describe("人偶描述 markDescs（与 roles[].desc 是两件事）", () => {
+  // ★★★ 这一组钉的是 2026-08-18 差点发出去的一个回归：套用提示词的括号原来取的是
+  //   `roles[].desc`，而**白模化（V2）那条路的 desc 来自原片**（「白发黑袍的少年」）——
+  //   拼出来就是「从左数第2个（白发黑袍的少年）=阿岚」，可参考视频里那个位置站着的是
+  //   一个一模一样的白人偶。最坏的情况是模型照着那句话把白模化**之前**那个人画回来。
+  //   ⇒ 拆成两位：`roles[].desc`（原来是谁，给人读）与 `markDescs[i]`（白模视频里那个
+  //     人偶什么样，给 r2v 指认）。有没有这一位是**建模板那一刻**决定的。
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+
+  const patchRoles = (id, roles, who = asOwner) =>
+    request(app).patch(`/api/branch/templates/${id}/roles`).set(who()).send({ roles });
+
+  /** 造一个「自己传白模视频」形状的模板：序数方案 + 三个位置 + 一份人偶描述 */
+  async function v1Detected(ts, { markDescs, markSlots = ["最左边", "从左数第2个", "最右边"] } = {}) {
+    const tpl = await createTemplate(ts);
+    await BranchTemplate().updateOne(
+      { _id: tpl.id },
+      {
+        $set: {
+          roles: markSlots.map((label, i) => ({ label, desc: `第${i + 1}个原来是谁`, labelConfirmed: false })),
+          markSlots,
+          ...(markDescs ? { markDescs } : {}),
+          provenAt: new Date(),
+        },
+      },
+    );
+    return tpl;
+  }
+
+  const detailOf = async (id) => (await request(app).get(`/api/branch/templates/${id}`).set(asOwner())).body.template;
+
+  test("真有就出；内容与 roles[].desc **各说各的**", async () => {
+    const descs = ["白色、抬手、在最左那盏灯下", "白色、弯腰、在中间柱子旁", "白色、蹲下、在最右门前"];
+    const tpl = await v1Detected(7101, { markDescs: descs });
+    const t = await detailOf(tpl.id);
+    expect(t.markDescs).toEqual(descs);
+    // ★ 两位互不覆盖：desc 说"原来是谁"，markDescs 说"白模视频里那个人偶什么样"
+    expect(t.roles.map((r) => r.desc)).toEqual(["第1个原来是谁", "第2个原来是谁", "第3个原来是谁"]);
+  });
+
+  test("★ 长度与 markSlots 不等 → **整份不出**（少一条就整份错位，而错位零报错）", async () => {
+    const tpl = await v1Detected(7102, { markDescs: ["白色、抬手"] }); // 3 个位置只给 1 条
+    expect((await detailOf(tpl.id)).markDescs).toBeUndefined();
+  });
+
+  test("★ 全是空串 → 也不出（一条都没验过，与「没有这一位」要做的事完全相同）", async () => {
+    const tpl = await v1Detected(7103, { markDescs: ["", "", ""] });
+    expect((await detailOf(tpl.id)).markDescs).toBeUndefined();
+  });
+
+  test("★ 部分空串 → 照出，空的那一条原样留着（长度是承重的）", async () => {
+    // ★ 空串 = 这一条没通过唯一性自证（只认出个颜色）。套用侧对空串不拼括号 ——
+    //   一句"7 个人里 6 个都符合"的话进提示词是纯噪音，2026-08-18 实拍验过。
+    const tpl = await v1Detected(7104, { markDescs: ["白色、抬手、在灯下", "", "白色、蹲下、在门前"] });
+    expect((await detailOf(tpl.id)).markDescs).toEqual(["白色、抬手、在灯下", "", "白色、蹲下、在门前"]);
+  });
+
+  test("★★ V2 形状（有 roles、没有 markDescs）→ 作者核对**不会凭空造出这一位**", async () => {
+    // ★★★ 这就是那个回归本身。V2 的 desc 来自原片，让它变成 markDescs 就等于把
+    //   白模化之前那个人的长相写进套用提示词。有没有这一位由建模板那一刻决定。
+    const tpl = await v1Detected(7105); // 不给 markDescs
+    await patchRoles(tpl.id, [
+      { label: "最左边", desc: "白发黑袍的少年" },
+      { label: "从左数第2个", desc: "红甲的女武士" },
+      { label: "最右边", desc: "戴斗笠的旅人" },
+    ]).expect(200);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.markDescs).toBeUndefined();
+    expect((await detailOf(tpl.id)).markDescs).toBeUndefined();
+    // 但 roles 照常收下（作者的核对本身没被影响）
+    expect(doc.roles.map((r) => r.desc)).toEqual(["白发黑袍的少年", "红甲的女武士", "戴斗笠的旅人"]);
+  });
+
+  test("★★ 已有这一位时，作者改写的描述**要生效**（否则那句「请你补一句」是在骗人）", async () => {
+    // ★ detect-roles 在没几条验过时会明说「请在核对面板里补一句认得出来的外形或动作」。
+    //   他补了却不进套用提示词的话，那句提示就是空操作，而他没有任何办法发现自己白改了。
+    const tpl = await v1Detected(7106, { markDescs: ["白色、抬手、在灯下", "", "白色、蹲下、在门前"] });
+    await patchRoles(tpl.id, [
+      { label: "最左边", desc: "白色、抬手、在灯下" },
+      { label: "从左数第2个", desc: "戴红围巾的那个" }, // ← 作者给没验过那一条补了话
+      { label: "最右边", desc: "白色、蹲下、在门前" },
+    ]).expect(200);
+    expect((await BranchTemplate().findById(tpl.id).lean()).markDescs).toEqual([
+      "白色、抬手、在灯下",
+      "戴红围巾的那个",
+      "白色、蹲下、在门前",
+    ]);
+  });
+
+  test("★★★ 作者删掉一个位子之后仍然按 label 配对，**不按下标**", async () => {
+    // ★★ markSlots 是历史事实、删位时一个字都不动，所以删完之后 roles 与 markSlots
+    //   **长度就不同了**。按数组下标硬配 = 整份错位（第2个位子的描述会写到第3个头上），
+    //   而错位是零报错的 —— 与 markBoxes 那条坑一模一样。
+    const tpl = await v1Detected(7107, { markDescs: ["左边那个", "中间那个", "右边那个"] });
+    await patchRoles(tpl.id, [
+      { label: "最左边", desc: "左边那个" },
+      { label: "最右边", desc: "右边那个改过了" }, // 删掉了中间那个位子
+    ]).expect(200);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.markSlots).toEqual(["最左边", "从左数第2个", "最右边"]); // 历史事实，没动
+    // ★ 「右边那个改过了」必须落在**第 3 格**（最右边的位置），不是第 2 格
+    expect(doc.markDescs).toEqual(["左边那个", "中间那个", "右边那个改过了"]);
+    expect(doc.roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
+  });
+});

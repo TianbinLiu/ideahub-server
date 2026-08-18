@@ -112,6 +112,19 @@ function markBoxesPayload(doc) {
   };
 }
 
+/**
+ * 人偶描述那一位的出口。★ 与 `markBoxesPayload` 同一条纪律：**真有才出、长度必须等于
+ * markSlots、全是空串就当没有**（那种情况下一条都没验过，出一个全空数组只会让客户端
+ * 多一次判断，而它与"没有这一位"要做的事完全相同）。
+ */
+function markDescsPayload(doc) {
+  const descs = Array.isArray(doc?.markDescs) ? doc.markDescs : null;
+  const slots = Array.isArray(doc?.markSlots) ? doc.markSlots.length : 0;
+  if (!descs || descs.length !== slots || !slots) return {};
+  const out = descs.map((d) => String(d || ""));
+  return out.some((d) => d) ? { markDescs: out } : {};
+}
+
 /** 响应形状。cloudinaryPublicId 刻意不出（纯内部回收记账，客户端拿它没有正当用途） */
 function toTemplatePayload(doc, viewer) {
   if (!doc) return null;
@@ -159,6 +172,9 @@ function toTemplatePayload(doc, viewer) {
     //   客户端就得自己猜是哪一帧，而猜错的表现是"框画在那儿、人已经走开了"。
     //   长度校验在 markBoxesPayload 里（服务端出口再兜一次，理由见 model 的 ★★）。
     ...markBoxesPayload(doc),
+    // 人偶描述（写进套用提示词、给 r2v 指认用）。★ 与上面两位同一条纪律：真有才出。
+    //   ⚠ 它**不是** roles[].desc 的副本，两者回答的是不同的问题，理由写在 model 里。
+    ...markDescsPayload(doc),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
     status: doc.status,
@@ -1472,6 +1488,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     let why = "";
     let tries = 0;
     let verified = 0;
+    let markDescs = [];
     try {
       const m = await blockout.measureRosterBoxes({
         publicId,
@@ -1495,6 +1512,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       tries = m.tries;
       why = m.why;
       verified = m.verified;
+      markDescs = m.markDescs;
     } catch (e) {
       why = String(e?.message || e).slice(0, 160);
       console.warn(`[branchTemplate] detect-roles 整段出错 ${id}：${why}`);
@@ -1506,6 +1524,11 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     if (roles.length) {
       update.$set.roles = roles;
       update.$set.markSlots = roles.map((x) => x.label);
+      // ★★ 人偶描述与 markSlots **同生同死**（一起写、长度必然相等，都来自同一个 kept）。
+      //   这条路（自己传白模视频）上传的**就是**白模视频，所以这份描述在产物里成立 ——
+      //   V2 白模化那条路不写这一位，它的认人看的是原片（理由写在 model 的 markDescs 上）。
+      //   ★ 内容由 measureRosterBoxes 产出（验过的给整句、没验过的给空串），这里不再判一遍。
+      update.$set.markDescs = markDescs;
       if (boxes.length) {
         update.$set.markBoxes = boxes;
         update.$set.markBoxAtSec = boxAtSec;
@@ -1715,6 +1738,32 @@ router.patch(
       //   方案位擦掉的话，套用侧当场从序数路退回编号路（输入框里冒出
       //   `编号从左数第3个=凛`），而库里、日志里、回包里**没有任何一处会报错**。
       //   zod 那边同样刻意不收它。
+      // ★★★ 人偶描述（markDescs）**跟着作者走**，但只**改已有的**、绝不凭空创建。
+      //   两句话，各有各的理由，别只做一半：
+      //   · 「跟着作者走」：detect-roles 在没几条验过时会明说「请你在核对面板里补一句
+      //     认得出来的外形或动作」。他补了却不进套用提示词的话，那句提示就是在骗人，
+      //     而这种**静默空操作**是本仓最忌的形状（他没有任何办法发现自己白改了）。
+      //     ⚠ 作者写的这一句**不再过唯一性自证**（这里没有视频、也不该为一次编辑去花钱）
+      //     —— 这是有意的：他**看得见画面**，而自证那一发本来就是在替代他的眼睛。
+      //     同一条纪律在框那边也成立：「框与 label 冲突时 label 赢」。
+      //   · 「不凭空创建」：V2 白模化那条路的 `desc` 说的是**原片里那个人**
+      //     （「白发黑袍的少年」），而参考视频里站着的是一个一模一样的白人偶。
+      //     凭空建出这一位 = 让 V2 模板拼出「从左数第2个（白发黑袍的少年）=阿岚」，
+      //     最坏的情况是模型照着括号里那句把白模化**之前**那个人画回来。
+      //     ⇒ 有没有这一位是**建模板那一刻**决定的（只有"自己传白模视频"那条路有），
+      //       这里只更新内容。判存在性，与本仓其它后加字段同一条纪律。
+      // ★ 连接键是 `markSlots.indexOf(label)`，不是数组下标：作者可以删位，删完之后
+      //   roles 与 markSlots **长度就不同了**（markSlots 是历史事实、不许动，见上面 ★★）。
+      //   按下标硬配等于整份错位 —— 与 markBoxes 那条坑一模一样。
+      if (Array.isArray(doc.markDescs) && Array.isArray(doc.markSlots) && doc.markDescs.length === doc.markSlots.length) {
+        for (const r of roles) {
+          const at = doc.markSlots.indexOf(r.label);
+          if (at >= 0) doc.markDescs[at] = r.desc;
+        }
+        // mongoose 对数组元素的原地赋值不一定认得出来，显式标脏（不标的话作者的改动
+        // **静默不落库** —— 又是同一个形状）
+        doc.markModified("markDescs");
+      }
       doc.roles = roles.map((r) => ({ ...r, labelConfirmed: true }));
       await doc.save();
       res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
