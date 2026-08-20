@@ -433,6 +433,8 @@ ideahub/
 - 快速验收命令（在本地或服务器上运行）:
   - `curl -I https://ideahubs.org`
   - `curl -I --resolve ideahubs.org:443:8.217.8.225 https://ideahubs.org`
+    （2026-08-20 起 443 仅对 Cloudflare 网段开放，此命令在公网跑会超时 —— 上机对
+    127.0.0.1 做等价验证，见 DEPLOYMENT_NOTES.md 同日第二条）
   - `curl -I https://api.ideahubs.org/api/health`
 
   - 部署用户: `deploy`

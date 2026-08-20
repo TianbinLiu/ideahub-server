@@ -9,6 +9,10 @@
 #      2026-08-07 开了 Cloudflare 橙云代理后，"按域名握手"到的是 Cloudflare 边缘证书，
 #      所以脚本分两层：[边缘] 按域名（用户实际握到的）+ [源站] 按 ECS IP + SNI（certbot 那张，
 #      真正的续期看门狗）。只查边缘会对源站证书全瞎 —— 2026-08-08~20 连红 13 天即此坑。
+#      2026-08-20（同日晚些时候）源站 :443/:80 收紧为只对 Cloudflare 网段开放，本工作流从
+#      公网够不着源站了：[源站] 层显式跳过（ORIGIN_HOST=""），搬进 ECS 机内由
+#      scripts/ops/origin-cert-watchdog.sh（同一份检查脚本 + healthchecks.io 死人开关）接管。
+#      本工作流从此负责两件事：[边缘] 证书 + 经 Cloudflare 的回源探活（见下方步骤）。
 #
 # 【上线后务必确认两件事，否则告警不会到你手上】
 #   A. GitHub → Settings → Notifications → Actions：勾选 email、"Send notifications for
@@ -37,12 +41,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查三域名证书到期
+      - name: 检查三域名证书到期（边缘层）
         run: bash scripts/cert-expiry-check.sh
         env:
-          WARN_DAYS: "21"
-          # HOSTS / EXPECT_SANS / ORIGIN_HOST / EDGE_WARN_DAYS 用脚本默认值
-          # （三域名；源站 = ECS 公网 IP；边缘阈值 7 天，Cloudflare 轮换时点不由我们控）
+          # 2026-08-20 起源站 :443 只对 Cloudflare 网段开放（阿里云安全组），GitHub runner
+          # 从公网握不进去是【预期】。源站层（certbot 看门狗）由 ECS 机内接管：
+          # scripts/ops/origin-cert-watchdog.sh（cron 日跑 + healthchecks.io 死人开关），
+          # 安装步骤见 DEPLOYMENT_NOTES.md 2026-08-20（第二条）。这里显式置空 = 跳过源站层
+          # （脚本会出声提示；WARN_DAYS 只作用于源站层，一并省去用默认值）。
+          ORIGIN_HOST: ""
+          # HOSTS / EXPECT_SANS / EDGE_WARN_DAYS 用脚本默认值（三域名；边缘阈值 7 天）
+
+      # 经 Cloudflare 的回源探活 —— 看证书之外的另一件事：CF 到源站这条路通不通。
+      # 443 收紧到 CF 网段后多了一种新死法：Cloudflare 新增回源网段、安全组没跟上 ——
+      # 症状是部分 POP 间歇 522/524，TLS 握手层完全看不出来。顺带补上此前一直缺席的
+      # "源站进程挂了"的外部探测。-f 让 4xx/5xx 变成非零退出码；522 不在 curl 的
+      # 瞬态重试清单里（408/429/5xx 官方名单），会立刻失败 —— 正合适。
+      - name: 经 Cloudflare 回源探活
+        run: |
+          curl -fsS -m 20 --retry 2 -o /dev/null https://api.ideahubs.org/api/health
+          curl -fsS -m 20 --retry 2 -o /dev/null https://ideahubs.org/
 
       # ↓↓↓ 可选：死人开关（dead-man's switch）。它补上 GitHub 方案的唯一盲区 ——
       #     "监控自己死了"（工作流被停用 / 仓库删了 / Actions 故障）。

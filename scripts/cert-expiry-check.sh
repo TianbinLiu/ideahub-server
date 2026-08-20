@@ -13,7 +13,12 @@
 #   ① 边缘证书的 *.ideahubs.org 被逐域名精确匹配（grep -qx）误判成"SAN 缺失"——假阳性；
 #   ② 源站证书从此彻底看不见 —— 假阴性，比假阳性更危险，只是恰好被 ① 的红灯盖住了。
 #
-# 退出码：0 = 两层全部健康；1 = 至少一个问题。CI 里非 0 → job 变红 → 自动邮件。
+# 【谁在跑我】2026-08-20 起源站 :443/:80 只对 Cloudflare 网段开放，两层从此分居两地：
+#   GitHub Actions（cert-expiry.yml）  → 只跑 [边缘]（ORIGIN_HOST="" 跳过源站层，公网握不进来是预期）
+#   ECS 机内（origin-cert-watchdog.sh）→ 只跑 [源站]（LAYERS=origin ORIGIN_HOST=127.0.0.1）
+# 两边用的都是本文件 —— 检查逻辑（check_endpoint / san_covers）只有这一处实现（铁律六）。
+#
+# 退出码：0 = 所请求的层全部健康；1 = 至少一个问题。CI 里非 0 → job 变红 → 自动邮件。
 #
 # 环境变量：
 #   WARN_DAYS        源站剩余天数阈值，默认 21（LE 证书 90 天一张、剩 30 天时 certbot 开始续；
@@ -23,9 +28,14 @@
 #   HOSTS            空格分隔的待查域名，默认三个
 #   EXPECT_SANS      每张证书都必须覆盖的域名，默认三个（查 SAN 漂移）
 #   ORIGIN_HOST      源站地址，默认 ECS 公网 IP（与 DEPLOYMENT_NOTES.md 记录一致；换机器要改这里）。
-#                    显式设成空串 = 跳过源站层（将来若 :443 只对 Cloudflare 网段开放、GitHub 连不进来
-#                    时用）——跳过会打醒目提示但不算失败；源站层握手失败则是响的（算失败），
-#                    这样"源站看不见了"永远不会无声无息
+#                    显式设成空串 = 跳过源站层（2026-08-20 起 CI 就是这么跑的：:443 只对 Cloudflare
+#                    网段开放，GitHub 连不进来）——跳过会打醒目提示但不算失败；源站层握手失败则是
+#                    响的（算失败），这样"源站看不见了"永远不会无声无息。机内看门狗设 127.0.0.1
+#                    （不经安全组，也绕开机内连自己公网 IP 的 hairpin 不确定性）。
+#   LAYERS           跑哪几层，空格分隔，默认 "edge origin"（CI 用默认）。机内看门狗只跑 origin：
+#                    边缘层健康与否不该影响"certbot 还活着吗"这个问题的退出码 —— Cloudflare 边缘
+#                    抖一下就把看门狗打红，等于把两个不同问题的告警搅在一起。
+#                    未知层名、或一层都没实际跑 = 失败：绿灯必须代表真的查过东西。
 
 set -uo pipefail
 
@@ -35,7 +45,18 @@ read -r -a HOSTS       <<< "${HOSTS:-ideahubs.org www.ideahubs.org api.ideahubs.
 read -r -a EXPECT_SANS <<< "${EXPECT_SANS:-ideahubs.org www.ideahubs.org api.ideahubs.org}"
 # 用 ${VAR-默认} 而不是 ${VAR:-默认}：设成空串是"明确要求跳过"，不设才落默认值
 ORIGIN_HOST="${ORIGIN_HOST-8.217.8.225}"
+LAYERS="${LAYERS:-edge origin}"
 PORT=443
+
+# 层名先验证再用：LAYERS=orign 这种笔误若不拦，结果是"什么都没查、绿灯照亮"——
+# 监控自己静默失效，正是本仓最恨的一类死法（铁律八）。
+for _l in $LAYERS; do
+  case "$_l" in
+    edge|origin) ;;
+    *) echo "❌ LAYERS 含未知层名 '$_l'（只认 edge / origin，空格分隔）"; exit 1 ;;
+  esac
+done
+layer_on() { case " $LAYERS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-15}"
 
 fail=0
@@ -111,17 +132,34 @@ check_endpoint() {
   echo "$icon $line"
 }
 
-for h in "${HOSTS[@]}"; do
-  check_endpoint "[边缘] $h" "$h" "$h" "$EDGE_WARN_DAYS"
-done
+ran_edge=0; ran_origin=0
 
-echo
-if [ -n "$ORIGIN_HOST" ]; then
+if layer_on edge; then
   for h in "${HOSTS[@]}"; do
-    check_endpoint "[源站] $h" "$ORIGIN_HOST" "$h" "$WARN_DAYS"
+    check_endpoint "[边缘] $h" "$h" "$h" "$EDGE_WARN_DAYS"
   done
-else
-  echo "⚠️ ORIGIN_HOST 为空 —— 源站层被显式跳过，certbot 续期失败期间将没有任何监控出声！"
+  ran_edge=1
+fi
+
+if layer_on origin; then
+  [ "$ran_edge" -eq 1 ] && echo
+  if [ -n "$ORIGIN_HOST" ]; then
+    for h in "${HOSTS[@]}"; do
+      check_endpoint "[源站] $h" "$ORIGIN_HOST" "$h" "$WARN_DAYS"
+    done
+    ran_origin=1
+  else
+    echo "⚠️ ORIGIN_HOST 为空 —— 源站层被显式跳过。真正的源站看门狗应在 ECS 机内运行"
+    echo "   （scripts/ops/origin-cert-watchdog.sh + healthchecks.io 死人开关）；"
+    echo "   若那边没装好，certbot 续期失败期间将没有任何监控出声！"
+  fi
+fi
+
+# 跳过是允许的（CI 里 ORIGIN_HOST="" 时边缘层还在跑），但"一层都没实际查"不是 ——
+# 那样的绿灯什么都不代表，按失败处理。
+if [ "$ran_edge" -eq 0 ] && [ "$ran_origin" -eq 0 ]; then
+  echo "❌ 一层都没实际检查（LAYERS='$LAYERS'，ORIGIN_HOST='$ORIGIN_HOST'）—— 按失败处理"
+  exit 1
 fi
 
 echo
@@ -136,5 +174,9 @@ if [ "$fail" -ne 0 ]; then
   echo "           DNS 页确认代理（橙云）没被误关；边缘证书我们改不了内容，只能核对配置。"
   exit 1
 fi
-echo "✅ 边缘 + 源站两层证书均正常（源站阈值 ${WARN_DAYS} 天 / 边缘 ${EDGE_WARN_DAYS} 天）"
+# 成功语只报实际跑过的层 —— "边缘 + 源站均正常"在只跑了一层时是谎话
+label=""
+[ "$ran_edge" -eq 1 ]   && label="边缘"
+[ "$ran_origin" -eq 1 ] && label="${label:+$label + }源站"
+echo "✅ ${label}层证书检查全部通过（源站阈值 ${WARN_DAYS} 天 / 边缘 ${EDGE_WARN_DAYS} 天）"
 exit 0

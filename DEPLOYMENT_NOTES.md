@@ -122,6 +122,32 @@ Change log
 - 2026-04-08: Confirmed V1 rebuild target as Alibaba Cloud Hong Kong with separate client/server deployments and `ideahubs.org` + `api.ideahubs.org` split.
 - 2026-04-10: Hong Kong ECS cutover completed; TLS now uses Let's Encrypt on nginx, backend runs from /var/www/ideahub-server, and frontend publishes to /var/www/ideahub-client-dist.
 - 2026-08-20: cert-expiry 监控升级为两层（边缘按域名 + 源站按 IP+SNI）。起因：2026-08-07 三域名（含 api）开启 Cloudflare 橙云代理后，旧脚本按域名握到的是 Cloudflare 边缘证书 —— 其 `*.ideahubs.org` 通配符被精确匹配误判为「SAN 缺失」（08-08 起连红 13 天，纯假阳性），同时源站 Let's Encrypt 证书对监控完全不可见（假阴性风险）。核查结论：源站证书三 SAN 齐全、有效期至 2026-11-06，certbot.timer 正常，08-08 的续期已在代理开启状态下成功（http-01 穿代理可用），服务器侧零改动。上文「api 先保持 DNS only」的建议自 08-07 起已不再是现状。
+- 2026-08-20（第二条）: 定案「源站只对 Cloudflare 开放」并完成仓库侧改造。
+  背景：本仓与 client 仓均为公开仓，源站 IP 已进 git 历史与 passive DNS/全网扫描库
+  （实测：对 8.217.8.225 无 SNI 握手即返回 CN=ideahubs.org 证书）——「藏 IP」既不可行
+  也不必要，改为让「流量必须经过 Cloudflare」成为网络层事实，防护从此不依赖 IP 保密。
+  - **安全组（控制台人工操作）**：入方向 443 与 80 的授权对象从 0.0.0.0/0 收紧为
+    Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips-v4 ，当前 15 段；nginx 只监听
+    IPv4、CF 回源走 A 记录，故 v6 段不需要）。先加 CF 规则、验证后再删全网规则，避免中间
+    出现拒绝窗口。22 本次不动（GitHub Actions 部署走公网 22，受限来源是单独议题）。
+  - **监控拓扑**：cert-expiry.yml 只跑 [边缘] 层（`ORIGIN_HOST=""` 显式跳过源站层），并新增
+    「经 Cloudflare 回源探活」步骤 —— 捕捉「CF 新增回源网段而安全组没跟上 → 间歇 522」与
+    源站宕机。[源站] 层（certbot 看门狗）搬进 ECS 机内：`scripts/ops/origin-cert-watchdog.sh`
+    （deploy 用户 cron 日跑，对 127.0.0.1:443 带 SNI 握手，同一份 cert-expiry-check.sh，
+    `LAYERS=origin`），结果上报 healthchecks.io 死人开关 —— 证书临期、检查失败、看门狗自身
+    死掉三种情况都会出声。
+  - **机内安装（deploy 用户，一次性）**：
+    1. healthchecks.io 建 check（Period = 1 day，Grace = 6 hours），拿到 ping URL；
+    2. `mkdir -p ~/.config/ideahub && printf '%s\n' '<ping URL>' > ~/.config/ideahub/origin-cert-hc-url && chmod 600 ~/.config/ideahub/origin-cert-hc-url`
+    3. 手动跑一次 `bash /var/www/ideahub-server/scripts/ops/origin-cert-watchdog.sh`，确认
+       healthchecks 面板收到 ping；
+    4. `(crontab -l 2>/dev/null; echo '47 8 * * * bash /var/www/ideahub-server/scripts/ops/origin-cert-watchdog.sh') | crontab -`
+  - ⚠ **由此作废**：从公网直连源站的一切诊断（`curl --resolve …:8.217.8.225`、
+    `openssl s_client -connect 8.217.8.225:443`）—— 收紧后一律上机对 127.0.0.1 做等价操作。
+  - ⚠ **新增巡检耦合**：Cloudflare 网段变更时，`/etc/nginx/conf.d/cloudflare-realip.conf` 与
+    安全组两条规则必须**一起刷**（同一份清单的两份拷贝，安全组无法代码收口）。
+  - certbot 不受影响：authenticator=nginx 的 http-01 验证按域名解析到 CF 边缘再回源，来源
+    属于 CF 网段（08-08 已在橙云状态下续期成功为证）。
 
 ---
 
