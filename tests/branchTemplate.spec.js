@@ -3326,4 +3326,99 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
       up.mockRestore();
     }
   });
+
+  it("低于像素硬门的源（836×480=401,280）→ 切段变换自动放大过门，c_scale 接在 so_/du_ 之后", async () => {
+    const ts = Date.now() + 4;
+    // 作者手上那段真实素材的形状：34.18s、836×480 —— 只差 1.6% 就过 407,696 的门
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18, width: 836, height: 480 }));
+    const seen = [];
+    const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
+      seen.push(String(subUrl));
+      // 假转码按变换 URL 里的参数如实回：宽 = c_scale 的 w，高按比例缩放（模拟 Cloudinary）
+      const w = Number((/c_scale,w_(\d+)/.exec(String(subUrl)) || [])[1] || 836);
+      const d = Number((/du_([\d.]+)/.exec(String(subUrl)) || [])[1] || 0);
+      const pid = `${opts.folder}/${opts.public_id}`;
+      return {
+        public_id: pid,
+        secure_url: `${CLOUD_PREFIX}/${pid}.mp4`,
+        duration: d,
+        width: w,
+        height: Math.round((480 * w) / 836),
+        bytes: 2_000_000,
+      };
+    });
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      // 不放大的话这一单会在逐段预检就 400（每段都低于像素门）——201 本身就是结论的一半
+      expect(res.status).toBe(201);
+      expect(seen).toHaveLength(2);
+      for (const u of seen) {
+        // 顺序承重：c_scale 排在 so_/du_ 之后（链式按书写顺序应用，反了就是先放大再被裁回去）
+        expect(u).toMatch(/\/so_[\d.]+,du_[\d.]+\/c_scale,w_\d+\//);
+      }
+      // 放大后的像素真的过门（只放到刚过线，不是拍一个大数）
+      const w = Number(/c_scale,w_(\d+)/.exec(seen[0])[1]);
+      const h = Math.round((480 * w) / 836);
+      expect(w * h).toBeGreaterThanOrEqual(407_696);
+      expect(w * h).toBeLessThan(407_696 * 1.1);
+      // 每段登记的是放大后的尺寸（refVideo 与真实资产一致，套用侧按它算画幅）
+      expect(res.body.parts[0].refVideo.width).toBe(w);
+    } finally {
+      up.mockRestore();
+    }
+  });
+
+  it("切过段的源视频：孤儿回收口整句拒；删到最后一段时连组源一起回收", async () => {
+    const ts = Date.now() + 6;
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
+    const up = mockPartUpload();
+    try {
+      const made = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      expect(made.status).toBe(201);
+      const srcId = `ideahub/template-videos/${owner.id}-${ts}`;
+      // ① 组还在：孤儿回收口拒删 —— 组源是整组合并时回填音轨的原片，从这里删掉的话
+      //   每一段照常出片、只有合并那步音轨拉不到，所有套用者一起坏且零报错
+      const refuse = await request(app).delete("/api/uploads/template-video").set(asOwner()).send({ publicId: srcId });
+      expect(refuse.status).toBe(400);
+      expect(refuse.body.message).toContain("分段");
+      // ② 删第一段：组源不动（还有兄弟段要用它的音轨）
+      destroySpy.mockClear();
+      await request(app).delete(`/api/branch/templates/${made.body.parts[0].id}`).set(asOwner()).expect(200);
+      expect(destroySpy.mock.calls.map((c) => c[0])).not.toContain(srcId);
+      // ③ 删最后一段：连组源一起回收（不收就是永久孤儿——孤儿口拒它、级联又没人指得到它）
+      destroySpy.mockClear();
+      await request(app).delete(`/api/branch/templates/${made.body.parts[1].id}`).set(asOwner()).expect(200);
+      expect(destroySpy.mock.calls.map((c) => c[0])).toContain(srcId);
+    } finally {
+      up.mockRestore();
+    }
+  });
+
+  it("像素够的源切段时不带 c_scale（放大只在不够时做）", async () => {
+    const ts = Date.now() + 5;
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 })); // 720×1280，过门
+    const seen = [];
+    const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
+      seen.push(String(subUrl));
+      const d = Number((/du_([\d.]+)/.exec(String(subUrl)) || [])[1] || 0);
+      const pid = `${opts.folder}/${opts.public_id}`;
+      return { public_id: pid, secure_url: `${CLOUD_PREFIX}/${pid}.mp4`, duration: d, width: 720, height: 1280, bytes: 2_000_000 };
+    });
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      expect(res.status).toBe(201);
+      for (const u of seen) expect(u).not.toMatch(/c_scale/);
+    } finally {
+      up.mockRestore();
+    }
+  });
 });

@@ -275,10 +275,27 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
         badRequest(`分段点要落在视频时长以内（0 ~ ${meta.duration.toFixed(1)} 秒，不含两端）。`);
       }
       const bounds = [0, ...splits, meta.duration];
-      // 每一段先按窗口验完再花任何转存的功夫：第 k 段越界就整单拒，点名是哪一段、差多少
+      // ★★ 低于方舟像素硬门的源（如 836×480 = 401,280 < 407,696）：切段时顺带放大到刚过线。
+      //   splits 路吃的是**整条原片、没有裁剪框**，源不过门时每一段切出来都过不了参考视频
+      //   窗口 —— 而这一条是能救的（像素能靠放大补出来；边长/比例补不出来，照旧整单拒，
+      //   见 upload.js「那"够不够格"由谁判」）。公式与 /uploads/template-video/derive 逐字
+      //   同源：只在不够时放、只放到刚过线（×1.02 防取整掉回门下）、宽取偶数。
+      //   变换必须**接在 so_/du_ 之后**（Cloudinary 链式按书写顺序应用 —— derive 那边
+      //   2026-08-17 写反过一次，表现是"放大了但尺寸没变"）。
+      let scaleW = 0;
+      if (meta.width * meta.height < TEMPLATE_REF_RULES.minPixels) {
+        const k = Math.sqrt((TEMPLATE_REF_RULES.minPixels * 1.02) / (meta.width * meta.height));
+        scaleW = Math.min(TEMPLATE_REF_RULES.maxEdge, Math.round((meta.width * k) / 2) * 2);
+      }
+      // 每一段先按窗口验完再花任何转存的功夫：第 k 段越界就整单拒，点名是哪一段、差多少。
+      // ★ 预检按**放大后**的尺寸算（不放的话低像素源在这儿就被整单拒，而真正切出来的段是
+      //   放大过的）；真正作数的仍是下面对每段转码产物的复核 —— 这里只是别拦错人
+      const preMeta = scaleW
+        ? { ...meta, width: scaleW, height: Math.round((meta.height * scaleW) / meta.width) }
+        : meta;
       for (let i = 0; i + 1 < bounds.length; i += 1) {
         const d = bounds[i + 1] - bounds[i];
-        const issue = templateRefIssue({ ...meta, duration: d }, `第 ${i + 1} 段（${d.toFixed(1)} 秒）`);
+        const issue = templateRefIssue({ ...preMeta, duration: d }, `第 ${i + 1} 段（${d.toFixed(1)} 秒）`);
         if (issue) badRequest(issue);
       }
 
@@ -291,8 +308,9 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
           const a = bounds[i];
           const d = bounds[i + 1] - bounds[i];
           // so_/du_ 子片段交给 Cloudinary 自己转码成独立资产（服务端出带宽，客户端零参与）。
-          // 小数保留 2 位：so_ 收小数，四舍五入到帧级足够
-          const subUrl = `https://res.cloudinary.com/${cloudName}/video/upload/so_${a.toFixed(2)},du_${d.toFixed(2)}/${own.publicId}.mp4`;
+          // 小数保留 2 位：so_ 收小数，四舍五入到帧级足够。
+          // c_scale 只在源不过像素门时出现（见上 scaleW 的 ★★），且必须排在 so_/du_ 之后
+          const subUrl = `https://res.cloudinary.com/${cloudName}/video/upload/so_${a.toFixed(2)},du_${d.toFixed(2)}${scaleW ? `/c_scale,w_${scaleW}` : ""}/${own.publicId}.mp4`;
           // publicId 沿用「<userId>-<时间戳>」形状（+i 保证组内唯一）——与正常上传无从区分，
           // 后续任何按形状校验归属的路径都不用为"段"开例外
           const partId = `${String(req.user._id)}-${Date.now() + i}`;
@@ -1961,6 +1979,18 @@ router.delete("/templates/:id", requireAuth, async (req, res, next) => {
     }
 
     await BranchTemplate.deleteOne({ _id: doc._id });
+
+    // ★ 分段组（2026-08-20）：删到**最后一段**时连组源视频一起回收（best-effort）。
+    //   组源不是任何一段的 refVideo，上面那次 destroy 够不着它；孤儿回收口在组还有段时
+    //   又是拒删它的（保合并音轨）—— 最后一段删掉后两端都没了句柄，不在这儿收就永久漏
+    //   一份 100MB 级的原片。还有别的段在就绝不动它：那是整组的音轨来源。
+    //   查放在 deleteOne 之后，本段自己不会把 exists 撑成真。
+    if (doc.group?.key && doc.group?.sourcePublicId) {
+      const left = await BranchTemplate.exists({ "group.key": doc.group.key });
+      if (!left) {
+        await destroyQuietly(doc.group.sourcePublicId, "video", "[branchTemplate] 分段组源视频");
+      }
+    }
     res.json({ ok: true });
   } catch (err) {
     next(err);

@@ -301,6 +301,17 @@ router.delete("/template-video", requireAuth, uploadLimit, async (req, res, next
         message: "这段视频是某个白模模板的原始素材（重做时还要用它），请改用删除那个模板（会连带回收）。",
       });
     }
+    // ★★ 第四种引用（2026-08-20 分段登记）：切过段的源视频是**整组的音轨来源** ——
+    //   合并成片时客户端按 group.sourceUrl 回填原片音轨。从这里删掉它，组里每一段照常
+    //   能出片，**只有合并那一步的音轨拉不到**，而且是所有套用者一起坏、零报错可查。
+    //   组员被逐段删光时它由模板删除级联回收（branchTemplate.routes 的 DELETE）。
+    const groupUsed = await BranchTemplate.exists({ "group.sourcePublicId": publicId });
+    if (groupUsed) {
+      return res.status(400).json({
+        ok: false,
+        message: "这段视频已被分段登记成一组模板（合并成片时还要用它的音轨），请改用删除那些模板（最后一段删除时会连带回收）。",
+      });
+    }
     // ★★ 白模 V2 拆成两阶段之后多出的第三种引用：**还没取回结果**的那一发。
     //   从受理到取回之间世上还没有模板，上面两条 exists 都落空 —— 而方舟那边可能
     //   还要去拉这段素材的变换地址（懒生成），此刻删掉它，用户那一发就会莫名其妙失败，
