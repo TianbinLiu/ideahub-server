@@ -130,9 +130,12 @@ Change log
     Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips-v4 ，当前 15 段；nginx 只监听
     IPv4、CF 回源走 A 记录，故 v6 段不需要）。先加 CF 规则、验证后再删全网规则，避免中间
     出现拒绝窗口。22 本次不动（GitHub Actions 部署走公网 22，受限来源是单独议题）。
-  - **监控拓扑**：cert-expiry.yml 只跑 [边缘] 层（`ORIGIN_HOST=""` 显式跳过源站层），并新增
-    「经 Cloudflare 回源探活」步骤 —— 捕捉「CF 新增回源网段而安全组没跟上 → 间歇 522」与
-    源站宕机。[源站] 层（certbot 看门狗）搬进 ECS 机内：`scripts/ops/origin-cert-watchdog.sh`
+  - **监控拓扑**：cert-expiry.yml 只跑 [边缘] 层（`ORIGIN_HOST=""` 显式跳过源站层）。
+    （原计划再加「经 Cloudflare 回源探活」捕捉「CF 新增回源网段而安全组没跟上 → 间歇 522」
+    与源站宕机 —— 首跑即被本 zone 对数据中心来源的拦截打了 403：GH runner 与 ECS 出公网
+    绕一圈都被拦，住宅 IP 的 curl 反而 200。已撤下；在 CF 给 /api/health 加 WAF Skip
+    规则后恢复，若拦截来自免费版 Bot Fight Mode 则 Skip 无效、需权衡关 BFM。）
+    [源站] 层（certbot 看门狗）搬进 ECS 机内：`scripts/ops/origin-cert-watchdog.sh`
     （deploy 用户 cron 日跑，对 127.0.0.1:443 带 SNI 握手，同一份 cert-expiry-check.sh，
     `LAYERS=origin`），结果上报 healthchecks.io 死人开关 —— 证书临期、检查失败、看门狗自身
     死掉三种情况都会出声。
