@@ -20,7 +20,6 @@ const Follow = require("../models/Follow");
 // 平台统计只用它数人头（countDocuments），不读任何字段
 const User = require("../models/User");
 const { uploadToCloudinary } = require("../middleware/upload");
-const { cloudinary } = require("../config/cloudinary");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 // 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用
@@ -43,21 +42,17 @@ const AUTHOR_FIELDS = "_id username displayName avatarUrl";
 // 「头像 + 名字」的小挂件，缺 avatarUrl 就只能画字母底。
 const MENTION_USER_FIELDS = AUTHOR_FIELDS;
 
-// 下载方舟视频的上限与超时（可用环境变量覆盖）
-const MAX_VIDEO_BYTES = Number(process.env.BRANCH_VIDEO_MAX_BYTES || 80 * 1024 * 1024);
-const VIDEO_FETCH_TIMEOUT_MS = Number(process.env.BRANCH_VIDEO_FETCH_TIMEOUT_MS || 60_000);
 // 转存失败时，超过该长度的 dataURL 不再内联落库（否则一条作品的 base64 会撑爆 16MB BSON 上限）
 const MAX_INLINE_FALLBACK = Number(process.env.BRANCH_INLINE_FALLBACK_MAX || 512 * 1024);
 
-// 火山方舟 / TOS 视频域名特征：命中则必须转存，否则 24h 后链接失效
-const ARK_HOST_PATTERNS = [
-  /(^|\.)volces\.com$/i,
-  /(^|\.)volccdn\.com$/i,
-  /(^|\.)byteimg\.com$/i,
-  /(^|\.)bytedance\.com$/i,
-  /(^|\.)ivolces\.com$/i,
-  /tos-[a-z0-9-]+\./i,
-];
+// 方舟成片 → 永久地址的域名表 / 上限 / 拉取与上传，全仓只有 videoAsset.service 一份实现
+// （出片后立即转存那条新路与这里共用，见 service 文件头的 ★）
+const {
+  isHttpUrl,
+  isArkVideoUrl,
+  uploadVideoBuffer,
+  downloadToBuffer,
+} = require("../services/videoAsset.service");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -69,20 +64,6 @@ function escapeRegExp(str) {
 
 function isDataUrl(value) {
   return typeof value === "string" && /^data:[\w.+-]*\/?[\w.+-]*;base64,/i.test(value.trim());
-}
-
-function isHttpUrl(value) {
-  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
-}
-
-function isArkVideoUrl(value) {
-  if (!isHttpUrl(value)) return false;
-  try {
-    const host = new URL(value.trim()).hostname;
-    return ARK_HOST_PATTERNS.some((re) => re.test(host));
-  } catch {
-    return false;
-  }
 }
 
 // ── 资源转存 ─────────────────────────────────────────────────────
@@ -103,45 +84,6 @@ function fallbackValue(original, label) {
     return "";
   }
   return raw;
-}
-
-async function uploadVideoBuffer(buffer, key) {
-  return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      {
-        folder: "ideahub/branch-videos",
-        public_id: `${key}`,
-        resource_type: "video",
-      },
-      (error, result) => {
-        if (error) reject(error);
-        else resolve(result?.secure_url || "");
-      }
-    );
-    stream.end(buffer);
-  });
-}
-
-async function downloadToBuffer(url) {
-  if (typeof fetch !== "function") throw new Error("global fetch unavailable (Node >= 18 required)");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VIDEO_FETCH_TIMEOUT_MS);
-  try {
-    const resp = await fetch(url, { redirect: "follow", signal: controller.signal });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const declared = Number(resp.headers.get("content-length") || 0);
-    if (declared && declared > MAX_VIDEO_BYTES) {
-      throw new Error(`video too large: ${declared} > ${MAX_VIDEO_BYTES}`);
-    }
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (!buf.length) throw new Error("empty body");
-    if (buf.length > MAX_VIDEO_BYTES) {
-      throw new Error(`video too large: ${buf.length} > ${MAX_VIDEO_BYTES}`);
-    }
-    return buf;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**

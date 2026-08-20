@@ -31,6 +31,8 @@ const { Readable } = require("node:stream");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
+// 方舟成片 → 永久地址：域名表/上限/拉取/上传只有这一份实现（发布时的转存也用它）
+const videoAsset = require("../services/videoAsset.service");
 const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
@@ -569,6 +571,48 @@ router.get("/asset", requireAuth, pollLimit, async (req, res) => {
   });
   src.on("error", () => res.destroy());
   src.pipe(res);
+});
+
+/**
+ * POST /api/ark/transfer-video —— 出片后立即把方舟成片转存成永久地址（Cloudinary）。
+ *
+ * ★ 为什么存在：videoUrl 揣着 TOS 直链到发布才转存，而预览/合并都在发布之前。
+ *   跨境用户直连 TOS 的下载速度（实测 1.06 MB/s）低于成片码率 —— 预览黑屏干等、
+ *   合并的代理抓取超时（2026-08-20 真机实测）。出片一成就换成全球 CDN 地址，
+ *   三条路一起变快，24h 过期坑也没了。拉取/上传/域名表与发布时那条老路共用
+ *   videoAsset.service 一份实现（铁律六）。
+ * ★ 不计费：它不产生算力消耗，只是把已经付过钱的产物搬个家。但它重
+ *   （最多拉 80MB + 传 Cloudinary），所以挂 genLimit（30 次/窗口）而不是 pollLimit ——
+ *   正常用法一次出片只调一次，30 已经宽裕；放 90 等于给带宽开洞。
+ * ★ 白名单 + assertPublicUrl 与 /asset 同一套：允许任意域就是公开搬运代理 + SSRF。
+ */
+router.post("/transfer-video", requireAuth, genLimit, async (req, res) => {
+  const raw = String((req.body && req.body.url) || "");
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return res.status(400).json({ message: "bad url" });
+  }
+  if (parsed.protocol !== "https:" || !videoAsset.isArkVideoUrl(raw)) {
+    return res.status(400).json({ message: "host not allowed" });
+  }
+  try {
+    await assertPublicUrl(raw); // DNS 层兜底：解析到内网的一律拒绝
+  } catch {
+    return res.status(400).json({ message: "host not allowed" });
+  }
+  try {
+    const buf = await videoAsset.downloadToBuffer(raw);
+    const key = `${req.user.id}-${Date.now()}-seg`;
+    const url = await videoAsset.uploadVideoBuffer(buf, key);
+    if (!url) throw new Error("cloudinary returned no url");
+    return res.json({ url });
+  } catch (e) {
+    // 失败不装死：客户端据此退回方舟直链（24h 内仍可用），发布时老路会再试一次
+    console.warn("[ark] transfer-video 失败:", (e && e.message) || e);
+    return res.status(502).json({ message: "transfer failed" });
+  }
 });
 
 module.exports = router;
