@@ -6,6 +6,9 @@
 #   2. 自带告警：job 变红时 GitHub 会给仓库 owner 发邮件，无需自备 SMTP
 #      （阿里云香港默认封 25 端口出站，on-box 直发 Gmail 本就发不出去）。
 #   3. 不看 certbot 日志：脚本只握手看服务端实际证书 —— 续期静默失败时 certbot 日志可能是空的。
+#      2026-08-07 开了 Cloudflare 橙云代理后，"按域名握手"到的是 Cloudflare 边缘证书，
+#      所以脚本分两层：[边缘] 按域名（用户实际握到的）+ [源站] 按 ECS IP + SNI（certbot 那张，
+#      真正的续期看门狗）。只查边缘会对源站证书全瞎 —— 2026-08-08~20 连红 13 天即此坑。
 #
 # 【上线后务必确认两件事，否则告警不会到你手上】
 #   A. GitHub → Settings → Notifications → Actions：勾选 email、"Send notifications for
@@ -38,7 +41,8 @@ jobs:
         run: bash scripts/cert-expiry-check.sh
         env:
           WARN_DAYS: "21"
-          # HOSTS / EXPECT_SANS 用脚本默认值（三域名）
+          # HOSTS / EXPECT_SANS / ORIGIN_HOST / EDGE_WARN_DAYS 用脚本默认值
+          # （三域名；源站 = ECS 公网 IP；边缘阈值 7 天，Cloudflare 轮换时点不由我们控）
 
       # ↓↓↓ 可选：死人开关（dead-man's switch）。它补上 GitHub 方案的唯一盲区 ——
       #     "监控自己死了"（工作流被停用 / 仓库删了 / Actions 故障）。

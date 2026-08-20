@@ -121,6 +121,7 @@ Change log
 - 2026-04-02: Initial migration summary added; GitHub Actions workflow `.github/workflows/deploy.yml` added; front-end env updated to VITE_API_BASE=https://api.ideahubs.org
 - 2026-04-08: Confirmed V1 rebuild target as Alibaba Cloud Hong Kong with separate client/server deployments and `ideahubs.org` + `api.ideahubs.org` split.
 - 2026-04-10: Hong Kong ECS cutover completed; TLS now uses Let's Encrypt on nginx, backend runs from /var/www/ideahub-server, and frontend publishes to /var/www/ideahub-client-dist.
+- 2026-08-20: cert-expiry 监控升级为两层（边缘按域名 + 源站按 IP+SNI）。起因：2026-08-07 三域名（含 api）开启 Cloudflare 橙云代理后，旧脚本按域名握到的是 Cloudflare 边缘证书 —— 其 `*.ideahubs.org` 通配符被精确匹配误判为「SAN 缺失」（08-08 起连红 13 天，纯假阳性），同时源站 Let's Encrypt 证书对监控完全不可见（假阴性风险）。核查结论：源站证书三 SAN 齐全、有效期至 2026-11-06，certbot.timer 正常，08-08 的续期已在代理开启状态下成功（http-01 穿代理可用），服务器侧零改动。上文「api 先保持 DNS only」的建议自 08-07 起已不再是现状。
 
 ---
 
