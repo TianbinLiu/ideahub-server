@@ -177,6 +177,19 @@ function toTemplatePayload(doc, viewer) {
     ...markDescsPayload(doc),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
+    // 分段归组（长视频切段登记）。真有才出；sourcePublicId 不出（同上隐私理由），
+    // sourceUrl 要出 —— 合并成片时客户端拿它解原片音轨
+    ...(doc.group && Number(doc.group.count) > 1
+      ? {
+          group: {
+            key: String(doc.group.key),
+            index: Number(doc.group.index),
+            count: Number(doc.group.count),
+            sourceUrl: doc.group.sourceUrl || "",
+            sourceDurationSec: Number(doc.group.sourceDurationSec || 0),
+          },
+        }
+      : {}),
     status: doc.status,
     provenAt: doc.provenAt ?? null,
     // 身份判定只认 ownerId 对当前账号，绝不拿显示名（CLAUDE.md「拿名字当身份」坑）
@@ -226,20 +239,124 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     //   拿上传口那套松窗口复核的话，一段 300s 的素材会被登记成模板，然后每个套用它的人
     //   在付费出片那一步撞 400 —— 而方舟受理后失败是不退费的。
     const meta = templateVideoMeta(resource);
-    const issue = templateRefIssue(meta);
-    if (issue) badRequest(issue);
-
-    // ★★ 重复登记的门要在**任何一次付费调用之前**（2026-08-17 加）。
-    //   在这之前，重复只靠 refVideo.url 的唯一索引在 create 那一刻抛 409 —— 而下面
-    //   两发 chat 的钱那时已经花掉了。用户手抖点两次就付两次，两次都"成功了一半"。
-    //   （与 blockoutize 开炼前那道 `BranchTemplate.exists` 同一条纪律、同一个理由。）
-    //   ★ 状态码与措辞**与下面那条唯一索引 409 逐字相同**：这一道只是把同一个判断
-    //     提前到花钱之前，不是一种新的失败。回 400 的话客户端就得认识两种"重复登记"，
-    //     而两者说的是同一件事（唯一索引那条仍留着 —— 它挡的是并发的第二发）。
-    if (await BranchTemplate.exists({ "refVideo.cloudinaryPublicId": own.publicId })) {
+    // ★★ 重复登记的门要在**任何一次付费/转存调用之前**（2026-08-17 加；2026-08-20 又
+    //   挪到窗口检查之前）：一段已经分段登记过的长视频再来一次，先撞窗口会得到
+    //   「时长要 4~30 秒」——把人往剪辑那条错路上指；它真正该听到的是「已经登记过了」。
+    //   状态码与措辞与 refVideo.url 唯一索引那条 409 逐字相同（那条仍留着，挡并发第二发）。
+    if (
+      await BranchTemplate.exists({
+        // 分段登记后源视频本体不再是任何一段的 refVideo —— 判重要连 group.sourcePublicId 一起问，
+        // 否则同一段长视频能被切两次、四份资产四份钱
+        $or: [{ "refVideo.cloudinaryPublicId": own.publicId }, { "group.sourcePublicId": own.publicId }],
+      })
+    ) {
       return res
         .status(409)
         .json({ ok: false, message: "这段视频已经登记过一个模板了，请直接使用那一个，或换一段视频。" });
+    }
+    // 分段登记（splits 非空）跳过**整片**时长窗口 —— 长视频正是靠切段进窗口的；
+    // 像素/边长/比例/元数据那几条在下面**逐段**照样验（每段一份 templateRefIssue）
+    const wantSplits = Array.isArray(req.body.splits) && req.body.splits.length > 0;
+    const issue = wantSplits ? null : templateRefIssue(meta);
+    if (issue) badRequest(issue);
+
+
+    // ── 分段登记（长视频，2026-08-20）───────────────────────────────
+    // splits 有值就走这条：把源视频物理切成 N 段独立资产、各自建一条普通模板（group 归组）。
+    // 为什么物理切而不是存子片段 URL：detect-roles 按 cloudinaryPublicId 从 0 秒抽帧、
+    // resolveR2v 按 refVideo.url 等值放行 —— 子片段要在**每个**读点补偏移算术，漏一处
+    // 就是"框画在 12 秒、人在第 2 段的 12 秒早走了"这类静默串位；独立资产零特殊分支。
+    const splits = Array.isArray(req.body.splits) ? req.body.splits : [];
+    if (splits.length > 0) {
+      for (let i = 1; i < splits.length; i += 1) {
+        if (!(splits[i] > splits[i - 1])) badRequest("分段点必须严格递增。");
+      }
+      if (splits[0] <= 0 || splits[splits.length - 1] >= meta.duration) {
+        badRequest(`分段点要落在视频时长以内（0 ~ ${meta.duration.toFixed(1)} 秒，不含两端）。`);
+      }
+      const bounds = [0, ...splits, meta.duration];
+      // 每一段先按窗口验完再花任何转存的功夫：第 k 段越界就整单拒，点名是哪一段、差多少
+      for (let i = 0; i + 1 < bounds.length; i += 1) {
+        const d = bounds[i + 1] - bounds[i];
+        const issue = templateRefIssue({ ...meta, duration: d }, `第 ${i + 1} 段（${d.toFixed(1)} 秒）`);
+        if (issue) badRequest(issue);
+      }
+
+      const cloudName = cloudinary.config().cloud_name;
+      const groupKey = new mongoose.Types.ObjectId().toString();
+      const made = []; // {publicId, receipt}，失败时逐个回收
+      const docs = [];
+      try {
+        for (let i = 0; i + 1 < bounds.length; i += 1) {
+          const a = bounds[i];
+          const d = bounds[i + 1] - bounds[i];
+          // so_/du_ 子片段交给 Cloudinary 自己转码成独立资产（服务端出带宽，客户端零参与）。
+          // 小数保留 2 位：so_ 收小数，四舍五入到帧级足够
+          const subUrl = `https://res.cloudinary.com/${cloudName}/video/upload/so_${a.toFixed(2)},du_${d.toFixed(2)}/${own.publicId}.mp4`;
+          // publicId 沿用「<userId>-<时间戳>」形状（+i 保证组内唯一）——与正常上传无从区分，
+          // 后续任何按形状校验归属的路径都不用为"段"开例外
+          const partId = `${String(req.user._id)}-${Date.now() + i}`;
+          const receipt = await cloudinary.uploader.upload(subUrl, {
+            resource_type: "video",
+            folder: "ideahub/template-videos",
+            public_id: partId,
+            timeout: 300_000,
+          });
+          made.push({ publicId: receipt.public_id, receipt });
+          // 产出验收（与 V2 finish 同一条纪律）：切出来的这段自己要过参考视频窗口
+          const pm = templateVideoMeta(receipt);
+          const pIssue = templateRefIssue(pm, `第 ${i + 1} 段`);
+          if (pIssue) throw new Error(`分段转码结果不合格：${pIssue}`);
+          docs.push({
+            ownerId: req.user._id,
+            authorName: req.user.username || "",
+            title: `${req.body.title} · 第 ${i + 1}/${bounds.length - 1} 段`,
+            intro: req.body.intro,
+            coverUrl: i === 0 ? req.body.coverUrl : "",
+            recipe: req.body.recipe,
+            refVideo: {
+              url: receipt.secure_url,
+              durationSec: Math.ceil(pm.duration), // 计价锚点取法与整段登记逐字相同（ceil）
+              realDurationSec: pm.duration,
+              width: pm.width,
+              height: pm.height,
+              bytes: pm.bytes,
+              cloudinaryPublicId: receipt.public_id,
+            },
+            group: {
+              key: groupKey,
+              index: i,
+              count: bounds.length - 1,
+              sourceUrl: resource.secure_url,
+              sourcePublicId: own.publicId,
+              sourceDurationSec: meta.duration,
+            },
+            status: "pending",
+            provenAt: null,
+          });
+        }
+        const created = await BranchTemplate.insertMany(docs, { ordered: true });
+        return res.status(201).json({
+          ok: true,
+          template: toTemplatePayload(created[0].toObject(), req.user),
+          parts: created.map((c) => toTemplatePayload(c.toObject(), req.user)),
+          needsDetect: true,
+        });
+      } catch (e) {
+        // 半途失败：把已经切出去的资产收回来（尽力而为、响亮记账），别让钱变成孤儿文件
+        for (const m of made) {
+          try {
+            await cloudinary.uploader.destroy(m.publicId, { resource_type: "video" });
+          } catch (e2) {
+            console.warn(`[branchTemplate] 分段登记回滚失败，遗留资产 ${m.publicId}:`, e2?.message || e2);
+          }
+        }
+        await BranchTemplate.deleteMany({ "group.key": groupKey }).catch(() => {});
+        console.error("[branchTemplate] 分段登记失败:", e?.message || e);
+        return res
+          .status(502)
+          .json({ ok: false, message: `分段登记没有完成（${String(e?.message || e).slice(0, 120)}），已回滚，本次可以重试。` });
+      }
     }
 
     // ★★★ 认人与量框**不在这条请求里做**（2026-08-17 拆开的）。
@@ -431,7 +548,12 @@ router.post(
       // 同一段素材不许做两次：refVideo 的 url 唯一索引会在最后一步才拦，
       // 那时钱已经花掉了 —— 在开炼之前就问一次
       const used = await BranchTemplate.exists({
-        $or: [{ "refVideo.cloudinaryPublicId": publicId }, { "source.publicId": publicId }],
+        // group.sourcePublicId：分段登记过的源视频同样算"用过了"（2026-08-20）
+        $or: [
+          { "refVideo.cloudinaryPublicId": publicId },
+          { "source.publicId": publicId },
+          { "group.sourcePublicId": publicId },
+        ],
       });
       if (used) {
         return fail(res, 400, "这段素材已经做过白模模板了，请直接使用那一个，或换一段素材。", { billed: false });

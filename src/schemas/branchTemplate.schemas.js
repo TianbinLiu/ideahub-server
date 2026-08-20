@@ -60,6 +60,14 @@ const recipeBody = z.object({
 
 // POST /api/branch/templates
 const createTemplateBody = z.object({
+  /**
+   * 长视频分段点（秒，升序，相对视频起点）。缺省/空 = 整段登记一个模板（老行为原样）。
+   * 有值 = 服务端把源视频**物理切成 N 段独立资产**各自登记（每段一个普通模板，group 归组）
+   * —— 切成独立资产而不是子片段 URL，是为了让识别/挂卡/出片对"段"零特殊分支。
+   * 每段都必须落在方舟 edit 的 [4,30] 窗口里：越界**整单 400**，服务端只验不修 ——
+   * 替用户挪分段点 = 替他改了每段的价钱（客户端负责把用户标的帧规划成合法分段）。
+   */
+  splits: z.array(z.number().min(0.5).max(600)).max(11).optional(),
   title: z.string().trim().min(1).max(120),
   intro: z.string().trim().max(2000).optional().default(""),
   coverUrl: z

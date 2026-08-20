@@ -161,6 +161,28 @@ const branchTemplateSchema = new mongoose.Schema(
     coverUrl: { type: String, default: "", trim: true, maxlength: 2000 },
     recipe: { type: recipeSchema, required: true },
     refVideo: { type: refVideoSchema, required: true },
+    /**
+     * 长视频分段登记的归组（2026-08-20）。缺省 = 独立模板（存量数据/整段登记）——
+     * 判它一律用**存在性**（后加字段铁律）。每段是物理独立的 Cloudinary 资产 +
+     * 一条普通模板记录，识别/挂卡/出片对"段"零特殊分支；这个子文档只回答
+     * "你的兄弟是谁、你排第几、原片在哪（合并时要拿原片音轨）"。
+     * sourcePublicId 只做"同一段源视频别登记两次"的判重，payload 刻意不出它
+     * （与 source 同一条隐私理由）。
+     */
+    group: {
+      type: new mongoose.Schema(
+        {
+          key: { type: String, required: true },
+          index: { type: Number, required: true, min: 0 },
+          count: { type: Number, required: true, min: 2 },
+          sourceUrl: { type: String, default: "", trim: true, maxlength: 2000 },
+          sourcePublicId: { type: String, default: "", trim: true, maxlength: 300 },
+          sourceDurationSec: { type: Number, default: 0 },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
     /** 角色位（白模 V2）。**服务端写**：来自白模化那一步 chat vision 的清单，
      *  客户端提交的一律不收（与 refVideo 元数据同一条理由，schema 里压根没这个字段）。
      *  V1 老模板没有这一项 —— 判它一律用存在性，别用 `=== []` 之类的等值。
@@ -411,6 +433,8 @@ branchTemplateSchema.statics.rolesConfirmHint = function rolesConfirmHint(doc) {
 // r2v 结算按参考视频 URL 反查登记（ark.routes.js 的 resolveR2v），一条 URL 只许一个模板。
 // url 是服务端规范化过的 secure_url（见上），所以这条唯一索引挡得住变体绕过。
 branchTemplateSchema.index({ "refVideo.url": 1 }, { unique: true });
+// 取兄弟段用（applyGroup 一次拉全组）。sparse：绝大多数模板没有 group
+branchTemplateSchema.index({ "group.key": 1 }, { sparse: true });
 // 「我的模板」按新旧排
 branchTemplateSchema.index({ ownerId: 1, createdAt: -1 });
 // 孤儿回收要问「这段原始素材还有模板在引用吗」（uploads.routes 的 DELETE /template-video）。

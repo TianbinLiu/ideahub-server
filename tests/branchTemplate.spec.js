@@ -3212,3 +3212,118 @@ describe("人偶描述 markDescs（与 roles[].desc 是两件事）", () => {
     expect(doc.roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+describe("分段登记（splits：长视频物理切段，group 归组）", () => {
+  /** 分段路的 uploader.upload 假回执：按 so_/du_ 子片段地址回一份"切好的独立资产" */
+  function mockPartUpload() {
+    return jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
+      const m = /so_([\d.]+),du_([\d.]+)/.exec(String(subUrl));
+      const d = m ? Number(m[2]) : 0;
+      const pid = `${opts.folder}/${opts.public_id}`;
+      return { public_id: pid, secure_url: `${CLOUD_PREFIX}/${pid}.mp4`, duration: d, width: 720, height: 1280, bytes: 2_000_000 };
+    });
+  }
+
+  it("34.2s + splits=[17] → 两段独立模板，group 齐全，标题带第 N/M 段", async () => {
+    const ts = Date.now();
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
+    const up = mockPartUpload();
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      expect(res.status).toBe(201);
+      expect(res.body.parts).toHaveLength(2);
+      const [p1, p2] = res.body.parts;
+      expect(p1.group).toMatchObject({ index: 0, count: 2, sourceDurationSec: 34.18 });
+      expect(p2.group).toMatchObject({ index: 1, count: 2 });
+      expect(p1.group.key).toBe(p2.group.key);
+      // sourcePublicId 不出（隐私口径与 source 一致）
+      expect(p1.group.sourcePublicId).toBeUndefined();
+      expect(p1.title).toBe("白模跑酷 · 第 1/2 段");
+      expect(p2.title).toBe("白模跑酷 · 第 2/2 段");
+      // 计价锚点 = ceil(每段真实时长)，与整段登记同一取法
+      expect(p1.refVideo.durationSec).toBe(17);
+      expect(p2.refVideo.durationSec).toBe(Math.ceil(34.18 - 17));
+      // 每段是独立资产：refVideo.url 互不相同、不含 so_/du_ 变换
+      expect(p1.refVideo.url).not.toBe(p2.refVideo.url);
+      expect(p1.refVideo.url).not.toMatch(/so_/);
+      // 同一段源视频再登记（不管切不切）都要 409
+      const again = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts)));
+      expect(again.status).toBe(409);
+    } finally {
+      up.mockRestore();
+    }
+  });
+
+  it("分出 <4s 的段整单 400，一个资产都不切", async () => {
+    const ts = Date.now() + 1;
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
+    const up = mockPartUpload();
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [2] }));
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("第 1 段");
+      expect(up).not.toHaveBeenCalled();
+    } finally {
+      up.mockRestore();
+    }
+  });
+
+  it("分出 >30s 的段整单 400（服务端只验不修）", async () => {
+    const ts = Date.now() + 2;
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 40 }));
+    const up = mockPartUpload();
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [5] }));
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("第 2 段");
+      expect(up).not.toHaveBeenCalled();
+    } finally {
+      up.mockRestore();
+    }
+  });
+
+  it("第二段切失败 → 已切资产回收、库里零残留、502 可重试", async () => {
+    const ts = Date.now() + 3;
+    resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
+    let n = 0;
+    const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
+      n += 1;
+      if (n >= 2) throw new Error("boom");
+      const pid = `${opts.folder}/${opts.public_id}`;
+      return { public_id: pid, secure_url: `${CLOUD_PREFIX}/${pid}.mp4`, duration: 17, width: 720, height: 1280, bytes: 2_000_000 };
+    });
+    try {
+      const res = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      expect(res.status).toBe(502);
+      expect(destroySpy).toHaveBeenCalledTimes(1); // 只切成了第 1 段，就回收那 1 个
+      const BranchTemplate = require("../src/models/BranchTemplate");
+      expect(await BranchTemplate.countDocuments({ "group.sourcePublicId": `ideahub/template-videos/${owner.id}-${ts}` })).toBe(0);
+      // 回滚干净之后同一段素材可以重试（判重不会误伤）
+      const retryUp = mockPartUpload();
+      const retry = await request(app)
+        .post("/api/branch/templates")
+        .set(asOwner())
+        .send(validBody(videoUrlOf(owner.id, ts), { splits: [17] }));
+      expect(retry.status).toBe(201);
+      retryUp.mockRestore();
+    } finally {
+      up.mockRestore();
+    }
+  });
+});
