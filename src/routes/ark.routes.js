@@ -33,6 +33,8 @@ const { aiRateLimit } = require("../middleware/rateLimit");
 const { assertPublicUrl } = require("../utils/ssrfGuard");
 // 方舟成片 → 永久地址：域名表/上限/拉取/上传只有这一份实现（发布时的转存也用它）
 const videoAsset = require("../services/videoAsset.service");
+// 转存的后台任务化（认领/去重/执行/查询）：轮询自动转存与 /transfer-video 两个入口共用
+const arkTransfer = require("../services/arkTransfer.service");
 const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
@@ -455,13 +457,7 @@ function clipOutOfBounds(clip, src) {
  * ★ 任何失败都不打断轮询响应（出片进行中的用户不该因为我们的记账问题看到报错），
  *   但要吼出来：吞掉的话作者会遇到"出片成功却还是不能发布"，查无可查（铁律八）。
  */
-async function noteR2vOutcome(taskId, text) {
-  let parsed;
-  try {
-    parsed = JSON.parse(text || "{}");
-  } catch {
-    return; // 上游给的不是 JSON —— 轮询端点会原样透传，这里不掺和
-  }
+async function noteR2vOutcome(taskId, parsed) {
   if (parsed?.status !== "succeeded") return;
   try {
     const trial = await BranchTemplateTrial.findOne({ taskId }).lean();
@@ -497,13 +493,52 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
     if (!TASK_ID_RE.test(req.params.id)) return res.status(400).json({ ok: false, message: "bad task id" });
     const { status, text } = await callArk({
       method: "GET",
-      path: `/contents/generations/tasks/${req.params.id}`,
+      path: `/contents/generations/tasks/${req.params.id}`, // query（?transfer=1）是我们与客户端的私货，不上桌给方舟
       timeoutMs: T_POLL,
     });
-    // 白模模板的试炼闸：succeeded 的 r2v 任务在这里被看见（只有 status 为 succeeded 的
-    // 响应才会碰库，running/queued 的高频轮询零额外开销）。失败只吼不打断轮询。
-    if (status === 200) await noteR2vOutcome(req.params.id, text);
-    return res.status(status).type("application/json").send(text || "{}");
+    let out = text || "{}";
+    if (status === 200) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(out);
+      } catch {
+        /* 上游给的不是 JSON —— 原样透传，这里不掺和 */
+      }
+      if (parsed?.status === "succeeded") {
+        // 白模模板的试炼闸：succeeded 的 r2v 任务在这里被看见（running/queued 的高频
+        // 轮询零额外开销）。失败只吼不打断轮询。
+        await noteR2vOutcome(req.params.id, parsed);
+        // ★★ 轮询自动转存（2026-08-21）：客户端带 ?transfer=1 声明「这个任务的成片请顺手
+        //   搬去永久地址」——server 在**看到 succeeded 的第一眼**就后台开搬（幂等，按产物
+        //   去重），进展以 `transfer` 字段挂回响应，客户端接着轮询就能拿到 Cloudinary 地址。
+        //   为什么由服务端搬而不是客户端 POST 一趟傻等：弱网手机上那一趟 180s 都不够
+        //   （server 拉 TOS 跨境 + 传 Cloudinary 跨境，两跳都慢），超时后只能静默退回直链，
+        //   预览/合并跟着全坏——而这活儿本来就不需要客户端在线（真机复盘见 CLAUDE.md）。
+        // ★ 要显式 opt-in 而不是见 succeeded 就搬：同一个轮询端点还伺候白模化
+        //   （产物由 finish 阶段按模板流程另行转存）与 Seed3D（zip，不是视频）——
+        //   对它们自动搬就是每单白搬 20MB 去一个没人读的角落。
+        // ★ content.video_url **原样保留**（不偷换）：老客户端读它自己去 POST /transfer-video，
+        //   那条路靠登记表与这里去重，行为不变只是变快。
+        const vurl = typeof parsed?.content?.video_url === "string" ? parsed.content.video_url : "";
+        if (req.query.transfer === "1" && videoAsset.isArkVideoUrl(vurl)) {
+          try {
+            const job = await arkTransfer.ensureTransfer(vurl, req.user._id);
+            parsed.transfer =
+              job.state === "done"
+                ? { state: "done", url: job.url }
+                : job.state === "failed"
+                  ? { state: "failed", message: job.error || "转存失败" }
+                  : { state: "pending" };
+            out = JSON.stringify(parsed);
+          } catch (e) {
+            // 登记失败不打断轮询（出片本身是成功的）。**不挂 transfer 字段** = 客户端
+            // 按"老服务端"退回它自己的兜底转存——降级有路可走，且这边留了日志（铁律八）。
+            console.error(`[ark] 轮询自动转存登记失败 task=${req.params.id}:`, e.message);
+          }
+        }
+      }
+    }
+    return res.status(status).type("application/json").send(out);
   } catch (err) {
     return next(err);
   }
@@ -573,17 +608,26 @@ router.get("/asset", requireAuth, pollLimit, async (req, res) => {
   src.pipe(res);
 });
 
+/** 阻塞形态的等待预算：老客户端（已装机 APK）那头是 180s 超时，这边要抢在它前面
+ *  给出可读的答复，而不是让它掐线后只留一句英文 AbortError。 */
+const TRANSFER_WAIT_BUDGET_MS = 165_000;
+
 /**
- * POST /api/ark/transfer-video —— 出片后立即把方舟成片转存成永久地址（Cloudinary）。
+ * POST /api/ark/transfer-video —— 把方舟成片转存成永久地址（Cloudinary）。
  *
  * ★ 为什么存在：videoUrl 揣着 TOS 直链到发布才转存，而预览/合并都在发布之前。
  *   跨境用户直连 TOS 的下载速度（实测 1.06 MB/s）低于成片码率 —— 预览黑屏干等、
- *   合并的代理抓取超时（2026-08-20 真机实测）。出片一成就换成全球 CDN 地址，
- *   三条路一起变快，24h 过期坑也没了。拉取/上传/域名表与发布时那条老路共用
- *   videoAsset.service 一份实现（铁律六）。
+ *   合并的代理抓取超时（2026-08-20 真机实测）。换成全球 CDN 地址三条路一起变快。
+ * ★ 2026-08-21 起搬运本体挪进 **arkTransfer.service 的后台任务**（真机复盘：同步搬完
+ *   再应答的形态在弱网手机上 180s 都等不完，超时=静默失败）。本端点收两种形态：
+ *     · 缺省（老客户端）：阻塞等登记表出结果，预算内搬完回 {url}，否则 502 + 中文原因
+ *       ——语义与老实现一致，但搬运**不会**随请求超时而废掉，下次再问就是现成的；
+ *     · body.wait === false（受理式）：立即 202 {state,url?,message?}，进展由
+ *       POST /transfer-video/status 或轮询端点的 transfer 字段拿。
+ *   同一个产物三个入口（轮询自动转存/受理式/阻塞式）在登记表上去重，只搬一次。
  * ★ 不计费：它不产生算力消耗，只是把已经付过钱的产物搬个家。但它重
  *   （最多拉 80MB + 传 Cloudinary），所以挂 genLimit（30 次/窗口）而不是 pollLimit ——
- *   正常用法一次出片只调一次，30 已经宽裕；放 90 等于给带宽开洞。
+ *   正常用法一段只踢一脚，30 已经宽裕；放 90 等于给带宽开洞。
  * ★ 白名单 + assertPublicUrl 与 /asset 同一套：允许任意域就是公开搬运代理 + SSRF。
  */
 router.post("/transfer-video", requireAuth, genLimit, async (req, res) => {
@@ -603,15 +647,47 @@ router.post("/transfer-video", requireAuth, genLimit, async (req, res) => {
     return res.status(400).json({ message: "host not allowed" });
   }
   try {
-    const buf = await videoAsset.downloadToBuffer(raw);
-    const key = `${req.user.id}-${Date.now()}-seg`;
-    const url = await videoAsset.uploadVideoBuffer(buf, key);
-    if (!url) throw new Error("cloudinary returned no url");
-    return res.json({ url });
+    if (req.body?.wait === false) {
+      const job = await arkTransfer.requestTransfer(raw, req.user._id);
+      return res.status(202).json(
+        job.state === "done"
+          ? { state: "done", url: job.url }
+          : job.state === "failed"
+            ? { state: "failed", message: job.error || "转存失败" }
+            : { state: "pending" }
+      );
+    }
+    const job = await arkTransfer.waitTransfer(raw, req.user._id, TRANSFER_WAIT_BUDGET_MS);
+    if (job?.state === "done" && job.url) return res.json({ url: job.url });
+    if (job?.state === "pending") {
+      // 预算用完还没搬完 ≠ 失败：后台还在搬。这句话老客户端会原样显示在进度行里，
+      // 所以必须说清"直链先顶着、稍后自动换上"，不能只给一个英文码（铁律八）。
+      return res.status(502).json({ message: "转存还在后台进行——先用方舟临时链接，合并/发布时会自动换成长期地址" });
+    }
+    console.warn("[ark] transfer-video 失败:", (job && job.error) || "unknown");
+    return res.status(502).json({ message: "transfer failed" });
   } catch (e) {
     // 失败不装死：客户端据此退回方舟直链（24h 内仍可用），发布时老路会再试一次
     console.warn("[ark] transfer-video 失败:", (e && e.message) || e);
     return res.status(502).json({ message: "transfer failed" });
+  }
+});
+
+/**
+ * POST /api/ark/transfer-video/status —— 批量查转存进展（只读，不登记不搬运）。
+ * body = { urls: string[] }（≤24 条），响应 { results: { [原样传入的 url]: {state,url?,message?} } }，
+ * 没登记过的是 {state:"none"}。挂 pollLimit（90/min）：剪辑页合并前自救每 5s 问一轮
+ * （一轮一个请求，段数打包在 body 里），与出片轮询同一个量级。
+ * ★ 用 POST 装 body 而不是 GET 拼 query：一批最多 24 条 2000 字节的 URL，塞 query
+ *   会顶穿各层的 URL 长度上限，而且日志里整串铺开毫无可读性。
+ */
+router.post("/transfer-video/status", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    const urls = Array.isArray(req.body?.urls) ? req.body.urls.slice(0, 24).map((u) => String(u).slice(0, 2000)) : [];
+    const results = await arkTransfer.statusOf(urls);
+    return res.json({ results });
+  } catch (err) {
+    return next(err);
   }
 });
 

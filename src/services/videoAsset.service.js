@@ -43,13 +43,16 @@ function isArkVideoUrl(value) {
   }
 }
 
-async function uploadVideoBuffer(buffer, key) {
+async function uploadVideoBuffer(buffer, key, opts) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
         folder: "ideahub/branch-videos",
         public_id: `${key}`,
         resource_type: "video",
+        // 后台转存（arkTransfer.service）传 timeoutMs=300s：ECS → Cloudinary 跨境传
+        // 20MB 级成片可能过分钟，SDK 默认 60s 会掐死在半途。发布老路不传 = 行为不变。
+        ...(opts && opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
       },
       (error, result) => {
         if (error) reject(error);
@@ -60,10 +63,12 @@ async function uploadVideoBuffer(buffer, key) {
   });
 }
 
-async function downloadToBuffer(url) {
+async function downloadToBuffer(url, opts) {
   if (typeof fetch !== "function") throw new Error("global fetch unavailable (Node >= 18 required)");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VIDEO_FETCH_TIMEOUT_MS);
+  // 后台转存传 timeoutMs=300s（没人在线上等它，宁可慢慢搬成——2026-08-21 真机链路
+  // 复盘：ECS 拉 TOS 跨境本身就可能超过默认的 60s）。发布老路不传 = 行为不变。
+  const timer = setTimeout(() => controller.abort(), (opts && opts.timeoutMs) || VIDEO_FETCH_TIMEOUT_MS);
   try {
     const resp = await fetch(url, { redirect: "follow", signal: controller.signal });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
