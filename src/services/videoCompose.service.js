@@ -33,8 +33,10 @@ const {
  *  "又长又赶上高峰"留的余量 —— 后台任务没人在线上等，宁可慢慢做成。 */
 const MATERIALIZE_TIMEOUT_MS = Number(process.env.COMPOSE_TIMEOUT_MS || 300_000);
 
-/** pending 多久没动静算僵尸（认领它的进程死在半路）——可被重新认领。同 arkTransfer 的取舍 */
-const STALE_PENDING_MS = 10 * 60 * 1000;
+/** pending 多久没动静算僵尸（认领它的进程死在半路）——可被重新认领。
+ *  ★ 从单趟超时推出来，不写死：MATERIALIZE_TIMEOUT_MS 可以用环境变量调大，而僵尸线一旦
+ *    比它短，就会把**还在跑**的任务判死并重开一发（白花一份配额，还可能两份产物互相覆盖）。 */
+const STALE_PENDING_MS = MATERIALIZE_TIMEOUT_MS * 2;
 
 /** 单实例并发上限。每一发都在 Cloudinary 侧真跑编码、也占我们一条出网连接；
  *  合并不赶时间，排队比把配额和连接一起打满强。 */
@@ -112,11 +114,21 @@ function schedule(key, userId, recipe) {
   p.finally(() => inflight.delete(p));
 }
 
-/** 结果（含失败）**必须**落库：落不下去客户端会一直看到 pending 干等（比报错更坏） */
+/**
+ * 结果（含失败）**必须**落库：落不下去客户端会一直看到 pending 干等（比报错更坏）。
+ *
+ * ★★ 只从 pending 迁出（与 arkTransfer.runTransfer 的守卫同款，那边的注释写的是同一件事）：
+ *   僵尸重认领会让同一个 key 有两个 runner，晚到的那个不许把另一趟刚写的终态打翻 ——
+ *   否则库里会出现 state=failed 却留着别人的 url，用户被告知失败，而那条成片没人认领、
+ *   照样按存储计费（TTL 回收的是**库里那行**，不是 Cloudinary 上的资产）。
+ * @returns {Promise<boolean>} 这次终态是不是自己写上的
+ */
 async function settle(key, patch) {
-  await VideoCompose.updateOne({ key }, { $set: patch }).catch((e) =>
-    console.error(`[compose] 状态落库失败 ${key}:`, e.message),
-  );
+  const r = await VideoCompose.updateOne({ key, state: "pending" }, { $set: patch }).catch((e) => {
+    console.error(`[compose] 状态落库失败 ${key}:`, e.message);
+    return null;
+  });
+  return !!(r && r.matchedCount);
 }
 
 /**
@@ -127,6 +139,9 @@ async function runCompose(key, userId, recipe) {
   const expected = expectedDurationSec(recipe.clips);
   let transform;
   try {
+    // ★ 起跑打一次心跳：僵尸判据看的是 updatedAt，而受理与真正起跑之间还隔着并发队列
+    //   （MAX_CONCURRENT=2）。不打的话，排队久了的**活**任务会被判成死的、再跑一遍。
+    await VideoCompose.updateOne({ key, state: "pending" }, { $set: { startedAt: new Date() } }).catch(() => {});
     transform = buildComposeTransform(recipe);
     const source = buildSourceUrl(recipe.clips[0].publicId);
     if (!source) throw new Error("这台服务器没有配置云存储（CLOUDINARY_*），合并功能不可用");
@@ -134,12 +149,19 @@ async function runCompose(key, userId, recipe) {
     // ★ 源 = 第 1 段的原始地址，拼接规则作为**入站变换**随这次（已签名的）上传请求发出。
     //   理由全在 utils/videoCompose.buildSourceUrl 的注释上 —— 一句话：这是三种做法里
     //   唯一既不产生派生垃圾、又保证存下来是常规 MP4（不是播放器读不出时长的分片容器）的。
-    const publicId = `${userId}-${Date.now()}-merged`;
+    // ★ 名字里必须带**配方指纹**。只有 `<userId>-<毫秒>` 的话，同一个人并发的两发
+    //   （不同配方 = 不同任务，指纹去重管不着，而 MAX_CONCURRENT=2 明确允许两发同时在跑）
+    //   会在同一毫秒算出**同一个** public_id，而上传默认 overwrite —— 后一发把前一发的成片
+    //   静默换掉：两条记录都还是 done（各自的自检只对自己的回执），用户发布出去的是另一条片子。
+    const publicId = `${userId}-${Date.now()}-${key.slice(0, 8)}-merged`;
     const receipt = await cloudinary.uploader.upload(source, {
       resource_type: "video",
       folder: BRANCH_VIDEO_FOLDER,
       public_id: publicId,
       raw_transformation: transform,
+      // ★ 打标：登记行 48h 后就被 TTL 回收了，届时这些成片在 Cloudinary 上再没有任何把手。
+      //   带上 tag，将来要盘点/回收"没被任何作品引用的成片"时才找得到它们。
+      tags: ["ideahub-merged"],
       timeout: MATERIALIZE_TIMEOUT_MS,
     });
 
@@ -157,6 +179,8 @@ async function runCompose(key, userId, recipe) {
         expectedSec: expected,
         actualSec: Number.isFinite(actual) ? actual : null,
         transform,
+        url: null,
+        publicId: null,
         error: `合并结果时长不对（应约 ${expected.toFixed(1)} 秒，实得 ${Number.isFinite(actual) ? actual.toFixed(1) : "未知"} 秒），已丢弃——请重试；若反复出现请反馈给我们`,
       });
       console.error(`[compose] 时长自检未过 ${key}: 期望 ${expected} 实得 ${actual} 变换=${transform.slice(0, 300)}`);
@@ -168,7 +192,7 @@ async function runCompose(key, userId, recipe) {
       console.warn(`[compose] ${key} 要了 BGM 但产物没有音轨（变换=${transform.slice(0, 200)}）`);
     }
 
-    await settle(key, {
+    const landed = await settle(key, {
       state: "done",
       url: receipt.secure_url,
       publicId: receipt.public_id,
@@ -177,7 +201,14 @@ async function runCompose(key, userId, recipe) {
       transform,
       error: null,
     });
-    console.log(`[compose] done ${key} → ${receipt.secure_url.slice(-70)} ${actual}s ${(receipt.bytes / 1e6).toFixed(1)}MB`);
+    if (!landed) {
+      // 另一趟（僵尸重认领）已经把这条写成终态了：我这份产物没有任何地方会引用它，
+      // 留着就是一条永远没人回收、却一直按存储计费的孤儿资产
+      console.warn(`[compose] ${key} 终态已被另一趟写过，销毁本趟产物 ${receipt.public_id}`);
+      await cloudinary.uploader.destroy(receipt.public_id, { resource_type: "video" }).catch(() => {});
+      return;
+    }
+    console.log(`[compose] done ${key} → ${String(receipt.secure_url).slice(-70)} ${actual}s ${(receipt.bytes / 1e6).toFixed(1)}MB`);
   } catch (e) {
     // Cloudinary 的错误对象把原因塞在 e.error.message 里；只取 e.message 会得到一句 "Error"
     const raw = (e && (e.error?.message || e.message)) || String(e);
@@ -200,56 +231,102 @@ function publicView(job) {
 }
 
 /**
+ * 「这条 pending 是不是僵尸」—— **判据只有这一处**（铁律六）。
+ * 受理侧（要不要重新开跑）与轮询侧（要不要判它死了）问的必须是同一个函数：
+ * 分家的话会出现"轮询说还在跑、再点一次却重开了一发"这种自相矛盾。
+ * ★ 阈值从 MATERIALIZE_TIMEOUT_MS 推出来而不是写死：那个数可以用环境变量调，
+ *   写死的僵尸线一旦比它短，就会把**还活着**的任务判死并重跑一遍（白花一份配额）。
+ */
+function isStale(job) {
+  return job.state === "pending" && Date.now() - new Date(job.updatedAt).getTime() > STALE_PENDING_MS;
+}
+
+/**
+ * 滚动 24 小时内这个人**预约掉**的产出秒数。
+ * ★ 求和用 `max(spentSec, expectedSec)`：spentSec 是"这份配方真跑过几趟"的累计
+ *   （受理一次 + 每次复活/僵尸重认领各再加一份）；老行没有这一位时退回 expectedSec，
+ *   至少不会白算成 0。**不能用 $ifNull**：mongoose 的 `default: 0` 会让新行拿到 0 而不是 null。
+ */
+async function spentSec24h(userId, upToId = null) {
+  const match = {
+    userId: new mongoose.Types.ObjectId(String(userId)),
+    createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+  };
+  // upToId：并发受理时只算"排在我前面（含我自己）"的那些 —— 靠 _id 定序，
+  // 一批并发里正好保留装得下的那个前缀，而不是要么全放要么全拒
+  if (upToId) match._id = { $lte: upToId };
+  const r = await VideoCompose.aggregate([{ $match: match }, { $group: { _id: null, sec: { $sum: { $max: ["$spentSec", "$expectedSec"] } } } }]);
+  return (r[0] && r[0].sec) || 0;
+}
+
+function deniedView(spent) {
+  return {
+    state: "denied",
+    // ★ 说"最近 24 小时"而不是"今天/明天"：窗口是**滚动**的，说"明天再来"会让人白等到第二天
+    //   却发现还是不行（额度是随着那一发满 24 小时才一点点回来的）。
+    message: `最近 24 小时的合并额度用完了（每 24 小时最多合成 ${Math.round(DAILY_OUTPUT_SEC_BUDGET / 60)} 分钟成片，已用 ${Math.round(spent / 60)} 分钟）——过一阵再试，或先把已经合好的发布掉`,
+  };
+}
+
+/**
  * 受理一份配方：没跑过就认领并后台开跑；跑过就把现成结果给回去。
  * ★ failed 会**复活重试**：合并失败往往是一次性的（上游抖动/生成超时），
  *   而用户主动再点一次合并就是明确的重试意图（同 arkTransfer.requestTransfer 的取舍）。
+ *
+ * ★★ 预算是**先预约再核账**（不是先查后写）：
+ *   查完再写中间隔着三个 await，并发的几发各读各的旧值，实测 6 发并行能放进 1799.99 秒
+ *   （上限 900）。现在的顺序是"先把这一趟记进账（create 或 $inc），再回头核对排在自己
+ *   前面的总和"，超了就**回滚**。多花的那一次数据库往返换的是"额度真的是额度"。
+ * ★★ 复活与僵尸重认领**同样要计费**：它们都会在 Cloudinary 上真跑一趟编码。
+ *   只按登记行数算的话，一份稳定失败的配方可以被无限重试（复审实测：6 次真编码、
+ *   预算只记 1 份），花钱的闸门等于不存在。
  */
 async function requestCompose(userId, recipe) {
   const key = recipeKey(userId, recipe);
+  const want = expectedDurationSec(recipe.clips);
 
-  // ★ 预算闸排在最前，但**已经跑过的配方不受它影响**（下面几条分支会直接返回现成结果）——
-  //   不然用户第二天来看昨天那条成片的地址，会被告知"今天的额度用完了"，而那一发早就跑完了。
-  //   所以这里只拦"要新开一发"的情况：先看有没有现成的。
-  const existing = await VideoCompose.findOne({ key }).lean();
-  const willSpend = !existing || existing.state === "failed" ||
-    (existing.state === "pending" && Date.now() > new Date(existing.updatedAt).getTime() + STALE_PENDING_MS);
-  if (willSpend) {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const used = await VideoCompose.aggregate([
-      { $match: { userId: new mongoose.Types.ObjectId(String(userId)), createdAt: { $gte: since } } },
-      { $group: { _id: null, sec: { $sum: "$expectedSec" } } },
-    ]);
-    const spent = (used[0] && used[0].sec) || 0;
-    const want = expectedDurationSec(recipe.clips);
-    if (spent + want > DAILY_OUTPUT_SEC_BUDGET) {
-      return {
-        state: "denied",
-        message: `今天的合并额度用完了（每天最多合成 ${Math.round(DAILY_OUTPUT_SEC_BUDGET / 60)} 分钟成片，已用 ${Math.round(spent / 60)} 分钟）——明天再来，或先把已经合好的发布掉`,
-      };
-    }
+  /** 预约之后核账；装不下就把预约退掉（回滚交给调用方，因为三条路退法不同） */
+  async function overBudget(docId) {
+    const spent = await spentSec24h(userId, docId);
+    return spent > DAILY_OUTPUT_SEC_BUDGET ? spent : 0;
   }
 
+  // ① failed → 复活重试（先把这一趟计进账）
   const revived = await VideoCompose.findOneAndUpdate(
     { key, state: "failed" },
-    { $set: { state: "pending", error: null } },
+    { $set: { state: "pending", error: null, url: null, publicId: null }, $inc: { spentSec: want } },
     { returnDocument: "after" },
   ).lean();
   if (revived) {
+    const over = await overBudget(revived._id);
+    if (over) {
+      // 退回预约并恢复失败态：这一发没被受理，不该占额度，也不该看起来像在跑
+      await VideoCompose.updateOne(
+        { key, state: "pending" },
+        { $set: { state: "failed", error: revived.error }, $inc: { spentSec: -want } },
+      );
+      return deniedView(over - want);
+    }
     schedule(key, userId, recipe);
     return publicView(revived);
   }
 
+  // ② 已有记录：done 直接给结果；pending 看是不是僵尸
   const found = await VideoCompose.findOne({ key }).lean();
   if (found) {
-    const staleAt = new Date(found.updatedAt).getTime() + STALE_PENDING_MS;
-    if (found.state === "pending" && Date.now() > staleAt) {
-      // 僵尸认领：按 updatedAt 原子抢（两个实例同时抢，只有一个改得动）
+    if (isStale(found)) {
+      // 僵尸认领：按 updatedAt 原子抢（两个实例同时抢，只有一个改得动），同样计一份账
       const claimed = await VideoCompose.findOneAndUpdate(
         { key, state: "pending", updatedAt: found.updatedAt },
-        { $set: { error: null } }, // timestamps 顺手刷新 updatedAt = 新的认领时刻
+        { $set: { error: null }, $inc: { spentSec: want } }, // timestamps 顺手刷新 updatedAt = 新的认领时刻
         { returnDocument: "after" },
       ).lean();
       if (claimed) {
+        const over = await overBudget(claimed._id);
+        if (over) {
+          await VideoCompose.updateOne({ key }, { $inc: { spentSec: -want } });
+          return deniedView(over - want);
+        }
         schedule(key, userId, recipe);
         return publicView(claimed);
       }
@@ -257,8 +334,14 @@ async function requestCompose(userId, recipe) {
     return publicView(found);
   }
 
+  // ③ 全新配方：先登记（= 预约），再核账，装不下就删掉这行
   try {
-    const doc = await VideoCompose.create({ key, userId, state: "pending", expectedSec: expectedDurationSec(recipe.clips) });
+    const doc = await VideoCompose.create({ key, userId, state: "pending", expectedSec: want, spentSec: want });
+    const over = await overBudget(doc._id);
+    if (over) {
+      await VideoCompose.deleteOne({ _id: doc._id });
+      return deniedView(over - want);
+    }
     schedule(key, userId, recipe);
     return publicView(doc.toObject());
   } catch (e) {
@@ -274,9 +357,25 @@ async function requestCompose(userId, recipe) {
 /**
  * 查进展。**必须带 userId**：jobId 是配方指纹，虽然含 userId 但仍是可猜测的字符串，
  * 不按人过滤就等于谁猜中谁就能看到别人的成片地址。
+ *
+ * ★★ 轮询路径要**自愈**：进程被 kill（优雅退出不等后台任务）或实例中途没了，登记行会
+ *   永远停在 pending —— 而客户端只会一直转圈，直到 48h TTL 把那行删掉、变成一句
+ *   「没有这个合并任务」。僵尸在这里翻成 failed，用户至少知道该重试（铁律八）。
+ *   判据与受理侧共用 isStale（阈值 > 单趟超时，所以不会误伤还在跑的那一发）。
  */
 async function statusOf(userId, jobId) {
-  const job = await VideoCompose.findOne({ key: String(jobId || "").slice(0, 64), userId }).lean();
+  const key = String(jobId || "").slice(0, 64);
+  const job = await VideoCompose.findOne({ key, userId }).lean();
+  if (job && isStale(job)) {
+    const msg = "合并没能跑完（服务重启或任务中断）——再点一次合并会重新开始";
+    // 只从 pending 迁出：万一那一发其实刚写完 done，这次更新就该落空
+    const r = await VideoCompose.updateOne({ key, state: "pending" }, { $set: { state: "failed", error: msg, url: null, publicId: null } });
+    if (r.matchedCount) {
+      console.warn(`[compose] 僵尸任务判失败 ${key}（pending 超过 ${Math.round(STALE_PENDING_MS / 1000)}s 没动静）`);
+      return { jobId: key, state: "failed", message: msg };
+    }
+    return publicView(await VideoCompose.findOne({ key, userId }).lean());
+  }
   return publicView(job);
 }
 

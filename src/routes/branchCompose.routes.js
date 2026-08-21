@@ -22,7 +22,7 @@ const { validate } = require("../middleware/validate");
 const { composeBody } = require("../schemas/branchCompose.schemas");
 const { badRequest, notFound } = require("../utils/http");
 const { cloudinary } = require("../config/cloudinary");
-const { COMPOSE_LIMITS, isBranchVideoUrl, parseOwnBranchVideoUrl } = require("../utils/videoCompose");
+const { COMPOSE_LIMITS, expectedDurationSec, isBranchVideoUrl, parseOwnBranchVideoUrl } = require("../utils/videoCompose");
 // 「这条地址是不是本账号在我们空间里的资产」判据复用 templateVideoAsset 那一份（铁律六）
 const { ownedCloudinaryAsset } = require("../utils/templateVideoAsset");
 const compose = require("../services/videoCompose.service");
@@ -89,7 +89,9 @@ router.post("/compose", requireAuth, composeLimit, validate({ body: composeBody 
       });
     }
 
-    const total = clips.reduce((s, c) => s + (c.endSec - c.startSec), 0);
+    // ★ 用 util 那一份，不在这儿再写一遍求和：预算闸与产物自检问的都是它，
+    //   这里自己算的话，三处口径分叉时**没有任何症状**（铁律六）
+    const total = expectedDurationSec(clips);
     if (total > COMPOSE_LIMITS.maxTotalSec) {
       return badRequest(`成片总时长 ${total.toFixed(1)} 秒，超过上限 ${COMPOSE_LIMITS.maxTotalSec} 秒`);
     }
@@ -113,6 +115,12 @@ router.post("/compose", requireAuth, composeLimit, validate({ body: composeBody 
       const durationSec = Number(meta.duration);
       if (!Number.isFinite(durationSec) || durationSec <= 0) {
         return badRequest("这段背景音乐没有可用的时长信息，换一首再试");
+      }
+      // ★ 太短的整句拒，不悄悄夹：`e_loop` 是实测行为不是文档契约，而我们只实测到 e_loop:3。
+      //   一段 0.1 秒的"音乐"铺满 300 秒会算出 e_loop:2999 —— 那是个谁都没验过的形状，
+      //   悄悄替用户改成别的次数则是另一种骗人（他听到的循环节奏不是他选的那段）。
+      if (durationSec < COMPOSE_LIMITS.minBgmSec) {
+        return badRequest(`背景音乐太短了（${durationSec.toFixed(1)} 秒），至少要 ${COMPOSE_LIMITS.minBgmSec} 秒`);
       }
       bgm = { publicId: own.publicId, durationSec, volume: audio.volume, replace: !!audio.replace };
     }

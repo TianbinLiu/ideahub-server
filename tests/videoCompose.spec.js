@@ -162,8 +162,11 @@ describe("背景音乐：循环次数与音量的换算", () => {
   const withBgm = (bgm) => buildComposeTransform({ clips, width: 704, height: 1248, bgm });
 
   test("BGM 比片子短 → 按 ceil(片长/BGM长)-1 补循环（实测语义：e_loop:N = 额外重复 N 次）", () => {
-    // 10 秒片 + 3 秒 BGM → ceil(10/3)-1 = 3（共播 4 遍 = 12 秒，被片长截断）
-    expect(withBgm({ publicId: "ideahub/workshop-media/u-9", durationSec: 3, volume: 1 })).toContain("e_loop:3");
+    // 30 秒片 + 7 秒 BGM → ceil(30/7)-1 = 4（共播 5 遍 = 35 秒，被片长截断）
+    // ★ 用 ≥ minBgmSec 的素材：更短的在端点侧就被整句拒了（那是另一条用例）
+    const long = [{ publicId: "ideahub/branch-videos/u-1-seg", startSec: 0, endSec: 30 }];
+    const t = buildComposeTransform({ clips: long, width: 704, height: 1248, bgm: { publicId: "ideahub/workshop-media/u-9", durationSec: 7, volume: 1 } });
+    expect(t).toContain("e_loop:4");
   });
 
   test("BGM 比片子长 → 不加 e_loop（多一次循环就是白烧一次配额）", () => {
@@ -423,9 +426,151 @@ describe("★ 每日产出秒数预算（限流只管次数，管不住钱）", 
   });
 });
 
+describe("★★ 复审逮到的四个真缺陷（每条都曾经能跑通攻击）", () => {
+  test("① 重试也要计费：同一份配方反复失败重试，跑不满额度就必须 429", async () => {
+    uploadSpy.mockRejectedValue(new Error("boom")); // 让它稳定失败 —— 时长自检失败那条路同理
+    const { DAILY_OUTPUT_SEC_BUDGET } = compose();
+    const each = 10; // body() 是两段各 5 秒
+    const allowed = Math.floor(DAILY_OUTPUT_SEC_BUDGET / each);
+    let denied = 0;
+    for (let i = 0; i < allowed + 3; i++) {
+      const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+      await compose().idle();
+      if (res.status === 429) denied++;
+    }
+    // 修之前：登记只有 1 行、expectedSec 恒为 10，spent 永远是 10，于是**一次都不会 429**
+    expect(denied).toBeGreaterThan(0);
+    expect(uploadSpy.mock.calls.length).toBeLessThanOrEqual(allowed);
+  }, 30_000);
+
+  test("② 预算不是先查后写：并发受理不该整体突破额度", async () => {
+    const { DAILY_OUTPUT_SEC_BUDGET } = compose();
+    // 六发**不同配方**（差 1 毫秒就是不同指纹，去重管不着）同时打进来，每发 200 秒
+    const burst = Array.from({ length: 6 }, (_, i) =>
+      request(app).post("/api/branch/compose").set(auth()).send(
+        body(userId, { clips: [{ url: segUrl(userId, 1001), startSec: i * 0.001, endSec: i * 0.001 + 200 }] }),
+      ),
+    );
+    const rs = await Promise.all(burst);
+    await compose().idle();
+    const accepted = rs.filter((r) => r.status === 202).length;
+    // 200 秒一发 → 900 秒的额度最多装得下 4 发。修之前六发全部 202（实测放进 1799.99 秒）
+    expect(accepted).toBeLessThanOrEqual(Math.floor(DAILY_OUTPUT_SEC_BUDGET / 200));
+    expect(uploadSpy.mock.calls.length).toBe(accepted);
+  }, 30_000);
+
+  test("③ 晚到的 runner 不许打翻已完成的任务，且要销毁自己那份产物（否则成片变孤儿）", async () => {
+    const VideoComposeModel = require("../src/models/VideoCompose");
+    // 让这一趟的上传卡在闸门上，中途把记录改成"另一趟已经跑完了"——这正是僵尸重认领的形状
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    uploadSpy.mockImplementation(async (_url, opts) => {
+      await gate;
+      return {
+        secure_url: `https://res.cloudinary.com/testcloud/video/upload/v1/${opts.folder}/${opts.public_id}.mp4`,
+        public_id: `${opts.folder}/${opts.public_id}`,
+        duration: 10.04, width: 704, height: 1248, bytes: 2_800_000,
+      };
+    });
+
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+    const jobId = res.body.jobId;
+    await VideoComposeModel.updateOne(
+      { key: jobId },
+      { $set: { state: "done", url: "https://winner.example/win.mp4", publicId: "ideahub/branch-videos/winner" } },
+    );
+    release();
+    await compose().idle();
+
+    const after = await VideoComposeModel.findOne({ key: jobId }).lean();
+    expect(after.state).toBe("done");
+    expect(after.url).toBe("https://winner.example/win.mp4"); // 没被晚到的那趟打翻
+    expect(destroySpy).toHaveBeenCalled();                     // 晚到那份产物被销毁
+    expect(destroySpy.mock.calls[0][0]).toMatch(/-merged$/);
+  });
+
+  test("④ 僵尸 pending 在**轮询**时就被判失败（不然客户端永远转圈，直到 48h 后变 404）", async () => {
+    const VideoComposeModel = require("../src/models/VideoCompose");
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+    const jobId = res.body.jobId;
+    await compose().idle();
+    // 造一条很久没动静的 pending（绕过 timestamps 自动刷新）
+    const past = new Date(Date.now() - compose().STALE_PENDING_MS - 60_000);
+    await VideoComposeModel.updateOne({ key: jobId }, { $set: { state: "pending", url: null } }, { timestamps: false });
+    await VideoComposeModel.updateOne({ key: jobId }, { $set: { updatedAt: past } }, { timestamps: false });
+
+    const st = await request(app).get(`/api/branch/compose/${jobId}`).set(auth());
+    expect(st.body.state).toBe("failed");
+    expect(st.body.message).toMatch(/没能跑完|重新开始/);
+  });
+});
+
+describe("★ 变换串注入：public_id 里的 , 与 : 是参数分隔符", () => {
+  const { buildComposeTransform } = require("../src/utils/videoCompose");
+  const good = { publicId: "ideahub/branch-videos/u-1-seg", startSec: 0, endSec: 5 };
+
+  test.each([
+    ["图层段落", { clips: [good, { publicId: "ideahub/branch-videos/x,fl_splice,l_video:ideahub:branch-videos:victim-1-seg", startSec: 0, endSec: 5 }] }],
+    ["基片段落", { clips: [{ publicId: "ideahub/branch-videos/x,e_volume:400", startSec: 0, endSec: 5 }] }],
+    ["BGM（归属判据对字符集是放行的，注入正是从这儿进）", {
+      clips: [good],
+      bgm: { publicId: "ideahub/x,fl_splice,l_video:ideahub:branch-videos:victim-1-seg/u-1", durationSec: 30, volume: 1 },
+    }],
+  ])("%s 带分隔符 → 响亮地抛，绝不拼进变换串", (_label, over) => {
+    expect(() => buildComposeTransform({ clips: [good], width: 704, height: 1248, ...over })).toThrow(/不允许的字符/);
+  });
+
+  test("正常的 public_id 照旧能用（别把合法字符一起挡了）", () => {
+    expect(() =>
+      buildComposeTransform({
+        clips: [good, { publicId: "ideahub/branch-videos/6993983f-1787213526158-3-cover", startSec: 0, endSec: 2 }],
+        width: 704, height: 1248,
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("★ BGM 循环次数不能没有上界", () => {
+  const { buildComposeTransform, COMPOSE_LIMITS } = require("../src/utils/videoCompose");
+
+  test("极短 BGM 不会算出天文数字的 e_loop（实测只验到 e_loop:3，没量过的形状不发出去）", () => {
+    const t = buildComposeTransform({
+      clips: [{ publicId: "ideahub/branch-videos/u-1-seg", startSec: 0, endSec: 300 }],
+      width: 704, height: 1248,
+      bgm: { publicId: "ideahub/workshop-media/u-9", durationSec: 0.1, volume: 1 },
+    });
+    const loops = Number(/e_loop:(\d+)/.exec(t)?.[1] ?? 0);
+    expect(loops).toBeLessThanOrEqual(COMPOSE_LIMITS.maxBgmLoops);
+  });
+
+  test("太短的 BGM 在端点侧整句拒（不悄悄替用户改成别的循环节奏）", async () => {
+    resourceSpy.mockResolvedValue({ duration: 1.2, public_id: `ideahub/workshop-media/${userId}-777` });
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(
+      body(userId, { audio: { url: `https://res.cloudinary.com/testcloud/video/upload/v1/ideahub/workshop-media/${userId}-777.mp3`, volume: 1 } }),
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/太短/);
+    expect(uploadSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("★ 产物命名要带配方指纹（同毫秒的两发不能互相覆盖）", () => {
+  test("不同配方产出不同 public_id", async () => {
+    await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+    const b2 = body(userId);
+    b2.clips[0].endSec = 4.5;
+    await request(app).post("/api/branch/compose").set(auth()).send(b2);
+    await compose().idle();
+    const ids = uploadSpy.mock.calls.map((c) => c[1].public_id);
+    expect(ids.length).toBe(2);
+    expect(new Set(ids).size).toBe(2);
+    for (const id of ids) expect(id).toMatch(/^[a-f0-9]{24}-\d+-[a-f0-9]{8}-merged$/);
+  });
+});
+
 describe("背景音乐：端点侧", () => {
   test("BGM 时长只从 Cloudinary 取，循环次数按它算（不收客户端报的数）", async () => {
-    resourceSpy.mockResolvedValue({ duration: 4, public_id: `ideahub/workshop-media/${userId}-777` });
+    resourceSpy.mockResolvedValue({ duration: 8, public_id: `ideahub/workshop-media/${userId}-777` });
     const b = body(userId, {
       audio: { url: `https://res.cloudinary.com/testcloud/video/upload/v1/ideahub/workshop-media/${userId}-777.mp3`, volume: 0.4 },
     });
@@ -435,7 +580,7 @@ describe("背景音乐：端点侧", () => {
     expect(resourceSpy).toHaveBeenCalled();
     const sent = uploadSpy.mock.calls[0][1].raw_transformation;
     expect(sent).toContain("l_audio:ideahub:workshop-media:");
-    expect(sent).toContain("e_loop:2"); // ceil(10/4)-1 = 2
+    expect(sent).toContain("e_loop:1"); // ceil(10/8)-1 = 1
     expect(sent).toContain("e_volume:-60");
   });
 

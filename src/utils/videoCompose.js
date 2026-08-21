@@ -26,9 +26,9 @@
 // （`Concatenated videos sizes don't match`）。所以每一格都无条件带上 `c_fill,w_,h_`，
 // 横竖混排靠它归一 —— 少写一格就是整单失败，而不是悄悄裁错。
 const { cloudinary } = require("../config/cloudinary");
-
-/** 成片段落在 Cloudinary 里的家。与 videoAsset.uploadVideoBuffer 的 folder 是同一个字符串 */
-const BRANCH_VIDEO_FOLDER = "ideahub/branch-videos";
+// ★ 目录字符串从**写入方**那里 import，不在这儿再写一份（铁律六）：两处各写一份的话，
+//   改目录时改一处漏一处不会报错，只会变成"刚转存好的段落，合并时说不是你的素材"
+const { BRANCH_VIDEO_FOLDER } = require("../services/videoAsset.service");
 
 /**
  * 合并的产品边界。**上限只有这一处**（CLAUDE.md「上限自己抄一份」那条坑的同款防线）：
@@ -46,14 +46,48 @@ const COMPOSE_LIMITS = Object.freeze({
   maxTotalSec: 300,
   maxEdge: 1920,
   minEdge: 64,
+  /**
+   * BGM 的两条边界。
+   * ★ `e_loop` 是**实测行为不是文档契约**（官方对音频图层的循环只字未提），而我们只实测到
+   *   `e_loop:3`。没量过的形状不该随请求发出去 —— 一段 0.1 秒的"音乐"要铺满 300 秒会算出
+   *   `e_loop:2999`，那是个谁都没验过、只会让上游去做 3000 次拼接的数。
+   * ★ 5 秒下限 + 60 次硬顶是同一件事的两个面（5 秒铺满 300 秒正好 59 次）。
+   */
+  minBgmSec: 5,
+  maxBgmLoops: 60,
 });
+
+/**
+ * 变换串里 `,` 与 `:` 就是**组件内的参数分隔符**。public_id 里混进这两个字符，等于让调用方
+ * 往一条**我们签名、我们付钱**的变换里塞任意参数（塞别人的 `l_video:` 也行）。
+ *
+ * ★★ 为什么必须在这一层挡：段落那条路的归属判据（ownBranchVideoPublicId）是整体形状匹配、
+ *   天然干净；但 BGM 那条走的是 templateVideoAsset.ownedCloudinaryAsset —— 它的 folder 段
+ *   写的是 `ideahub/[^/]+/`，那个函数本来只为「删模板时 best-effort 回收封面」而写，
+ *   从不关心字符集。于是一条精心构造的地址
+ *   `…/ideahub/x,fl_splice,l_video:<别人的段落>/<自己的>-1700.mp3`
+ *   能被它认成"本人的资产"，再被拼进变换串（复审实测逐字节复现）。
+ * ★ 挡在**拼装这一处**而不是各调用点：这里是唯一把 public_id 写进变换串的地方，
+ *   将来多一条图层路径也自动受保护（铁律六）。
+ * ★ 响亮地抛而不是悄悄过滤：能走到这里的怪字符只可能是构造出来的，
+ *   过滤掉再拼一条"看着正常"的变换，等于把一次攻击变成一条谁也解释不了的账单。
+ */
+const SAFE_PUBLIC_ID = /^[A-Za-z0-9_\-./]{1,300}$/;
+
+function assertSafePublicId(publicId, what) {
+  if (!SAFE_PUBLIC_ID.test(String(publicId || ""))) {
+    throw new Error(`${what}的资源名里有不允许的字符，无法用于合并`);
+  }
+}
 
 /** 画质档。默认 good（实测 ≈2.2Mbps @704×1248），best ≈3.4Mbps（体积 +54%，带宽也是钱）。
  *  源片本身 11Mbps —— 走 Cloudinary 必然重编码，这是方案的已知代价，不是 bug。 */
 const QUALITY = Object.freeze({ good: "q_auto:good", best: "q_auto:best" });
 
-/** public_id 里的斜杠在**图层引用**里必须换成冒号；URL 路径里的那份保持斜杠（官方规则） */
-function layerRef(publicId) {
+/** public_id 里的斜杠在**图层引用**里必须换成冒号；URL 路径里的那份保持斜杠（官方规则）。
+ *  ★ 换之前先过字符集：换完就分不清"本来就有的冒号"和"我们换出来的冒号"了 */
+function layerRef(publicId, what = "素材") {
+  assertSafePublicId(publicId, what);
   return String(publicId).replace(/\//g, ":");
 }
 
@@ -142,6 +176,8 @@ function expectedDurationSec(clips) {
  * 固定下来只是为了让两条路（基片/图层）长得一样、diff 时看得出差别。
  */
 function clipParams(clip, width, height, mute) {
+  // 基片不走 layerRef（它进的是 URL 路径不是图层引用），字符集这一关得自己过
+  assertSafePublicId(clip.publicId, "视频片段");
   return [
     `c_fill,w_${width},h_${height}`,
     ...(mute ? ["ac_none"] : []),
@@ -178,7 +214,7 @@ function buildComposeTransform({ clips, width, height, quality = "good", bgm = n
   // ★★ fl_splice 与 l_video 同格（陷阱①）；裁剪单独成格（官方形状，实测等价于同格）；
   //    fl_layer_apply **裸着**，一个参数都不挂（陷阱② —— 那一格的 so_ 是"拼到最前面"的意思）。
   const layers = rest.map(
-    (c) => `fl_splice,l_video:${layerRef(c.publicId)}/${clipParams(c, width, height, mute)}/fl_layer_apply`,
+    (c) => `fl_splice,l_video:${layerRef(c.publicId, "视频片段")}/${clipParams(c, width, height, mute)}/fl_layer_apply`,
   );
 
   const parts = [head, ...layers];
@@ -190,14 +226,19 @@ function buildComposeTransform({ clips, width, height, quality = "good", bgm = n
     // ⚠ 官方文档对"音频图层能不能循环"只字未提，这是**实测行为不是契约**：
     //   所以产物落地后那道"音轨够不够长"的自检不能省（见 service 的 verify）。
     const total = expectedDurationSec(clips);
-    const dur = Math.max(0.1, Number(bgm.durationSec) || 0);
-    const loops = dur > 0 ? Math.max(0, Math.ceil(total / dur) - 1) : 0;
+    // ★ 下限由路由整句拒（说得出原因），这里再夹一次是**兜底**：夹在 minBgmSec 上，
+    //   循环次数就永远落在 maxBgmLoops 以内 —— 不夹的话一段 0.1 秒的"音乐"会算出
+    //   e_loop:2999，那是个谁都没验过的形状，只会让上游去做三千次拼接。
+    const dur = Math.max(COMPOSE_LIMITS.minBgmSec, Number(bgm.durationSec) || 0);
+    const loops = Math.min(COMPOSE_LIMITS.maxBgmLoops, Math.max(0, Math.ceil(total / dur) - 1));
     // volume：客户端给 0..1（剪辑页那个滑块），Cloudinary 收的是 -100..400 的百分比增量。
     // 1.0 → 0（原样）、0.5 → -50、0 → mute。实测单调生效（取纯音频比字节：
     // -100 得 40,971 字节的近似静音，默认 172,587，+100 得 181,011）。
     const vol = Math.max(-100, Math.min(400, Math.round((Number(bgm.volume) - 1) * 100)));
     const bgmParams = [
-      `l_audio:${layerRef(bgm.publicId)}`,
+      // ★ 这一路的归属判据（templateVideoAsset.ownedCloudinaryAsset）对字符集是放行的 ——
+      //   注入就从这里进（见 assertSafePublicId 的 ★★），layerRef 会当场拦下
+      `l_audio:${layerRef(bgm.publicId, "背景音乐")}`,
       `du_${sec(Math.min(dur, total))}`,
       ...(loops > 0 ? [`e_loop:${loops}`] : []),
       ...(vol !== 0 ? [`e_volume:${vol}`] : []),
@@ -232,6 +273,7 @@ module.exports = {
   BRANCH_VIDEO_FOLDER,
   COMPOSE_LIMITS,
   QUALITY,
+  assertSafePublicId,
   layerRef,
   ownBranchVideoPublicId,
   isBranchVideoUrl,

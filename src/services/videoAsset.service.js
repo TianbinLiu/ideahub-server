@@ -15,6 +15,12 @@
 //   只表现为"同一条链接发布时能转存、出片时却说 host 不认"。
 const { cloudinary } = require("../config/cloudinary");
 
+/** 成片段落在 Cloudinary 里的家 —— **这个字符串只有这一处**（写入方持有它）。
+ *  校验方（utils/videoCompose 的归属判据）从这里 import：两处各写一份的话，
+ *  哪天改了目录，写进去的和认得出的就是两个地方，而且都不报错 —— 表现是
+ *  "刚转存好的段落，合并时说不是你的素材"（铁律六）。 */
+const BRANCH_VIDEO_FOLDER = "ideahub/branch-videos";
+
 // 下载方舟视频的上限与超时（可用环境变量覆盖）
 const MAX_VIDEO_BYTES = Number(process.env.BRANCH_VIDEO_MAX_BYTES || 80 * 1024 * 1024);
 const VIDEO_FETCH_TIMEOUT_MS = Number(process.env.BRANCH_VIDEO_FETCH_TIMEOUT_MS || 60_000);
@@ -47,7 +53,7 @@ async function uploadVideoBuffer(buffer, key, opts) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
-        folder: "ideahub/branch-videos",
+        folder: BRANCH_VIDEO_FOLDER,
         public_id: `${key}`,
         resource_type: "video",
         // 后台转存（arkTransfer.service）传 timeoutMs=300s：ECS → Cloudinary 跨境传
@@ -88,6 +94,7 @@ async function downloadToBuffer(url, opts) {
 }
 
 module.exports = {
+  BRANCH_VIDEO_FOLDER,
   MAX_VIDEO_BYTES,
   VIDEO_FETCH_TIMEOUT_MS,
   ARK_HOST_PATTERNS,

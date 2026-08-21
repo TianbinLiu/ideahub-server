@@ -27,6 +27,15 @@ const videoComposeSchema = new mongoose.Schema(
     /** 自检用：期望时长与实测时长。对不上就是踩了静默陷阱，留着可回溯 */
     expectedSec: { type: Number, default: null },
     actualSec: { type: Number, default: null },
+    /**
+     * 这份配方**真跑过**的输出秒数累计（受理一次 + 每次复活重试/僵尸重认领各再加一份）。
+     * ★ 预算算的是"跑过几趟"而不是"登记了几行"：复活重试同样在 Cloudinary 上真跑一趟编码、
+     *   同样花钱。只按行算的话，一份稳定失败的配方可以被无限重试，花钱的闸门等于不存在。
+     */
+    spentSec: { type: Number, default: 0 },
+    /** 真正起跑的时刻（受理与起跑之间隔着并发队列）。写它是为了刷新 updatedAt = 心跳，
+     *  否则排队久了的**活**任务会被僵尸判据当成死的再跑一遍 */
+    startedAt: { type: Date, default: null },
     /** 出问题时能照着复现的那串变换（只存变换，不存 host/签名） */
     transform: { type: String, default: null, maxlength: 4000 },
   },
@@ -35,6 +44,9 @@ const videoComposeSchema = new mongoose.Schema(
 
 // 认领锁：一份配方只有一条（插入撞 11000 = 别的请求/实例刚认领，读回来即可）
 videoComposeSchema.index({ key: 1 }, { unique: true });
+// 预算聚合（按人 + 滚动 24h 求和）走这条。没有它就只能靠 TTL 那条 createdAt 索引扫
+// **全站** 24 小时的行再在内存里挑出这个人的 —— 用户一多，每次受理都在扫别人的账
+videoComposeSchema.index({ userId: 1, createdAt: -1 });
 // TTL 兜底回收（48h）
 videoComposeSchema.index({ createdAt: 1 }, { expireAfterSeconds: 48 * 60 * 60 });
 
