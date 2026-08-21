@@ -132,7 +132,10 @@ router.post("/compose", requireAuth, composeLimit, validate({ body: composeBody 
       return res.status(429).json({ ok: false, code: "COMPOSE_QUOTA", message: view.message });
     }
     // done 用 200（客户端可以直接拿地址走人），pending 用 202（受理了，去轮询）
-    return res.status(view.state === "done" ? 200 : 202).json(view);
+    // ★ 带上 ok:true —— 全仓约定「成功 {ok:true,…}／失败 {ok:false,code,message}」，
+    //   api/client.ts 正是按 `data.ok === false` 判失败的。少这一位今天不会出错，
+    //   但下一个照着别处写判断的人会踩空（铁律六：约定也是规则）
+    return res.status(view.state === "done" ? 200 : 202).json({ ok: true, ...view });
   } catch (err) {
     return next(err);
   }
@@ -147,7 +150,7 @@ router.get("/compose/:jobId", requireAuth, pollLimit, async (req, res, next) => 
   try {
     const view = await compose.statusOf(String(req.user._id), req.params.jobId);
     if (view.state === "none") return notFound("没有这个合并任务");
-    return res.json(view);
+    return res.json({ ok: true, ...view });
   } catch (err) {
     return next(err);
   }
