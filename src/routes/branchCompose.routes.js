@@ -127,7 +127,9 @@ router.post("/compose", requireAuth, composeLimit, validate({ body: composeBody 
 
     const view = await compose.requestCompose(userId, { clips, width, height, quality: quality || "good", bgm });
     // ★ 每日产出秒数预算（花钱的闸门，限流只管次数不管量 —— 理由在 service 那个常量上）。
-    //   429 而不是 403：这是"稍后再来"，不是"你没资格"，客户端据此提示明天再试而不是去升级套餐。
+    //   429 而不是 403：这是"稍后再来"，不是"你没资格"——客户端据此原样显示这句话，
+    //   而不是引导去升级套餐。★ 别把它翻译成"明天再试"：窗口是**滚动**的，
+    //   额度随每一发满 24 小时才一点点回来（deniedView 的话术就是照这个写的）。
     if (view.state === "denied") {
       return res.status(429).json({ ok: false, code: "COMPOSE_QUOTA", message: view.message });
     }

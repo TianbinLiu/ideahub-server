@@ -505,6 +505,93 @@ describe("★★ 复审逮到的四个真缺陷（每条都曾经能跑通攻击
   });
 });
 
+describe("★★ 静默失败复审逮到的第二批", () => {
+  test("① 产物恰好只有第 1 段那么长 → 判失败（容差拦不住的那个画中画形状）", async () => {
+    // 两段各 0.3 秒：期望 0.6，画中画产物 0.3，差 0.3 < 容差 0.59 —— 只看总时长的话判过
+    const b = body(userId, {
+      clips: [
+        { url: segUrl(userId, 1001), startSec: 0, endSec: 0.3 },
+        { url: segUrl(userId, 1002), startSec: 0, endSec: 0.3 },
+      ],
+    });
+    uploadSpy.mockImplementation(async (_u, opts) => ({
+      secure_url: `https://res.cloudinary.com/testcloud/video/upload/v1/${opts.folder}/${opts.public_id}.mp4`,
+      public_id: `${opts.folder}/${opts.public_id}`,
+      duration: 0.3, width: 704, height: 1248, bytes: 100,
+    }));
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(b);
+    await compose().idle();
+    const st = await request(app).get(`/api/branch/compose/${res.body.jobId}`).set(auth());
+    expect(st.body.state).toBe("failed");
+    expect(st.body.message).toMatch(/只有第 1 段那么长/);
+    expect(destroySpy).toHaveBeenCalled();
+  });
+
+  test("② 时长对但没有画面（纯音频/坏产物）→ 判失败，不许发布出去", async () => {
+    uploadSpy.mockImplementation(async (_u, opts) => ({
+      secure_url: "https://x/y.mp4", public_id: `${opts.folder}/${opts.public_id}`,
+      duration: 10.04, bytes: 1000, // 没有 width/height
+    }));
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+    await compose().idle();
+    const st = await request(app).get(`/api/branch/compose/${res.body.jobId}`).set(auth());
+    expect(st.body.state).toBe("failed");
+    expect(st.body.message).toMatch(/没有画面/);
+  });
+
+  test("③ 自检失败的话术不再邀请重试（同一份配方重试还是同样结果，且每次都真花钱）", async () => {
+    uploadSpy.mockImplementation(async (_u, opts) => ({
+      secure_url: "https://x/y.mp4", public_id: `${opts.folder}/${opts.public_id}`,
+      duration: 5.04, width: 704, height: 1248, bytes: 100,
+    }));
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+    await compose().idle();
+    const st = await request(app).get(`/api/branch/compose/${res.body.jobId}`).set(auth());
+    expect(st.body.message).toMatch(/重新剪|同样的结果/);
+    expect(st.body.message).not.toMatch(/请重试/);
+  });
+
+  test("④ 派发之前就失败（这台服务器没配云存储）→ 不计预算、话术不邀请重试", async () => {
+    const VideoComposeModel = require("../src/models/VideoCompose");
+    const { cloudinary } = require("../src/config/cloudinary");
+    // 真实可发生的那种"永久性失败"：配置缺失。buildSourceUrl 在没有 cloud_name 时返回 null，
+    // 服务整句抛出去 —— 重试多少次都是同一个结果，而且一秒编码都没跑过
+    const cfg = jest.spyOn(cloudinary, "config").mockReturnValue({});
+    try {
+      const res = await request(app).post("/api/branch/compose").set(auth()).send(body(userId));
+      await compose().idle();
+      const st = await request(app).get(`/api/branch/compose/${res.body.jobId}`).set(auth());
+      expect(st.body.state).toBe("failed");
+      expect(st.body.message).toMatch(/没能开始/);
+      expect(st.body.message).not.toMatch(/可以再试一次/);
+      expect(uploadSpy).not.toHaveBeenCalled(); // 一秒编码都没跑
+      // 预约的额度退回去了：没花的钱不能记在人家账上
+      const row = await VideoComposeModel.findOne({ key: res.body.jobId }).lean();
+      expect(row.spentSec).toBe(0);
+    } finally {
+      cfg.mockRestore();
+    }
+  });
+
+  test("⑤ replace 模式下 BGM 没混上 → done 也要把话带给用户（不能只写日志）", async () => {
+    resourceSpy.mockResolvedValue({ duration: 30, public_id: `ideahub/workshop-media/${userId}-777` });
+    uploadSpy.mockImplementation(async (_u, opts) => ({
+      secure_url: "https://x/y.mp4", public_id: `${opts.folder}/${opts.public_id}`,
+      duration: 10.04, width: 704, height: 1248, bytes: 100,
+      audio: {}, // ★ Cloudinary 无音轨时回的正是空对象（真值）——旧写法 !receipt.audio 永远为假
+    }));
+    const res = await request(app).post("/api/branch/compose").set(auth()).send(
+      body(userId, {
+        audio: { url: `https://res.cloudinary.com/testcloud/video/upload/v1/ideahub/workshop-media/${userId}-777.mp3`, volume: 1, replace: true },
+      }),
+    );
+    await compose().idle();
+    const st = await request(app).get(`/api/branch/compose/${res.body.jobId}`).set(auth());
+    expect(st.body.state).toBe("done"); // 画面与时长都对，成片能用
+    expect(st.body.message).toMatch(/背景音乐没能混进/);
+  });
+});
+
 describe("★ 变换串注入：public_id 里的 , 与 : 是参数分隔符", () => {
   const { buildComposeTransform } = require("../src/utils/videoCompose");
   const good = { publicId: "ideahub/branch-videos/u-1-seg", startSec: 0, endSec: 5 };
