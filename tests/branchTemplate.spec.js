@@ -37,6 +37,9 @@ function fakeResource(publicId, over = {}) {
     width: 720,
     height: 1280,
     bytes: 5_000_000,
+    // ★ 真实资源一定带 format（直传那条路把它当格式白名单的判据）——
+    //   假回执漏了它，会让"格式不对"这一条抢在所有别的原因前面命中
+    format: "mp4",
     ...over,
   };
 }
@@ -676,6 +679,109 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
     const res = await request(app)
       .post("/api/uploads/template-video")
       .attach("video", Buffer.from("x"), { filename: "a.mp4", contentType: "video/mp4" });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 直传 Cloudinary（sign + confirm）。这条路上**字节根本不经过我们的服务器**，
+// 所以老路里由 multer 与 upload_stream 顺手把住的几道闸全部消失了，必须逐条另钉：
+//   ① public_id 由服务端生成并签死 —— 客户端能自选 = 能覆盖任何人的资产
+//   ② overwrite:false 进签名 —— 签名 1 小时可复用，不锁就能在过审后原地换内容
+//   ③ 限流仍在签名端点上 —— 没有签名就传不上去，这是唯一还能拦住刷量的地方
+//   ④ confirm 用 Admin API 自取元数据 + 格式 + 大小 —— 客户端报的数一个都不能信
+describe("直传 Cloudinary：POST /api/uploads/template-video/sign", () => {
+  // ★ 测试环境没有真的 Cloudinary 配置（端点会正确地回 503）。这里给一份假的：
+  //   签名算法本身用假 secret 一样成立，我们要钉的是"签了哪些参数"，不是签出的那串值。
+  let configSpy;
+  beforeEach(() => {
+    const real = cloudinary.config();
+    configSpy = jest
+      .spyOn(cloudinary, "config")
+      .mockImplementation(() => ({ ...real, cloud_name: "testcloud", api_key: "123456789", api_secret: "TESTSECRET" }));
+  });
+  afterEach(() => configSpy.mockRestore());
+
+  test("签名参数由服务端定：public_id 归属本人、overwrite 锁死、签名与要发的字段是同一份", async () => {
+    const res = await request(app).post("/api/uploads/template-video/sign").set(asOwner()).send({});
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    // public_id 必须正好是归属判据认得的那个形状（folder/<userId>-<digits>）
+    expect(res.body.publicId).toMatch(new RegExp("^ideahub/template-videos/" + owner.id + "-[0-9]+$"));
+    expect(res.body.uploadUrl).toMatch(/^https:\/\/api\.cloudinary\.com\/v1_1\/.+\/video\/upload$/);
+    // ★★ 这一条是本次改造的核心防线：不签 overwrite:false，用户就能在模板过审后
+    //   用同一个签名把 Cloudinary 上那份原地换掉（DB 一个字段都不动、零报错）
+    expect(res.body.params.overwrite).toBe(false);
+    expect(res.body.params.public_id).toBe(res.body.publicId);
+    expect(res.body.params.timestamp).toEqual(expect.any(Number));
+    expect(res.body.params.signature).toEqual(expect.any(String));
+    expect(res.body.params.api_key).toEqual(expect.any(String));
+    // 客户端原样转发即可：params 里不该出现 api_secret 之类
+    expect(JSON.stringify(res.body)).not.toContain("secret");
+    expect(res.body.chunkBytes).toBeGreaterThan(5 * 1024 * 1024); // Cloudinary：除末块外每块 > 5MB
+  });
+
+  test("客户端说了不算：请求体里塞 public_id 也改不动服务端生成的那个", async () => {
+    const res = await request(app)
+      .post("/api/uploads/template-video/sign")
+      .set(asOwner())
+      .send({ publicId: `ideahub/template-videos/${other.id}-1`, folder: "evil", overwrite: true });
+    expect(res.status).toBe(200);
+    expect(res.body.publicId).toMatch(new RegExp("^ideahub/template-videos/" + owner.id + "-[0-9]+$"));
+    expect(res.body.params.overwrite).toBe(false);
+  });
+
+  test("未登录拿不到签名（否则签名端点就是对全网开放的写入口）", async () => {
+    const res = await request(app).post("/api/uploads/template-video/sign").send({});
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("直传 Cloudinary：POST /api/uploads/template-video/confirm（服务端验收）", () => {
+  const okId = () => `ideahub/template-videos/${owner.id}-1712000000`;
+
+  test("合格 → 200，回执形状与老路逐字相同（下游一行都不用改）", async () => {
+    const res = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: okId() });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, duration: 10, width: 720, height: 1280, bytes: 5_000_000 });
+    expect(res.body.publicId).toBe(okId());
+    expect(res.body.url).toContain("/ideahub/template-videos/");
+    expect(destroySpy).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["别人的 public_id", () => `ideahub/template-videos/${other.id}-1`],
+    ["目录外", () => `ideahub/avatars/${owner.id}-1`],
+    ["多一层路径", () => `ideahub/template-videos/evil/${owner.id}-1`],
+    ["形状不对（后缀不是纯数字）", () => `ideahub/template-videos/${owner.id}-abc`],
+  ])("归属判据挡住：%s → 400，且不去打 Cloudinary", async (_label, make) => {
+    const res = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: make() });
+    expect(res.status).toBe(400);
+    expect(resourceSpy).not.toHaveBeenCalled();
+  });
+
+  test("Cloudinary 上没有这个资源 → 404 且说人话（多半是上传没真的完成）", async () => {
+    resourceSpy.mockRejectedValue({ error: { http_code: 404, message: "Resource not found" } });
+    const res = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: okId() });
+    expect(res.status).toBe(404);
+    expect(res.body.message).toMatch(/上传没真的完成|重新选/);
+  });
+
+  test.each([
+    ["格式不对（webm）", { format: "webm" }, /只收 mp4 \/ mov/],
+    ["超过大小上限", { bytes: 200 * 1024 * 1024 }, /最大 100MB/],
+    ["太短（3s）", { duration: 3 }, /至少 5 秒/],
+    ["边长不够", { width: 200, height: 3000 }, /边长至少 300 像素/],
+  ])("验收不过：%s → 先 destroy 再 400（不回收就是配额只增不减）", async (_label, over, re) => {
+    resourceSpy.mockImplementation(async (publicId) => fakeResource(publicId, over));
+    const res = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: okId() });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(re);
+    expect(destroySpy).toHaveBeenCalledWith(okId(), { resource_type: "video" });
+  });
+
+  test("未登录 → 401", async () => {
+    const res = await request(app).post("/api/uploads/template-video/confirm").send({ publicId: okId() });
     expect(res.status).toBe(401);
   });
 });

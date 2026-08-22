@@ -9,6 +9,7 @@ const {
   MAX_MEDIA_SIZE_BYTES,
   uploadTemplateVideo,
   MAX_TEMPLATE_VIDEO_BYTES,
+  ALLOWED_TEMPLATE_VIDEO_FORMATS,
   templateVideoMeta,
   templateSourceIssue,
   templateRefIssue,
@@ -19,7 +20,13 @@ const BranchTemplate = require("../models/BranchTemplate");
 // 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
 const BlockoutJob = require("../models/BlockoutJob");
 // 归属判据只有一处（utils/templateVideoAsset），此前这里手写过一份 startsWith 前缀
-const { ownTemplateVideoPublicId, buildClipUrl, clipTransform } = require("../utils/templateVideoAsset");
+const {
+  ownTemplateVideoPublicId,
+  buildClipUrl,
+  clipTransform,
+  // 直传要在服务端拼 public_id，落点必须与归属判据认的那个 folder 是**同一个字符串**
+  TEMPLATE_VIDEO_FOLDER,
+} = require("../utils/templateVideoAsset");
 
 // ★ 上传此前**一个限流器都没有**（2026-08-14 复查发现）：每一发都真实占用
 //   Cloudinary 配额与出网带宽，且上传即永久留存（全服务端目前零 destroy 调用）——
@@ -27,6 +34,11 @@ const { ownTemplateVideoPublicId, buildClipUrl, clipTransform } = require("../ut
 //   与登录限流同一条理由）。20/分钟对真实使用绰绰有余：发布一条作品的
 //   materializeDraft 串行传帧，一分钟传不到 20 张。
 const uploadLimit = userRateLimit({ max: 20, windowMs: 60 * 1000, scope: "uploads" });
+
+/** 直传的分块大小。★ Cloudinary 的硬约束是「除最后一块外每块 > 5MB」（官方文档原文），
+ *  官方 SDK 默认 20,000,000。这里取 6,000,000：够宽（>5MB）也够小 —— 手机慢网上
+ *  一块几十秒，中途断了只重传这一块，而不是从头再来 47MB。 */
+const DIRECT_UPLOAD_CHUNK_BYTES = 6_000_000;
 
 router.post("/image", requireAuth, uploadLimit, upload.single("image"), async (req, res, next) => {
   try {
@@ -196,6 +208,138 @@ router.post("/template-video/derive", requireAuth, tplVideoMinuteLimit, tplVideo
       height: meta.height,
       bytes: meta.bytes,
       ...(scaleW ? { upscaledTo: scaleW } : {}),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ══ 直传 Cloudinary（2026-08-22 加）══════════════════════════════════════════
+//
+// ★★★ 为什么必须绕开我们自己的服务器：**Cloudflare 的 Proxy Read Timeout = 125 秒**。
+//   nginx 默认 `proxy_request_buffering on` —— 要把整个 body 收完才回包，于是整段上传
+//   期间 CF 看到的是"源站零响应"，125 秒一到就掐断连接（nginx 记 499、客户端只拿到一个
+//   没有状态码的 fetch 失败）。2026-08-22 三发连续复现，`rt=125.006 / 125.005 / 125.006`
+//   精确到毫秒一致。⇒ 走 /template-video 那条老路的真实上限**不是 100MB，是「125 秒内
+//   能推上去多少」**：实测手机 5G 上行 0.126MB/s ⇒ 约 15MB；而服务端这边还要同步等
+//   Cloudinary 吃完才回包（11.6MB 那发就占了约 79 秒），可用体积还要再打折。
+//   ⚠ 这个 125 秒**只有 Enterprise 套餐能调**，升到 Pro/Business 一样是 125 秒。
+//   ⇒ 唯一的根治办法是让**文件字节根本不经过 CF 与我们的源站**：客户端拿服务端签的名，
+//     直接分块传给 api.cloudinary.com。
+//
+// ★★ 安全面靠三条钉死，缺一条就有绕行路：
+//   ① **public_id 由服务端生成并签进签名**（客户端改一个字签名就失效）——
+//      它就是「这段视频是谁传的」的唯一判据（ownTemplateVideoPublicId）。
+//      客户端能自选 public_id = 能覆盖任何人的资产。
+//   ② **限流仍在服务端**（签名端点上挂的就是老路那两个 scope，额度共用）——
+//      没有签名就传不上去，所以刷 Cloudinary 必须先过这道闸。
+//   ③ **元数据以服务端向 Cloudinary 取回的那份为准**（confirm 里的 api.resource），
+//      客户端报的数一个都不信 —— 它现在能直接和 Cloudinary 对话，回执完全可以伪造。
+//
+// ★ 老路 `POST /template-video` **保留不删**：已经装在用户手机上的旧版 App 只认它，
+//   删掉等于让所有没更新的人当场失去上传能力（而更新是他们自己决定的）。
+router.post("/template-video/sign", requireAuth, tplVideoMinuteLimit, tplVideoDailyLimit, async (req, res, next) => {
+  try {
+    const { cloud_name, api_key, api_secret } = cloudinary.config();
+    if (!cloud_name || !api_key || !api_secret) {
+      return res.status(503).json({ ok: false, message: "服务器还没配好视频存储，暂时不能上传。" });
+    }
+    // ★★ public_id 在**这里**生成，不接受客户端传任何一部分：形状必须与
+    //   ownTemplateVideoPublicId 的 `^<userId>-\d+$` 完全吻合，否则传上去之后
+    //   confirm、登记、回收三处都会判它"不是你的"，而那时文件已经在 Cloudinary 上了。
+    const userId = req.user._id.toString();
+    const publicId = `${TEMPLATE_VIDEO_FOLDER}/${userId}-${Date.now()}`;
+    const timestamp = Math.round(Date.now() / 1000);
+    // ★ 只签这两项：签名覆盖的是"要写到哪个 id 上"这件事本身。resource_type 不参与
+    //   签名（它在 URL 路径里），但直传地址只给 /video/upload —— 而且就算客户端改成
+    //   别的 resource_type，confirm 那一步用 resource_type: "video" 去取就取不到。
+    // ★★★ `overwrite: false` 是这条新路**必须**签进去的一项（2026-08-22 实测确认）：
+    //   签名有效期是 1 小时且可复用 ⇒ 不加这一项的话，用户可以先传一段干净素材、
+    //   走完复核与登记、模板过审发布，**再用同一个签名把 Cloudinary 上那份原地换成别的**：
+    //   数据库里一个字段都不动、全程零报错，而所有套用者拿到的已经是新内容。
+    //   实测：不带它时同一签名把 41.2s 的资产换成了 13.7s 的（version 变了、DB 不会知道）；
+    //   带上它时回的是 `existing: true` + 旧资产元数据，新内容写不进去。
+    //   ⚠ 老路没有这个洞不是因为它更安全，而是因为 public_id 由服务端每次新生成、
+    //     客户端从来拿不到"再写一次同一个 id"的机会 —— 直传把这个机会给出去了。
+    //   ⚠ 也实测过它**不影响分块**：中间块照常回 `{done:false}`，末块照常回完整资产。
+    const params = { overwrite: false, public_id: publicId, timestamp };
+    // ★★ 签名与"要发哪些字段"**用同一个对象**：多签一个没发、或发了一个没签，
+    //   Cloudinary 都只回一句 Invalid Signature，而那是最难查的一类错。
+    //   客户端拿到 params 之后**原样逐字段转发**，不许自己拼、也不许增删。
+    const signature = cloudinary.utils.api_sign_request(params, api_secret);
+    res.json({
+      ok: true,
+      uploadUrl: `https://api.cloudinary.com/v1_1/${cloud_name}/video/upload`,
+      publicId,
+      // 客户端要原样发出去的表单字段（file / Content-Range / X-Unique-Upload-Id 另加）
+      params: { ...params, api_key, signature },
+      // 分块大小由服务端说了算：Cloudinary 要求"除最后一块外每块 > 5MB"，
+      // 这里给 6,000,000（十进制），够宽也够小 —— 慢网上一块几十秒，断了只重传一块。
+      chunkBytes: DIRECT_UPLOAD_CHUNK_BYTES,
+      maxSizeBytes: MAX_TEMPLATE_VIDEO_BYTES,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 直传完成后的**服务端验收**。客户端只报一个 public_id，其余一个字都不信。
+// ★★ 这一步等价于老路里"回执复核"那一段，而且更该有：老路的回执是**我们自己**从
+//   Cloudinary 拿到的，直传的回执是**客户端**给的 —— 不复核就等于让用户自报时长与尺寸，
+//   而时长正是 r2v 的计价输入（让用户自己标价）。
+// ★ 不过就 destroy 再拒：不回收的话每一次被拒的上传都永久占着配额（零症状，只有月底
+//   的用量报表知道）—— 与老路那段同一条纪律。
+router.post("/template-video/confirm", requireAuth, uploadLimit, async (req, res, next) => {
+  try {
+    const raw = String(req.body?.publicId ?? "").slice(0, 300);
+    const publicId = ownTemplateVideoPublicId(raw, req.user._id.toString());
+    if (!publicId) {
+      return res.status(400).json({ ok: false, message: "这段视频不是本账号传的（或者地址被改过），不能用来做模板。" });
+    }
+    let resource;
+    try {
+      resource = await cloudinary.api.resource(publicId, { resource_type: "video", media_metadata: true });
+    } catch (e) {
+      const code = e?.error?.http_code ?? e?.http_code;
+      if (code === 404) {
+        return res.status(404).json({
+          ok: false,
+          message: "没在服务器上找到这段视频——多半是上传没真的完成（中途断了）。请重新选一次文件再传。",
+        });
+      }
+      console.error(`[uploads] 直传验收取资源失败 public_id=${publicId}:`, e?.message || e);
+      return res.status(502).json({ ok: false, message: "视频存储暂时取不到这段视频的信息，请稍后重试。" });
+    }
+    const meta = templateVideoMeta(resource);
+    // ★★ 格式与大小这两道闸在老路上是 **multer** 把的（MIME 白名单 + fileSize），
+    //   而直传那条路上 multer 根本不在链上 —— 不在这里补回来就等于两条路的验收标准不一样，
+    //   且松的那条零症状（一个 webm/avi 能进来，套用时才在方舟那边 400）。
+    const format = String(resource?.format || "").toLowerCase();
+    const issue =
+      (!ALLOWED_TEMPLATE_VIDEO_FORMATS.includes(format)
+        ? `模板视频只收 ${ALLOWED_TEMPLATE_VIDEO_FORMATS.join(" / ")} 格式（AI 出片引擎只认这两种），这段是 ${format || "未知格式"}，请转码后重试。`
+        : null) ||
+      (meta.bytes > MAX_TEMPLATE_VIDEO_BYTES
+        ? `视频最大 ${Math.round(MAX_TEMPLATE_VIDEO_BYTES / 1024 / 1024)}MB（当前约 ${Math.round(meta.bytes / 1024 / 1024)}MB），请先压小再传。`
+        : null) ||
+      templateSourceIssue(meta);
+    if (issue) {
+      try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
+      } catch (e) {
+        console.error(`[uploads] 直传验收不过、回收失败 public_id=${publicId}:`, e?.message || e);
+      }
+      return res.status(400).json({ ok: false, message: issue });
+    }
+    res.json({
+      ok: true,
+      url: resource.secure_url,
+      publicId: resource.public_id,
+      duration: meta.duration,
+      width: meta.width,
+      height: meta.height,
+      bytes: meta.bytes,
+      maxSizeBytes: MAX_TEMPLATE_VIDEO_BYTES,
     });
   } catch (err) {
     next(err);

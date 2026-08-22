@@ -30,6 +30,18 @@ const ALLOWED_TEMPLATE_VIDEO_MIMES = ["video/mp4", "video/quicktime"];
 const MAX_TEMPLATE_VIDEO_BYTES = 100 * 1024 * 1024;
 
 /**
+ * Cloudinary 自己探出来的**容器格式**白名单。
+ *
+ * ★★ 它与 `ALLOWED_TEMPLATE_VIDEO_MIMES` 是**同一条规则的两种表述**，必须同进同退：
+ *   multer 把的是"浏览器报的 MIME"（走我们服务器那条老路），这一份把的是"Cloudinary 探到的
+ *   format"（走客户端直传那条新路 —— 那条路上 multer 根本不在链上）。少改一边的表现是
+ *   "同一个文件从一条路进得来、从另一条路进不来"，两边各自看着都没错。
+ * ★ 值取 Cloudinary 的 `format` 字段口径（小写、无点）：video/mp4 → "mp4"，
+ *   video/quicktime → "mov"。
+ */
+const ALLOWED_TEMPLATE_VIDEO_FORMATS = Object.freeze(["mp4", "mov"]);
+
+/**
  * ③ **白模化的输入**（作者框选、要送去做白模的那一段）的时长下限。
  *
  * ★★ 这个 5 **不是方舟的窗口**。方舟 `edit` 的硬窗口永远是 [4,30]（见下面的
@@ -437,6 +449,7 @@ module.exports = {
   MAX_MEDIA_SIZE_BYTES,
   uploadTemplateVideo,
   ALLOWED_TEMPLATE_VIDEO_MIMES,
+  ALLOWED_TEMPLATE_VIDEO_FORMATS,
   MAX_TEMPLATE_VIDEO_BYTES,
   // ★ 三套窗口是**三件事**，名字必须分得开：一个名字管两种含义，正是"改一处漏一处"的温床。
   //   TEMPLATE_SOURCE_* = 用户传上来的原始素材；
