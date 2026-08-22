@@ -721,6 +721,15 @@ describe("直传 Cloudinary：POST /api/uploads/template-video/sign", () => {
     expect(res.body.chunkBytes).toBeGreaterThan(5 * 1024 * 1024); // Cloudinary：除末块外每块 > 5MB
   });
 
+  test("allowed_formats 必须在签名参数里（少了它，一张 /video 的票就能往 /raw 传任意文件）", async () => {
+    const res = await request(app).post("/api/uploads/template-video/sign").set(asOwner()).send({});
+    expect(res.status).toBe(200);
+    // ★★ 实测过：不带这一项时，同一串签名把一个 HTML 传进了 /raw/upload（resource_type
+    //   不参与签名，只在 URL 路径里），而那类资产我们三处 destroy 都写死 video、永远回收不到。
+    //   带上之后 Cloudinary 回 "Raw file format html not allowed"。
+    expect(res.body.params.allowed_formats).toBe("mp4,mov");
+  });
+
   test("客户端说了不算：请求体里塞 public_id 也改不动服务端生成的那个", async () => {
     const res = await request(app)
       .post("/api/uploads/template-video/sign")
@@ -778,6 +787,20 @@ describe("直传 Cloudinary：POST /api/uploads/template-video/confirm（服务�
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(re);
     expect(destroySpy).toHaveBeenCalledWith(okId(), { resource_type: "video" });
+  });
+
+  test("验收不过、但这段视频已被某个模板引用 → 不许删（confirm 不是删除原语）", async () => {
+    // 先把这段视频登记成一个真模板（此后它就是别人可能正在付费套用的东西）
+    const tpl = await createTemplate(1712000000);
+    expect(tpl).toBeTruthy();
+    // 再让它在 confirm 的窗口里"不合格"（白模产物 4~5 秒是常见值，而原始素材下限是 5 秒）
+    resourceSpy.mockImplementation(async (publicId) => fakeResource(publicId, { duration: 4.7 }));
+    const res = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: okId() });
+    expect(res.status).toBe(400);
+    // ★★ 关键：**一次 destroy 都不许发**。少了这道检查，任何作者都能点名删掉自己
+    //   已登记、已发布的模板参考视频 —— DB 零改动、不可逆、零报错，损失落在套用者身上。
+    expect(destroySpy).not.toHaveBeenCalled();
+    expect(res.body.message).toMatch(/没有被删掉/);
   });
 
   test("未登录 → 401", async () => {

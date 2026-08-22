@@ -35,6 +35,41 @@ const {
 //   materializeDraft 串行传帧，一分钟传不到 20 张。
 const uploadLimit = userRateLimit({ max: 20, windowMs: 60 * 1000, scope: "uploads" });
 
+/**
+ * 「这段模板视频还有人在用吗」—— **这条规则的唯一实现**（铁律六）。
+ *
+ * ★★ 为什么必须共用：`destroy` 不可逆，而"什么时候可以 destroy"此前只长在 DELETE 一处。
+ *   直传的 confirm 也会 destroy（验收不过时），它自己不查引用的话就变成
+ *   **一个客户端可以点名的删除原语**：拿一个**已经登记、已经发布**的模板参考视频的
+ *   publicId 去 confirm，只要它落在验收窗口外（白模产物常见 4~5 秒，而原始素材窗口
+ *   下限正是 5 秒），服务端就会当场把别人正在付费套用的那段视频删掉 ——
+ *   数据库一个字段都不动、不可逆、零报错。
+ * @returns {Promise<string|null>} 整句拒绝理由；null = 没人用，可以删
+ */
+async function templateVideoInUse(publicId) {
+    const refUsed = await BranchTemplate.exists({ "refVideo.cloudinaryPublicId": publicId });
+    if (refUsed) return "这段视频已登记为白模模板，请改用删除模板（会连带回收视频）。";
+    const srcUsed = await BranchTemplate.exists({ "source.publicId": publicId });
+    if (srcUsed) return "这段视频是某个白模模板的原始素材（重做时还要用它），请改用删除那个模板（会连带回收）。";
+    // ★★ 第四种引用（2026-08-20 分段登记）：切过段的源视频是**整组的音轨来源** ——
+    //   合并成片时客户端按 group.sourceUrl 回填原片音轨。从这里删掉它，组里每一段照常
+    //   能出片，**只有合并那一步的音轨拉不到**，而且是所有套用者一起坏、零报错可查。
+    //   组员被逐段删光时它由模板删除级联回收（branchTemplate.routes 的 DELETE）。
+    const groupUsed = await BranchTemplate.exists({ "group.sourcePublicId": publicId });
+    if (groupUsed) return "这段视频已被分段登记成一组模板（合并成片时还要用它的音轨），请改用删除那些模板（最后一段删除时会连带回收）。";
+    // ★★ 白模 V2 拆成两阶段之后多出的第三种引用：**还没取回结果**的那一发。
+    //   从受理到取回之间世上还没有模板，上面两条 exists 都落空 —— 而方舟那边可能
+    //   还要去拉这段素材的变换地址（懒生成），此刻删掉它，用户那一发就会莫名其妙失败，
+    //   **而钱已经花了**（受理后失败不退），且没有任何一层会说这是他自己删的。
+    const jobUsed = await BlockoutJob.exists({
+      "source.publicId": publicId,
+      status: { $in: ["pending", "claimed"] },
+      expiresAt: { $gt: new Date() },
+    });
+    if (jobUsed) return "这段视频正在做白模化（费用已经产生），现在删掉会让那一发白花钱。请先到「待取回的白模」里把结果取回来。";
+  return null;
+}
+
 /** 直传的分块大小。★ Cloudinary 的硬约束是「除最后一块外每块 > 5MB」（官方文档原文），
  *  官方 SDK 默认 20,000,000。这里取 6,000,000：够宽（>5MB）也够小 —— 手机慢网上
  *  一块几十秒，中途断了只重传这一块，而不是从头再来 47MB。 */
@@ -250,9 +285,7 @@ router.post("/template-video/sign", requireAuth, tplVideoMinuteLimit, tplVideoDa
     const userId = req.user._id.toString();
     const publicId = `${TEMPLATE_VIDEO_FOLDER}/${userId}-${Date.now()}`;
     const timestamp = Math.round(Date.now() / 1000);
-    // ★ 只签这两项：签名覆盖的是"要写到哪个 id 上"这件事本身。resource_type 不参与
-    //   签名（它在 URL 路径里），但直传地址只给 /video/upload —— 而且就算客户端改成
-    //   别的 resource_type，confirm 那一步用 resource_type: "video" 去取就取不到。
+    // ★ 签名覆盖三件事：写到哪个 id、能不能覆盖、允许什么格式。
     // ★★★ `overwrite: false` 是这条新路**必须**签进去的一项（2026-08-22 实测确认）：
     //   签名有效期是 1 小时且可复用 ⇒ 不加这一项的话，用户可以先传一段干净素材、
     //   走完复核与登记、模板过审发布，**再用同一个签名把 Cloudinary 上那份原地换成别的**：
@@ -262,7 +295,23 @@ router.post("/template-video/sign", requireAuth, tplVideoMinuteLimit, tplVideoDa
     //   ⚠ 老路没有这个洞不是因为它更安全，而是因为 public_id 由服务端每次新生成、
     //     客户端从来拿不到"再写一次同一个 id"的机会 —— 直传把这个机会给出去了。
     //   ⚠ 也实测过它**不影响分块**：中间块照常回 `{done:false}`，末块照常回完整资产。
-    const params = { overwrite: false, public_id: publicId, timestamp };
+    // ★★★ `allowed_formats` 是**必须签**的第二项（2026-08-22 实测出来的真实漏洞）：
+    //   Cloudinary 算签名时**排除 resource_type**（它只在 URL 路径里），所以一张
+    //   `/video/upload` 的票，把 URL 改成 `/raw/upload` 照样有效 —— 实测把一个 HTML
+    //   文件传进了 `res.cloudinary.com/<我们的 cloud>/raw/upload/ideahub/template-videos/…`，
+    //   等于在我们的可信域上开了一个任意文件托管（钓鱼载荷，投诉与封号都记在我们头上）。
+    //   ⚠ `overwrite:false` 拦不住它：三种 resource_type 是**三套独立命名空间**。
+    //   ⚠ 而且这类资产**我们自己永远回收不到**：三处 destroy 全写死 resource_type:"video"
+    //     且不带扩展名，而 raw 资产的 public_id 是带扩展名的（实测 `…-<ts>.html`）。
+    //   加上这一项之后实测回的是 `{"error":{"message":"Raw file format html not allowed"}}`。
+    //   ⚠ 值从 ALLOWED_TEMPLATE_VIDEO_FORMATS 派生（唯一实现）；实测 .mov 传上去
+    //     Cloudinary 报的 format 正是 "mov"，两边对得上，不会误伤。
+    const params = {
+      allowed_formats: ALLOWED_TEMPLATE_VIDEO_FORMATS.join(","),
+      overwrite: false,
+      public_id: publicId,
+      timestamp,
+    };
     // ★★ 签名与"要发哪些字段"**用同一个对象**：多签一个没发、或发了一个没签，
     //   Cloudinary 都只回一句 Invalid Signature，而那是最难查的一类错。
     //   客户端拿到 params 之后**原样逐字段转发**，不许自己拼、也不许增删。
@@ -289,7 +338,13 @@ router.post("/template-video/sign", requireAuth, tplVideoMinuteLimit, tplVideoDa
 //   而时长正是 r2v 的计价输入（让用户自己标价）。
 // ★ 不过就 destroy 再拒：不回收的话每一次被拒的上传都永久占着配额（零症状，只有月底
 //   的用量报表知道）—— 与老路那段同一条纪律。
-router.post("/template-video/confirm", requireAuth, uploadLimit, async (req, res, next) => {
+// ★★ 限流器**不能用通用的 uploadLimit（20/分）**：这个端点每次都打一发 Cloudinary
+//   **Admin API**，而免费档 Admin API 是全局 500 次/小时 —— 20/分 = 1200/小时，
+//   单个账号就能把全站的 Admin 预算打空，连带 /derive 与白模取件的元数据重读一起挂，
+//   而它们的失败话术说的都是别的原因（同仓其他打 Admin API 的端点都是 3~5/分）。
+const tplVideoConfirmLimit = userRateLimit({ max: 5, windowMs: 60 * 1000, scope: "uploads:tplVideoConfirm" });
+
+router.post("/template-video/confirm", requireAuth, tplVideoConfirmLimit, async (req, res, next) => {
   try {
     const raw = String(req.body?.publicId ?? "").slice(0, 300);
     const publicId = ownTemplateVideoPublicId(raw, req.user._id.toString());
@@ -324,6 +379,13 @@ router.post("/template-video/confirm", requireAuth, uploadLimit, async (req, res
         : null) ||
       templateSourceIssue(meta);
     if (issue) {
+      // ★★ 先问「还有人在用吗」再 destroy（与 DELETE **同一处实现**）。不问的话这个端点
+      //   就是一个客户端可点名的删除原语 —— 详见 templateVideoInUse 的 ★★。
+      //   有人在用时**既不删也不假装成功**：两件事都说清楚，用户才知道发生了什么。
+      const inUse = await templateVideoInUse(publicId);
+      if (inUse) {
+        return res.status(400).json({ ok: false, message: `${issue}（这段视频没有被删掉：${inUse}）` });
+      }
       try {
         await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
       } catch (e) {
@@ -434,43 +496,8 @@ router.delete("/template-video", requireAuth, uploadLimit, async (req, res, next
     if (!publicId) {
       return res.status(400).json({ ok: false, message: "只能回收本账号上传的模板视频。" });
     }
-    const refUsed = await BranchTemplate.exists({ "refVideo.cloudinaryPublicId": publicId });
-    if (refUsed) {
-      return res.status(400).json({ ok: false, message: "这段视频已登记为白模模板，请改用删除模板（会连带回收视频）。" });
-    }
-    const srcUsed = await BranchTemplate.exists({ "source.publicId": publicId });
-    if (srcUsed) {
-      return res.status(400).json({
-        ok: false,
-        message: "这段视频是某个白模模板的原始素材（重做时还要用它），请改用删除那个模板（会连带回收）。",
-      });
-    }
-    // ★★ 第四种引用（2026-08-20 分段登记）：切过段的源视频是**整组的音轨来源** ——
-    //   合并成片时客户端按 group.sourceUrl 回填原片音轨。从这里删掉它，组里每一段照常
-    //   能出片，**只有合并那一步的音轨拉不到**，而且是所有套用者一起坏、零报错可查。
-    //   组员被逐段删光时它由模板删除级联回收（branchTemplate.routes 的 DELETE）。
-    const groupUsed = await BranchTemplate.exists({ "group.sourcePublicId": publicId });
-    if (groupUsed) {
-      return res.status(400).json({
-        ok: false,
-        message: "这段视频已被分段登记成一组模板（合并成片时还要用它的音轨），请改用删除那些模板（最后一段删除时会连带回收）。",
-      });
-    }
-    // ★★ 白模 V2 拆成两阶段之后多出的第三种引用：**还没取回结果**的那一发。
-    //   从受理到取回之间世上还没有模板，上面两条 exists 都落空 —— 而方舟那边可能
-    //   还要去拉这段素材的变换地址（懒生成），此刻删掉它，用户那一发就会莫名其妙失败，
-    //   **而钱已经花了**（受理后失败不退），且没有任何一层会说这是他自己删的。
-    const jobUsed = await BlockoutJob.exists({
-      "source.publicId": publicId,
-      status: { $in: ["pending", "claimed"] },
-      expiresAt: { $gt: new Date() },
-    });
-    if (jobUsed) {
-      return res.status(400).json({
-        ok: false,
-        message: "这段视频正在做白模化（费用已经产生），现在删掉会让那一发白花钱。请先到「待取回的白模」里把结果取回来。",
-      });
-    }
+    const inUse = await templateVideoInUse(publicId);
+    if (inUse) return res.status(400).json({ ok: false, message: inUse });
     const result = await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
     // Cloudinary 对不存在的资源回 "not found" 而不是报错 —— 对回收来说这就是目标态，
     // 一样算成功（幂等：客户端重试第二次不该看到失败）
