@@ -36,6 +36,29 @@ const {
 const uploadLimit = userRateLimit({ max: 20, windowMs: 60 * 1000, scope: "uploads" });
 
 /**
+ * 「这份 Cloudinary 回执/资源的格式与体积过不过关」—— **两条上传路共用的唯一实现**。
+ *
+ * ★★ 为什么必须共用：老路上这两道是 **multer** 顺手把的（MIME 白名单 + fileSize），
+ *   而直传那条路上 multer 根本不在链上。各写一份的表现是**同一个文件从一条路进得来、
+ *   从另一条进不来**，且两边各自看着都没错 —— 正是 ALLOWED_TEMPLATE_VIDEO_FORMATS
+ *   注释里预言的那句话。
+ * ★ 老路此前**从不看 format**（`templateVideoMeta` 只取 duration/width/height/bytes），
+ *   于是一个改名成 .mp4 的 avi：浏览器按扩展名报 video/mp4 → multer 放行 →
+ *   Cloudinary 存下来、回执里 format 是 "avi" → 一路活到别人**付费套用**时被方舟 400。
+ * @returns {string|null} 整句拒绝理由；null = 过
+ */
+function templateVideoFormatIssue(resource, meta) {
+  const format = String(resource?.format || "").toLowerCase();
+  if (!ALLOWED_TEMPLATE_VIDEO_FORMATS.includes(format)) {
+    return `模板视频只收 ${ALLOWED_TEMPLATE_VIDEO_FORMATS.join(" / ")} 格式（AI 出片引擎只认这两种），这段是 ${format || "未知格式"}，请转码后重试。`;
+  }
+  if (meta.bytes > MAX_TEMPLATE_VIDEO_BYTES) {
+    return `视频最大 ${Math.round(MAX_TEMPLATE_VIDEO_BYTES / 1024 / 1024)}MB（当前约 ${Math.round(meta.bytes / 1024 / 1024)}MB），请先压小再传。`;
+  }
+  return null;
+}
+
+/**
  * 「这段模板视频还有人在用吗」—— **这条规则的唯一实现**（铁律六）。
  *
  * ★★ 为什么必须共用：`destroy` 不可逆，而"什么时候可以 destroy"此前只长在 DELETE 一处。
@@ -369,15 +392,7 @@ router.post("/template-video/confirm", requireAuth, tplVideoConfirmLimit, async 
     // ★★ 格式与大小这两道闸在老路上是 **multer** 把的（MIME 白名单 + fileSize），
     //   而直传那条路上 multer 根本不在链上 —— 不在这里补回来就等于两条路的验收标准不一样，
     //   且松的那条零症状（一个 webm/avi 能进来，套用时才在方舟那边 400）。
-    const format = String(resource?.format || "").toLowerCase();
-    const issue =
-      (!ALLOWED_TEMPLATE_VIDEO_FORMATS.includes(format)
-        ? `模板视频只收 ${ALLOWED_TEMPLATE_VIDEO_FORMATS.join(" / ")} 格式（AI 出片引擎只认这两种），这段是 ${format || "未知格式"}，请转码后重试。`
-        : null) ||
-      (meta.bytes > MAX_TEMPLATE_VIDEO_BYTES
-        ? `视频最大 ${Math.round(MAX_TEMPLATE_VIDEO_BYTES / 1024 / 1024)}MB（当前约 ${Math.round(meta.bytes / 1024 / 1024)}MB），请先压小再传。`
-        : null) ||
-      templateSourceIssue(meta);
+    const issue = templateVideoFormatIssue(resource, meta) || templateSourceIssue(meta);
     if (issue) {
       // ★★ 先问「还有人在用吗」再 destroy（与 DELETE **同一处实现**）。不问的话这个端点
       //   就是一个客户端可点名的删除原语 —— 详见 templateVideoInUse 的 ★★。
@@ -444,7 +459,9 @@ router.post(
       //   拿严窗口卡上传口的话，一段 3 分钟素材连传都传不上来，而它裁出的 8 秒完全合格。
       //   两套窗口都在 middleware/upload.js 一处（建模板/裁剪后复核走 templateRefIssue）。
       const meta = templateVideoMeta(receipt);
-      const issue = templateSourceIssue(meta);
+      // ★ 格式那一道**老路此前没有**（multer 只看浏览器报的 MIME，改个扩展名就绕过去了）——
+      //   与直传共用同一份判据，否则两条路的验收标准会分叉，而松的那条零症状。
+      const issue = templateVideoFormatIssue(receipt, meta) || templateSourceIssue(meta);
       if (issue) {
         // ★ 先 destroy 再拒：不回收的话，每一次被拒的上传都永久占着配额
         //   （此前全服务端零 destroy 调用，上传即永久留存）。回收失败不改变拒收结论，

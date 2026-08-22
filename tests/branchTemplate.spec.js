@@ -618,6 +618,17 @@ describe("POST /api/uploads/template-video：回执复核 + 不合格先 destroy
   //   "编辑页框选、服务端裁出来的那一段"，原片本身不再直接进方舟。
   //   所以这里**不再**拒 3s / 20s / 细长比例 —— 那三条现在都是合法素材
   //   （下面另有一组正面钉住"确实放行了"）。
+  test("格式白名单老路也把：改名成 .mp4 的 avi 照样拒 + destroy（两条路同一份判据）", async () => {
+    mockUploadReceipt({ format: "avi" });
+    const res = await request(app)
+      .post("/api/uploads/template-video")
+      .set(asOwner())
+      .attach("video", Buffer.from("fake"), { filename: "a.mp4", contentType: "video/mp4" });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/只收 mp4 \/ mov/);
+    expect(destroySpy).toHaveBeenCalled();
+  });
+
   test.each([
     ["太长（700s）", { duration: 700 }, /最长 600 秒/],
     ["边长不够（200×3000）", { width: 200, height: 3000 }, /边长至少 300 像素/],
@@ -787,6 +798,24 @@ describe("直传 Cloudinary：POST /api/uploads/template-video/confirm（服务�
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(re);
     expect(destroySpy).toHaveBeenCalledWith(okId(), { resource_type: "video" });
+  });
+
+  test("老路与新路的回执**字段集合**必须一样（不是靠人肉抄一遍）", async () => {
+    // ★★ 这条替代"逐字相同"那种人肉断言：下一次给老路加字段时（本仓每隔一阵就发生一次），
+    //   confirm 少这个字段 → 客户端 receiptOf 根本不校验它 → 新客户端拿到 undefined、
+    //   退回上一代逻辑，全程零报错。字段集合一比就当场红。
+    const direct = await request(app).post("/api/uploads/template-video/confirm").set(asOwner()).send({ publicId: okId() });
+    expect(direct.status).toBe(200);
+    const streamSpy = jest.spyOn(cloudinary.uploader, "upload_stream").mockImplementation((opts, cb) => ({
+      end: () => cb(null, fakeResource(`${opts.folder}/${opts.public_id}`)),
+    }));
+    const legacy = await request(app)
+      .post("/api/uploads/template-video")
+      .set(asOwner())
+      .attach("video", Buffer.from("fake-mp4"), { filename: "a.mp4", contentType: "video/mp4" });
+    streamSpy.mockRestore();
+    expect(legacy.status).toBe(200);
+    expect(Object.keys(direct.body).sort()).toEqual(Object.keys(legacy.body).sort());
   });
 
   test("验收不过、但这段视频已被某个模板引用 → 不许删（confirm 不是删除原语）", async () => {
