@@ -31,12 +31,48 @@ fi
 echo "$(ts) [deploy] installing server dependencies" >> "$LOGFILE" 2>&1
 (cd "$SERVER_DIR" && npm ci --omit=dev) >> "$LOGFILE" 2>&1 || (cd "$SERVER_DIR" && npm install --omit=dev) >> "$LOGFILE" 2>&1
 
+# ── geoip-lite 的数据文件：npm ci 会把它一起删掉 ──────────────
+#
+# ★★★ 2026-08-23 真实事故：`npm ci` 会**先整个删掉 node_modules**，而 geoip-lite 的
+#   ~111MB 数据（`node_modules/geoip-lite/data/`）就在里面。那次装出来的树是残缺的
+#   （data/ 整个没有），于是 `auth.controller` 一 require 就抛
+#   `ENOENT … geoip-country.dat`，**两个 worker 双双进重启循环、线上 502 十几分钟**。
+#   ⚠ 补不回来：这个包没有 postinstall，`npm run updatedb` 要 MaxMind 的 license_key。
+#   ⇒ 在 node_modules **之外**留一份，装完依赖后补回去。这一步失败**不算致命**
+#     （npm ci 正常时数据本来就在），但要吼出来。
+GEOIP_BACKUP="${GEOIP_BACKUP:-$HOME/geoip-data}"
+GEOIP_DIR="$SERVER_DIR/node_modules/geoip-lite/data"
+if [ -d "$GEOIP_BACKUP" ]; then
+  mkdir -p "$GEOIP_DIR" 2>/dev/null || true
+  if cp -n "$GEOIP_BACKUP"/* "$GEOIP_DIR"/ 2>/dev/null; then
+    echo "$(ts) [deploy] geoip 数据已从 $GEOIP_BACKUP 补齐" >> "$LOGFILE" 2>&1
+  else
+    echo "$(ts) [deploy] WARN: geoip 数据补齐失败（若 npm ci 自带则无碍）" >> "$LOGFILE" 2>&1
+  fi
+else
+  echo "$(ts) [deploy] WARN: 没有 geoip 备份目录 $GEOIP_BACKUP —— npm ci 装残时无法自愈" >> "$LOGFILE" 2>&1
+fi
+
 # ── 部署前配置自检 ────────────────────────────────────────────
 # 在【重启之前】就发现配置问题。否则新实例起不来，才发现 .env 少了一项，
 # 而那时旧实例可能已经被换掉了。check:config 不启动服务，只做检查。
 echo "$(ts) [deploy] preflight config check" >> "$LOGFILE" 2>&1
 if ! (cd "$SERVER_DIR" && NODE_ENV=production npm run check:config) >> "$LOGFILE" 2>&1; then
   echo "$(ts) [deploy] ABORT: 配置自检未通过，未做任何重启（详见上方输出）" >> "$LOGFILE" 2>&1
+  exit 1
+fi
+
+# ── 部署前**装载**自检（2026-08-23 加）────────────────────────
+#
+# ★★★ 上面那个 check:config 只看配置，**不 require 任何业务模块** —— 所以
+#   "依赖装残了/某个模块 import 就抛"这一类它一个字都看不见。那次事故正是这样：
+#   配置自检打了个 ✅，reload 下去，两个 worker 直接进重启循环，
+#   而健康检查在 reload **之后**才跑 —— 等它发现，线上已经 502 了。
+#   ⇒ 在动 pm2 **之前**把整棵路由树 require 一遍。它不监听端口、不连数据库，
+#     几百毫秒；抛了就当场停下，旧实例一根汗毛都没动。
+echo "$(ts) [deploy] preflight module load check" >> "$LOGFILE" 2>&1
+if ! (cd "$SERVER_DIR" && NODE_ENV=production node -e 'require("./src/app")') >> "$LOGFILE" 2>&1; then
+  echo "$(ts) [deploy] ABORT: 装载自检未通过（依赖或模块有问题），未做任何重启" >> "$LOGFILE" 2>&1
   exit 1
 fi
 
