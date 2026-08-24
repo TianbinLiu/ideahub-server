@@ -48,6 +48,10 @@ const userSchema = new mongoose.Schema(
     providers: {
       google: { type: String, default: "" }, // google sub
       github: { type: String, default: "" }, // github id
+      // QQ 的 openid。★ 它是**按应用隔离**的：同一个 QQ 号在不同 AppID 下 openid 不同，
+      //   所以换 AppID 等于所有 QQ 用户失联 —— 换之前先想清楚怎么迁移。
+      //   （跨应用认同一个人要用 unionid，那需要额外申请，我们没开。）
+      qq: { type: String, default: "" },
     },
 
     avatarUrl: { type: String, default: "" },

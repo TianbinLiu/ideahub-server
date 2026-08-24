@@ -24,6 +24,15 @@ function collectConfigProblems(env = process.env) {
   else if (secret.length < 32) problems.push(`JWT_SECRET 过短（${secret.length} 字符，至少 32）`);
   else if (/^(replace|change|example|test|secret|dev)/i.test(secret)) problems.push("JWT_SECRET 仍是示例值");
 
+  // QQ 登录是可选特性，不配就整个关掉——但**半配**要报出来：
+  // 只填了 ID 没填 Key 时服务照常启动，App 里的 QQ 按钮也照常亮着（它只看跑没跑在壳里），
+  // 用户点下去才拿到 503。这正是"配错了但能跑起来"那一类，所以在这里就拦住。
+  const qqId = env.QQ_APP_ID || "";
+  const qqKey = env.QQ_APP_KEY || "";
+  if (Boolean(qqId) !== Boolean(qqKey)) {
+    problems.push(`QQ 登录只配了一半（${qqId ? "有 QQ_APP_ID 缺 QQ_APP_KEY" : "有 QQ_APP_KEY 缺 QQ_APP_ID"}）`);
+  }
+
   if (isProd) {
     if (!env.OTP_PEPPER || env.OTP_PEPPER === "dev_pepper_change_me") {
       problems.push("OTP_PEPPER 未设置或仍是默认值（6 位验证码的 sha256 可离线暴破）");
