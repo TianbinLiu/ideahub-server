@@ -144,6 +144,19 @@ async function exchangeCodeForOpenid(code) {
 }
 
 /**
+ * QQ 的头像地址回的是 **http://**（thirdqq.qlogo.cn），必须升到 https。
+ *
+ * ★★ 2026-08-24 真机实测才发现的：App 的 WebView 跑在 `https://localhost` 上，
+ *   一个 http 图片属于**混合内容**，Chromium 直接静默丢弃 —— 页面不报错、
+ *   logcat 里也没有（release 包吞 console），表现就是"昵称有了、头像是个空占位"，
+ *   看起来像 get_user_info 没取到，实际取到了、还存进库了。
+ *   同一个 host 支持 https（实测 200 image/jpeg），换个协议就行。
+ */
+function toHttps(url) {
+  return url.startsWith("http://") ? "https://" + url.slice("http://".length) : url;
+}
+
+/**
  * 取昵称与头像，**尽最大努力**：失败一律返回空对象，绝不让它挡住登录。
  * 拿不到就退到随机用户名 + 默认头像，用户随时能自己改；
  * 而为了一个装饰性字段把整条登录路打断，是明显更坏的取舍。
@@ -159,7 +172,7 @@ async function fetchProfile(accessToken, openid) {
     return {
       nickname: String(p.nickname || "").trim().slice(0, 40),
       // figureurl_qq_2 是 100×100 那档；没有就退 40×40 的 figureurl_qq_1
-      avatarUrl: String(p.figureurl_qq_2 || p.figureurl_qq_1 || "").trim(),
+      avatarUrl: toHttps(String(p.figureurl_qq_2 || p.figureurl_qq_1 || "").trim()),
     };
   } catch {
     return {};

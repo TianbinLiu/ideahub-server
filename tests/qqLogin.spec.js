@@ -65,7 +65,8 @@ beforeEach(async () => {
       return JSON.stringify({ client_id: APP_ID, openid: REAL_OPENID });
     }
     if (u.pathname === "/user/get_user_info") {
-      return JSON.stringify({ ret: 0, nickname: "阿真", figureurl_qq_2: "https://q.qq.com/a.png" });
+      // ★ QQ 真实回的就是 http://（见 toHttps 的注释），这里照实模拟
+      return JSON.stringify({ ret: 0, nickname: "阿真", figureurl_qq_2: "http://thirdqq.qlogo.cn/x/100" });
     }
     return JSON.stringify({ error: 404, error_description: "unexpected path" });
   };
@@ -155,6 +156,15 @@ test("新建的 QQ 用户：昵称进 displayName，用户名是随机的、邮�
   expect(me.username).toMatch(/^user_[0-9a-f]{8}$/);
   expect(me.email).toBe(`qq_${REAL_OPENID}@no-email.ideahub.local`);
   expect(me.passwordHash).toBe("");
+});
+
+// 2026-08-24 真机上发现：QQ 给的头像是 http://，而 App 的 WebView 在 https://localhost 上，
+// 混合内容被 Chromium **静默**丢弃 —— 昵称有、头像空，页面和 logcat 都不报错。
+test("QQ 头像地址存进库时必须已经升成 https（混合内容会被静默丢弃）", async () => {
+  const res = await login({ code: "CODE" });
+  const me = await User.findById(res.body.user.id).lean();
+  expect(me.avatarUrl).toBe("https://thirdqq.qlogo.cn/x/100");
+  expect(me.avatarUrl.startsWith("http://")).toBe(false);
 });
 
 test("没配 QQ_APP_KEY 时整条特性关闭（503），而不是拿空密钥去打 QQ", async () => {
