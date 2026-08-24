@@ -29,6 +29,11 @@ const branchCardSchema = new mongoose.Schema(
     modelUrl: { type: String, default: "" },
     /** 铸卡时的完整生成提示词（卡片详情页的「生成蓝图」） */
     genPrompt: { type: String, default: "" },
+    /** 画面里是真实人物——用户在圈选提取时自己勾的声明（像不像真人机器判不准，只能
+     *  让当事人表态）。真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
+     *  缺省 false = 老卡/未声明 = 非真人（客户端读侧判否定，见 app 仓 types.Card.realPerson）。
+     *  ⚠ 漏在这里的后果与 modelUrl 那次同形：zod 放行了、strict 模式落库时剥掉，零报错 */
+    realPerson: { type: Boolean, default: false },
     /** 多图参考（最多 3 张，只可能是 http(s)）。喂给 Seedream 画方案首尾帧时锁形象。
      *  ★ 空数组与「字段不存在」在这里是**同一件事**（都表示"只有封面这一张形象"），
      *    所以 default 给 `[]` 而不是 undefined：客户端的归一（老卡 → 拿 cover 当唯一

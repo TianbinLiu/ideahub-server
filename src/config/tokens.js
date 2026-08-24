@@ -344,10 +344,37 @@ function r2vTokens(inputDurationSec, model) {
  *      也就是**实际可能比报价低**。
  *   两边都是"如实按调用收"，要对齐得改 app 的报价口径，不是改这里。
  */
+/**
+ * 真人档（MiniMax 海螺 2.3 · 768P）按发一口价（token/发，键 = 时长秒）。
+ *
+ * ★★ 跨仓钉子：app 的 src/data/economy.ts VIDEO_TIERS 里 id:"real" 的 flatCost
+ *   必须与这张表**逐条相等**（报价=实扣；realPersonProxy.spec.js 末尾钉着）。
+ * ★ 数的来历（2026-08-24）：MiniMax 官方 $0.28/发(768P·6s)、$0.56/发(768P·10s)，
+ *   汇率 7.2 ⇒ ¥2.016/¥4.032；按全仓 token 锚（15 元/百万 = 系数 1）折算
+ *   = 134,400 / 268,800，取整 135k / 270k。成本价 1.0x（仓库主人拍板）。
+ * ⚠ 汇率会动：调价时**两仓同一个提交**改这两处，别让报价悄悄偏离实扣。
+ * ★ 只有 768P 一档分辨率、6/10 两档时长 —— 路由在扣费**之前**把参数钉死在这
+ *   张表能报价的范围内（计价参数与扣费同一拍，照 resolveR2v 的先例），
+ *   表里查不到的组合根本走不到扣费。
+ */
+const MINIMAX_FLAT_COST = Object.freeze({ 6: 135000, 10: 270000 });
+/** 真人档唯一在册的模型与分辨率（价目只锚了它们，别的组合没有价） */
+const MINIMAX_REAL_MODEL = "MiniMax-Hailuo-2.3";
+const MINIMAX_REAL_RESOLUTION = "768P";
+
 function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
   if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
   if (kind === "chat") return CHAT_TURN_TOKENS;
+  // 真人档：按发查表。路由已把 duration 钉在表内（见 MINIMAX_FLAT_COST 的 ★）；
+  // 万一有人绕过路由校验把别的时长带进来，兜底取表内最贵档 —— 报价宁高不低
+  // （与 segmentCost 的 r2v 兜底同一取向），并 console.error 点名让人当场看见。
+  if (kind === "minimax_video") {
+    const hit = MINIMAX_FLAT_COST[Number(body?.duration)];
+    if (hit) return hit;
+    console.error(`[tokens] minimax_video 计价表里没有 duration=${String(body?.duration)}（调用方该先校验）`);
+    return Math.max(...Object.values(MINIMAX_FLAT_COST));
+  }
   if (kind === "task") {
     const model = String(body?.model ?? "");
     if (model === MODEL3D_ID) return MODEL3D_TOKENS;
@@ -372,6 +399,9 @@ function priceOf(kind, body, r2v = null) {
 //   留着它就等于在按 model 的价目表旁边放第二处"一张图的价"，而两者迟早分叉
 //   （今天这个缺口正是分叉的产物）。要一张图的价一律走 imageTokensOf(model)。
 module.exports = {
+  MINIMAX_FLAT_COST,
+  MINIMAX_REAL_MODEL,
+  MINIMAX_REAL_RESOLUTION,
   PLANS,
   DEFAULT_PLAN_ID,
   planOf,

@@ -201,6 +201,9 @@ async function transferDraftAssets(draft, userId) {
         summary: c.summary || "",
         cover: await transferImage(ctx, c.cover, `deck.cards[${i}]`),
         tags: Array.isArray(c.tags) ? c.tags : [],
+        // 真人声明跟着快照走：观众「收入卡组」拿到的就是这份卡对象，掉了它，
+        // 真人卡经作品这条路洗一遍就变回"非真人"，出片档位分流静默失效
+        realPerson: c.realPerson === true,
         // 多图参考跟着快照走：少了它，观众装走这套卡组后炼出来的人物不是同一个人，
         // 而且一点错都不报。★ 这里**不需要**转存：views 只可能是永久 URL
         //   （客户端在加图那一刻就传过了），能不能带出去由 shareableViews 一处判（铁律六）

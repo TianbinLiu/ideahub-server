@@ -65,6 +65,10 @@ const deckCardSchema = new mongoose.Schema(
     // 转存失败时可能残留 dataURL，同 segment 的帧字段，不设 maxlength
     cover: { type: String, default: "" },
     tags: { type: [String], default: [] },
+    /** 真人声明。与 views 同一个理由入快照（modelUrl/genPrompt 是"卡主私有"才不入）：
+     *  观众收入卡组后要按它分流出片档位，漏声明 = mongoose 落库时静默剥掉，
+     *  真人卡经作品这条路走一遭就变回"非真人"，零报错 */
+    realPerson: { type: Boolean, default: false },
     /** 卡片的多图参考（http(s)，最多 3 张）。★ 与 modelUrl/genPrompt 那两个**刻意不入**
      *  快照的字段不同：views 是喂给 Seedream 锁形象的图，观众把这套卡组装走后要靠它
      *  炼出同一个人。漏声明的话 mongoose 落库时静默丢掉 —— 卡还在、参考图没了，

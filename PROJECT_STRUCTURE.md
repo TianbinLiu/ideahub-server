@@ -1618,6 +1618,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `uploads.routes.js` - 内容图片上传
 - `users.routes.js` - 用户资料与关注关系
 - `workshop.routes.js` - 工坊模板市场、编辑与全站 AI 改版
+- `minimax.routes.js` - 真人视频档供应商代理（MiniMax 海螺）。脚手架：未配 MINIMAX_API_KEY 全部 501；白名单转发，接上钱包扣费前不要在生产配真 key
+- `runway.routes.js` - 真人视频档供应商代理（Runway image_to_video）。同上；contentModeration 由服务端钉死不透传（合规决定，见文件头）
 
 ---
 

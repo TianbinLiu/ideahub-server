@@ -76,7 +76,41 @@ async function callArk({ method = "POST", path, body, timeoutMs = T_CREATE }) {
  *   | { ok:false, reason:"model"|"plan"|"funds", status:number, body:object, wallet:object|null }
  * >}
  */
-async function chargedArkCall({ user, modelAllowed, kind, path, body, r2v = null, timeoutMs = T_CREATE }) {
+/**
+ * 把最新余额挂在响应头上，App 的钱包镜像据此同步（省掉一次 GET /api/me/wallet）。
+ * ★ 从 ark.routes 迁到这里（2026-08-24）：minimax 路由也要写同一对头 ——
+ *   响应头协议只有一份实现，两个路由各写一份迟早在字段名上分叉。
+ * ★ 跨域可见需要 CORS 的 exposedHeaders 放行，见 app.js。
+ */
+function setWalletHeaders(res, w) {
+  if (!w) return;
+  res.setHeader("X-Wallet-Plan", String(w.plan));
+  res.setHeader("X-Wallet-Addon", String(w.addon));
+}
+
+async function chargedArkCall({
+  user,
+  modelAllowed,
+  kind,
+  path,
+  body,
+  r2v = null,
+  timeoutMs = T_CREATE,
+  /**
+   * 换上游用的钩子（2026-08-24 为 minimax 真人档参数化）：缺省走方舟（callArk）。
+   * 整段「钱」的序列（门禁→原子扣→转发→没受理退→管理员免单记账）**仍然只有这一份**——
+   * 参数化的是"往哪儿转发"，不是把序列抄去别处。
+   */
+  forward = null,
+  /**
+   * 「上游受理了吗」的判据：缺省 = HTTP 2xx（方舟口径）。MiniMax 习惯 200 +
+   * base_resp.status_code 报错，同一个判据会把"业务拒绝"当成"已受理"——
+   * 那就是拒了也扣钱，方向性的错。
+   */
+  acceptedOf = null,
+  /** 退款流水的类别标签：月底对账要分得出哪家上游退的钱 */
+  refundTag = "ark_refund",
+}) {
   const model = String(body?.model ?? "");
   if (!modelAllowed(model)) {
     console.warn(`[ark] 拒绝未在册的模型: ${model.slice(0, 64)}`);
@@ -140,14 +174,14 @@ async function chargedArkCall({ user, modelAllowed, kind, path, body, r2v = null
     }
   }
 
-  const { status, text } = await callArk({ method: "POST", path, body, timeoutMs });
-  const accepted = status >= 200 && status < 300;
+  const { status, text } = forward ? await forward() : await callArk({ method: "POST", path, body, timeoutMs });
+  const accepted = acceptedOf ? acceptedOf(status, text) : status >= 200 && status < 300;
 
   // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
   // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
   //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
   if (!accepted && !free) {
-    const back = await wallet.credit(user._id, cost, "ark_refund", `${memo} 上游 ${status}`);
+    const back = await wallet.credit(user._id, cost, refundTag, `${memo} 上游 ${status}`);
     w = back ?? w;
     console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
   }
@@ -161,4 +195,4 @@ async function chargedArkCall({ user, modelAllowed, kind, path, body, r2v = null
   return { ok: true, status, text, accepted, wallet: w, cost, free };
 }
 
-module.exports = { ARK_BASE, T_CREATE, T_POLL, arkConfigured, callArk, chargedArkCall };
+module.exports = { ARK_BASE, T_CREATE, T_POLL, arkConfigured, callArk, chargedArkCall, setWalletHeaders };

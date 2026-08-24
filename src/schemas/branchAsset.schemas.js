@@ -91,6 +91,11 @@ const cardItem = z
     //   但发布/安装时会被 shareableModelUrl() 剥掉——见 controller。
     modelUrl: z.string().trim().max(2000).optional().default(""),
     genPrompt: z.string().trim().max(4000).optional().default(""),
+    // ★ 真人声明（客户端圈选提取时用户勾的，肖像同意责任在协议那一步压给了用户）：
+    //   真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
+    //   缺省 = 老客户端/老卡 = 非真人（读侧判否定）——所以**不给 default**，
+    //   留 undefined 让 controller 统一按 `=== true` 归一。
+    realPerson: z.boolean().optional(),
     // ★ 超过 3 张 / 非 http(s) 一律 **400，不是悄悄截断**：截断的话用户挂了 4 张、
     //   界面上显示 3 张，他只会以为自己少点了一下；而"第 4 张没生效"和
     //   "第 4 张生效了但 AI 没用上"在结果里长得一模一样，查都没法查（铁律八）。
@@ -112,6 +117,10 @@ const addCardsBody = z.object({
 //   200 + "改好了"，而库里什么都没发生 —— 同一类静默 no-op，只是换了个地方发生。
 const updateCardBody = z.object({
   views: z.array(cardView).max(MAX_CARD_VIEWS),
+  // 真人声明可以跟着一起改（可选；不带就保留库里原值——controller 只在拿到布尔时 $set）。
+  // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
+  //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。
+  realPerson: z.boolean().optional(),
 });
 
 const deckName = z.string().trim().max(60);

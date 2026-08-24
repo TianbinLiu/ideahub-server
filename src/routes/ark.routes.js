@@ -53,7 +53,7 @@ const {
 } = require("../middleware/upload");
 // ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
-const { callArk, chargedArkCall, arkConfigured, T_CREATE, T_POLL } = require("../services/arkGateway.service");
+const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_POLL } = require("../services/arkGateway.service");
 
 const router = express.Router();
 
@@ -87,7 +87,11 @@ const TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
 
 /** 方舟产物只在这两个域。允许任意域就等于开了一个公开的下载代理。 */
-const ASSET_HOST_RE = /(^|\.)(volces|volccdn)\.com$/i;
+// ★ 第二条是 MiniMax（真人档）出片视频的落点（2026-08-24 实测：
+//   public-cdn-video-data-algeng.oss-cn-wulanchabu.aliyuncs.com）。收口到
+//   public-cdn-video-data* 前缀的阿里 OSS，不放开整个 aliyuncs.com——那是把
+//   任意人的 OSS 桶都变成我们代理的开放跳板。
+const ASSET_HOST_RE = /(^|\.)(volces|volccdn)\.com$|^public-cdn-video-data[\w-]*\.oss-cn-[\w-]+\.aliyuncs\.com$/i;
 
 /**
  * GET /api/ark/health —— 只回"这台服务器配没配 key"，不泄露 key 本身。
@@ -98,13 +102,8 @@ router.get("/health", (_req, res) => {
   res.json({ ok: true, ark: arkConfigured() });
 });
 
-/** 把最新余额挂在响应头上，App 的钱包镜像据此同步（省掉一次 GET /api/me/wallet）。
- *  ★ 跨域可见需要 CORS 的 exposedHeaders 放行，见 app.js。 */
-function setWalletHeaders(res, w) {
-  if (!w) return;
-  res.setHeader("X-Wallet-Plan", String(w.plan));
-  res.setHeader("X-Wallet-Addon", String(w.addon));
-}
+// setWalletHeaders 2026-08-24 迁到 arkGateway.service（minimax 路由也要写同一对头，
+// 响应头协议只留一份实现）——这里只是引用。
 
 /**
  * 计费转发：**先扣钱，再转发；上游没受理就退回来**（W2）。
