@@ -568,6 +568,49 @@ describe("卡片/卡组发布到创意工坊", () => {
     ]);
   });
 
+  // ★★ 肖像闸门（2026-08-27）。这条是**产品决定**落到代码里的那一份：卡上那张脸是某个
+  //   真实的人，他同意的是"卡主拿去做视频"，不是"挂到广场任人取用"。漏了它的表现不是
+  //   报错，而是**真人卡真的被发布出去了** —— 而受害的是一个不在场、也不知情的人。
+  test("A14 声明过真人的卡不能发布到广场（卡片与卡组两条路都拦）", async () => {
+    const author = await registerUser();
+
+    const real = cardOf({ name: "真人卡", realPerson: true });
+    const normal = cardOf({ name: "普通卡" });
+    await addCards(author.token, [real, normal]).expect(201);
+
+    // ① 卡片：整发 400，且**不能**悄悄发布出去
+    const denied = await request(app)
+      .post(`/api/branch/cards/${real.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(400);
+    expect(String(denied.body.message || denied.body.error || "")).toContain("真实人物");
+
+    const shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.find((c) => c.cardId === real.cardId)).toBeUndefined();
+
+    // 同一个账号的普通卡照常发得出去（闸只拦该拦的）
+    await request(app)
+      .post(`/api/branch/cards/${normal.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    // ② 卡组：组里有一张真人卡就整组拒，并**点名是哪一张**
+    const deck = await request(app)
+      .post("/api/branch/decks")
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ name: "混着真人卡的组", cardIds: [normal.cardId, real.cardId] })
+      .expect(201);
+    const deckId = deck.body.deck.id || deck.body.deck._id;
+    const deckDenied = await request(app)
+      .post(`/api/branch/decks/${deckId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(400);
+    expect(String(deckDenied.body.message || deckDenied.body.error || "")).toContain("真人卡");
+
+    const sharedDecks = await request(app).get("/api/branch/decks/shared").expect(200);
+    expect(sharedDecks.body.decks.find((d) => String(d.id || d._id) === String(deckId))).toBeUndefined();
+  });
+
   test("A12b 卡组快照里带得上 views（modelUrl 当年就是快照那份漏了声明）", async () => {
     const author = await registerUser();
     const taker = await registerUser();

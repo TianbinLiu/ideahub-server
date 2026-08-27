@@ -575,6 +575,14 @@ async function publishDeck(req, res, next) {
     if (blocked) {
       badRequest(`卡组里的「${blocked.name || blocked.cardId}」挂的是第三方版权模型，未获授权前不能分享`);
     }
+    // ★★ 同一条肖像闸门的卡组版：组里只要有一张真人卡，整组不许发布（与版权模型同款处置：
+    //   点名是哪一张、整发 400，不悄悄把那张剥掉——剥掉的话用户以为发的是完整卡组）。
+    const realBlocked = owned.find((c) => c.realPerson === true);
+    if (realBlocked) {
+      badRequest(
+        `卡组里的「${realBlocked.name || realBlocked.cardId}」声明过是真实人物，不能分享到创意工坊：肖像授权只覆盖卡主自己使用`
+      );
+    }
 
     // 按卡组里的顺序快照
     const byId = new Map(owned.map((c) => [c.cardId, c]));
@@ -861,6 +869,15 @@ async function publishCard(req, res, next) {
     //   对我们是"以为拦住了其实每次都在发"。自有的 milltina 不受此限。
     if (isThirdPartyModel(doc.modelUrl)) {
       badRequest("这张卡挂的是第三方版权模型，未获授权前不能分享");
+    }
+    // ★★ 肖像闸门：声明过是真实人物的卡**不许发布到广场**。
+    //   卡上那张脸是某个真实的人，他同意的是"卡主拿去做视频"，不是"挂上市场任人取用"
+    //   —— 平台没有资格替他做第二个授权。就算卡主在方舟做过肖像授权，那份可信素材也
+    //   绑死在他自己的火山账号下，别人装走只会拿到一张没有任何授权依据的人脸图。
+    //   ⚠ 这是**权威的那一份**：app 侧 shareBlockReason 只是不让按钮亮着。
+    //   ⚠ 与 modelUrl 同样是 400 而不是"悄悄剥掉 realPerson 再发"——后者对用户是静默降级。
+    if (doc.realPerson === true) {
+      badRequest("这张卡声明过是真实人物，不能分享到创意工坊：肖像授权只覆盖卡主自己使用");
     }
 
     if (req.body && req.body.description !== undefined) {
