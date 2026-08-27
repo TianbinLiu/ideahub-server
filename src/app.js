@@ -161,6 +161,9 @@ app.use("/api/branch", require("./routes/branchVideo.routes"));
 // 白模模板（blockout r2v）：同一个 /api/branch base（App 只记一个前缀），
 // 路径全在 /templates 下，与 /videos /cards /decks 不重叠
 app.use("/api/branch", require("./routes/branchTemplate.routes"));
+// 提示词方案（人物卡设定图的出图配方）与它的广场。同一个 /api/branch base，
+// 路径全在 /schemes 下，与 /videos /cards /decks /templates 不重叠
+app.use("/api/branch", require("./routes/promptScheme.routes"));
 // 成片合并（把已转存的 N 段拼成一条）。同一个 /api/branch base，路径全在 /compose 下。
 // 端上原来用 MediaRecorder 实时重录，弱网/低端机上不可靠（2026-08-21 真机复盘）
 app.use("/api/branch", require("./routes/branchCompose.routes"));
