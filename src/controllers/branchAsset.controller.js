@@ -21,6 +21,8 @@ const {
   assetKey: assetKeySchema,
   assetKind: assetKindSchema,
   CARD_VIEW_KINDS,
+  CARD_VIEW_ROLES,
+  CARD_VIEW_TAG_MAX,
   MAX_CARD_VIEWS,
   isShareableViewUrl,
 } = require("../schemas/branchAsset.schemas");
@@ -98,6 +100,13 @@ function shareableViews(raw) {
       // 认不出的 kind 退 "detail" 而不是丢掉这张图：kind 只影响提示词里怎么描述它
       // （face=面部特征 / body=服装与体型），退成中性的说法仍然有用，丢掉就真没了
       kind: CARD_VIEW_KINDS.includes(item?.kind) ? item.kind : "detail",
+      // ★★ role / tag 是**逐字段重建**的这一跳最容易漏的两行（CLAUDE.md 那条坑的服务端版）：
+      //   漏了不会报错，只会让方案做出来的卡在"发布→装回"之后**整份退回固定三格**，
+      //   花名没了、display 位变成能进模型的 aux —— 画面变差且没有任何一处会说话。
+      // ★ 认不出的 role 就**不写这一位**（而不是退个默认值）：缺省的语义是"按 kind 推"，
+      //   而 kind 在上一行已经归一过 —— 写死一个默认值反而会把老数据judgment固化成错的。
+      ...(CARD_VIEW_ROLES.includes(item?.role) ? { role: item.role } : {}),
+      ...(String(item?.tag || "").trim() ? { tag: String(item.tag).trim().slice(0, CARD_VIEW_TAG_MAX) } : {}),
       note: String(item?.note || "").trim().slice(0, 200),
     });
     if (out.length >= MAX_CARD_VIEWS) break;

@@ -31,6 +31,20 @@ const ASSET_ACTIONS = ["like", "bookmark"];
 //   同一人物的多角度素材会被模型识别成多个不同主体，反而加剧 ID 漂移
 //   （方舟提示词指南原文）。道具/场景卡不存在这个问题（它们不是"主体身份"）。
 const CARD_VIEW_KINDS = ["face", "body", "detail"];
+
+// ── 灵活图位（role / tag）2026-08-24 ──────────────────────────────────
+// 「提示词方案」让一张卡的图位不再固定成三格，于是要回答两个**不同**的问题：
+//   · role —— 这张图在**出片管线**里干什么（机器读，受控词表）
+//   · tag  —— 它在界面上叫什么（人读，自由文本，方案作者/用户起的花名）
+//
+// ★★ 为什么不动 kind：它是**跨仓冻结**的三值（app 的 types.CardView 同一条 ★★）。
+//   加取值 = 老客户端/老服务端整批 400，而 app 那侧 emitApiError 没人监听 = 静默丢卡。
+//   所以 kind 一个字不改，继续当"存储层与老客户端看的那一份"，客户端每次都照写
+//   （由 role 反推）—— 老端拿到的仍是完全合法的三值数据，只是丢了花名：**降级不是损坏**。
+// ★ role 缺省不写默认值：缺省本身就是"老数据，按 kind 推"（app 的 roleOf 一处实现）。
+//   在这里补一个 default 等于**第二处默认值**，两边推法一旦分叉就是静默错配。
+const CARD_VIEW_ROLES = ["face", "primary", "aux", "display"];
+const CARD_VIEW_TAG_MAX = 24;
 const MAX_CARD_VIEWS = 3;
 
 // ★★ views[].url 只收 http(s)。这一条挡的是两件**性质不同**、都出过事的问题：
@@ -63,6 +77,9 @@ const cardView = z.object({
     .max(2000)
     .regex(VIEW_URL_RE, "view url must be an http(s) URL (dataURL / idb: 不收)"),
   kind: z.enum(CARD_VIEW_KINDS).optional().default("detail"),
+  // ★ 不给 default：缺省 = 老数据 = 由客户端按 kind 推（理由见 CARD_VIEW_ROLES 的 ★）
+  role: z.enum(CARD_VIEW_ROLES).optional(),
+  tag: z.string().trim().max(CARD_VIEW_TAG_MAX).optional(),
   note: z.string().trim().max(200).optional().default(""),
 });
 
@@ -163,6 +180,8 @@ const publishBody = z
   .default({});
 
 module.exports = {
+  CARD_VIEW_ROLES,
+  CARD_VIEW_TAG_MAX,
   addCardsBody,
   updateCardBody,
   createDeckBody,

@@ -514,6 +514,60 @@ describe("卡片/卡组发布到创意工坊", () => {
     expect(installed.body.card.views.map((v) => v.url)).toEqual(views.map((v) => v.url));
   });
 
+  // ★★ A12d 盯的是**灵活图位**（role/tag，2026-08-24）那条五处一起改的链子。
+  //   漏任何一处都不会报错，只会让"提示词方案"做出来的卡在发布→装回之后**整份退回固定三格**：
+  //   花名没了、display 位变成能进模型的 aux —— 画面因此变差（合成规格图当人物参考会加剧
+  //   ID 漂移），而没有任何一处会说话。所以这条必须钉在**回读**与**装走**两个点上。
+  test("A12d role/tag 存得下、读得回，并跟着分享/安装一起走", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+
+    const views = [
+      { url: "https://cdn.example.com/s-face.jpg", kind: "face", role: "face", tag: "面部特写" },
+      { url: "https://cdn.example.com/s-sheet.jpg", kind: "detail", role: "display", tag: "无面部白模三视图" },
+    ];
+    const card = cardOf({ name: "方案卡", views });
+    await addCards(author.token, [card]).expect(201);
+
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).views).toEqual([
+      { url: "https://cdn.example.com/s-face.jpg", kind: "face", role: "face", tag: "面部特写", note: "" },
+      { url: "https://cdn.example.com/s-sheet.jpg", kind: "detail", role: "display", tag: "无面部白模三视图", note: "" },
+    ]);
+
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    const installed = await request(app)
+      .post(`/api/branch/cards/${card.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    // 装走那份尤其要紧：display 位一旦退成 aux，装卡的人出片时它就真进模型了
+    expect(installed.body.card.views.map((v) => [v.role, v.tag])).toEqual([
+      ["face", "面部特写"],
+      ["display", "无面部白模三视图"],
+    ]);
+  });
+
+  // 老卡（不带 role/tag）必须**一个字段都不多长出来**：缺省的语义是"按 kind 推"，
+  // 服务端补一个默认值就是第二处推法，两边一旦分叉就是静默错配（所以这条也钉住）。
+  test("A12e 不带 role/tag 的老卡回读时不会被补上默认值", async () => {
+    const author = await registerUser();
+    const card = cardOf({ name: "老卡", views: [{ url: "https://cdn.example.com/old.jpg", kind: "body" }] });
+    await addCards(author.token, [card]).expect(201);
+    const listed = await request(app)
+      .get("/api/branch/cards")
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).views).toEqual([
+      { url: "https://cdn.example.com/old.jpg", kind: "body", note: "" },
+    ]);
+  });
+
   test("A12b 卡组快照里带得上 views（modelUrl 当年就是快照那份漏了声明）", async () => {
     const author = await registerUser();
     const taker = await registerUser();
