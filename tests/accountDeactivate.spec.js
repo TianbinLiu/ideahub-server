@@ -28,6 +28,8 @@ beforeEach(async () => {
   await mongoose.connection.db.dropDatabase();
 });
 
+const { DEACTIVATED_MESSAGE } = require('../src/utils/banned');
+
 function authHeader(token) {
   return { Authorization: `Bearer ${token}` };
 }
@@ -67,7 +69,7 @@ describe('POST /api/me/deactivate', () => {
       .set(authHeader(token))
       .expect(401);
     expect(after.body.ok).toBe(false);
-    expect(after.body.message).toBe('Account deactivated');
+    expect(after.body.message).toBe(DEACTIVATED_MESSAGE);
 
     // deactivatedAt 已打标记 + tokenVersion 已自增（旧 token 全部作废）
     const User = require('../src/models/User');
@@ -90,7 +92,7 @@ describe('POST /api/me/deactivate', () => {
     const User = require('../src/models/User');
     const { signToken } = require('../src/utils/jwt');
     const fresh = await User.findById(user._id);
-    expect(() => signToken(fresh)).toThrow('Account deactivated');
+    expect(() => signToken(fresh)).toThrow(DEACTIVATED_MESSAGE);
   });
 
   test('即使伪造一个 tokenVersion 匹配的 token，已注销账号仍 401', async () => {
@@ -121,7 +123,44 @@ describe('POST /api/me/deactivate', () => {
       .get('/api/speaking-style')
       .set(authHeader(forged))
       .expect(401);
-    expect(res.body.message).toBe('Account deactivated');
+    expect(res.body.message).toBe(DEACTIVATED_MESSAGE);
+  });
+
+  test('注销后用密码登录 → 401 且整句说清已注销（登录端点整链）', async () => {
+    // signToken 拒签已有单测；这条把 /api/auth/login 整条链路钉死——
+    // 含 bcrypt 比对成功之后才撞到拒签（密码对不对与注没注销是两道门，
+    // 顺序错了会变成用“已注销”回答一切错密码，泄露账号存在性）。
+    const bcrypt = require('bcryptjs');
+    const User = require('../src/models/User');
+    const { signToken } = require('../src/utils/jwt');
+
+    const random = new mongoose.Types.ObjectId().toString().slice(-6);
+    const user = await User.create({
+      username: `deact_${random}`,
+      email: `${random}@test.local`,
+      passwordHash: await bcrypt.hash('realpass123', 4),
+    });
+    const token = signToken(user);
+    await request(app)
+      .post('/api/me/deactivate')
+      .set(authHeader(token))
+      .send({ confirmUsername: user.username })
+      .expect(200);
+
+    // 正确密码：被拒且说“已注销”，而不是发 token
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ emailOrUsername: user.username, password: 'realpass123' })
+      .expect(401);
+    expect(res.body.token).toBeUndefined();
+    expect(res.body.message).toBe(DEACTIVATED_MESSAGE);
+
+    // 错误密码：仍是普通的凭据错误，不泄露注销状态
+    const bad = await request(app)
+      .post('/api/auth/login')
+      .send({ emailOrUsername: user.username, password: 'wrongpass' })
+      .expect(401);
+    expect(bad.body.message).not.toBe(DEACTIVATED_MESSAGE);
   });
 
   test('confirmUsername 不匹配 → 400，且账号未被注销', async () => {

@@ -3,7 +3,7 @@ const User = require("../models/User");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 // 「封没封 / 给用户看哪句话」只有 utils/banned.js 一处（铁律六）
-const { isBanned, bannedMessage } = require("../utils/banned");
+const { isBanned, bannedMessage, DEACTIVATED_MESSAGE } = require("../utils/banned");
 
 const AUTH_DEBUG_ENABLED = process.env.AUTH_DEBUG === "true";
 
@@ -46,13 +46,14 @@ async function requireAuth(req, res, next) {
 
     // 已注销（软删除）账号：一律视为未授权。
     // 放在 tokenVersion 校验【之前】，这样注销后旧 token 得到的是明确的
-    // "Account deactivated" 而不是笼统的 "Session expired"。
+    // 「账号已注销」而不是笼统的 "Session expired"。文案与 signToken 同一处
+    // （utils/banned.DEACTIVATED_MESSAGE），两边各写一句迟早说岔。
     if (user.deactivatedAt) {
       authDebug("Account deactivated:", userId);
       throw new AppError({
         code: CODES.UNAUTHORIZED,
         status: 401,
-        message: "Account deactivated",
+        message: DEACTIVATED_MESSAGE,
       });
     }
 

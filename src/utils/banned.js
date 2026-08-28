@@ -35,4 +35,13 @@ function bannedMessage(banned) {
   return reason ? `账号已被封禁：${reason}` : "账号已被封禁";
 }
 
-module.exports = { isBanned, bannedMessage, BANNED_FILTER, NOT_BANNED_FILTER };
+/**
+ * 已注销账号的对外说法（2026-08-28 中文化并收口到此）。
+ * 消费方与封禁完全同构：utils/jwt.js 的 signToken（登录侧拒签）与
+ * middleware/auth.js 的 requireAuth（请求侧拦旧 token）——两边各写一句迟早说岔。
+ * ★ 恢复渠道要说出来：App 的注销页与隐私政策承诺的都是 support 邮箱，
+ *   这里不带的话，被拒的用户只知道"门关了"、不知道钥匙在哪。
+ */
+const DEACTIVATED_MESSAGE = "账号已注销，无法登录。如需恢复，请发邮件到 support@ideahubs.org";
+
+module.exports = { isBanned, bannedMessage, BANNED_FILTER, NOT_BANNED_FILTER, DEACTIVATED_MESSAGE };
