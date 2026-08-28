@@ -3,8 +3,8 @@
 const jwt = require("jsonwebtoken");
 const AppError = require("./AppError");
 const CODES = require("./errorCodes");
-// 「封没封 / 给用户看哪句话」只有 utils/banned.js 一处（铁律六）
-const { isBanned, bannedMessage } = require("./banned");
+// 「封没封 / 注销没注销 / 各给用户看哪句话」只有 utils/banned.js 一处（铁律六）
+const { isBanned, bannedMessage, DEACTIVATED_MESSAGE } = require("./banned");
 
 /**
  * 签发登录 token。
@@ -32,7 +32,7 @@ function signToken(user) {
     throw new AppError({
       code: CODES.UNAUTHORIZED,
       status: 401,
-      message: "Account deactivated",
+      message: DEACTIVATED_MESSAGE,
     });
   }
   if (isBanned(user)) {
