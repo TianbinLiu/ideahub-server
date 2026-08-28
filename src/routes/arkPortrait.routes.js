@@ -157,4 +157,59 @@ router.get("/portrait/assets", requireAuth, async (req, res, next) => {
   }
 });
 
+/**
+ * GET /api/ark/portrait/assets/:id/image —— 把某份授权素材的**图片本体**代取回来。
+ * 造卡流程用它把授权照片自动填进卡面/图位（仓库主人 2026-08-28 两次点名要的）。
+ *
+ * ★ 签名直链仍然不出服务端：这里在服务端现列 ListAssets 拿到带签名的 TOS 直链、
+ *   服务端去取字节、只把**图片内容**流回去 —— 链接本身（含签名与桶路径）一个字符不外泄。
+ * ⚠⚠ 已知且**有意接受**的边界（主人在"本地重选 vs 服务端代取"两案里选了后者）：
+ *   组↔用户目前无法归属（方舟没有归属字段，见 docs/backlog.md §1.6），所以这里只能
+ *   requireAuth —— 也就是说**任何登录用户**都取得到平台账号下任何一份授权素材的照片。
+ *   当前全部用户就是仓库主人本人，风险为零；**开放注册前必须先做归属**（invite 时记
+ *   uuid→userId 或让用户绑自己的火山账号），这条钉在 backlog §1.6。
+ * ★ 图片按方舟素材门最大 30MB，整体缓冲后回吐（不落盘、不缓存）。
+ */
+router.get("/portrait/assets/:id/image", requireAuth, async (req, res, next) => {
+  try {
+    if (!openApiConfigured()) return notConfigured(res);
+    const id = String(req.params.id || "").trim();
+    const r = await listPortraitAssets({});
+    if (!r.ok) return passThroughArkError(res, r);
+    const items = Array.isArray(r.result && r.result.Items) ? r.result.Items : [];
+    const it = items.find((x) => x.Id === id);
+    if (!it) {
+      return res.status(404).json({ ok: false, code: "ASSET_NOT_FOUND", message: "方舟里没有这份素材（可能已被删除）" });
+    }
+    if (!it.URL) {
+      return res.status(502).json({ ok: false, code: "NO_ASSET_URL", message: "方舟没有给这份素材的下载地址" });
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    let up;
+    try {
+      up = await fetch(it.URL, { signal: controller.signal });
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        code: "ASSET_FETCH_FAILED",
+        message: `取素材图片失败：${e instanceof Error ? e.message : e}`,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!up.ok) {
+      // 签名直链会过期（X-Tos-Expires），过期就整句说清而不是回一张坏图
+      return res.status(502).json({ ok: false, code: "ASSET_FETCH_FAILED", message: `素材源返回 HTTP ${up.status}（签名可能已过期，重试一次即可——每次都会现签）` });
+    }
+    const buf = Buffer.from(await up.arrayBuffer());
+    res.set("Content-Type", up.headers.get("content-type") || "image/jpeg");
+    // 私人肖像：任何一层都不许缓存
+    res.set("Cache-Control", "private, no-store");
+    res.send(buf);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

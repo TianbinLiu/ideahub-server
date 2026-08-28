@@ -211,6 +211,58 @@ describe("真人肖像授权端点 · /api/ark/portrait", () => {
     }
   });
 
+  test("素材图片代取：字节回吐、直链不外泄、404 整句、未登录 401", async () => {
+    process.env.VOLC_AK = "AKtest";
+    process.env.VOLC_SK = "sktest";
+    const realFetch = global.fetch;
+    const IMG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]); // 假 JPEG 头
+    global.fetch = async (url) => {
+      if (String(url).includes("open.volcengineapi.com")) {
+        return {
+          status: 200,
+          json: async () => ({
+            Result: {
+              Items: [
+                { Id: "asset-20260828141416-5zb5l", Name: "a.jpg", AssetType: "Image", Status: "Active", URL: "https://tos.example/signed?X-Tos-Signature=deadbeef" },
+              ],
+              TotalCount: 1,
+            },
+          }),
+        };
+      }
+      // TOS 直链那一跳
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (k) => (k === "content-type" ? "image/jpeg" : null) },
+        arrayBuffer: async () => IMG.buffer.slice(IMG.byteOffset, IMG.byteOffset + IMG.byteLength),
+      };
+    };
+    try {
+      await request(app).get("/api/ark/portrait/assets/asset-20260828141416-5zb5l/image").expect(401);
+      const token = await registerUser();
+      const ok = await request(app)
+        .get("/api/ark/portrait/assets/asset-20260828141416-5zb5l/image")
+        .set("Authorization", `Bearer ${token}`)
+        .expect(200);
+      expect(ok.headers["content-type"]).toContain("image/jpeg");
+      expect(ok.headers["cache-control"]).toContain("no-store");
+      expect(Buffer.compare(ok.body, IMG)).toBe(0);
+      // 直链一个字符都不许出现在任何响应里
+      expect(JSON.stringify(ok.headers)).not.toContain("X-Tos-Signature");
+
+      const miss = await request(app)
+        .get("/api/ark/portrait/assets/asset-00000000000000-none/image")
+        .set("Authorization", `Bearer ${token}`)
+        .expect(404);
+      expect(miss.body.code).toBe("ASSET_NOT_FOUND");
+    } finally {
+      global.fetch = realFetch;
+      delete process.env.VOLC_AK;
+      delete process.env.VOLC_SK;
+    }
+  });
+
   test("火山返回业务错时原样透出（502 + 火山的 Code/Message，不替它翻译）", async () => {
     process.env.VOLC_AK = "AKtest";
     process.env.VOLC_SK = "sktest";
