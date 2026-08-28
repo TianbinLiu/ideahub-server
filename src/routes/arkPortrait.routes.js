@@ -16,6 +16,7 @@ const {
   openApiConfigured,
   createAuthorizationInvite,
   listAuthorizationAssetGroups,
+  listPortraitAssets,
 } = require("../services/arkOpenApi.service");
 
 /**
@@ -73,40 +74,84 @@ router.post("/portrait/invite", requireAuth, validate({ body: inviteBody }), asy
   }
 });
 
+/** 未配 AK/SK 时的统一回法：明说未开通，让 app 退回"控制台手工 + 手填 asset id" */
+function notConfigured(res) {
+  return res.status(503).json({
+    ok: false,
+    code: "PORTRAIT_NOT_CONFIGURED",
+    message: "真人肖像授权功能未开通（服务器未配置火山 AK/SK）",
+  });
+}
+
+/** 火山业务错的统一透出：**原样**给 Code/Message，别替它翻译（铁律八） */
+function passThroughArkError(res, r) {
+  return res.status(502).json({
+    ok: false,
+    code: r.error ? r.error.Code : "ARK_OPENAPI_ERROR",
+    message: r.error ? r.error.Message : `方舟返回 HTTP ${r.status}`,
+    requestId: r.requestId,
+  });
+}
+
 /**
- * GET /api/ark/portrait/groups —— 列资产组（查授权状态 + asset id）。
+ * GET /api/ark/portrait/groups —— 列**资产组**（授权状态那一层）。
  * → { ok, totalCount, items }
  *
- * ⚠⚠ items[] 的字段名**尚未实证**（要等真有一条授权入库；现在恒 TotalCount:0）。
- *   这里**原样透传** result.Items，不在服务端硬造字段结构 —— 硬造的话等真数据回来时
- *   字段对不上，是"看起来有值其实全 undefined"那类静默错。app 侧同样先原样收，
- *   等真授权跑通再一起定 asset id / 状态 / 演员名 的读法（docs/backlog.md §1.6 TODO）。
+ * ★ items[] 原样透传方舟的 `Items`（2026-08-28 已见真数据，形状见 service 注释）。
+ *   刻意**不**在这里逐字段重建：重建就是"少写一行没有任何症状"的那类坑（CLAUDE.md
+ *   「服务端给实体加了字段」那条），而这一层的消费方只需要"有几条、授没授权"。
+ * ⚠⚠ 组 `Authorized` **不等于**有素材可用 —— 素材要单独过内容审核，可能整张 `Failed`。
+ *   要判"能不能出片"请用 /portrait/assets，别拿这里的 totalCount 当依据。
  */
 router.get("/portrait/groups", requireAuth, async (req, res, next) => {
   try {
-    if (!openApiConfigured()) {
-      return res.status(503).json({
-        ok: false,
-        code: "PORTRAIT_NOT_CONFIGURED",
-        message: "真人肖像授权功能未开通（服务器未配置火山 AK/SK）",
-      });
-    }
+    if (!openApiConfigured()) return notConfigured(res);
     const r = await listAuthorizationAssetGroups();
-    if (!r.ok) {
-      return res.status(502).json({
-        ok: false,
-        code: r.error ? r.error.Code : "ARK_OPENAPI_ERROR",
-        message: r.error ? r.error.Message : `方舟返回 HTTP ${r.status}`,
-        requestId: r.requestId,
-      });
-    }
+    if (!r.ok) return passThroughArkError(res, r);
     const result = r.result || {};
     res.json({
       ok: true,
       totalCount: result.TotalCount || 0,
-      // 原样透传，字段留给真数据定（见上 ⚠⚠）
       items: Array.isArray(result.Items) ? result.Items : [],
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/ark/portrait/assets —— 列**素材**（出片要用的 `asset-…` 就在这里）。
+ * query: `groupId?`（只看某个组）
+ * → { ok, totalCount, items: [{ id, name, assetType, groupId, status, error?, createTime }] }
+ *
+ * ★★ 这里是**逐字段挑**而不是原样透传，只为一件事：**把那个签名直链挡在服务端**。
+ *   方舟回的 `Items[].URL` 是带签名的 TOS 直链（`X-Tos-Expires=41400`），指向的是
+ *   **某个真人的肖像原图**。它对 app 一点用都没有（app 只需要知道 id 与能不能用），
+ *   透出去却等于把肖像原图发到端上、还可能被截图/落盘/进日志。⇒ 白名单式挑字段。
+ * ★ `error` 照抄方舟的 `{Code,Message}`：素材审核失败的**原因**必须一路走到用户眼前
+ *   （铁律八）。实测第一发就是 `InputImageSensitiveContentDetected.PolicyViolation`
+ *   「输入图片可能涉及版权限制」—— 如果这里把它吞掉，用户看到的就是"授权成功但用不了"。
+ * ★ `status` 原样给，**不在服务端判可用性**：成功那个字符串我们还没见过（只见过 "Failed"），
+ *   现在写任何 `=== "成功"` 的判断都是猜。上层只判得起"是不是 Failed"。
+ */
+router.get("/portrait/assets", requireAuth, async (req, res, next) => {
+  try {
+    if (!openApiConfigured()) return notConfigured(res);
+    const groupId = typeof req.query.groupId === "string" ? req.query.groupId.trim() : "";
+    const r = await listPortraitAssets(groupId ? { groupId } : {});
+    if (!r.ok) return passThroughArkError(res, r);
+    const result = r.result || {};
+    const items = (Array.isArray(result.Items) ? result.Items : []).map((it) => ({
+      id: it.Id,
+      name: it.Name,
+      assetType: it.AssetType,
+      groupId: it.GroupId,
+      status: it.Status,
+      ...(it.Error ? { error: { code: it.Error.Code, message: it.Error.Message } } : {}),
+      createTime: it.CreateTime,
+      // ⚠ 故意不带 URL（见上 ★★）
+    }));
+    res.json({ ok: true, totalCount: result.TotalCount || 0, items });
   } catch (err) {
     next(err);
   }

@@ -141,8 +141,23 @@ async function callOpenApi(action, body, opts = {}) {
 
 // ── 真人肖像授权（素材库）──────────────────────────────────────────────
 //
-// 三个 Action 的入参 schema 均 2026-08-27 逐字段实证（见 docs/backlog.md §1.6）。
-// 「接收授权」的 Action 尚未抓到（要等真有人扫码授权后控制台才出现那颗按钮），留 TODO。
+// 入参 schema 全部逐字段实证（2026-08-27 前三个、2026-08-28 补 ListAssets；见 docs/backlog.md §1.6）。
+//
+// ★★ **组 ≠ 素材，两层**（2026-08-28 用真授权量出来的，之前一直以为是一层）：
+//   · `ListAuthorizationAssetGroup` 给的是**资产组** `group-20260828131552-jlbz5` + 授权态；
+//   · 出片时 `asset://` 要的是**素材** `asset-20260828131637-4872q`，在
+//     `ListAssets` 里，`Items[].Id`。
+//   ⇒ 只查到"组已授权"**不等于有素材可用**：素材要单独过内容审核，会 `Status:"Failed"`。
+//     实测第一发就是这样（`InputImageSensitiveContentDetected.PolicyViolation`），
+//     而组那一层依然写着 `Authorized` —— 只看组就是"看起来成了，其实一张都不能用"。
+//
+// 探针记录（`{}` 空 body 打一发就能分辨 Action 存不存在）：存在的有 `ListAssets`
+// （必填 `Filter.GroupType` + `PageNumber`）、`GetAuthorizationAssetGroup`（必填 `GroupId`）、
+// `GetAssetGroup`（必填 `Id`）；不存在的有 ListAuthorizationAsset(s) / ListAsset /
+// ListAssetGroupAsset / ListLivenessFaceAsset / DescribeAuthorizationAssetGroup
+// （全回 404 `InvalidActionOrVersion`）。
+// 「接收授权」的 Action 仍未抓到 —— 本账号是自己授权自己（`AssetOwnership:"SelfUploaded"`），
+// 走不到"接收别人授权"那颗按钮，留 TODO。
 
 /**
  * 生成一条**邀约**（被拍者扫码授权用）。返回 UUID —— 邀约 H5 链接就靠它拼。
@@ -157,19 +172,51 @@ async function createAuthorizationInvite({ startSec, endSec }) {
 }
 
 /**
- * 列出资产组（查授权状态 + asset id）。
+ * 列出**资产组**（授权状态那一层，不含素材）。
  * ★ `AssetOwnership` 是枚举且**大小写敏感**，实测只有 `"All"` 收（Owned/Authorized/Self 全 Invalid）。
- * ⚠ `result.Items[]` 的字段要等**真有一条授权入库**后才看得到（现在 TotalCount:0）——
- *   接 app 轮询前用一条真授权把字段名抠准，别猜（docs/backlog.md §1.6 的 TODO）。
+ * ★ 2026-08-28 真数据的形状：`Items[] = { AssetGroup:{Id,Name,GroupType,ProjectName,
+ *   CreateTime,UpdateTime}, Status:"Authorized", Validity:{Start,End}, AccountType:"Company",
+ *   CompanyName, CreditCode, AssetOwnership:"SelfUploaded" }`。
+ *   ⚠ `Validity.End` 实测回来是 `253399593600`（≈ 9999 年 = 永久），**不是**我们建邀约时给的
+ *   那个一年 —— 有效期最终由授权人在火山那一页选，我们的 `days` 只是个建议值。
+ * ⚠ 组 `Authorized` ≠ 有素材可用，见本节顶部 ★★。要 asset id 请用 listPortraitAssets。
  */
 async function listAuthorizationAssetGroups() {
   return callOpenApi("ListAuthorizationAssetGroup", { Filter: { AssetOwnership: "All" } });
 }
 
+/** 真人肖像素材组的类型。`ListAssets` 的 `Filter.GroupType` 必填，实测这个值收 */
+const LIVENESS_GROUP_TYPE = "LivenessFace";
+
+/**
+ * 列出**素材**（出片要用的 `asset-…` 就在这里）。
+ *
+ * @param {object} [o]
+ * @param {string} [o.groupId]  只看某个资产组；不给 = 本账号该类型的全部
+ * @param {number} [o.pageSize] 默认 50
+ *
+ * ★ 入参三处都是必需的，少一个就 400：`Filter.GroupType`、`PageNumber`、（`PageSize` 不给
+ *   会走默认 10，我们显式给）。`Filter.GroupId` 实测生效（单数形式）。
+ * ★ 回来的 `Items[] = { Id:"asset-…", Name, URL, AssetType:"Image", GroupId, Status,
+ *   Error?:{Code,Message}, Moderation:{Strategy}, CreateTime, UpdateTime, ProjectName }`。
+ *   ⚠⚠ `URL` 是带签名的 TOS 直链（`X-Tos-Expires=41400` ≈ 11.5 小时），**别落库、别外传**：
+ *   它是某个真人的肖像原图，签名过期后还会变成死链。我们只往上层传"有没有、能不能用"。
+ * ⚠ `Status` 只实证到 `"Failed"` 这一个值（成功那个字符串还没见过，因为还没有一张过审的）。
+ *   ⇒ **不许**在这一层按 Status 过滤或翻译，原样透出，判读留给上层并且只判得起
+ *   "是不是 Failed"（判否定，同本仓那条老规矩）。
+ */
+async function listPortraitAssets(o = {}) {
+  const filter = { GroupType: LIVENESS_GROUP_TYPE };
+  if (o.groupId) filter.GroupId = o.groupId;
+  return callOpenApi("ListAssets", { Filter: filter, PageNumber: 1, PageSize: o.pageSize || 50 });
+}
+
 module.exports = {
   OPENAPI_HOST,
+  LIVENESS_GROUP_TYPE,
   openApiConfigured,
   callOpenApi,
   createAuthorizationInvite,
   listAuthorizationAssetGroups,
+  listPortraitAssets,
 };
