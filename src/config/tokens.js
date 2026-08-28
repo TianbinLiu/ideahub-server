@@ -321,6 +321,33 @@ function r2vTokens(inputDurationSec, model) {
 }
 
 /**
+ * 素材参考出片（reference 子任务：用户素材视频 + 多图 + 提示词点名首中尾帧）扣多少 token。
+ *
+ * ★ 与 r2vTokens（edit 复刻）是**两个公式**：edit 输出≈输入所以是 输入×2；
+ *   reference 的输出时长由用户选（3~10s），公式是 (输入 + 输出)×720p 锚×同一系数
+ *   ——(输入+输出)×W×H×fps÷1024 那条账单公式的直接代入，系数同 VIDEO_MULT_R2V
+ *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）。
+ * ★★ 两个夹取区间必须与 app 的 economy.materialRefCost **逐字相等**（报价=实扣，
+ *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹 [3,10]
+ *   （resolveR2v 的素材钉子拒掉了区间外与 -1，这里的夹取只是导出函数的第二道保险）。
+ */
+function materialRefTokens(inputDurationSec, outputDurationSec, model) {
+  const ri = Number(inputDurationSec);
+  const i = Math.max(4, Math.min(30, Math.round(Number.isFinite(ri) ? ri : 0)));
+  if (i !== ri) {
+    console.error(`[tokens] 素材参考输入时长异常（${String(inputDurationSec)}），已按 ${i}s 计价 —— 登记数据可能被弄坏了`);
+  }
+  const ro = Number(outputDurationSec);
+  const o = Math.max(3, Math.min(10, Math.round(Number.isFinite(ro) ? ro : 0)));
+  let mult = VIDEO_MULT_R2V[model];
+  if (mult === undefined) {
+    console.error(`[tokens] 素材参考模型 ${String(model).slice(0, 64)} 不在 VIDEO_MULT_R2V 里，按最贵档 ${MAX_R2V_MULT} 收费`);
+    mult = MAX_R2V_MULT;
+  }
+  return Math.round((i + o) * R2V_TOKENS_PER_SEC * mult);
+}
+
+/**
  * 这一次方舟调用要扣多少 token。
  *
  * @param {string} kind "image" | "chat" | "task"
@@ -381,7 +408,11 @@ function priceOf(kind, body, r2v = null) {
     // r2v（白模出片）：输入时长计进 token，走单独的公式与系数表。
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
-    if (r2v) return r2vTokens(r2v.durationSec, model);
+    if (r2v) {
+      // 素材参考（reference）与白模复刻（edit）各自的公式——kind 由 resolveR2v 定
+      if (r2v.kind === "material") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
+      return r2vTokens(r2v.durationSec, model);
+    }
     return segTokens(body?.duration, model);
   }
   return 0;
@@ -419,6 +450,7 @@ module.exports = {
   VIDEO_MULT_R2V,
   R2V_TOKENS_PER_SEC,
   r2vTokens,
+  materialRefTokens,
   PAID_ONLY_MODELS,
   isFreePlan,
   paidOnlyDenial,

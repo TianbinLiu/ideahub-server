@@ -38,6 +38,7 @@ const arkTransfer = require("../services/arkTransfer.service");
 const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
+const MaterialRefVideo = require("../models/MaterialRefVideo");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const { cloudinary } = require("../config/cloudinary");
 // 归属与「裁剪变换 URL」的形状判据只有一处（铁律六）
@@ -295,6 +296,29 @@ async function resolveR2v(req, res, next) {
         //   请求体里客户端说什么都不作数
         durationSec: Number(tpl.refVideo?.durationSec),
       };
+    } else if (url && (await MaterialRefVideo.exists({ url }))) {
+      // ── 分支三：已登记的**用户素材参考视频**（2026-08-28，工作流「自定义 =
+      //    多图 + 参考视频」那条路）────────────────────────────
+      // ★ 与模板两条分支的本质区别：它走的是 reference 子任务（不是 edit 复刻），
+      //   输出时长由用户选（3~10s），首/中/尾帧用 reference_image + 提示词点名。
+      //   参数钉子因此是**另一套**（见下面 material 那个分支），别把 edit 的钉子
+      //   套在它头上——duration:-1 在 reference 子任务上会推到 30s 上界（A7 实测），
+      //   那正是"按小价买大产出"的口子。
+      const mat = await MaterialRefVideo.findOne({ url }).select("_id userId durationSec publicId").lean();
+      // 素材**私有**：登记者本人才能拿它出片。别人拿到 URL 也不能蹭（与未发布模板同一条边界）
+      if (String(mat.userId) !== String(req.user._id)) {
+        return deny("这段素材视频是别人登记的，不能用它出片——当前请求未被受理，也没有扣费。");
+      }
+      verdict = {
+        kind: "material",
+        templateId: null, // 不是模板 —— 试炼追踪按空跳过（同分支二）
+        ownerId: String(mat.userId),
+        // 计价输入只读服务端登记值（register 时从 Cloudinary 写入），请求体说什么不作数
+        durationSec: Number(mat.durationSec),
+        sourcePublicId: mat.publicId,
+        // 输出时长 = 用户点的 duration（下面素材钉子会把它钉成 3..10 的有限数）
+        outputSec: Number(req.body?.duration),
+      };
     } else {
       // ── 分支二：本账号刚传、**尚未登记**的托管素材（白模化那一发的输入）──
       //
@@ -357,6 +381,26 @@ async function resolveR2v(req, res, next) {
       };
     }
 
+    if (verdict.kind === "material") {
+      // ★★ 素材参考（reference 子任务）的钉子 —— 与 edit 那套**分开**，各钉各的计价假设。
+      //   计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens）。
+      const dur = req.body?.duration;
+      if (req.body?.omni_reference_task_type !== undefined) {
+        return deny("素材参考出片不接受 omni_reference_task_type（那是白模复刻的参数）——当前请求未被受理，也没有扣费。");
+      }
+      if (!Number.isFinite(Number(dur)) || Number(dur) < 3 || Number(dur) > 10) {
+        // -1（智能时长）明确拒：reference 子任务上它会推到 30s 上界（A7 实测），报价对不上实扣
+        return deny("素材参考出片要指定 3~10 秒的时长（不收 -1 智能时长）——当前请求未被受理，也没有扣费。");
+      }
+      const resl = req.body?.resolution;
+      if (resl !== undefined && resl !== "720p") {
+        return deny("素材参考出片目前只支持 720p——当前请求未被受理，也没有扣费。");
+      }
+      const ratio = req.body?.ratio;
+      if (ratio !== undefined && !["16:9", "9:16", "adaptive"].includes(ratio)) {
+        return deny("素材参考出片的画幅只收 16:9 / 9:16 / adaptive——当前请求未被受理，也没有扣费。");
+      }
+    } else {
     // ★★ 把 r2v 的**生成参数钉死在计价假设上**，不符整句 400。
     //   计价是 (登记时长×2)×720p×24fps（tokens.r2vTokens），成立的前提是
     //   edit 子任务 + duration:-1（输出≈输入）+ 720p —— 这三件只有客户端
@@ -378,6 +422,7 @@ async function resolveR2v(req, res, next) {
     const ratio = req.body?.ratio;
     if (ratio !== undefined && ratio !== "adaptive") {
       return deny("白模出片的画幅跟随模板视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
+    }
     }
     // ★ generate_audio 同样要钉，但钉的是「**与该模型的支持情况一致**」，不是"必须 false"。
     //   2026-08-15 零成本探针实测：方舟在 r2v edit 路上真收这个参数（给非法值报的是

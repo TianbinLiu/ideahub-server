@@ -17,6 +17,7 @@ const {
 } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const BranchTemplate = require("../models/BranchTemplate");
+const MaterialRefVideo = require("../models/MaterialRefVideo");
 // 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
 const BlockoutJob = require("../models/BlockoutJob");
 // 归属判据只有一处（utils/templateVideoAsset），此前这里手写过一份 startsWith 前缀
@@ -418,6 +419,67 @@ router.post("/template-video/confirm", requireAuth, tplVideoConfirmLimit, async 
       bytes: meta.bytes,
       maxSizeBytes: MAX_TEMPLATE_VIDEO_BYTES,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /uploads/material-video/register —— 把一段**直传完成**的自有视频登记成
+ * 「素材参考视频」（工作流自定义 = 多图 + 参考视频那条路的合法来源）。
+ * body: { publicId } → { ok, url, durationSec }
+ *
+ * ★ 上传本身复用 /template-video/sign + 直传 + /confirm 那一整套（同一张票、同一个
+ *   归属判据 ownTemplateVideoPublicId、同一个"元数据以服务端向 Cloudinary 取回为准"）。
+ *   这里只负责**登记**：把服务端认定的 url + durationSec 写进 MaterialRefVideo，
+ *   resolveR2v 的分支三按 url 反查、按登记时长计价 —— 客户端在计价输入上没有话语权。
+ * ★ 时长窗口用 TEMPLATE_REF_RULES（方舟 r2v 输入窗口的唯一实现）：登记时就拒掉
+ *   出片必败的素材，别让用户到扣费那一步才撞英文 400。
+ * ★ 限流 5/分（同 confirm 的理由：每发打一次 Cloudinary Admin API，免费档全局 500/时）。
+ */
+const materialRegisterLimit = userRateLimit({ max: 5, windowMs: 60 * 1000, scope: "uploads:materialRegister" });
+router.post("/material-video/register", requireAuth, materialRegisterLimit, async (req, res, next) => {
+  try {
+    const raw = String(req.body?.publicId ?? "").slice(0, 300);
+    const publicId = ownTemplateVideoPublicId(raw, req.user._id.toString());
+    if (!publicId) {
+      return res.status(400).json({ ok: false, message: "这段视频不是本账号传的（或者地址被改过），不能登记为素材。" });
+    }
+    let resource;
+    try {
+      resource = await cloudinary.api.resource(publicId, { resource_type: "video", media_metadata: true });
+    } catch (e) {
+      const code = e?.error?.http_code ?? e?.http_code;
+      if (code === 404) {
+        return res.status(404).json({ ok: false, message: "没在服务器上找到这段视频——上传可能没真的完成，请重传后再登记。" });
+      }
+      console.error(`[uploads] 素材登记取资源失败 public_id=${publicId}:`, e?.message || e);
+      return res.status(502).json({ ok: false, message: "视频存储暂时取不到这段视频的信息，请稍后重试。" });
+    }
+    const meta = templateVideoMeta(resource);
+    const fmtIssue = templateVideoFormatIssue(resource, meta);
+    if (fmtIssue) return res.status(400).json({ ok: false, message: fmtIssue });
+    const d = Number(meta.duration);
+    if (!Number.isFinite(d) || d < TEMPLATE_REF_RULES.minSec || d > TEMPLATE_REF_RULES.maxSec) {
+      return res.status(400).json({
+        ok: false,
+        message: `参考视频时长要在 ${TEMPLATE_REF_RULES.minSec}~${TEMPLATE_REF_RULES.maxSec} 秒之间（这段约 ${Math.round(d * 10) / 10}s）——出片引擎收不了，剪一段再传。`,
+      });
+    }
+    const doc = await MaterialRefVideo.findOneAndUpdate(
+      { publicId: resource.public_id },
+      {
+        userId: req.user._id,
+        publicId: resource.public_id,
+        url: resource.secure_url,
+        durationSec: d,
+        bytes: meta.bytes,
+        width: meta.width,
+        height: meta.height,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+    res.json({ ok: true, url: doc.url, durationSec: doc.durationSec });
   } catch (err) {
     next(err);
   }

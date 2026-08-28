@@ -970,3 +970,85 @@ describe("跨仓 r2v 系数一致性（app 的报价 vs 服务端的结算）", 
     expect(r2vTokens(10, SEEDANCE_2_5)).toBeGreaterThan(segTokens(10, SEEDANCE_2_5));
   });
 });
+
+describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 参考视频，2026-08-28）", () => {
+  // ★ 与前两条分支的差别：reference 子任务（不是 edit）、输出时长用户选（3~10）、
+  //   计价 = (登记输入 + 输出)×720p 锚×2.8（tokens.materialRefTokens）。
+  //   参数钉子是素材专属那一套（omni 必须缺省、duration 必须 3~10 有限数）。
+  const MaterialRefVideo = require("../src/models/MaterialRefVideo");
+  let matUrl;
+
+  /** 素材参考的任务体 —— 形状 = App 自定义车道的真实请求 */
+  function matBody(url, extra = {}) {
+    return {
+      model: "doubao-seedance-2-5-260628",
+      content: [
+        { type: "text", text: "图片1是这段视频的第一帧画面，图片2是最后一帧画面。" },
+        { type: "video_url", role: "reference_video", video_url: { url } },
+        { type: "image_url", role: "reference_image", image_url: { url: "https://res.example/first.jpg" } },
+        { type: "image_url", role: "reference_image", image_url: { url: "https://res.example/last.jpg" } },
+      ],
+      duration: 5,
+      resolution: "720p",
+      ratio: "9:16",
+      ...extra,
+    };
+  }
+
+  beforeAll(async () => {
+    matUrl = "https://res.cloudinary.com/test/video/upload/v1/ideahub/template-videos/" + paidUserId + "-777.mp4";
+    await MaterialRefVideo.create({
+      userId: paidUserId,
+      publicId: `ideahub/template-videos/${paidUserId}-777`,
+      url: matUrl,
+      durationSec: 10,
+      bytes: 1_000_000,
+      width: 704,
+      height: 1248,
+    });
+  });
+
+  test("登记素材 + 合规参数 → 过闸并按 (10+5)×21600×2.8 扣费（501 = 无 key 走到 forward）", async () => {
+    const wallet = require("../src/services/tokenWallet.service");
+    const before = await wallet.getWallet(paidUserId);
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(matBody(matUrl));
+    // 没配 ARK key：闸门全过后 forward 才失败（与既有试炼用例同判法）——
+    // 且未受理的钱要原路退回（W2）
+    expect(res.status).toBe(501);
+    const after = await wallet.getWallet(paidUserId);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+    // 计价公式独立断言（与 app economy.materialRefCost 跨仓逐字相等）
+    const { materialRefTokens } = require("../src/config/tokens");
+    expect(materialRefTokens(10, 5, "doubao-seedance-2-5-260628")).toBe(Math.round((10 + 5) * 21_600 * 2.8));
+  });
+
+  test("别人的素材 → 400（素材私有，URL 泄了也蹭不了）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth())
+      .send(matBody(matUrl));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(res.body.message).toMatch(/别人/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["带 omni_reference_task_type（那是白模的参数）", { omni_reference_task_type: "edit" }],
+    ["duration=-1（reference 会推到 30s 上界）", { duration: -1 }],
+    ["duration=30（超出 3~10）", { duration: 30 }],
+    ["resolution=1080p", { resolution: "1080p" }],
+    ["ratio=1:1", { ratio: "1:1" }],
+  ])("素材参考参数越出计价假设（%s）→ 400 不出网", async (_n, extra) => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(matBody(matUrl, extra));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
