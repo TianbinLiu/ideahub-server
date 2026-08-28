@@ -13,8 +13,8 @@ const {
   uploadLive2dBundle,
   uploadMyLive2dBundle,
 } = require("../controllers/components.controller");
-const { deactivateAccount, getMyPoints, listMyPointsLedger } = require("../controllers/me.controller");
-const { deactivateBody } = require("../schemas/me.schemas");
+const { deactivateAccount, getMyPoints, listMyPointsLedger, acceptTerms } = require("../controllers/me.controller");
+const { deactivateBody, acceptTermsBody } = require("../schemas/me.schemas");
 const { listBlockedUserIds, toIdString } = require("../utils/blocking");
 
 router.get("/likes", requireAuth, async (req, res, next) => {
@@ -147,6 +147,9 @@ router.put("/profile", requireAuth, async (req, res, next) => {
 
 // POST /api/me/deactivate - 注销账号（软删除：打标记 + 使所有旧 token 失效）
 router.post("/deactivate", requireAuth, validate({ body: deactivateBody }), deactivateAccount);
+
+// POST /api/me/accept-terms - 记录同意的协议版本（App 端点"同意"后上报，读走 /api/auth/me）
+router.post("/accept-terms", requireAuth, validate({ body: acceptTermsBody }), acceptTerms);
 
 // ── 虚拟点数（★不是真钱：无现金价值，不可提现/兑换）──
 // GET /api/me/points        - 当前余额

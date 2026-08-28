@@ -56,6 +56,13 @@ const userSchema = new mongoose.Schema(
 
     avatarUrl: { type: String, default: "" },
 
+    // 用户协议同意记录（2026-08-28 App 侧上线协议链路时加）。
+    // ★ 服务端只存不判：值是 App 端 data/agreements 的 TERMS_UPDATED（形如 "2026-08-28"），
+    //   "要不要重新弹"由客户端拿它对自己当前的版本；这里是合规留痕（谁、哪版、何时）。
+    //   缺省空串 = 没同意过（存量用户），客户端会视为需要补签——判否定，别判相等。
+    termsAcceptedVersion: { type: String, default: "" },
+    termsAcceptedAt: { type: Date, default: null },
+
     joinedGroupSlugs: { type: [String], default: [] },
 
     activeWorkshopTemplate: { type: mongoose.Schema.Types.ObjectId, ref: "WorkshopTemplate", default: null },
