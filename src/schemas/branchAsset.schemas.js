@@ -108,6 +108,10 @@ const cardItem = z
     //   但发布/安装时会被 shareableModelUrl() 剥掉——见 controller。
     modelUrl: z.string().trim().max(2000).optional().default(""),
     genPrompt: z.string().trim().max(4000).optional().default(""),
+    // ★ 固定身份句（2026-08-28，客户端出片提示词用：名字+2~3个不变的视觉特征，≤60字，
+    //   上限放宽到 200 兜住旧客户端塞长文）。不声明就会被 z.object strip 掉——
+    //   与 genPrompt 当年"发得出、存不下"同一个坑，所以这里必须有名字。
+    idLine: z.string().trim().max(200).optional().default(""),
     // ★ 真人声明（客户端圈选提取时用户勾的，肖像同意责任在协议那一步压给了用户）：
     //   真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
     //   缺省 = 老客户端/老卡 = 非真人（读侧判否定）——所以**不给 default**，

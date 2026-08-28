@@ -29,6 +29,10 @@ const branchCardSchema = new mongoose.Schema(
     modelUrl: { type: String, default: "" },
     /** 铸卡时的完整生成提示词（卡片详情页的「生成蓝图」） */
     genPrompt: { type: String, default: "" },
+    /** 固定身份句（2026-08-28）：≤60 字「名字+2~3个不变的视觉特征」，客户端出片提示词
+     *  直接用它（业界通行做法：长设定不进视频 prompt）。strict 模式下漏声明 = 落库时
+     *  被剥掉且零报错（modelUrl/genPrompt 的旧伤），所以必须有名字 */
+    idLine: { type: String, default: "", trim: true, maxlength: 200 },
     /** 画面里是真实人物——用户在圈选提取时自己勾的声明（像不像真人机器判不准，只能
      *  让当事人表态）。真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
      *  缺省 false = 老卡/未声明 = 非真人（客户端读侧判否定，见 app 仓 types.Card.realPerson）。

@@ -24,6 +24,9 @@ const snapshotCardSchema = new mongoose.Schema(
     //   modelUrl 只可能是 http(s)（发布时 shareableModelUrl 已经剥过本地指针）。
     modelUrl: { type: String, default: "" },
     genPrompt: { type: String, default: "" },
+    /** 固定身份句（与 BranchCard.idLine 同批，2026-08-28）。快照漏声明的后果同上：
+     *  随卡组装走的卡出片时退回"名字+简介"，形象锚定变弱且看不出为什么 */
+    idLine: { type: String, default: "", trim: true, maxlength: 200 },
     /** 真人声明。★ 快照里漏声明的后果：真人卡随卡组装走后变回"非真人"，出片档位
      *  分流静默失效——审核该严的没严，直到供应商拒单才暴露，而那时用户看到的只是
      *  "别人的卡组出片失败"，不会怀疑是装的时候掉了一个布尔 */

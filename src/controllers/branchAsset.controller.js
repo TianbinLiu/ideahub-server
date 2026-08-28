@@ -132,6 +132,7 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     modelUrl: doc.modelUrl || "",
     genPrompt: doc.genPrompt || "",
+    idLine: doc.idLine || "",
     // 真人声明：老文档没有这个字段 → false（与"声明过不是"同义，读侧判否定）
     realPerson: doc.realPerson === true,
     // ★ 老卡这里是空数组。**不在服务端补"拿 cover 当唯一一张图"** —— 那份归一
@@ -337,6 +338,7 @@ async function addCards(req, res, next) {
         //   自己那份记录的一部分）；发布/安装时才由 shareableModelUrl 剥掉。
         modelUrl: typeof raw.modelUrl === "string" ? raw.modelUrl.slice(0, 2000) : "",
         genPrompt: typeof raw.genPrompt === "string" ? raw.genPrompt.slice(0, 4000) : "",
+        idLine: typeof raw.idLine === "string" ? raw.idLine.slice(0, 200) : "",
         // 真人声明只认布尔 true：老客户端不发（undefined → false），怪值不当真。
         // 漏在这里 = zod 放行了、入库文档逐字段重建时剥掉，零报错（modelUrl 的老坑）
         realPerson: raw.realPerson === true,
@@ -602,6 +604,8 @@ async function publishDeck(req, res, next) {
         // 本地指针对别人本来就没有任何意义，剥掉它不会少给用户任何东西。
         modelUrl: shareableModelUrl(c.modelUrl),
         genPrompt: c.genPrompt || "",
+        // 身份句跟着快照走：掉了它，装走的人出片时形象锚定退回"名字+简介"
+        idLine: c.idLine || "",
         // 真人声明必须跟着快照走：掉了它，装走的人出片时档位分流按"非真人"放行
         realPerson: c.realPerson === true,
         // 参考图必须跟着快照走：少了它，装走的人炼出来的人物就不是同一个人
@@ -738,6 +742,7 @@ async function installDeck(req, res, next) {
                 //   剥掉是唯一能做的事 —— 拒绝安装只会让用户装不了一套他没参与制作的卡组。
                 modelUrl: shareableModelUrl(c.modelUrl),
                 genPrompt: c.genPrompt || "",
+                idLine: c.idLine || "", // 老快照缺省空串，客户端读侧兜底成"名字+简介"
                 // 老快照（本字段上线前发布的）没有它 → false，与"非真人"同义
                 realPerson: c.realPerson === true,
                 views: shareableViews(c.views),
@@ -842,6 +847,7 @@ function toSharedCardPayload(doc, stats = EMPTY_STATS) {
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     modelUrl: shareableModelUrl(doc.modelUrl),
     genPrompt: doc.genPrompt || "",
+    idLine: doc.idLine || "", // 身份句随分享走：装走的人出片要靠它锚形象
     // 真人声明**不剥**：它不是隐私字段，是内容属性——逛广场的人有权在装之前知道
     // "这张卡出片要过真人审核"，装回去的档位分流也靠它
     realPerson: doc.realPerson === true,
@@ -1013,6 +1019,7 @@ async function installCard(req, res, next) {
           // ★ 设备本地指针与第三方素材都在这里被拦下：别人拿到的必须是他真能用的东西
           modelUrl: shareableModelUrl(src.modelUrl),
           genPrompt: src.genPrompt || "",
+          idLine: src.idLine || "", // 身份句跟着装（同 genPrompt 一批的搬运点）
           // 真人声明跟着装：装走的人出片同样要按真人档分流
           realPerson: src.realPerson === true,
           views: shareableViews(src.views),
