@@ -19,13 +19,13 @@ const {
 } = require("../services/arkOpenApi.service");
 
 /**
- * 邀约 H5 的前缀（被拍者扫码打开的那一页，在火山域名下）。
- * ★ 抓包见到的是 `https://ark.volcengine.com/region:cn-beijing/mobile/livenees-face-manage/…`
- *   （原文拼写 livenees，非笔误）。⚠ **UUID 拼进 query 的确切参数名尚未实证** ——
- *   下面用 `?uuid=` 是合理猜测，接 UI 时必须用一个真 UUID 在真机上打开核对
- *   （docs/backlog.md §1.6 的 TODO）。猜错的表现是"扫了码打开是空白页"，不报错。
+ * 邀约 H5 的完整前缀（被拍者扫码打开的那一页，在火山域名下）。
+ * ★ 2026-08-27 从控制台生成的真二维码里抠出并核对：
+ *   `https://ark.volcengine.com/region:cn-beijing/mobile/livenees-face-manage/index?uuid=<UUID>`
+ *   —— 结尾是 **`/index`**（此前少了这段，扫了会是空白页；原文拼写 livenees 非笔误），
+ *   query 参数名确实是 `uuid`。这两点都对着控制台真链接核过。
  */
-const INVITE_H5_PREFIX = "https://ark.volcengine.com/region:cn-beijing/mobile/livenees-face-manage/";
+const INVITE_H5_PREFIX = "https://ark.volcengine.com/region:cn-beijing/mobile/livenees-face-manage/index";
 
 /** 邀约有效期上限。★ 控制台默认给到 1 年，这里也放到 366 天，不做更严的限制 */
 const MAX_VALIDITY_DAYS = 366;
@@ -66,7 +66,7 @@ router.post("/portrait/invite", requireAuth, validate({ body: inviteBody }), asy
     if (!uuid) {
       return res.status(502).json({ ok: false, code: "NO_UUID", message: "方舟没有返回 UUID", requestId: r.requestId });
     }
-    // ⚠ url 的 query 参数名待真机核对（见 INVITE_H5_PREFIX 的 ★）
+    // url 格式已对着控制台真二维码核对（见 INVITE_H5_PREFIX 的 ★）
     res.json({ ok: true, uuid, url: `${INVITE_H5_PREFIX}?uuid=${encodeURIComponent(uuid)}`, startSec, endSec });
   } catch (err) {
     next(err);
