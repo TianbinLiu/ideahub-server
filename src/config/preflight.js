@@ -33,6 +33,15 @@ function collectConfigProblems(env = process.env) {
     problems.push(`QQ 登录只配了一半（${qqId ? "有 QQ_APP_ID 缺 QQ_APP_KEY" : "有 QQ_APP_KEY 缺 QQ_APP_ID"}）`);
   }
 
+  // 火山 AK/SK（真人肖像授权 OpenAPI）也是可选特性——不配就整个关掉（端点 503）。
+  // 但**半配**要报出来：只填一个，签名一定失败，而 app 里"扫码授权"入口照常亮着
+  // （它只看端点在不在），用户点下去才拿到 502。同 QQ 那条的"配错了但能跑起来"。
+  const volcAk = env.VOLC_AK || "";
+  const volcSk = env.VOLC_SK || "";
+  if (Boolean(volcAk) !== Boolean(volcSk)) {
+    problems.push(`火山 AK/SK 只配了一半（${volcAk ? "有 VOLC_AK 缺 VOLC_SK" : "有 VOLC_SK 缺 VOLC_AK"}）—— 真人肖像授权会签名失败`);
+  }
+
   if (isProd) {
     if (!env.OTP_PEPPER || env.OTP_PEPPER === "dev_pepper_change_me") {
       problems.push("OTP_PEPPER 未设置或仍是默认值（6 位验证码的 sha256 可离线暴破）");

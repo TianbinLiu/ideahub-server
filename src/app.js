@@ -174,6 +174,10 @@ app.use("/api/tts", require("./routes/tts.routes"));
 // 原来是 app 仓 vite dev 的代理，APK 里不存在，而 Capacitor 对未命中路径回 200+index.html，
 // 表现成"第 1 段生成失败：Unexpected token '<'"。白名单转发，不是通用反向代理。
 app.use("/api/ark", require("./routes/ark.routes"));
+// 真人肖像授权（素材库）：生成邀约二维码 / 查授权状态。同一个 /api/ark base，
+// 路径全在 /portrait 下，与代理不重叠。走 AK/SK 的 OpenAPI（arkOpenApi.service），
+// 不烧 token、不进钱包 —— 与 /api/ark 代理是两套认证，别混。
+app.use("/api/ark", require("./routes/arkPortrait.routes"));
 // 真人视频档的两家供应商代理（MiniMax 海螺 / Runway）。当前是**脚手架**：key 还没申请，
 // 未配时全部 501，App 据此把真人档置灰。与 /api/ark 同款纪律：白名单转发、密钥只在
 // 服务端；★ 接上钱包扣费之前不要在生产配真 key（见两个文件头）。Runway 的
