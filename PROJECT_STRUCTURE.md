@@ -1607,7 +1607,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `authOtp.routes.js` - OTP验证
 - `oauth.routes.js` - OAuth（登录 + 显式第三方账号绑定/解绑；不再按 email 自动并号）
 - `ideas.routes.js` - 创意
-- `me.routes.js` - 个人中心（含 `GET /points` 余额、`GET /points/ledger` 点数流水）
+- `me.routes.js` - 个人中心（含 `GET /points` 余额、`GET /points/ledger` 点数流水、
+  `POST /accept-terms` 用户协议同意留痕——写 `User.termsAcceptedVersion/At`，
+  读走 `GET /api/auth/me`；契约细节见 app 仓 `docs/api-contract.md`「用户协议同意留痕」）
 - `company.routes.js` - 公司
 - `messages.routes.js` - 私信与会话请求
 - `notifications.routes.js` - 通知

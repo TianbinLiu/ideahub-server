@@ -95,4 +95,23 @@ async function listMyPointsLedger(req, res, next) {
   }
 }
 
-module.exports = { deactivateAccount, getMyPoints, listMyPointsLedger };
+// POST /api/me/accept-terms —— 记录"这个账号同意了哪一版用户协议"（合规留痕）。
+//
+// ★ 幂等：同版本重复提交只是刷新时间戳，无副作用——App 端的对账自愈
+//   （data/account.adoptUser → reconcileTermsWithServer）可能多发，多发无害。
+// ★ 不校验版本内容：协议正文与版本号都由客户端仓维护（app 的 data/agreements），
+//   服务端只负责"谁、哪版、何时"。长度由 acceptTermsBody 限住。
+async function acceptTerms(req, res, next) {
+  try {
+    const { version } = req.body;
+    await User.updateOne(
+      { _id: req.user._id },
+      { $set: { termsAcceptedVersion: version, termsAcceptedAt: new Date() } }
+    );
+    res.json({ ok: true, termsAcceptedVersion: version });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { deactivateAccount, getMyPoints, listMyPointsLedger, acceptTerms };

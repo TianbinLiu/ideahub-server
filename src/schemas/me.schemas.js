@@ -9,4 +9,10 @@ const deactivateBody = z.object({
   confirmUsername: z.string().min(1).max(200),
 });
 
-module.exports = { deactivateBody };
+// 同意协议 body：版本串就是 App 端 data/agreements 的 TERMS_UPDATED（日期形）。
+// 限长只为防灌数据；不校验格式——协议正文与版本号都归客户端仓维护，服务端只留痕。
+const acceptTermsBody = z.object({
+  version: z.string().trim().min(1).max(32),
+});
+
+module.exports = { deactivateBody, acceptTermsBody };

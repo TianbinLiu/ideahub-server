@@ -18,6 +18,9 @@ function serializeAuthUser(user) {
     role: user.role,
     avatarUrl: user.avatarUrl || "",
     hasPassword: Boolean(user.passwordHash),
+    // 同意到哪一版用户协议（空串 = 没同意过）。App 端登录/冷启动拿它对账：
+    // 服务端已有当前版本就不再弹补签门（POST /api/me/accept-terms 是写入口）
+    termsAcceptedVersion: user.termsAcceptedVersion || "",
   };
 }
 
@@ -188,7 +191,7 @@ async function login(req, res, next) {
 
 async function me(req, res, next) {
   try {
-    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash termsAcceptedVersion");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
@@ -214,7 +217,7 @@ async function setPassword(req, res, next) {
       });
     }
 
-    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash termsAcceptedVersion");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
@@ -261,7 +264,7 @@ async function changePassword(req, res, next) {
       });
     }
 
-    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash");
+    const user = await User.findById(req.user._id).select("_id username email role avatarUrl passwordHash termsAcceptedVersion");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
