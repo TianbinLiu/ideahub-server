@@ -196,7 +196,17 @@ const LIVENESS_GROUP_TYPE = "LivenessFace";
  * @param {number} [o.pageSize] 默认 50
  *
  * ★ 入参三处都是必需的，少一个就 400：`Filter.GroupType`、`PageNumber`、（`PageSize` 不给
- *   会走默认 10，我们显式给）。`Filter.GroupId` 实测生效（单数形式）。
+ *   会走默认 10，我们显式给）。
+ *
+ * ⚠⚠ **`ListAssets` 对不认识的 `Filter` 键直接静默忽略**（实测 `AssetType:"__bogus__"` /
+ *   `Status:"__bogus__"` 都照样 200 + 全量返回，不报错）。⇒ 按组过滤**只有复数
+ *   `GroupIds:[…]` 生效，单数 `GroupId` 是被忽略的**：
+ *     GroupType 全量 → 1 条；`GroupId`=空组 → **仍是 1 条**（被忽略）；
+ *     `GroupIds`=[空组] → 0 条；`GroupIds`=[有料组] → 1 条。
+ *   这条一开始写错过（用了单数），而它**零报错**：表现是"按某个组查"悄悄返回了**所有组**
+ *   的素材 —— 拿去自动绑就会把别人那份肖像素材绑到这张卡上。
+ *   ⇒ 以后给这个 Filter 加任何新键，都必须拿**反例数据**证一遍（用一个"结果应该为空"的
+ *   条件去查），别拿"查到了预期那条"当证据 —— 生效与被忽略在那种测法下结果一模一样。
  * ★ 回来的 `Items[] = { Id:"asset-…", Name, URL, AssetType:"Image", GroupId, Status,
  *   Error?:{Code,Message}, Moderation:{Strategy}, CreateTime, UpdateTime, ProjectName }`。
  *   ⚠⚠ `URL` 是带签名的 TOS 直链（`X-Tos-Expires=41400` ≈ 11.5 小时），**别落库、别外传**：
@@ -207,7 +217,8 @@ const LIVENESS_GROUP_TYPE = "LivenessFace";
  */
 async function listPortraitAssets(o = {}) {
   const filter = { GroupType: LIVENESS_GROUP_TYPE };
-  if (o.groupId) filter.GroupId = o.groupId;
+  // 复数形式，别改回单数：单数被静默忽略 = 悄悄返回所有组（见上 ⚠⚠）
+  if (o.groupId) filter.GroupIds = [o.groupId];
   return callOpenApi("ListAssets", { Filter: filter, PageNumber: 1, PageSize: o.pageSize || 50 });
 }
 

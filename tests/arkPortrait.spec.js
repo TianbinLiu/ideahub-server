@@ -140,14 +140,17 @@ describe("真人肖像授权端点 · /api/ark/portrait", () => {
         PageSize: 50,
       });
 
-      // 带 groupId 时进 Filter.GroupId（单数——实测生效的是这个形式）
+      // ⚠⚠ 带 groupId 时必须走**复数** GroupIds：单数 GroupId 会被方舟**静默忽略**
+      //   （拿一个空组去查、结果仍返回别的组那份素材，实证过）。写成单数的后果是
+      //   "按这个组查"悄悄返回了所有组 —— 自动绑就可能把别人那份肖像素材绑到卡上，
+      //   全程零报错。这一条钉死在这里，别再改回单数。
       await request(app)
         .get("/api/ark/portrait/assets?groupId=group-20260828131552-jlbz5")
         .set("Authorization", `Bearer ${token}`)
         .expect(200);
       expect(JSON.parse(captured.init.body).Filter).toEqual({
         GroupType: "LivenessFace",
-        GroupId: "group-20260828131552-jlbz5",
+        GroupIds: ["group-20260828131552-jlbz5"],
       });
     } finally {
       global.fetch = realFetch;
