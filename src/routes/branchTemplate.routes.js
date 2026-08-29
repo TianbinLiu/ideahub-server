@@ -22,6 +22,7 @@ const {
   blockoutizeBody,
   finishBlockoutizeBody,
   patchRolesBody,
+  setCategoryBody,
 } = require("../schemas/branchTemplate.schemas");
 const BranchTemplate = require("../models/BranchTemplate");
 // 白模 V2 的**取件凭据**（两阶段的分界线）。为什么非拆不可见该文件的文件头
@@ -135,6 +136,7 @@ function toTemplatePayload(doc, viewer) {
     authorName: doc.authorName || "",
     title: doc.title || "",
     intro: doc.intro || "",
+    category: doc.category || "", // 市场人话分类；空串 = 未分类（存量）
     coverUrl: doc.coverUrl || "",
     recipe: {
       styleHint: doc.recipe?.styleHint || "",
@@ -1755,6 +1757,30 @@ router.patch("/templates/:id/unpublish", requireAuth, async (req, res, next) => 
     next(err);
   }
 });
+
+// ── 市场人话分类（2026-08-29）─────────────────────────────────────────
+// PATCH /api/branch/templates/:id/category   body: { category: "story" | … | "" }
+// 分类只有这一条写路（app 仓详情页作者工作台）：四条建模板的车道一条不动，
+// 存量老模板也靠它补分类。空串 = 清掉。发布状态不设门槛——分类是陈列信息不是内容变更。
+router.patch(
+  "/templates/:id/category",
+  requireAuth,
+  validate({ body: setCategoryBody }),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      if (!mongoose.isValidObjectId(id)) invalidId("Invalid template id");
+      const doc = await BranchTemplate.findById(id);
+      if (!doc) notFound("Template not found");
+      if (String(doc.ownerId) !== String(req.user._id)) forbidden("Forbidden");
+      doc.category = req.body.category;
+      await doc.save();
+      res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // ── 角色位标记的核对（白模 V2）───────────────────────────────────────
 //

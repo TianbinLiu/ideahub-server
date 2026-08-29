@@ -156,6 +156,10 @@ const branchTemplateSchema = new mongoose.Schema(
     authorName: { type: String, default: "", trim: true, maxlength: 120 },
     title: { type: String, required: true, trim: true, maxlength: 120 },
     intro: { type: String, default: "", trim: true, maxlength: 2000 },
+    /** 市场人话分类（2026-08-29，app 仓 types.TPL_CATEGORIES 的 id：story/emotion/fun/
+     *  morph/festival/commerce）。存宽松字符串不 enum：客户端加新分类不该让老服务端 400。
+     *  空串 = 未分类（存量模板全是），作者在详情页工作台随时可补（PATCH /:id/category） */
+    category: { type: String, default: "", trim: true, maxlength: 20 },
     /** 市场卡片封面。https URL（发布链路里由 /api/uploads/image 转存），不收 dataURL——
      *  dataURL 会让 shared 列表一次回包几十 MB（与 BranchDeck.cover 同一条教训） */
     coverUrl: { type: String, default: "", trim: true, maxlength: 2000 },

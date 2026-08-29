@@ -204,4 +204,10 @@ const patchRolesBody = z.object({
   roles: z.array(roleItemBody).max(BLOCKOUT_ROLE_MAX),
 });
 
-module.exports = { createTemplateBody, blockoutizeBody, finishBlockoutizeBody, patchRolesBody, HTTPS_RE };
+// 市场人话分类（PATCH /templates/:id/category）。宽松字符串不 enum：分类表活在客户端
+// （app 仓 types.TPL_CATEGORIES），加新分类不该要求先发服务端。空串 = 清掉分类。
+const setCategoryBody = z.object({
+  category: z.string().trim().max(20),
+});
+
+module.exports = { createTemplateBody, blockoutizeBody, finishBlockoutizeBody, patchRolesBody, setCategoryBody, HTTPS_RE };
