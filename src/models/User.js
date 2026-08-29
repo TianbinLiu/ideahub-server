@@ -58,6 +58,12 @@ const userSchema = new mongoose.Schema(
 
     avatarUrl: { type: String, default: "" },
 
+    // ✅ 公开数字 UID（个人页展示的那个）。9 位随机数，出处只有 utils/uid.js。
+    // ★ sparse+unique 且**绝不给 default**——与 phone 同一条理由：给 default 会让
+    //   所有存量用户拿到同一个值互相撞唯一索引；「有没有这个字段」还是回填的判据。
+    // ★ 是随机不是顺序：顺序号会暴露注册先后并允许遍历爬名单（见 utils/uid.js 头注）。
+    uid: { type: Number, unique: true, sparse: true },
+
     // 用户协议同意记录（2026-08-28 App 侧上线协议链路时加）。
     // ★ 服务端只存不判：值是 App 端 data/agreements 的 TERMS_UPDATED（形如 "2026-08-28"），
     //   "要不要重新弹"由客户端拿它对自己当前的版本；这里是合规留痕（谁、哪版、何时）。
@@ -172,6 +178,15 @@ const userSchema = new mongoose.Schema(
 //   为什么不去动 `username_1`：那条是 mongoose 从 `unique: true` 自动建的，
 //   动它要连 schema 一起改，而两条 unique 索引（一条区分大小写、一条不区分）
 //   同时存在是合法的，后者更严，前者自然就成了它的子集。少动一处是一处。
+// ★ uid 在 pre-save 里补，而不是在每条建号路径里各写一遍：邮箱/手机/Google/GitHub/
+//   QQ/微信共七处 User.create，漏一处零报错（"新 provider 没搬全"那族坑）。
+//   钩子只动 isNew 且还没有 uid 的文档；生成与查重的实现在 utils/uid.js（一处实现）。
+userSchema.pre("save", async function assignUid() {
+  if (!this.isNew || this.uid != null) return;
+  const { generateUid } = require("../utils/uid");
+  this.uid = await generateUid(async (uid) => !!(await this.constructor.exists({ uid })));
+});
+
 userSchema.index({ username: 1 }, { name: "username_ci", collation: CI_COLLATION, unique: true });
 
 // ★ displayName 的同款索引，服务的是**找人搜索里的"精确档"**

@@ -37,7 +37,7 @@ const { isAdmin } = require("../utils/roles");
 // 封禁判据的查询侧写法（statsBanned 用）。文档侧判断在 middleware/auth，这里用不上
 const { BANNED_FILTER } = require("../utils/banned");
 
-const AUTHOR_FIELDS = "_id username displayName avatarUrl";
+const AUTHOR_FIELDS = "_id username displayName avatarUrl uid";
 // 评论里 @ 到的人。★ 与 AUTHOR_FIELDS 同一组字段：提及在客户端也是渲染成
 // 「头像 + 名字」的小挂件，缺 avatarUrl 就只能画字母底。
 const MENTION_USER_FIELDS = AUTHOR_FIELDS;

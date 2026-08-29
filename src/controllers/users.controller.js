@@ -40,7 +40,7 @@ function searchRank(user, qLower) {
 }
 
 /** 搜索结果的字段投影：回包要什么就取什么，别把整条 User（含 passwordHash）拉进内存 */
-const SEARCH_FIELDS = "_id username displayName avatarUrl";
+const SEARCH_FIELDS = "_id username displayName avatarUrl uid";
 
 /**
  * 单次搜索允许 mongod 花的时间上限。
@@ -113,6 +113,12 @@ async function searchUsers(req, res, next) {
     //   **根本不会被取回来** —— 而 searchRank 只能给取回来的行排序。
     //   表现是：你按朋友的账号名精确搜索，结果里全是冒名的人，朋友查无此人。
     //   username 是唯一索引，那一发最多回一行，代价可以忽略。
+    // ★ 9 位纯数字先按 UID 精确找一发（唯一索引等值，最多一行）。
+    //   不排他：数字也可能真是某人用户名/昵称的一段，两路结果照常合并去重
+    const uidHit = /^\d{9}$/.test(raw)
+      ? await User.findOne({ uid: Number(raw) }).select(SEARCH_FIELDS).maxTimeMS(SEARCH_MAX_TIME_MS).lean()
+      : null;
+
     const [fuzzy, exactName, exactDisplay] = await Promise.all([
       User.find({ $or: [{ username: re }, { displayName: re }] })
         .select(SEARCH_FIELDS)
@@ -137,7 +143,7 @@ async function searchUsers(req, res, next) {
     // 真正的名次仍然由 searchRank 决定（这里不许悄悄替代排序规则）。
     const users = [];
     const seenIds = new Set();
-    for (const u of [...(exactName ? [exactName] : []), ...exactDisplay, ...fuzzy]) {
+    for (const u of [...(uidHit ? [uidHit] : []), ...(exactName ? [exactName] : []), ...exactDisplay, ...fuzzy]) {
       const key = String(u._id);
       if (seenIds.has(key)) continue;
       seenIds.add(key);
@@ -158,6 +164,7 @@ async function searchUsers(req, res, next) {
         username: u.username || "",
         displayName: u.displayName || "",
         avatarUrl: u.avatarUrl || "",
+        uid: u.uid ?? null,
       }));
 
     res.json({ ok: true, users: ranked });
@@ -192,7 +199,7 @@ async function getUserProfile(req, res, next) {
       await ensureUsersVisibleOrThrow(currentUserId, id);
     }
 
-    const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt');
+    const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt uid');
     if (!user) {
       throw new AppError('User not found', 404, 'USER_NOT_FOUND');
     }
@@ -213,6 +220,7 @@ async function getUserProfile(req, res, next) {
       user: {
         _id: user._id,
         username: user.username,
+        uid: user.uid ?? null,
         displayName: user.displayName,
         bio: user.bio,
         avatarUrl: user.avatarUrl,

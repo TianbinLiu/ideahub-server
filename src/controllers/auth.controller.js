@@ -14,6 +14,7 @@ function serializeAuthUser(user) {
   return {
     _id: user._id,
     username: user.username,
+    uid: user.uid ?? null,
     email: user.email,
     role: user.role,
     avatarUrl: user.avatarUrl || "",
