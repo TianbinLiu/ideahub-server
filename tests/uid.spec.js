@@ -88,3 +88,24 @@ test("公开个人资料回包带 uid", async () => {
   const payload = res.body.user ?? res.body;
   expect(payload.uid).toBe(u.uid);
 });
+
+test("GET /api/auth/me 回包带 uid（App 冷启动走的就是这条）", async () => {
+  // ★ 回归钉：serializeAuthUser 早就会回 uid，但 /me 是先 .select(...) 再喂给它 ——
+  //   select 串里漏掉 uid 的表现是「登录当场有、冷启动后个人页那行 UID 消失」，零报错。
+  //   2026-08-29 真机上就是这么发现的。
+  const u = await mkUser("me");
+  const { signToken } = require("../src/utils/jwt");
+  const token = signToken(u);
+  const res = await request(app).get("/api/auth/me").set("Authorization", `Bearer ${token}`);
+  expect(res.status).toBe(200);
+  expect(res.body.user.uid).toBe(u.uid);
+});
+
+test("GET /api/me/profile 回包带 uid（hydrateProfile 合并的另一半）", async () => {
+  const u = await mkUser("prof2");
+  const { signToken } = require("../src/utils/jwt");
+  const token = signToken(u);
+  const res = await request(app).get("/api/me/profile").set("Authorization", `Bearer ${token}`);
+  expect(res.status).toBe(200);
+  expect(res.body.user.uid).toBe(u.uid);
+});

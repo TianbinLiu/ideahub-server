@@ -110,7 +110,7 @@ router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, ne
 router.get("/profile", requireAuth, async (req, res, next) => {
   try {
     const user = await User.findById(req.user._id).select(
-      "username displayName bio avatarUrl role createdAt"
+      "username uid displayName bio avatarUrl role createdAt"
     );
     if (!user) {
       res.status(404);

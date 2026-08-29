@@ -385,8 +385,12 @@ async function resolveR2v(req, res, next) {
       // ★★ 素材参考（reference 子任务）的钉子 —— 与 edit 那套**分开**，各钉各的计价假设。
       //   计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens）。
       const dur = req.body?.duration;
-      if (req.body?.omni_reference_task_type !== undefined) {
-        return deny("素材参考出片不接受 omni_reference_task_type（那是白模复刻的参数）——当前请求未被受理，也没有扣费。");
+      // 收 undefined 或显式 "reference"：app 对 2.5 显式发 reference（auto 判错是**异步**
+      // 失败且不退费，显式判错是提交时同步 400 —— arkClient 那行 ★ 的同一条理由）。
+      // edit 一律拒：那是白模复刻的计价形状（输出跟随输入），揣着素材票走 edit 就是错价。
+      const omni = req.body?.omni_reference_task_type;
+      if (omni !== undefined && omni !== "reference") {
+        return deny("素材参考出片只走 reference 子任务——当前请求未被受理，也没有扣费。");
       }
       if (!Number.isFinite(Number(dur)) || Number(dur) < 3 || Number(dur) > 10) {
         // -1（智能时长）明确拒：reference 子任务上它会推到 30s 上界（A7 实测），报价对不上实扣
