@@ -32,6 +32,11 @@ function collectConfigProblems(env = process.env) {
   if (Boolean(qqId) !== Boolean(qqKey)) {
     problems.push(`QQ 登录只配了一半（${qqId ? "有 QQ_APP_ID 缺 QQ_APP_KEY" : "有 QQ_APP_KEY 缺 QQ_APP_ID"}）`);
   }
+  const wxId = env.WECHAT_APP_ID || "";
+  const wxSecret = env.WECHAT_APP_SECRET || "";
+  if (Boolean(wxId) !== Boolean(wxSecret)) {
+    problems.push(`微信登录只配了一半（${wxId ? "有 WECHAT_APP_ID 缺 WECHAT_APP_SECRET" : "有 WECHAT_APP_SECRET 缺 WECHAT_APP_ID"}）`);
+  }
 
   // 火山 AK/SK（真人肖像授权 OpenAPI）也是可选特性——不配就整个关掉（端点 503）。
   // 但**半配**要报出来：只填一个，签名一定失败，而 app 里"扫码授权"入口照常亮着

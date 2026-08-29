@@ -52,6 +52,8 @@ const userSchema = new mongoose.Schema(
       //   所以换 AppID 等于所有 QQ 用户失联 —— 换之前先想清楚怎么迁移。
       //   （跨应用认同一个人要用 unionid，那需要额外申请，我们没开。）
       qq: { type: String, default: "" },
+      // 微信：unionid 优先、openid 兜底（wechatOauth.service 文件头有取舍说明）
+      wechat: { type: String, default: "" },
     },
 
     avatarUrl: { type: String, default: "" },
