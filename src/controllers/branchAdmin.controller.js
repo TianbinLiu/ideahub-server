@@ -19,6 +19,10 @@ const BranchCommentLike = require("../models/BranchCommentLike");
 const BranchLike = require("../models/BranchLike");
 const BranchDanmaku = require("../models/BranchDanmaku");
 const BranchCard = require("../models/BranchCard");
+const BranchTemplate = require("../models/BranchTemplate");
+const BranchTemplateTrial = require("../models/BranchTemplateTrial");
+const PendingAssetPurge = require("../models/PendingAssetPurge");
+const { ownedRecyclableAsset, RECYCLABLE_FOLDERS } = require("../utils/templateVideoAsset");
 const BranchDeck = require("../models/BranchDeck");
 const BranchAssetLike = require("../models/BranchAssetLike");
 const BranchAssetStat = require("../models/BranchAssetStat");
@@ -282,6 +286,18 @@ async function unbanUser(req, res, next) {
  *      ★ 卡片的 BranchAssetStat **不删**：kind="card" 的 key 是 cardId，是**跨用户
  *        全局聚合**的（同一张市场卡在每个装过的人库里都有一份文档）—— 删掉计数会把
  *        别人手里同一张卡的热度一起清零，那是丢别人的数据。
+ *   ⑦.5 BranchTemplate（他做的白模模板）→ 句柄落 PendingAssetPurge 后 deleteMany，
+ *      顺带清 BranchTemplateTrial（试用记录）。
+ *      ★★ 2026-08-31 补。**它此前既不在"删"的清单里，也不在下面"不删（刻意的）"
+ *      的清单里 —— 是纯遗漏**，整个文件一次都没提到 BranchTemplate。后果不是少删一张表：
+ *      模板市场的列表是裸的 `find({ status: "published" })`（不查作者在不在），
+ *      于是被永久删号的人发布的模板**原封不动留在货架上**，别人照样套用出片、
+ *      照样按 r2v 付费，卡片还挂着已删账号的 authorName 快照；而那份 100MB 级的
+ *      参考视频/原始素材在产品内**再没有任何把手能删**（模板的删除端点只认 ownerId
+ *      本人，而那个人已经不存在了；孤儿回收口在模板还在时是拒删的）。全程零报错。
+ *      ⚠ 资产走 PendingAssetPurge + sweepPendingPurges，**不在这里抄第二份回收逻辑**：
+ *      顺序（refVideo → 封面 → source → 分段组末段）与 DELETE /templates/:id 一致，
+ *      但那边是同步 destroy、这边是欠账重试 —— 一个管理员操作不该被一次云端抖动挡住。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
  *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany。
@@ -368,6 +384,51 @@ async function purgeUserCascade(userId) {
 
   // ⑦ 卡片（计数不删，理由见函数头）
   removed.cards = (await BranchCard.deleteMany({ owner: uid })).deletedCount;
+
+  // ⑦.5 白模模板（理由见函数头 ★★）。顺序与 DELETE /templates/:id 一致：
+  //     refVideo → 封面 → 原始素材 → （删完之后）分段组的最后一段带走组源视频。
+  const templates = await BranchTemplate.find({ ownerId: uid })
+    .select("_id coverUrl refVideo source group")
+    .lean();
+  if (templates.length) {
+    const handles = [];
+    const push = (publicId, resourceType, source) => {
+      if (publicId) handles.push({ publicId: String(publicId), resourceType, owner: uid, source: String(source) });
+    };
+    for (const t of templates) {
+      // 模板视频的 publicId 是我们自己签发的，直接用（不经 ownedRecyclableAsset：
+      // 那个函数认的是 URL，而这里手里就是 public_id）
+      push(t.refVideo && t.refVideo.cloudinaryPublicId, "video", t._id);
+      push(t.source && t.source.publicId, "video", t._id);
+      // 封面是 URL，要先判"是不是我们空间里、这个人自己的"——认不出的一律不动
+      const cover = ownedRecyclableAsset(t.coverUrl, String(uid), RECYCLABLE_FOLDERS);
+      if (cover) handles.push({ ...cover, owner: uid, source: String(t._id) });
+    }
+    const groupKeys = [...new Set(templates.map((t) => t.group && t.group.key).filter(Boolean))];
+    removed.templates = (await BranchTemplate.deleteMany({ ownerId: uid })).deletedCount;
+    // ★ 组源视频只在"这一组一段都不剩"时才收：还有别的段（别人做的同组段）就绝不动它，
+    //   那是整组的音轨来源。查放在 deleteMany 之后，本人那几段不会把 exists 撑成真。
+    for (const key of groupKeys) {
+      const left = await BranchTemplate.exists({ "group.key": key });
+      if (left) continue;
+      const src = templates.find((t) => t.group && t.group.key === key && t.group.sourcePublicId);
+      push(src && src.group.sourcePublicId, "video", `group:${key}`);
+    }
+    if (handles.length) {
+      try {
+        await PendingAssetPurge.bulkWrite(
+          handles.map((h) => ({
+            updateOne: { filter: { publicId: h.publicId }, update: { $setOnInsert: h }, upsert: true },
+          })),
+          { ordered: false }
+        );
+      } catch (err) {
+        // 同 purgeVideo：句柄没落住也不许因此拒绝删号（隐私诉求不该被实现细节挡住）
+        if (!err || err.code !== 11000) console.warn("[branch] 模板资产句柄落库失败:", err && (err.message || err));
+      }
+    }
+    removed.templateTrials = (await BranchTemplateTrial.deleteMany({ userId: uid })).deletedCount;
+  }
 
   // ⑧ 举报
   removed.reports = (
