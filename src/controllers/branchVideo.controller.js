@@ -913,10 +913,21 @@ async function updateVideo(req, res, next) {
     //   ⚠ 用 $unset 而不是 `linkOnly: false`：这个字段判**有值**（default undefined），
     //     写个 false 进去等于给每条老作品凭空长出一个字段。
     const $unset = {};
-    if (patch.visibility === "public") {
-      delete patch.linkOnly;
+    // ★★ 判据是「带了 visibility 却**没带** linkOnly」，不是「改成了 public」（2026-08-30 修正）。
+    //   原来只在改回 public 时清 —— 于是老客户端（≤v2.36，它的 PATCH 白名单里根本没有
+    //   linkOnly）无论怎么保存都碰不到那一位：它把这条作品显示成「仅自己可见」、
+    //   提示语写着"别人拿到链接也打不开"，而链接照旧人人打得开。
+    //   我在上一条 commit 里写"老客户端读到 private 更严格，失败方向从泄漏翻成过度保守"
+    //   —— 那句话**只对显示成立、对效果不成立**：界面收紧了，实际没有。
+    //   而这正是隐私功能最不该错的方向（本仓的规矩：往放心的方向说错比往吓人的方向说错更糟）。
+    //   ⇒ 「带 visibility 不带 linkOnly」只可能来自老客户端，而它此刻表达的正是
+    //     「仅自己可见」——按它说的办，往严的方向兜底。
+    //   ★ 新客户端不受影响：`types.visibilityWire` 两个键一起发（private 显式发
+    //     `linkOnly: false`），唯一不带的是 public，而那一档本来就该清掉这一位。
+    if (patch.visibility !== undefined && patch.linkOnly === undefined) {
       $unset.linkOnly = "";
     }
+    if (patch.visibility === "public") delete patch.linkOnly;
     const update = Object.keys($unset).length ? { $set: patch, $unset } : { $set: patch };
     const updated = await BranchVideo.findByIdAndUpdate(id, update, { returnDocument: "after" })
       .populate("author", AUTHOR_FIELDS)

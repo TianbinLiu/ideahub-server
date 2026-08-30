@@ -618,11 +618,16 @@ describe("凭链接可见（linkOnly）", () => {
     expect("linkOnly" in raw).toBe(false);
   });
 
-  test("U4 老客户端的编辑不会把它变成公开（这条决定了整个设计）", async () => {
-    // ★★ 老客户端读到的 visibility 是 "private"（它不认识 linkOnly），
-    //   它的 PATCH 也**不带** linkOnly ⇒ $set 碰不到那个字段 ⇒ 作品照旧凭链接可见。
-    //   如果当初把这一档做成 visibility 的第三个枚举值，老客户端会把它归一成 public，
-    //   随便改个标题保存就把作品静默变成全站公开 —— 那是隐私泄漏方向的失败。
+  test("U4 老客户端的编辑：不会变成公开，而且会**收紧**成真私密", async () => {
+    // ★★ 这条决定了整个设计。老客户端（≤v2.36）读到的 visibility 是 "private"
+    //   （它不认识 linkOnly），界面上显示「仅自己可见 · 别人拿到链接也打不开」。
+    //   ① 它绝不会把作品变成公开 —— 如果当初把这一档做成 visibility 的第三个枚举值，
+    //      老客户端会把 "unlisted" 归一成 public，随便改个标题保存就静默全站公开。
+    //   ② 但"不变公开"还不够：它的 PATCH 不带 linkOnly，原来 $set 碰不到那一位 ⇒
+    //      链接照旧人人打得开，而它的界面**明说打不开** —— 界面收紧了、实际没有，
+    //      用户在那台设备上做完他能做的一切也收不紧。那是"往放心的方向说错"。
+    //   ⇒ 「带了 visibility 却不带 linkOnly」只可能来自老客户端，按它显示的那一档办：
+    //      收紧成真私密。效果与它告诉用户的话终于一致了。
     const author = await registerUser();
     const id = String((await publishLinkOnly(author.token, { title: "旧客户端来改" }).expect(201)).body.video._id);
 
@@ -632,11 +637,38 @@ describe("凭链接可见（linkOnly）", () => {
       .send({ title: "改了个标题", visibility: "private" }) // 老客户端会原样回传它读到的 private
       .expect(200);
     expect(patched.body.video.title).toBe("改了个标题");
-    expect(patched.body.video.linkOnly).toBe(true);
-    // 仍然打得开、仍然不在列表里
-    await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(patched.body.video.visibility).toBe("private");
+    expect(patched.body.video.linkOnly).toBeUndefined(); // 收紧了
+    // 链接从此打不开（与老客户端界面上那句话一致），也仍然不在列表里
+    await request(app).get(`/api/branch/videos/${id}`).expect(404);
     const list = await request(app).get("/api/branch/videos").expect(200);
     expect(idsOf(list.body)).not.toContain(id);
+  });
+
+  test("U4b 新客户端把两个键一起发，所以「凭链接可见」改标题不会被误收紧", async () => {
+    // ★ 上一条的兜底不能误伤新客户端：`types.visibilityWire` 对 unlisted 发的是
+    //   `{visibility:"private", linkOnly:true}` —— 两个键一起来，走不进那个 $unset。
+    const author = await registerUser();
+    const id = String((await publishLinkOnly(author.token, { title: "新客户端来改" }).expect(201)).body.video._id);
+    const patched = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ title: "改了个标题", visibility: "private", linkOnly: true })
+      .expect(200);
+    expect(patched.body.video.linkOnly).toBe(true);
+    await request(app).get(`/api/branch/videos/${id}`).expect(200); // 链接照常
+  });
+
+  test("U4c 新客户端从「凭链接可见」收紧到「仅自己可见」：发 linkOnly:false，链接当场失效", async () => {
+    const author = await registerUser();
+    const id = String((await publishLinkOnly(author.token).expect(201)).body.video._id);
+    await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ visibility: "private", linkOnly: false })
+      .expect(200);
+    await request(app).get(`/api/branch/videos/${id}`).expect(404);
   });
 
   test("U1b 拿到链接的人**能互动**：点赞/评论/弹幕/播放计数都不能 404", async () => {
