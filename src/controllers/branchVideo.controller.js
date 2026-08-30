@@ -22,6 +22,7 @@ const User = require("../models/User");
 const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
+const BranchCollect = require("../models/BranchCollect");
 const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurge.service");
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
@@ -275,6 +276,34 @@ function toBranchTreePayload(tree) {
   };
 }
 
+/**
+ * 卡组快照 → 回包。**下发侧**的肖像闸（2026-08-31 补）。
+ *
+ * ★★ 为什么必须有它：`branchAsset.publishCard` 对 `realPerson === true` 的卡是**硬 400**，
+ *   注释写着「平台没有资格替他做第二个授权」—— 那道闸存在的全部理由，是不让一个
+ *   **从没打开过我们 app 的人**的脸被别人取走。而作品的卡组快照**刻意保留了**
+ *   `realPerson` 与 `views`（保留是对的：档位分流要靠前者），`toVideoPayload` 原样
+ *   下发整份 `doc.deck`，而 `GET /videos` 与 `GET /videos/:id` 都是 `optionalAuth`
+ *   ⇒ **未登录的任何人都能拿到那张真实人物的照片**。那道 400 闸就这样被绕过去了。
+ * ★ 只剥**别人看的时候**：作者本人（isOwner）与管理员照常看得到，否则他会以为自己的卡坏了。
+ * ★ 剥的是 `views`，**不剥 `realPerson`**：那一位是给出片档位分流用的，
+ *   丢了它这张卡经作品这条路洗一遍就变回"非真人"（views 当年就是这么丢的）。
+ * ★ 写在**下发侧**而不是发布侧：线上已经存着的每一条作品都要立刻生效，
+ *   而库里那份是作者自己的记录，没有理由销毁。
+ * ★ 带一个 `portraitWithheld` 让客户端说得出为什么这张卡没有形象图 —— 不说的话
+ *   用户只会觉得"这张卡坏了"（铁律八）。
+ */
+function toDeckPayload(deck, ctx) {
+  if (!deck || !Array.isArray(deck.cards) || !deck.cards.length) return undefined;
+  if (ctx.isOwner || ctx.admin) return deck;
+  return {
+    ...deck,
+    cards: deck.cards.map((c) =>
+      c && c.realPerson === true ? { ...c, views: [], portraitWithheld: true } : c
+    ),
+  };
+}
+
 function toVideoPayload(doc, ctx = {}) {
   if (!doc) return null;
   const payload = {
@@ -315,7 +344,9 @@ function toVideoPayload(doc, ctx = {}) {
   }
   const tree = toBranchTreePayload(doc.branchTree);
   if (tree) payload.branchTree = tree;
-  if (doc.deck && Array.isArray(doc.deck.cards) && doc.deck.cards.length) payload.deck = doc.deck;
+  // 卡组快照走 toDeckPayload：真人卡的形象图对**别人**一律不发（见它的 ★★）
+  const deckOut = toDeckPayload(doc.deck, ctx);
+  if (deckOut) payload.deck = deckOut;
   if (doc.pricing && doc.pricing.mode === "paid") payload.pricing = doc.pricing;
   if (ctx.comments) payload.comments = ctx.comments;
   return payload;
@@ -1028,6 +1059,10 @@ async function purgeVideo(videoId) {
 
   await Promise.all([
     BranchVideo.deleteOne({ _id: videoId }),
+    // ★ 收藏行跟着作品一起删：留着就是一堆指向不存在作品的死行，而「我的收藏」
+    //   拿它们逐条取详情只会得到一屏 404 墓碑（新表加进来时**必须**同时落在这里
+    //   与 purgeUserCascade 两处 —— 漏了哪一处都零症状，模板那次就是这么漏的）
+    BranchCollect.deleteMany({ video: videoId }),
     BranchLike.deleteMany({ video: videoId }),
     BranchComment.deleteMany({ video: videoId }),
     commentIds.length ? BranchCommentLike.deleteMany({ comment: { $in: commentIds } }) : Promise.resolve(),
@@ -1098,6 +1133,80 @@ async function syncLikes(videoId) {
 }
 
 // POST /api/branch/videos/:id/like
+/**
+ * POST /videos/:id/collect —— 收藏。DELETE 同一条路取消。
+ *
+ * ★★ 为什么收藏必须服务端存（2026-08-31）：在这之前它只活在内存里 ——
+ *   `account.persist()` 在远端模式一个字节都不写盘（防幽灵账号，那是对的），
+ *   而服务端根本没有这条端点 ⇒ 用户收藏 10 条、书签点亮、个人页「收藏 10」都对，
+ *   杀掉 App 再打开**全部归零**，零报错。
+ * ★ 走 `assertVisible`（按 id 的那把尺）而不是列表那把：「凭链接可见」的作品
+ *   别人发链接给你、你打得开、也就该收藏得了。⚠ 这两把尺**故意不一致**，
+ *   别顺手统一（见 readableFilter 那段 ★★）。
+ * ★ 幂等靠唯一索引 + upsert，不靠调用方先查一遍。
+ * ★ **不写任何计数**：理由钉在 models/BranchCollect 的 ★★ 上。
+ */
+async function collectVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    await assertVisible(id, req.user, "_id");
+    await BranchCollect.updateOne(
+      { user: req.user._id, video: id },
+      { $setOnInsert: { user: req.user._id, video: id } },
+      { upsert: true }
+    );
+    res.json({ ok: true, collected: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** DELETE /videos/:id/collect —— 取消收藏。
+ *  ★ **不查可见性**：作者事后设成私密/下架之后，用户仍然必须能把它从自己的收藏里去掉，
+ *    否则那一行永远删不掉（同「分享/取消分享」那条：一个开关的两个方向不能共用判据）。 */
+async function uncollectVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    await BranchCollect.deleteOne({ user: req.user._id, video: id });
+    res.json({ ok: true, collected: false });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /me/collects —— 我收藏了哪些作品的 **id 列表**（按收藏时间倒序）。
+ *
+ * ★★ 只回 id，**不做 `feed=collected` 那种列表**。理由是一条实打实的坑：
+ *   列表口径是 `{ visibility: { $ne: "private" } }`，而按 id 那把尺才认「凭链接可见」。
+ *   走列表的话 —— 别人把 unlisted 作品的链接发给你 → 你打得开、也收藏得了（行真的写进去了）
+ *   → 去收藏页却**永远看不到它**，服务端存 10 行、页面回 7 条，零报错，
+ *   而且与"作者改私密了"完全无法区分。而「凭链接可见」正是熟人小圈子里最典型的收藏对象。
+ *   客户端拿着 id 逐条 `fetchVideoById`（走按 id 那把尺）反而天然是对的。
+ * ★ 上限 500：收藏是轻量列表，真到这个量级要分页时再说，但**不许静默截断**——
+ *   到顶时回一个 `truncated` 让客户端说得出口。
+ */
+async function listMyCollects(req, res, next) {
+  try {
+    const LIMIT = 500;
+    const rows = await BranchCollect.find({ user: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(LIMIT + 1)
+      .select("video")
+      .lean();
+    const truncated = rows.length > LIMIT;
+    res.json({
+      ok: true,
+      ids: (truncated ? rows.slice(0, LIMIT) : rows).map((r) => String(r.video)),
+      ...(truncated ? { truncated: true } : {}),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function likeVideo(req, res, next) {
   try {
     const { id } = req.params;
@@ -1836,6 +1945,9 @@ module.exports = {
   branchStats,
   addPlay,
   likeVideo,
+  collectVideo,
+  uncollectVideo,
+  listMyCollects,
   unlikeVideo,
   listComments,
   addComment,

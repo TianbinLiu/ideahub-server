@@ -19,6 +19,7 @@ const BranchCommentLike = require("../models/BranchCommentLike");
 const BranchLike = require("../models/BranchLike");
 const BranchDanmaku = require("../models/BranchDanmaku");
 const BranchCard = require("../models/BranchCard");
+const BranchCollect = require("../models/BranchCollect");
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
@@ -298,6 +299,8 @@ async function unbanUser(req, res, next) {
  *      ⚠ 资产走 PendingAssetPurge + sweepPendingPurges，**不在这里抄第二份回收逻辑**：
  *      顺序（refVideo → 封面 → source → 分段组末段）与 DELETE /templates/:id 一致，
  *      但那边是同步 destroy、这边是欠账重试 —— 一个管理员操作不该被一次云端抖动挡住。
+ *   ⑦.6 BranchCollect（他收藏别人的那些）→ deleteMany。别人收藏他作品的那些行
+ *      随①的 purgeVideo 一起删。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
  *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany。
@@ -429,6 +432,10 @@ async function purgeUserCascade(userId) {
     }
     removed.templateTrials = (await BranchTemplateTrial.deleteMany({ userId: uid })).deletedCount;
   }
+
+  // ⑦.6 他的收藏（关系表，纯私有数据）。⚠ 只删**他收藏别人的**那些；
+  //     "别人收藏了他的作品"那些行随①的 purgeVideo 一起删掉了。
+  removed.collects = (await BranchCollect.deleteMany({ user: uid })).deletedCount;
 
   // ⑧ 举报
   removed.reports = (
