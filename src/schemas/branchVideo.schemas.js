@@ -55,7 +55,12 @@ const deckCardBody = z
     cover: assetUrl,
     tags: z.array(z.string().trim().max(40)).max(20).optional().default([]),
   })
-  .loose(); // 卡上还有 modelUrl/genPrompt 等本地字段，收下但不入库
+  // ★★ `.loose()` 在这里是**有意的**，而且它比看起来重要：卡上还有 modelUrl/genPrompt
+  //   这类"卡主私有、不入快照"的字段要收下丢掉；但**同时**还有几个 controller 真的要读、
+  //   却没在上面声明的键 —— `realPerson`、`views`、`idLine`（2026-08-31 补的第三个）。
+  //   ⚠ 所以别照着这张表判断"快照里有哪些字段"：真相在 controller 的 cards.push 与
+  //   models/BranchVideo.deckCardSchema 两处，三处要一起改（漏了哪一处都零报错）。
+  .loose();
 
 const deckBody = z.object({
   name: z.string().trim().max(120).optional().default(""),
