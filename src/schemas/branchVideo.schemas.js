@@ -88,6 +88,9 @@ const publishBody = z.object({
   //   deck 之前就是因为没写这行被静默丢掉的——客户端发了、服务端存了个空。
   deck: deckBody.optional(),
   visibility: visibility.optional().default("public"),
+  // 「只有拿到链接的人能看」。★ 与 visibility 一起构成三档：
+  //   public / private+linkOnly（凭链接可见）/ private。见 model 里那条 ★★（为什么不加枚举值）
+  linkOnly: z.boolean().optional(),
   pricing: pricingBody.optional(),
   // 幂等键（客户端生成，重试沿用）。z.object 默认 strip 未声明字段，不写这行就到不了 controller
   clientId: z.string().trim().min(1).max(120).optional(),
@@ -104,6 +107,9 @@ const updateBody = z
     // 标签可改（属于"壳"，与标题/简介/分区同类）。★ 不给 default：见本对象顶部那条 ★
     tags: z.array(z.string().trim().max(40)).max(20).optional(),
     visibility: visibility.optional(),
+    // ★ 老客户端**不发**这个键 ⇒ $set 碰不到它 ⇒ 它们的编辑不会把"凭链接可见"改掉。
+    //   这正是把它做成独立字段（而不是 visibility 的第三个枚举值）想要的效果。
+    linkOnly: z.boolean().optional(),
     // 封面可改（成片不可改，但"用哪一帧当封面"属于壳）。
     // ★ 只收 http(s) URL，**不收 dataURL**：客户端先把它传成永久 URL 再 PATCH
     //   （app 的 EditPage 走 publishAssets.imageToUrl，与发布路径同一条）。
