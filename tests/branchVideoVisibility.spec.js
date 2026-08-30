@@ -280,6 +280,56 @@ describe("作品编辑（PATCH）", () => {
     await request(app).patch(`/api/branch/videos/${id}`).send({ title: "我改了" }).expect(401);
   });
 
+  // ★★ 肖像闸（2026-08-31）。`publishCard` 对 realPerson 是硬 400，理由是"平台没有资格
+  //   替他做第二个授权"；而作品的卡组快照刻意保留 realPerson + views，`toVideoPayload`
+  //   原样下发，两条 GET 又都是 optionalAuth ⇒ **未登录的任何人都能拿到那张真人照片**，
+  //   那道 400 闸被整个绕过去。受害的是一个从没打开过我们 app 的人。
+  test("真人卡的形象图：别人（含未登录）拿不到，作者本人照常看得见", async () => {
+    const author = await registerUser();
+    const other = await registerUser();
+    const realCard = {
+      id: "c_real",
+      name: "阿姨",
+      realPerson: true,
+      views: [{ url: "https://cdn.example.com/a-real-face.jpg", kind: "face" }],
+    };
+    const propCard = { id: "c_prop", name: "道具", views: [{ url: "https://cdn.example.com/prop.jpg", kind: "body" }] };
+    const id = String(
+      (await publish(author.token, { deck: { name: "带真人卡的卡组", cards: [realCard, propCard] } })).body.video._id
+    );
+
+    // ① 未登录
+    const anon = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    const anonCards = anon.body.video.deck.cards;
+    expect(anonCards.find((c) => c.cardId === "c_real").views).toEqual([]);
+    expect(anonCards.find((c) => c.cardId === "c_real").portraitWithheld).toBe(true);
+    // ★ realPerson 那一位**不许跟着剥**：它是出片档位分流的判据
+    expect(anonCards.find((c) => c.cardId === "c_real").realPerson).toBe(true);
+    // 非真人卡不受影响（闸只拦该拦的）
+    expect(anonCards.find((c) => c.cardId === "c_prop").views).toHaveLength(1);
+
+    // ② 登录的别人，一样拿不到
+    const stranger = await request(app)
+      .get(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${other.token}`)
+      .expect(200);
+    expect(stranger.body.video.deck.cards.find((c) => c.cardId === "c_real").views).toEqual([]);
+
+    // ③ 作者本人照常看得见（否则他会以为自己的卡坏了）
+    const mine = await request(app)
+      .get(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(mine.body.video.deck.cards.find((c) => c.cardId === "c_real").views).toHaveLength(1);
+
+    // ④ 列表这一路同样要剥（它也 optionalAuth，且 deck 同样下发）
+    const feed = await request(app).get("/api/branch/videos?limit=30").expect(200);
+    const row = feed.body.items.find((v) => String(v._id) === id);
+    if (row && row.deck) {
+      expect(row.deck.cards.find((c) => c.cardId === "c_real").views).toEqual([]);
+    }
+  });
+
   // ★★ 卡组快照是**逐字段重建**的（controller 的 cards.push），少搬一行零报错 ——
   //   views / realPerson 各漏过一次，idLine 是第三次（2026-08-31）。这条钉住"三处都在"：
   //   zod 放行（.loose）、controller 搬、model 声明。任一处漏掉，读回来就是空串，
@@ -754,3 +804,90 @@ describe("凭链接可见（linkOnly）", () => {
     expect(idsOf(list.body)).toContain(id);
   });
 });
+
+// ★★ 收藏（2026-08-31 服务端化）。在这之前它只活在内存里 —— 杀掉 App 全部归零、零报错。
+describe("收藏", () => {
+  test("K1 收藏能存住、幂等、取消得掉，且「我的收藏」按收藏时间倒序", async () => {
+    const me = await registerUser();
+    const author = await registerUser();
+    const a = String((await publish(author.token, { title: "先收的" })).body.video._id);
+    const b = String((await publish(author.token, { title: "后收的" })).body.video._id);
+
+    const col = (id, tok) =>
+      request(app).post(`/api/branch/videos/${id}/collect`).set("Authorization", `Bearer ${tok}`);
+    await col(a, me.token).expect(200);
+    await col(b, me.token).expect(200);
+    await col(b, me.token).expect(200); // 幂等：再点一次不该出错、也不该多一行
+
+    let mine = await request(app)
+      .get("/api/branch/me/collects")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(mine.body.ids).toEqual([b, a]); // 收藏时间倒序 —— 那才是用户预期的顺序
+
+    await request(app)
+      .delete(`/api/branch/videos/${a}/collect`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    mine = await request(app)
+      .get("/api/branch/me/collects")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(mine.body.ids).toEqual([b]);
+  });
+
+  // ★★ 这条是整个设计的由来：列表口径 `{visibility: {$ne:"private"}}` 不认「凭链接可见」，
+  //   而按 id 那把尺认。所以收藏页**只能**按 id 取详情 —— 走 feed=collected 的话，
+  //   别人发链接给你、你收藏了、行也真写进去了，收藏页却永远看不到它，且零报错。
+  test("K2 「凭链接可见」的作品收藏得了，而且在「我的收藏」里真的回得来", async () => {
+    const me = await registerUser();
+    const author = await registerUser();
+    const id = String(
+      (await publish(author.token, { title: "凭链接看的", visibility: "private", linkOnly: true })).body.video._id
+    );
+    await request(app)
+      .post(`/api/branch/videos/${id}/collect`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    const mine = await request(app)
+      .get("/api/branch/me/collects")
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+    expect(mine.body.ids).toContain(id);
+    // 而它确实不在列表口径里 —— 这正是不能走 feed=collected 的原因
+    const feed = await request(app).get("/api/branch/videos?limit=50").expect(200);
+    expect(feed.body.items.map((v) => String(v._id))).not.toContain(id);
+  });
+
+  test("K3 真·私密的别人作品收藏不了（404，不泄露存在性）；作者事后设私密后仍取消得掉", async () => {
+    const me = await registerUser();
+    const author = await registerUser();
+    const id = String((await publish(author.token, { title: "公开的" })).body.video._id);
+    await request(app)
+      .post(`/api/branch/videos/${id}/collect`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+
+    // 作者改成仅自己可见
+    await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ visibility: "private" })
+      .expect(200);
+
+    // 别人现在收藏不了它
+    const other = await registerUser();
+    await request(app)
+      .post(`/api/branch/videos/${id}/collect`)
+      .set("Authorization", `Bearer ${other.token}`)
+      .expect(404);
+
+    // ★ 但已经收藏过的人必须**取消得掉** —— 一个开关的两个方向不能共用判据，
+    //   否则那一行永远删不掉
+    await request(app)
+      .delete(`/api/branch/videos/${id}/collect`)
+      .set("Authorization", `Bearer ${me.token}`)
+      .expect(200);
+  });
+});
+

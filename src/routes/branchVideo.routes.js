@@ -14,6 +14,9 @@ const {
   removeVideo,
   addPlay,
   likeVideo,
+  collectVideo,
+  uncollectVideo,
+  listMyCollects,
   unlikeVideo,
   listComments,
   addComment,
@@ -50,6 +53,14 @@ router.post("/videos/:id/play", optionalAuth, rateLimit({ windowMs: 60 * 1000, m
 const likeLimit = userRateLimit({ windowMs: 60 * 1000, max: 60, scope: "branch:like" });
 router.post("/videos/:id/like", requireAuth, likeLimit, likeVideo);
 router.delete("/videos/:id/like", requireAuth, likeLimit, unlikeVideo);
+
+// 收藏。★ 与点赞同一把限流尺（同类的轻量互动，按账号严）。
+// ★ 「我的收藏」只回 id 列表，**不做 feed=collected** —— 理由钉在 listMyCollects 的 ★★
+//   （列表口径不认「凭链接可见」，走列表会让那些作品在收藏页永远看不到，且零报错）。
+const collectLimit = userRateLimit({ windowMs: 60 * 1000, max: 60, scope: "branch:collect" });
+router.post("/videos/:id/collect", requireAuth, collectLimit, collectVideo);
+router.delete("/videos/:id/collect", requireAuth, collectLimit, uncollectVideo);
+router.get("/me/collects", requireAuth, listMyCollects);
 
 router.get("/videos/:id/comments", optionalAuth, listComments);
 // ★ 发评论也要限频，而且**单开一个桶**，不和 branch:danmaku 共用：共用的话
