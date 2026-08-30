@@ -292,3 +292,112 @@ describe("删作品时的连带清理", () => {
     expect(await Notification.countDocuments({ videoId: vid })).toBe(0);
   });
 });
+
+// ── 删作品要回收云端资产（2026-08-30）────────────────────────────────
+//
+// ★★ 这组用例盯的是一个**隐私**问题：作品从库里删了，而成片/封面那几个 https 地址
+//   仍然人人可访问 —— purgeVideo 此前一次 `uploader.destroy` 都没有。
+// ★ 更要紧的是**不许多删**：回收范围写宽一点，删一个号就会顺手 destroy 掉别人还在
+//   用的东西，而且零报错。所以这里逐条钉"该删的删了、不该碰的一个都没碰"。
+describe("删作品回收云端资产", () => {
+  const cloudinaryMod = require("../src/config/cloudinary");
+  const PendingAssetPurge = require("../src/models/PendingAssetPurge");
+  let destroySpy;
+
+  beforeEach(() => {
+    destroySpy = jest
+      .spyOn(cloudinaryMod.cloudinary.uploader, "destroy")
+      .mockResolvedValue({ result: "ok" });
+  });
+  afterEach(() => destroySpy.mockRestore());
+
+  /** 造一条 Cloudinary 风格的地址（形状与服务端真实上传一致） */
+  const cld = (folder, base, type = "image", ext = "jpg") =>
+    `https://res.cloudinary.com/demo/${type}/upload/v1/ideahub/${folder}/${base}.${ext}`;
+
+  test("Y1 自己的帧/成片/封面都被回收，且 resource_type 各自正确", async () => {
+    const author = await registerUser();
+    const uid = author.userId;
+    const cover = cld("branch-frames", `${uid}-1756500000000-1-cover-1756500000001`);
+    const first = cld("branch-frames", `${uid}-1756500000000-2-firstFrame-1756500000002`);
+    const vid = cld("branch-videos", `${uid}-1756500000000-seg`, "video", "mp4");
+
+    const videoId = await publish(author.token, {
+      cover,
+      segments: [{ title: "第一段", firstFrame: first, videoUrl: vid, durationSec: 10 }],
+    });
+    await request(app)
+      .delete(`/api/branch/videos/${videoId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    const called = destroySpy.mock.calls.map(([id, opts]) => `${id}|${opts && opts.resource_type}`);
+    expect(called).toContain(`ideahub/branch-frames/${uid}-1756500000000-1-cover-1756500000001|image`);
+    expect(called).toContain(`ideahub/branch-frames/${uid}-1756500000000-2-firstFrame-1756500000002|image`);
+    // ★ resource_type 必须从 URL 路径段取。写死 "video" 的话封面删不掉，而 Cloudinary
+    //   对不存在的资源回 "not found" 不报错 —— 零症状
+    expect(called).toContain(`ideahub/branch-videos/${uid}-1756500000000-seg|video`);
+    // 成功的句柄行要清干净（这张表是工作队列，不是日志）
+    expect(await PendingAssetPurge.countDocuments({ source: String(videoId) })).toBe(0);
+  });
+
+  test("Y2 别人的资产、外链、模板目录一个都不许碰", async () => {
+    const author = await registerUser();
+    const other = await registerUser();
+    const videoId = await publish(author.token, {
+      cover: cld("branch-frames", `${other.userId}-1756500000000-1-x-2`), // 别人的
+      segments: [
+        {
+          title: "第一段",
+          firstFrame: "https://cdn.example.com/outside.jpg", // 外链
+          videoUrl: cld("template-videos", `${author.userId}-1756500000000`, "video", "mp4"), // 模板目录
+          durationSec: 10,
+        },
+      ],
+    });
+    await request(app)
+      .delete(`/api/branch/videos/${videoId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(destroySpy).not.toHaveBeenCalled();
+  });
+
+  test("Y3 卡组快照里的卡面**绝对不能**跟着删（别人装走的是同一个地址）", async () => {
+    // ★★ 这是本组最重要的一条：installDeck 是按 URL 复制的，把 deck 算进回收范围
+    //   等于"作者删自己的作品 → 所有装过这套卡组的人卡面全变裂图"，而且零报错。
+    const author = await registerUser();
+    const uid = author.userId;
+    const deckCover = cld("branch-frames", `${uid}-1756500000000-9-deck-1`);
+    const videoId = await publish(author.token, {
+      segments: [{ title: "第一段", firstFrame: "https://cdn.example.com/a.jpg", durationSec: 10 }],
+      deck: { name: "本片卡组", cards: [{ cardId: "c_1", name: "卡", cover: deckCover }] },
+    });
+    await request(app)
+      .delete(`/api/branch/videos/${videoId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    const called = destroySpy.mock.calls.map(([id]) => id);
+    expect(called).not.toContain(`ideahub/branch-frames/${uid}-1756500000000-9-deck-1`);
+  });
+
+  test("Y4 云端删失败时句柄留在库里（作品照删，不把隐私诉求挡在实现细节后面）", async () => {
+    destroySpy.mockRejectedValue(new Error("cloudinary down"));
+    const author = await registerUser();
+    const uid = author.userId;
+    const cover = cld("branch-frames", `${uid}-1756500000000-1-cover-9`);
+    const videoId = await publish(author.token, { cover });
+
+    // 作品照样删掉（200），不是 502
+    await request(app)
+      .delete(`/api/branch/videos/${videoId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    await request(app).get(`/api/branch/videos/${videoId}`).expect(404);
+
+    // 句柄还在，带着失败原因和次数 —— 地址只存在于那份正文里，正文一删就再也找不回来
+    const row = await PendingAssetPurge.findOne({ publicId: `ideahub/branch-frames/${uid}-1756500000000-1-cover-9` }).lean();
+    expect(row).toBeTruthy();
+    expect(row.attempts).toBe(1);
+    expect(row.lastError).toMatch(/cloudinary down/);
+  });
+});
