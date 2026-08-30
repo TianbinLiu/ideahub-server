@@ -4,6 +4,7 @@
 //   GET /api/app/download            启梦的安装包 302
 //   GET /api/app/:app/latest.json    指定 App 的清单（qimeng / shihui）
 //   GET /api/app/:app/download       指定 App 的安装包 302
+//   GET /api/app/file/:name          安装包**本体**（本机镜像，国内用户走这条）
 //
 // ★★ 为什么服务端要转一手，而不是让 App 直接去 GitHub 拿：
 //   ① **国内快**。App 每次冷启动都要拉一次这个清单去比版本号；直连 GitHub
@@ -19,6 +20,17 @@
 //
 // ★ 这里**不重新计算任何东西**（版本号、sha256 的唯一出处仍是各自发版脚本生成的清单），
 //   只做缓存与地址改写（铁律六）。
+//
+// ★★ 2026-08-30 线上事故：国内用户点「本地更新」报「GitHub 无法连接」。
+//   查下来清单本身没问题（走的就是这台机器），断的是**下载那一步** —— 清单里的
+//   apkUrl 原样透传了 GitHub Releases 的地址（83MB），国内直连基本下不动。
+//   这个文件早就留了 `*_APK_BASE` 这个换源开关，只是生产没配、也没有地方放包。
+//   现在补上「本机镜像」：发版脚本把 apk 传到 APP_APK_DIR，配上 APP_APK_BASE 之后
+//   清单里的 apkUrl 就改写成本机地址。
+//   ⚠ 这条修复**不需要用户先装新包**：清单是这台服务器下发的，老用户下次检查更新
+//     拿到的就已经是新的下载地址 —— 这正是当初把清单放服务端的理由（见上面 ②）。
+const fs = require("fs");
+const path = require("path");
 const router = require("express").Router();
 
 /**
@@ -44,6 +56,13 @@ const APPS = {
     cache: null,
   },
 };
+/**
+ * 安装包镜像目录（发版脚本 scp 上来的那些 .apk）。
+ * ★ 不用 express.static 挂一个目录：那会把整个目录变成可枚举的下载点，也容易随手多放
+ *   一个不该公开的文件进去。这里只按**清单里那个文件名**取，且只认 .apk。
+ */
+const APK_DIR = process.env.APP_APK_DIR || path.join(__dirname, "../../releases");
+
 /** 历史地址 /api/app/latest.json 指的是哪个 App。**改这一行等于让所有老用户换 App**，别动。 */
 const DEFAULT_APP = "qimeng";
 
@@ -152,6 +171,39 @@ async function handleDownload(req, res, key) {
   res.set("Cache-Control", "no-store");
   res.redirect(302, apkUrl);
 }
+
+// GET /api/app/file/:name —— 安装包本体（本机镜像）。
+//
+// ★ 只认**纯文件名**且必须是 .apk：`:name` 来自公网，任何形式的路径都要拒。
+//   basename 之后再比一次原值，`a/../b.apk` 这类会被判不等而挡下（不是靠正则猜）。
+// ★ 用 res.sendFile：它带 ETag / Last-Modified / **Range**（断点续传）——83MB 的包在
+//   手机 4G 上断一次是常事，没有 Range 就得从头再来。
+// ★ Content-Type 必须是 apk 的：安卓的下载/安装器按它判类型，给成 octet-stream
+//   有些机型会把包存成一个装不了的文件。
+// ★ 缓存一年 + immutable：文件名里带版本号，内容不会变；这条是给 CDN 看的 ——
+//   命中之后国内用户就不再回源了。
+router.get("/file/:name", (req, res) => {
+  const name = String(req.params.name || "");
+  if (name !== path.basename(name) || !/^[\w.-]+\.apk$/i.test(name)) {
+    res.status(400).json({ ok: false, code: "BAD_NAME", message: "文件名不合法" });
+    return;
+  }
+  const file = path.join(APK_DIR, name);
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) {
+      res.status(404).json({ ok: false, code: "NOT_FOUND", message: "这个版本的安装包不在镜像里" });
+      return;
+    }
+    res.set("Content-Type", "application/vnd.android.package-archive");
+    res.set("Cache-Control", "public, max-age=31536000, immutable");
+    res.sendFile(file, { dotfiles: "deny" }, (e) => {
+      // 客户端中途断开是常态（用户取消/切后台），不当错误刷日志
+      if (e && e.code !== "ECONNABORTED" && !res.headersSent) {
+        console.warn(`[app] 发安装包失败 ${name}:`, e.message);
+      }
+    });
+  });
+});
 
 // ── 历史地址：启梦已安装用户的自更新与老版官网都打这两条，语义永远不变 ──
 router.get("/latest.json", (req, res) => handleManifest(req, res, DEFAULT_APP));
