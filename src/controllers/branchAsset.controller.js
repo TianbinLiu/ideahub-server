@@ -139,6 +139,10 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     //   只在 app 的 viewsOf() 一处做（理由见 models/BranchCard.js 的字段注释）。
     views: shareableViews(doc.views),
     published: !!doc.published,
+    // ★ 这一份是不是转发件（原件主人的 id）。客户端只用它决定"分享按钮亮不亮"——
+    //   服务端 publishCard 那道 400 才是权威闸门，这里只是不让按钮亮着
+    //   （一个"按下去必然失败"的按钮比灰着更糟）。老数据没有 → 不发这个键。
+    ...(doc.sourceOwner ? { sourceOwner: String(doc.sourceOwner) } : {}),
     publishedAt: doc.publishedAt,
     description: doc.description || "",
     stats,
@@ -746,6 +750,9 @@ async function installDeck(req, res, next) {
                 // 老快照（本字段上线前发布的）没有它 → false，与"非真人"同义
                 realPerson: c.realPerson === true,
                 views: shareableViews(c.views),
+                // ★ 跟着卡组装进来的也是**转发件**：来源记原卡组的主人（快照里没有原卡的 owner，
+                //   而"这不是你原创的"这一件事记到这个精度就够了）。见 BranchCard.sourceOwner 的 ★★
+                sourceOwner: src.owner,
                 createdAt: new Date(),
               },
             },
@@ -885,6 +892,24 @@ async function publishCard(req, res, next) {
     if (doc.realPerson === true) {
       badRequest("这张卡声明过是真实人物，不能分享到创意工坊：肖像授权只覆盖卡主自己使用");
     }
+    // ★★ 转发闸门：装来的卡不许再分享出去（2026-08-30）。
+    //   不是洁癖，是**机制上根本做不到**：卡片按全局 cardId 去重，广场那一行永远来自
+    //   `findAuthoritativeCard`（最早发布的那条）⇒ 转发者写的推荐语进了库却谁也看不见、
+    //   广场那行仍然挂着原作者的名字，而按钮却翻成「已在工坊·取消分享」的成功态。
+    //   这是一次彻底静默的空操作加一句假承诺，所以正解是**拒绝并说清楚**，不是署名转发。
+    //   ⚠ 判**有值**而不是判否定：老数据没有 sourceOwner = 当作原创，不能把存量卡
+    //     一夜之间全判成转发件（那会让一批人突然撤不下自己的卡）。
+    if (doc.sourceOwner) {
+      badRequest("这张卡是从别人那儿装来的，不能再分享一遍：广场上显示的始终是最早分享那份，你发出去也没人看得见。想让别人看到你的版本，用它做一张自己的卡。");
+    }
+    // ★ 第二道闸，覆盖**没有来源标记**的那批：跟着作品卡组 / 模板快照经 POST /cards
+    //   落库的卡，服务端无从判断它是不是你原创的（客户端逐字段发上来的）。
+    //   但"广场上已经有别人先分享过同一个 cardId"是个硬事实，够判了。
+    //   ⚠ 顺序在 sourceOwner 之后：两句话说的不是一回事，先说更确定的那句。
+    const first = await findAuthoritativeCard(cardId);
+    if (first && String(first.owner) !== String(owner)) {
+      badRequest("这张卡已经有人先分享到工坊了，广场上显示的是最早那份 —— 你再发一遍不会多出一行，也没人看得见。");
+    }
 
     if (req.body && req.body.description !== undefined) {
       doc.description = String(req.body.description || "").trim().slice(0, 200);
@@ -982,6 +1007,54 @@ async function listSharedCards(req, res, next) {
   }
 }
 
+// GET /cards/:cardId —— 按 id 读一张**已分享**的卡（optionalAuth：不登录也能看）。
+//
+// ★★ 为什么要有它：客户端的卡片详情页此前只有两条来路 —— 自己库里那份，或者上一页
+//   经路由 state 递过来的对象。也就是说**一条卡片链接是打不开的**：会话恢复、分享出去的
+//   链接、通知深链，落地都是一句"这张卡不在你的收藏里"，而那张卡在广场上好好地挂着。
+//   （模板那边 2026-08-14 就因为同一形状的"撒谎路径"补过 GET /templates/:id，这条照它做。）
+//
+// ★★ **只读已分享的那份，未分享的一律 404（不是 403）**：
+//   ① 403 等于承认"这个 id 存在但你不能看"，把私有卡的存在性变成可枚举的事实
+//      （模板那条与用例 A2b 都是这个口径）；
+//   ② cardId 不是能力令牌 —— 它是 `${prefix}_${Date.now()}_${6位base36}`，
+//      时间戳公开、随机位少且不是 CSPRNG，拿它当"知道 id 就有权看"的凭据，
+//      等于把卡主的 name/summary/genPrompt/views/idLine 挂在一个弱口令后面；
+//   ③ 真人卡按定义永远进不了广场（publishCard 那道 400），published-only 天然把它挡在外面。
+//
+// ★ 权威那份用 findAuthoritativeCard（与广场列表、安装同一把尺）。三条路口径不一致的话，
+//   用户"详情页看到的"和"装到手的"会是两张卡，而且两次请求都 200。
+async function getSharedCard(req, res, next) {
+  try {
+    const cardId = String(req.params.cardId || "").trim();
+    if (!cardId) invalidId("Invalid card id");
+
+    const doc = await BranchCard.findOne({ cardId, published: true })
+      .sort(AUTHORITATIVE_SORT)
+      .populate("owner", CARD_AUTHOR_FIELDS)
+      .lean();
+    if (!doc) notFound("Card not found");
+
+    const stats = await loadStats("card", [cardId]);
+    // 已登录时标出「我库里已经有这张了」「这是我自己发的」—— 与广场列表同一组字段，
+    // 客户端那边共用同一份映射（sharedToCard），少一位就会走错"添加"的分支
+    let installed = false;
+    if (req.user) {
+      installed = !!(await BranchCard.exists({ owner: req.user._id, cardId }));
+    }
+    res.json({
+      ok: true,
+      card: {
+        ...toSharedCardPayload(doc, stats.get(cardId) || EMPTY_STATS),
+        installed,
+        isOwner: req.user ? String((doc.owner && doc.owner._id) || doc.owner) === String(req.user._id) : false,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // POST /cards/:cardId/install —— 把别人分享的卡装进我的库。
 // 幂等：{ owner, cardId } 唯一索引就是幂等的地基，重复装只会拿回已有那张。
 async function installCard(req, res, next) {
@@ -1023,6 +1096,8 @@ async function installCard(req, res, next) {
           // 真人声明跟着装：装走的人出片同样要按真人档分流
           realPerson: src.realPerson === true,
           views: shareableViews(src.views),
+          // ★ 记下原件是谁的：这一份是转发件，不许再被分享出去（见 model 的 ★★）
+          sourceOwner: src.owner,
           createdAt: new Date(),
         },
       },
@@ -1255,6 +1330,7 @@ module.exports = {
   publishCard,
   unpublishCard,
   listSharedCards,
+  getSharedCard,
   installCard,
   addAssetView,
   likeAsset,

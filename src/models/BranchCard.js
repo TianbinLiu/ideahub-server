@@ -47,6 +47,21 @@ const branchCardSchema = new mongoose.Schema(
     views: { type: [cardViewSchema], default: [] },
 
     // ── 发布到创意工坊（与 BranchDeck 同一套语义）──
+    /**
+     * 这张卡是**从别人那儿来的**（从广场装的 / 跟着作品卡组、模板快照落库的）。
+     * 有值 = 转发件，值是**原件主人**的 userId。
+     *
+     * ★★ 它只做一件事：挡住"把别人的卡再分享一遍"。为什么必须挡而不是署名转发 ——
+     *   卡片的身份是**全局 cardId**，`{owner, cardId}` 唯一索引 + 广场按 cardId 去重
+     *   （dedupeAuthoritative 取最早发布那条）⇒ 转发根本**没有第二行可放**：
+     *   点了以后推荐语没人看得见、广场那行仍然是原作者的，而原作者想撤时还会被
+     *   "已经有别人也发过"这件事搅乱。今天那颗能点的按钮是个**假承诺**。
+     *   （卡组不同：每装一次生成一份新文档，广场天然多一行，所以那边能做 remixOf 署名。）
+     * ★ **只由服务端写**：POST /cards 是逐字段重建 + zod z.object strip，客户端发不上来。
+     *   ⚠ 别哪天顺手把它加进 addCardsBody —— 那等于让任何人自称原创者。
+     * ★ 判否定：老数据没有这个字段 = 当作原创（不能把存量卡一夜之间全判成转发件）。
+     */
+    sourceOwner: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: undefined },
     published: { type: Boolean, default: false },
     publishedAt: { type: Date, default: undefined },
     description: { type: String, default: "", trim: true, maxlength: 200 },
