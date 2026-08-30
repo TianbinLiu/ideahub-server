@@ -786,4 +786,40 @@ describe("分支视频 @提及", () => {
     expect(mentionsOf(res)).toHaveLength(0);
     expect(await inbox(bob.token)).toHaveLength(0);
   });
+
+  // ★★ 「凭链接可见」+ @提及（2026-08-31）。这条曾经**整条静默失效**：addComment 的
+  //   select 手写了一份可见性字段清单（visibility / takedown），而 linkOnly 是这个功能
+  //   上线时才加的第三列、没跟上 ⇒ readableBy 拿 undefined 判，整批提及被丢掉。
+  //   而提及本身是落库的、回包 mentions 齐全、客户端算出 droppedMentions === 0 ——
+  //   连那句黄字警告都不出现。被 @ 的人永远收不到通知，零报错、零日志。
+  //   公开作品下是好的，所以只有这一条用例能拦住它。
+  test("「凭链接可见」的作品下 @ 人，通知发得出去", async () => {
+    const author = await registerUser();
+    const commenter = await registerUser();
+    const mentioned = await registerUser();
+
+    const created = await request(app)
+      .post("/api/branch/videos")
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({
+        title: "凭链接看的片",
+        category: "剧情",
+        segments: [{ title: "第一段", firstFrame: "https://cdn.example.com/a.jpg", durationSec: 3 }],
+        visibility: "private",
+        linkOnly: true,
+      })
+      .expect(201);
+    const vid = String(created.body.video._id);
+
+    const text = `@${mentioned.username} 看看这个`;
+    const posted = await comment(commenter.token, vid, {
+      text,
+      mentions: [{ userId: mentioned.userId, offset: 0, length: mentioned.username.length + 1 }],
+    }).expect(201);
+    // 提及本身一直是落库的 —— 坏掉的只有通知那一半，所以这一行在修之前也过
+    expect(posted.body.comment.mentions).toHaveLength(1);
+
+    const got = await inbox(mentioned.token);
+    expect(got.some((n) => n.type === "BRANCH_MENTION")).toBe(true);
+  });
 });
