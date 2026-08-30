@@ -22,6 +22,7 @@ const User = require("../models/User");
 const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
+const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurge.service");
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
 const { ownedRecyclableAsset, RECYCLABLE_FOLDERS } = require("../utils/templateVideoAsset");
@@ -1037,7 +1038,8 @@ async function purgeVideo(videoId) {
   ]);
 
   // ④ 库删干净了才去动云端。失败**不抛**：作品已经没了，这时候报错只会让调用方
-  //    以为"没删成"而重试一遍（那一遍会删掉别的东西）。欠着的那几行留给清扫器。
+  //    以为"没删成"而重试一遍（那一遍会删掉别的东西）。欠着的那几行留给清扫器
+  //    （services/assetPurge —— 它是 PendingAssetPurge 的唯一读方，见那边的 ★★）。
   await Promise.all(
     handles.map(async (h) => {
       try {
@@ -1051,6 +1053,11 @@ async function purgeVideo(videoId) {
       }
     })
   );
+
+  // ⑤ 顺手扫一轮**以前**欠下的（惰性扫，见 services/assetPurge 的 ★）：
+  //    有删除就有清扫，不另起常驻定时器（生产是 pm2 双实例，那会两边同时跑）。
+  //    ⚠ 不 await：这是搭车跑的后台活，不该拖慢用户这一次删除；它自己永不抛。
+  void sweepPendingPurges();
 
   return { removed: 1 + commentIds.length, assets: handles.length };
 }
@@ -1799,11 +1806,15 @@ async function branchStats(req, res, next) {
       BranchDanmaku.countDocuments({}),
     ]);
     const pendingReports = await pendingReportCount();
+    // ★ 「还没删干净的云端资产」必须有人看得见：这张表此前只有写方没有读方，
+    //   于是 Cloudinary 抖一下就是"用户以为删了、东西还在公网"，且**零症状**。
+    //   清扫器会自己重试（services/assetPurge），这个数长期不归零才是要人管的信号。
+    const pendingPurges = await pendingPurgeCount();
 
     res.json({
       ok: true,
       // banned 是后加的键：老 App 读不到就当没有（只加不减，铁律七）
-      stats: { users, banned, videos, takenDown, comments, danmaku, pendingReports },
+      stats: { users, banned, videos, takenDown, comments, danmaku, pendingReports, pendingPurges },
     });
   } catch (err) {
     next(err);
