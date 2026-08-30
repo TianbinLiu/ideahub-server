@@ -13,3 +13,4 @@ uploads/
 #   2026-08-15 一次 git add -A 把它当成 gitlink 提交了进去（推出去才发现）——
 #   加进 .gitignore 免得下次又被卷进来。要删它本身请人工确认后再动。
 ideahub-server/
+releases/
