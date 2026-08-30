@@ -29,6 +29,7 @@ const {
   publishCard,
   unpublishCard,
   listSharedCards,
+  getSharedCard,
   installCard,
   addAssetView,
   likeAsset,
@@ -44,6 +45,9 @@ const {
 //   /decks/shared 下面那条同理，这是本文件唯一一条排序要求。
 router.get("/cards/shared", optionalAuth, listSharedCards);
 router.get("/cards", requireAuth, listCards);
+// 按 id 读一张**已分享**的卡（不登录也能看）。未分享的一律 404 —— 见 controller 的 ★★。
+// ★ 排在 /cards/shared 之后（见上面那条排序要求），"shared" 才不会被当成 cardId。
+router.get("/cards/:cardId", optionalAuth, getSharedCard);
 router.post("/cards", requireAuth, validate({ body: addCardsBody }), addCards);
 // 改一张已有的卡（只收 views）。★ 不能并进 POST /cards：那条是 $setOnInsert 的
 //   新增语义，用它改卡会 201 但库里一字未动，见 controller 的 updateCard 注释

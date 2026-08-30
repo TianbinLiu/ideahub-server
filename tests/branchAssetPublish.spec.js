@@ -162,6 +162,66 @@ describe("卡片/卡组发布到创意工坊", () => {
     expect(shared.body.cards.some((c) => c.cardId === card.cardId)).toBe(false);
   });
 
+  // ── GET /cards/:cardId（2026-08-30 新增）─────────────────────────
+  //
+  // ★★ 这组用例盯的是「一条卡片链接打不开」那个洞：客户端详情页原来只有两条来路
+  //   （自己库里那份 / 上一页经路由 state 递过来的对象），于是分享链接、会话恢复、
+  //   通知深链落地都是一句"这张卡不在你的收藏里"，而那张卡在广场上好好挂着。
+  //   同时钉死权限口径：**未分享的一律 404，不是 403**（403 等于承认这个 id 存在）。
+  test("A2c 按 id 读一张已分享的卡：游客也能读；未分享 / 不存在一律 404", async () => {
+    const author = await registerUser();
+    const card = cardOf({ name: "深链测试卡" });
+    await addCards(author.token, [card]).expect(201);
+
+    // 还没分享：游客 404，**卡主自己也 404** —— 这条端点只回答"广场上那份"，
+    // 卡主要看自己的卡走 GET /cards（他自己的库）
+    await request(app).get(`/api/branch/cards/${card.cardId}`).expect(404);
+    await request(app)
+      .get(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(404);
+
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ description: "一句话推荐" })
+      .expect(200);
+
+    // 分享之后：游客读得到，且字段与广场列表同一份形状
+    const guest = await request(app).get(`/api/branch/cards/${card.cardId}`).expect(200);
+    expect(guest.body.card.cardId).toBe(card.cardId);
+    expect(guest.body.card.name).toBe("深链测试卡");
+    expect(guest.body.card.description).toBe("一句话推荐");
+    expect(guest.body.card.author.username).toBeTruthy();
+    expect(guest.body.card.installed).toBe(false);
+    expect(guest.body.card.isOwner).toBe(false);
+
+    // 登录的卡主读：isOwner / installed 两位都要对（客户端靠它们决定按钮长什么样）
+    const own = await request(app)
+      .get(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(own.body.card.isOwner).toBe(true);
+    expect(own.body.card.installed).toBe(true);
+
+    // 取消分享之后又回到 404（广场上没有了，链接也就不该再打得开）
+    await request(app)
+      .delete(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    await request(app).get(`/api/branch/cards/${card.cardId}`).expect(404);
+
+    // 压根不存在的 id 也是 404，不是 500
+    await request(app).get("/api/branch/cards/nope_not_a_real_card").expect(404);
+  });
+
+  test("A2d /cards/shared 没被新端点吃掉（路由顺序）", async () => {
+    // ★ "shared" 会不会被当成 cardId 送进 GET /cards/:cardId —— 那样广场会永远空着
+    //   且返回 200，一点错都不报（这正是路由表里那条排序注释在防的事）。
+    const res = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(Array.isArray(res.body.cards)).toBe(true);
+  });
+
   test("A2b 只有卡主能发布自己的卡；别人发同名 cardId 只影响他自己那份", async () => {
     const author = await registerUser();
     const stranger = await registerUser();
@@ -387,7 +447,9 @@ describe("卡片/卡组发布到创意工坊", () => {
     const secondPublisher = await registerUser();
     const taker = await registerUser();
 
-    // 同一个 cardId 在库里是每人一份，各份的名字/封面/建模可以完全不一样
+    // 同一个 cardId 在库里是每人一份，各份的名字/封面/建模可以完全不一样。
+    // ★★ 2026-08-30 起**发不出第二份**了（见下面的 A10b）——但库里可能有存量重复行
+    //   （闸门上线之前发的），去重逻辑就是为它们存在的。所以这里绕过 API 直接造那种数据。
     const cardId = `mkt_same_card_${Date.now().toString(36)}`;
     await addCards(firstPublisher.token, [
       cardOf({ cardId, name: "先分享的那份", genPrompt: "原作者的蓝图" }),
@@ -401,10 +463,12 @@ describe("卡片/卡组发布到创意工坊", () => {
       .set("Authorization", `Bearer ${firstPublisher.token}`)
       .expect(200);
     await new Promise((r) => setTimeout(r, 20)); // 让两条的 publishedAt 真的分得开
-    await request(app)
-      .post(`/api/branch/cards/${cardId}/publish`)
-      .set("Authorization", `Bearer ${secondPublisher.token}`)
-      .expect(200);
+    // 存量重复行：直接改库（这正是闸门上线之前 API 会产出的形状）
+    const BranchCard = require("../src/models/BranchCard");
+    await BranchCard.updateOne(
+      { cardId, name: "后分享的那份" },
+      { $set: { published: true, publishedAt: new Date() } }
+    );
 
     // 广场：只出现一条，且是**最早**分享的那份（谁先分享算谁的）
     const shared = await request(app).get("/api/branch/cards/shared").expect(200);
@@ -421,7 +485,67 @@ describe("卡片/卡组发布到创意工坊", () => {
     expect(installed.body.card.name).toBe(rows[0].name);
     expect(installed.body.card.genPrompt).toBe(rows[0].genPrompt);
     expect(String(installed.body.card._id)).not.toBe(String(rows[0]._id)); // 是我自己那份副本
-    expect(rows[0].name).toBe("先分享的那份");
+  });
+
+  // ── 转发闸门（2026-08-30）────────────────────────────────────────
+  //
+  // ★★ 这是**产品语义变更**：从"库里任何一张卡都能挂上广场"改成"只有原创那份能挂"。
+  //   理由是机制层面的 —— 卡片身份是全局 cardId，`{owner,cardId}` 唯一索引 + 广场按
+  //   cardId 去重（最早发布那条）⇒ 转发**根本没有第二行可放**。此前那颗能点的按钮是个
+  //   假承诺：推荐语进了库谁也看不见，广场那行仍是原作者的，而按钮翻成了成功态。
+  test("A10b 装来的卡不能再分享一遍（两道闸各自独立成立）", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const card = cardOf({ name: "会被转发的卡" });
+    await addCards(author.token, [card]).expect(201);
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    // 装走 → 库里那份带上了 sourceOwner
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+
+    // 第一道闸：sourceOwner 有值 → 400，且**说清楚为什么**（不是一句 Bad Request）
+    const refused = await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(400);
+    expect(String(refused.body.message || refused.body.error || "")).toMatch(/装来的|最早/);
+
+    // ★ 原作者自己**照常**能撤下、能再发（闸门只拦转发，不许误伤原创）
+    await request(app)
+      .delete(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    await request(app)
+      .post(`/api/branch/cards/${card.cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+  });
+
+  test("A10c 第二道闸：没有来源标记的快照卡，靠「已经有人先发过」拦住", async () => {
+    // 跟着作品卡组 / 模板快照经 POST /cards 落库的卡没有 sourceOwner —— 服务端无从
+    // 判断它是不是你原创的，但"广场上已经有别人先分享过同一个 cardId"是硬事实。
+    const author = await registerUser();
+    const other = await registerUser();
+    const cardId = `mkt_snapshot_${Date.now().toString(36)}`;
+    await addCards(author.token, [cardOf({ cardId, name: "原件" })]).expect(201);
+    await addCards(other.token, [cardOf({ cardId, name: "手里的快照副本" })]).expect(201);
+
+    await request(app)
+      .post(`/api/branch/cards/${cardId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+
+    const refused = await request(app)
+      .post(`/api/branch/cards/${cardId}/publish`)
+      .set("Authorization", `Bearer ${other.token}`)
+      .expect(400);
+    expect(String(refused.body.message || refused.body.error || "")).toMatch(/已经有人先分享|最早/);
   });
 
   test("A11 卡组里有第三方版权模型：整个发布 400 并点名是哪张卡，不是悄悄剥掉", async () => {

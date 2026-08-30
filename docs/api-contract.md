@@ -268,6 +268,7 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | POST | `/api/branch/cards` | required | 批量新增 `{ cards: Card[] }`（按 cardId 幂等） |
 | DELETE | `/api/branch/cards/:cardId` | required | 删除一张 |
 | GET | `/api/branch/cards/shared` | optional | 创意工坊的卡片广场。**必须注册在 `/cards/:cardId` 之前** |
+| GET | `/api/branch/cards/:cardId` | optional | 按 id 读**一张已分享的卡**（卡片深链回源）。回包与广场列表同形（含 `installed`/`isOwner`）。⚠ **未分享 / 已撤下 / 不存在一律 404，不是 403** —— 403 等于承认"这个 id 存在但你不能看"，而 cardId 是 `前缀_时间戳_6位随机`，不是能力令牌。内容取**权威那份**（`findAuthoritativeCard`：最早发布的那条），与广场列表、安装同一把尺 |
 | POST | `/api/branch/cards/:cardId/publish` | required | 分享到工坊 `{ description? }`（仅作者）。挂第三方版权模型的卡 **400** |
 | DELETE | `/api/branch/cards/:cardId/publish` | required | 取消分享 |
 | POST | `/api/branch/cards/:cardId/install` | required | 装走一张（按 `{owner, cardId}` 幂等：首次 201，之后 200 + `alreadyInstalled`） |

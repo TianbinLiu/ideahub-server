@@ -89,6 +89,65 @@ function ownedCloudinaryAsset(rawUrl, userId) {
   return { publicId: m[2].replace(/\.[A-Za-z0-9]+$/, ""), resourceType: m[1] };
 }
 
+/**
+ * 作品/卡片删除时**可以回收**的 Cloudinary 目录白名单。
+ *
+ * ★ 刻意不含 `template-videos`：那条有自己的四道 in-use 闸与级联（见 branchTemplate.routes）。
+ * ★ 刻意不含 `avatars`：头像不随作品走，删作品把头像删了是另一种事故。
+ */
+const RECYCLABLE_FOLDERS = ["branch-frames", "branch-videos", "content-images", "workshop-media"];
+
+/**
+ * 上面这批目录里，服务端生成的 public_id 形状是 `${userId}-${ts}` **再带若干后缀段**
+ * （`-1-cover-<ts>` / `-seg` / `-<seq>-<slug>-<ts>`，见 branchVideo.nextKey 与
+ * videoAsset.uploadVideoBuffer / arkTransfer 的 cldKey）。
+ *
+ * ⚠ **不能复用 `ownBaseRe`**：那条是 `^<id>-\d+$`，认得出 content-images/workshop-media，
+ *   认不出 branch-frames / branch-videos。用错的表现是"功能上线了、代码看着对、
+ *   月底用量一点没降"，而没回收到的恰恰是**体积最大**的那批（成片）。
+ * ⚠ 反过来也不能把 `ownBaseRe` 放宽成这个：模板那条严格形状是**安全属性**
+ *   （没有拼接余地），放宽它等于给"拿别人的资产登记模板"开一条缝。两条各管各的。
+ */
+function ownRecyclableBaseRe(userId) {
+  // ⚠ `\\d` 必须写两个反斜杠：模板字符串里的 `\d` 是**无效转义**，运行时退化成字母 d，
+  //   于是这条正则永远匹配不上，而且**零报错**（CLAUDE.md 那格坑，本次又栽了一次）。
+  return new RegExp(`^${String(userId)}-\\d+(?:-[A-Za-z0-9_-]+)*$`);
+}
+
+/**
+ * 这个 https URL 是不是「**这个账号**传到我们这几个目录里」的资产 —— 删除时据此回收。
+ *
+ * @param {string} rawUrl
+ * @param {string} userId
+ * @param {string[]} folders **必填**，无默认值。给默认值的话，新调用点漏传就悄悄退回
+ *   "什么目录都认"，而那正是这条最危险的失败方式：删一个号会顺手 destroy 掉别人还在
+ *   用的东西，且零报错（与 shareBlockReason 的方向参数必填同一条纪律）。
+ * @returns {{ publicId: string, resourceType: string } | null} null = 不认（外链 / 别人的资产 / 不在白名单目录）
+ */
+function ownedRecyclableAsset(rawUrl, userId, folders) {
+  if (!Array.isArray(folders) || folders.length === 0) {
+    throw new Error("ownedRecyclableAsset: folders 必须显式给（见该函数的 ⚠）");
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname !== "res.cloudinary.com") return null;
+  // 路径形如 /<cloud>/<resource_type>/upload/v123/ideahub/<folder>/<base>.<ext>
+  // ★ resourceType 从**路径段**取，绝不写死 "video"：workshop-media 一个目录里 image/video
+  //   都有，写死的表现是"合并成片删得掉、封面删不掉"，而 Cloudinary 对不存在的资源
+  //   回 "not found" 不报错 —— 又是零症状。
+  const m = parsed.pathname.match(/^\/[^/]+\/(image|video)\/upload\/(?:v\d+\/)?ideahub\/([^/]+)\/([^/]+)$/);
+  if (!m) return null;
+  const [, resourceType, folder, file] = m;
+  if (!folders.includes(folder)) return null;
+  const base = file.replace(/\.[A-Za-z0-9]+$/, "");
+  if (!ownRecyclableBaseRe(userId).test(base)) return null;
+  return { publicId: `ideahub/${folder}/${base}`, resourceType };
+}
+
 // ── 裁剪变换（白模 V2）────────────────────────────────────────────────
 //
 // 2026-08-15 实测（F8）：`so_<秒>,du_<秒>,c_crop,x_,y_,w_,h_` 一条变换同时做
@@ -207,6 +266,8 @@ function parseOwnClipUrl(rawUrl, userId) {
 }
 
 module.exports = {
+  RECYCLABLE_FOLDERS,
+  ownedRecyclableAsset,
   TEMPLATE_VIDEO_FOLDER,
   ownTemplateVideoPublicId,
   parseOwnTemplateVideoUrl,

@@ -20,6 +20,11 @@ const Follow = require("../models/Follow");
 // 平台统计只用它数人头（countDocuments），不读任何字段
 const User = require("../models/User");
 const { uploadToCloudinary } = require("../middleware/upload");
+const { cloudinary } = require("../config/cloudinary");
+const PendingAssetPurge = require("../models/PendingAssetPurge");
+// 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
+const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
+const { ownedRecyclableAsset, RECYCLABLE_FOLDERS } = require("../utils/templateVideoAsset");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 // 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用
@@ -932,6 +937,39 @@ async function purgeVideo(videoId) {
   // 否则删完作品那些 BranchCommentLike 会永远留在库里（谁也再查不到、也删不掉）。
   const commentIds = (await BranchComment.find({ video: videoId }).select("_id").lean()).map((c) => c._id);
 
+  // ★★ 云端资产的**句柄先落库**（2026-08-30 补）。此前这个函数只清六张 Mongo 表，
+  //   `uploader.destroy` 一次都没有 —— 用户删掉作品之后，成片与封面那几个 https 地址
+  //   **仍然人人可访问**。删除是隐私诉求，这是它没被满足。
+  //   顺序是这条改动的核心：① 读正文拿地址 → ② 句柄落 PendingAssetPurge →
+  //   ③ 删六张表 → ④ 逐条 destroy，成功即删句柄行。任何一步失败，句柄都还在；
+  //   而地址**只存在于那份正文里**，正文一删就再也找不回来（见 PendingAssetPurge 的 ★★）。
+  const doc = await BranchVideo.findById(videoId).select("author cover segments branchTree").lean();
+  const owner = doc && doc.author;
+  const handles = [];
+  if (doc && owner) {
+    for (const url of assetUrlsOfVideo(doc)) {
+      // 认不出的一律不动（外链、别人的资产、模板目录）—— 回收范围写宽一点，
+      // 删一个号就会顺手 destroy 掉别人还在用的东西，且零报错
+      const own = ownedRecyclableAsset(url, String(owner), RECYCLABLE_FOLDERS);
+      if (own) handles.push({ ...own, owner, source: String(videoId) });
+    }
+  }
+  if (handles.length) {
+    try {
+      // 同一个 publicId 只欠一次（并发删同一条、重试都靠 publicId 唯一索引幂等）
+      await PendingAssetPurge.bulkWrite(
+        handles.map((h) => ({
+          updateOne: { filter: { publicId: h.publicId }, update: { $setOnInsert: h }, upsert: true },
+        })),
+        { ordered: false }
+      );
+    } catch (err) {
+      // 唯一索引撞车 = 已经欠着了，不算失败；其它错误也只记日志：
+      // ★ 不许因为"句柄没落住"就拒绝删除 —— 那会把用户的隐私诉求挡在我们的实现细节后面。
+      if (!err || err.code !== 11000) console.warn("[branch] 资产句柄落库失败:", err?.message || err);
+    }
+  }
+
   await Promise.all([
     BranchVideo.deleteOne({ _id: videoId }),
     BranchLike.deleteMany({ video: videoId }),
@@ -946,7 +984,23 @@ async function purgeVideo(videoId) {
     Notification.deleteMany({ videoId }),
   ]);
 
-  return { removed: 1 + commentIds.length };
+  // ④ 库删干净了才去动云端。失败**不抛**：作品已经没了，这时候报错只会让调用方
+  //    以为"没删成"而重试一遍（那一遍会删掉别的东西）。欠着的那几行留给清扫器。
+  await Promise.all(
+    handles.map(async (h) => {
+      try {
+        await cloudinary.uploader.destroy(h.publicId, { resource_type: h.resourceType, invalidate: true });
+        await PendingAssetPurge.deleteOne({ publicId: h.publicId });
+      } catch (err) {
+        await PendingAssetPurge.updateOne(
+          { publicId: h.publicId },
+          { $inc: { attempts: 1 }, $set: { lastError: String(err?.message || err).slice(0, 500) } }
+        ).catch(() => {});
+      }
+    })
+  );
+
+  return { removed: 1 + commentIds.length, assets: handles.length };
 }
 
 // POST /api/branch/videos/:id/play
