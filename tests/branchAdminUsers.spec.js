@@ -617,4 +617,54 @@ describe("U6 内容钻取", () => {
       .set(bearer(admin.token))
       .expect(400);
   });
+
+  // ★★ 删号级联漏表这一类（2026-08-31 补）：BranchTemplate 此前整个文件一次都没提到 ——
+  //   既不在"删"的清单里，也不在"不删（刻意的）"的清单里。后果不是少删一张表：
+  //   模板市场列表是裸的 find({status:"published"})（不查作者在不在），于是被永久删号的人
+  //   发布的模板原封不动留在货架上，别人照样套用出片、照样付费；那份 100MB 级素材在产品内
+  //   再没有任何把手能删（删模板端点只认 ownerId 本人，而那个人已经不存在了）。
+  test("删号会把他的白模模板一并清掉，云端句柄落进待清扫队列", async () => {
+    const BranchTemplate = require("../src/models/BranchTemplate");
+    const PendingAssetPurge = require("../src/models/PendingAssetPurge");
+    await PendingAssetPurge.deleteMany({});
+
+    const admin = await registerAdmin();
+    const victim = await registerUser();
+    const tpl = await BranchTemplate.create({
+      ownerId: victim.userId,
+      title: "违规用户的白模模板",
+      status: "published",
+      coverUrl: "https://res.cloudinary.com/demo/image/upload/v1/ideahub/template-covers/x.jpg",
+      recipe: { durationSec: 5 },
+      refVideo: {
+        url: "https://res.cloudinary.com/demo/video/upload/v1/a.mp4",
+        cloudinaryPublicId: "ideahub/template-videos/a",
+        durationSec: 5,
+        width: 720,
+        height: 1280,
+        bytes: 1024,
+      },
+      source: {
+        publicId: "ideahub/template-sources/a-src",
+        startSec: 0,
+        durSec: 5,
+        crop: { x: 0, y: 0, w: 720, h: 1280 },
+      },
+    });
+
+    await request(app)
+      .delete(`/api/admin/branch/users/${victim.userId}`)
+      .set("Authorization", `Bearer ${admin.token}`)
+      .expect(200);
+
+    // 模板行没了 —— 别人在货架上再也看不到它
+    expect(await BranchTemplate.findById(tpl._id).lean()).toBeNull();
+    const shelf = await request(app).get("/api/branch/templates/shared").expect(200);
+    const rows = shelf.body.templates || shelf.body.items || [];
+    expect(rows.find((t) => String(t.id || t._id) === String(tpl._id))).toBeUndefined();
+
+    // 云端那三份的句柄欠着，交给 sweepPendingPurges 重试（不在删号这条路上同步 destroy）
+    const owed = (await PendingAssetPurge.find({}).lean()).map((r) => r.publicId);
+    expect(owed).toEqual(expect.arrayContaining(["ideahub/template-videos/a", "ideahub/template-sources/a-src"]));
+  });
 });
