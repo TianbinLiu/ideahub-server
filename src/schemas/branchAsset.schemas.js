@@ -136,13 +136,27 @@ const addCardsBody = z.object({
 //   于是在下一次冷启动时无声消失。那是丢数据，不是"暂未同步"。
 // ★ views 是**必填**：body 里没有它就 400。可选的话，一个拼错字段名的调用会拿到
 //   200 + "改好了"，而库里什么都没发生 —— 同一类静默 no-op，只是换了个地方发生。
-const updateCardBody = z.object({
-  views: z.array(cardView).max(MAX_CARD_VIEWS),
-  // 真人声明可以跟着一起改（可选；不带就保留库里原值——controller 只在拿到布尔时 $set）。
-  // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
-  //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。
-  realPerson: z.boolean().optional(),
-});
+const updateCardBody = z
+  .object({
+    // ★ 改成 optional（2026-08-30）：这条 PATCH 现在也用来改名字/简介，
+    //   不带 views 时**必须保留库里原值** —— controller 是定向 $set，不带就不动它。
+    views: z.array(cardView).max(MAX_CARD_VIEWS).optional(),
+    // ★★ 名字 / 简介 / 关键词可以改（2026-08-30 补）。此前这条 PATCH **只收 views** ——
+    //   于是"名字打错一个字"的唯一出路是**删了重铸**，而铸卡是花钱的（一张顶档卡片
+    //   连带 3D 建模是十几万 token）。客户端那边 `updateCard` 也只写本地不同步，
+    //   所以改了名换台设备就打回原形。
+    //   ⚠ 上限与建卡（cardItem）**逐字相同**：两处不等的话，用户能建出来的卡改不动，
+    //     或者改完发过去吃一个 400 —— 而这条 PATCH 是"救回一张已经花过钱的卡"用的。
+    name: z.string().trim().max(120).optional(),
+    summary: z.string().trim().max(2000).optional(),
+    tags: z.array(z.string().trim().max(40)).max(12).optional(),
+    // 真人声明可以跟着一起改（可选；不带就保留库里原值——controller 只在拿到布尔时 $set）。
+    // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
+    //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。
+    realPerson: z.boolean().optional(),
+  })
+  // ★ 空对象要 400，不能"成功但什么都没改"（与作品的 updateBody 同一条）
+  .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 
 const deckName = z.string().trim().max(60);
 const deckCardIds = z.array(z.string().trim().min(1).max(120)).max(500);

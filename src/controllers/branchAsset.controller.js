@@ -438,8 +438,18 @@ async function updateCard(req, res, next) {
     const cardId = String(req.params.cardId || "").trim();
     if (!cardId) invalidId("Invalid card id");
 
+    // ★ 定向 $set：只动这次真给了的字段。改成"每个字段都判一次"是因为这条 PATCH
+    //   现在有两种用途（改图 / 改名字简介），无条件写 views 会让"只改名字"顺手把
+    //   参考图清空 —— 那是一次静默的丢数据。
+    const $set = {};
     // 去重与归一走与入库/发布同一个闸门，别在这里另写一遍（铁律六）
-    const $set = { views: shareableViews(req.body.views) };
+    if (req.body.views !== undefined) $set.views = shareableViews(req.body.views);
+    // ★★ 名字/简介/关键词：此前改不了，用户只能删了重铸 —— 而铸卡是花钱的。
+    //   ⚠ 只改**卡主自己这份**：随作品/卡组发出去的是**快照**（逐字段复制的），
+    //     改名不会追改那些副本，这一点客户端要如实说，别许诺"全网都改"。
+    if (typeof req.body.name === "string") $set.name = req.body.name;
+    if (typeof req.body.summary === "string") $set.summary = req.body.summary;
+    if (Array.isArray(req.body.tags)) $set.tags = req.body.tags;
     // 真人声明只在这次真给了布尔时才动：PATCH 是定向 $set，不带 = 保留库里原值。
     // （当前客户端不发它；schema 里声明是留门，见 schemas 里 updateCardBody 的注释）
     if (typeof req.body.realPerson === "boolean") $set.realPerson = req.body.realPerson;
