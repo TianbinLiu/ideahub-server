@@ -150,6 +150,23 @@ const branchVideoSchema = new mongoose.Schema(
     // 可见性。★ 查询一律用 { visibility: { $ne: "private" } } 而不是 { visibility: "public" }：
     // 这个字段是后加的，**存量作品没有它**，按等值查会把所有老作品从首页上抹掉。
     visibility: { type: String, enum: ["public", "private"], default: "public" },
+    /**
+     * 「只有拿到链接的人能看」——列表里不出现，但按 id 直取放行。
+     *
+     * ★★ 为什么是**另一个字段**而不是给 visibility 加第三个枚举值 `unlisted`
+     *   （这条与上面「下架为什么是另一个字段」是同一类的取舍，但理由不同）：
+     *   客户端**分不出新老**（请求里没有版本号），而老客户端的 `toVideoItem` 是
+     *   `v.visibility === "private" ? "private" : "public"` —— 收到 "unlisted" 会归一成
+     *   **public**，之后用户在那台设备上随便改个标题保存，就把一条"只给链接看"的作品
+     *   静默变成了全站公开。那是**隐私泄漏方向**的失败。
+     *   存成 `private + linkOnly` 之后，老客户端读到的是"仅自己可见"——**更严格**，
+     *   而且它的 PATCH 不带 linkOnly，`$set` 碰不到它，作品照旧是"凭链接可见"。
+     *   ⇒ 失败方向从"泄漏"翻成了"过度保守"，这才是隐私功能该有的方向。
+     * ★ 只有 `visibility === "private"` 时它才有意义。visibility 改回 public 时必须清掉它
+     *   （见 controller 的写入点），否则库里会留下一个自相矛盾的状态。
+     * ★ 判**有值**：老数据没有这个字段 = 不是"凭链接可见"。
+     */
+    linkOnly: { type: Boolean, default: undefined },
     // 平台下架。★ 不给 default：绝大多数作品**没有**这个字段，给 default 会让
     // 每一条老作品都凭空多出一个空的下架记录（同 pricing / aspect 那两处的理由）。
     takedown: { type: takedownSchema, default: undefined },

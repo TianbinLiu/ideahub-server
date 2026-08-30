@@ -288,6 +288,9 @@ function toVideoPayload(doc, ctx = {}) {
     commentCount: Number(doc.commentCount || 0),
     // 老数据没这个字段，对外一律归一成 "public"（客户端就不用再判 undefined）
     visibility: doc.visibility === "private" ? "private" : "public",
+    // ★ 「凭链接可见」。只在为真时发这个键（老数据不发）—— 老客户端读不懂它，
+    //   但它们看到的 visibility 是 "private"，那是**更严格**的一档，不会泄漏。
+    ...(doc.linkOnly === true && doc.visibility === "private" ? { linkOnly: true } : {}),
     liked: !!ctx.liked,
     isOwner: !!ctx.isOwner,
     createdAt: doc.createdAt,
@@ -507,7 +510,12 @@ function isTakenDown(doc) {
  */
 function readableBy(doc, user) {
   if (ownedBy(doc, user) || isAdmin(user)) return true;
-  return doc?.visibility !== "private" && !isTakenDown(doc);
+  if (isTakenDown(doc)) return false;
+  // ★ 「凭链接可见」= 按 id 直取放行、列表里不出现。所以它只在**这一处**放行，
+  //   readableFilter（列表那条）刻意不认它 —— 两处不一致是**有意的**，
+  //   而这正是这个功能的定义。⚠ 改这两个函数时别"顺手统一"。
+  if (doc?.visibility === "private" && doc?.linkOnly === true) return true;
+  return doc?.visibility !== "private";
 }
 
 /**
@@ -777,6 +785,8 @@ async function createVideo(req, res, next) {
         ...(deck && deck.cards.length ? { deck } : {}),
         ...(draft.pricing && draft.pricing.mode === "paid" ? { pricing: draft.pricing } : {}),
         visibility: draft.visibility === "private" ? "private" : "public",
+        // 「凭链接可见」只在私密时有意义（见 model 的 ★）
+        ...(draft.linkOnly === true && draft.visibility === "private" ? { linkOnly: true } : {}),
         author: req.user._id,
         ...(clientId ? { clientId } : {}),
         plays: 0,
@@ -876,8 +886,19 @@ async function updateVideo(req, res, next) {
     //   或者把 takedown 声明进去，那条会红。
     //   ⚠ 这里**刻意不再写一遍 `delete patch.takedown`**：同一条规则写两处，
     //     以后只会有人改一处（铁律六）。真正的门在 schema 上。
-    const patch = req.body;
-    const updated = await BranchVideo.findByIdAndUpdate(id, { $set: patch }, { returnDocument: "after" })
+    const patch = { ...req.body };
+    // ★★ 「凭链接可见」只有在 private 下才成立。改回 public 时**必须把它清掉**，
+    //   否则库里留下 `public + linkOnly:true` 这种自相矛盾的状态 —— 今天没人读它，
+    //   但下一个人写判据时会撞上，而它不报错、只是行为诡异。
+    //   ⚠ 用 $unset 而不是 `linkOnly: false`：这个字段判**有值**（default undefined），
+    //     写个 false 进去等于给每条老作品凭空长出一个字段。
+    const $unset = {};
+    if (patch.visibility === "public") {
+      delete patch.linkOnly;
+      $unset.linkOnly = "";
+    }
+    const update = Object.keys($unset).length ? { $set: patch, $unset } : { $set: patch };
+    const updated = await BranchVideo.findByIdAndUpdate(id, update, { returnDocument: "after" })
       .populate("author", AUTHOR_FIELDS)
       .lean();
 

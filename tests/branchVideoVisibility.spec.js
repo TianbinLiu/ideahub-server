@@ -563,3 +563,92 @@ describe("按标签搜索", () => {
     expect(res.body.items).toEqual([]);
   });
 });
+
+// ── 「凭链接可见」（2026-08-30）────────────────────────────────────
+//
+// ★★ 这一档的定义就是**两处刻意不一致**：列表里不出现（readableFilter 不认它），
+//   按 id 直取放行（readableBy 认它）。所以这组用例两头都要钉死 —— 少钉一头，
+//   下一个人"顺手统一"那两个函数时，要么这功能没了，要么私密作品漏进首页。
+describe("凭链接可见（linkOnly）", () => {
+  const publishLinkOnly = (token, extra = {}) =>
+    publish(token, { visibility: "private", linkOnly: true, ...extra });
+
+  test("U1 列表/搜索里不出现，但拿到 id 谁都打得开", async () => {
+    const author = await registerUser();
+    const created = await publishLinkOnly(author.token, { title: "凭链接看的片", tags: ["链接档"] }).expect(201);
+    const id = String(created.body.video._id);
+    expect(created.body.video.visibility).toBe("private");
+    expect(created.body.video.linkOnly).toBe(true);
+
+    // 列表：匿名与他人都看不到
+    const list = await request(app).get("/api/branch/videos").expect(200);
+    expect(idsOf(list.body)).not.toContain(id);
+    // 搜索也不行（q 那条路同样走 readableFilter）
+    const found = await request(app).get("/api/branch/videos?q=%E9%93%BE%E6%8E%A5%E6%A1%A3").expect(200);
+    expect(idsOf(found.body)).not.toContain(id);
+
+    // 按 id：匿名也能打开 —— 这正是这一档存在的理由
+    const anon = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(anon.body.video.title).toBe("凭链接看的片");
+    const other = await registerUser();
+    await request(app).get(`/api/branch/videos/${id}`).set("Authorization", `Bearer ${other.token}`).expect(200);
+  });
+
+  test("U2 纯私密（没有 linkOnly）照旧 404 —— 别把两档搞混", async () => {
+    const author = await registerUser();
+    const created = await publish(author.token, { title: "真私密", visibility: "private" }).expect(201);
+    const id = String(created.body.video._id);
+    expect(created.body.video.linkOnly).toBeUndefined();
+    await request(app).get(`/api/branch/videos/${id}`).expect(404);
+  });
+
+  test("U3 改回公开会清掉 linkOnly（不留 public+linkOnly 这种自相矛盾的状态）", async () => {
+    const author = await registerUser();
+    const id = String((await publishLinkOnly(author.token).expect(201)).body.video._id);
+
+    const back = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ visibility: "public" })
+      .expect(200);
+    expect(back.body.video.visibility).toBe("public");
+    expect(back.body.video.linkOnly).toBeUndefined();
+    // 库里也真的没了这个键（不是写成 false）
+    const raw = await BranchVideo.collection.findOne({ _id: new mongoose.Types.ObjectId(id) });
+    expect("linkOnly" in raw).toBe(false);
+  });
+
+  test("U4 老客户端的编辑不会把它变成公开（这条决定了整个设计）", async () => {
+    // ★★ 老客户端读到的 visibility 是 "private"（它不认识 linkOnly），
+    //   它的 PATCH 也**不带** linkOnly ⇒ $set 碰不到那个字段 ⇒ 作品照旧凭链接可见。
+    //   如果当初把这一档做成 visibility 的第三个枚举值，老客户端会把它归一成 public，
+    //   随便改个标题保存就把作品静默变成全站公开 —— 那是隐私泄漏方向的失败。
+    const author = await registerUser();
+    const id = String((await publishLinkOnly(author.token, { title: "旧客户端来改" }).expect(201)).body.video._id);
+
+    const patched = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ title: "改了个标题", visibility: "private" }) // 老客户端会原样回传它读到的 private
+      .expect(200);
+    expect(patched.body.video.title).toBe("改了个标题");
+    expect(patched.body.video.linkOnly).toBe(true);
+    // 仍然打得开、仍然不在列表里
+    await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    const list = await request(app).get("/api/branch/videos").expect(200);
+    expect(idsOf(list.body)).not.toContain(id);
+  });
+
+  test("U5 存量作品（库里根本没有 visibility 字段）照旧出现在列表里", async () => {
+    // ★ 这是"后加字段判否定"那条规则的回归：readableFilter 用的是 $ne/$nin 而不是
+    //   `= "public"` —— 用等值判会把所有老作品从首页上抹掉，而且一点错都不报。
+    const author = await registerUser();
+    const id = String((await publish(author.token, { title: "老作品" }).expect(201)).body.video._id);
+    await BranchVideo.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $unset: { visibility: "" } }
+    );
+    const list = await request(app).get("/api/branch/videos").expect(200);
+    expect(idsOf(list.body)).toContain(id);
+  });
+});

@@ -249,9 +249,9 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/api/branch/videos` | optional | 列表。query：`feed=recommend\|following`、`category`、`q`（对 **title / description / tags** 三者做不区分大小写的子串匹配）、`author`(用户 id)、`cursor`、`limit`(默认 12)。返回 `{ ok, items, nextCursor, author? }`；`items[].liked` 表示当前用户是否已赞。**只返回公开作品 + 自己的作品**（见下「可见性」）。★ `author` 生效时会**原样回显**在响应里 —— 老服务端会把这个 query strip 掉然后照常回推荐流，客户端只能靠"这个键在不在"分辨"按作者筛过、这人没作品"与"压根没筛"，判内容或判状态码都分不出来 |
-| POST | `/api/branch/videos` | required | 发布。body=DraftVideo（title/category/description/**tags**/cover/segments/branchTree/**deck**/**visibility**/**clientId**）。**服务端负责把 body 里的外链资源转存**（见下）。带 `clientId` 时按 `{author, clientId}` 幂等：重发返回首次那条、状态码 200（首发是 201） |
+| POST | `/api/branch/videos` | required | 发布。body=DraftVideo（title/category/description/**tags**/cover/segments/branchTree/**deck**/**visibility**/**linkOnly**/**clientId**）。**服务端负责把 body 里的外链资源转存**（见下）。带 `clientId` 时按 `{author, clientId}` 幂等：重发返回首次那条、状态码 200（首发是 201） |
 | GET | `/api/branch/videos/:id` | optional | 详情（含 comments 前 50 条）。非作者访问 private 作品返回 **404**（不是 403） |
-| PATCH | `/api/branch/videos/:id` | required | 作品编辑，仅作者。body `{ title?, category?, description?, tags?, visibility?, cover? }`，**至少给一个字段**（空对象 400）。segments / branchTree / deck 一律被 strip —— 发布即定稿 |
+| PATCH | `/api/branch/videos/:id` | required | 作品编辑，仅作者。body `{ title?, category?, description?, tags?, visibility?, linkOnly?, cover? }`，**至少给一个字段**（空对象 400）。segments / branchTree / deck 一律被 strip —— 发布即定稿 |
 | DELETE | `/api/branch/videos/:id` | required | 仅作者可删 |
 | POST | `/api/branch/videos/:id/play` | optional | 播放计数 +1，返回 `{ ok, plays }` |
 | POST | `/api/branch/videos/:id/like` | required | 点赞，返回 `{ ok, likes, liked: true }` |
@@ -450,6 +450,37 @@ query `q`、`limit`(默认 8，上限 20)。返回 `{ ok, users: [{ _id, usernam
 ★ **必须写成 `!== "private"` 而不是 `=== "public"`**：这个字段是后加的，存量作品这一项是
 `undefined`，按等值判会把库里所有老作品从首页上抹掉——而且一点错都不报。
 响应里的 `visibility` 已经归一过（`undefined` → `"public"`），客户端不用判缺省。
+
+### 「凭链接可见」（`linkOnly`，2026-08-30）
+
+界面上有**三档**：公开 / 凭链接可见 / 仅自己可见。但线上存的是**两个字段**：
+
+| 界面档位 | `visibility` | `linkOnly` | 列表/搜索 | 按 id 直取 |
+|---|---|---|---|---|
+| 公开 | `public` | 不发 | 出现 | 放行 |
+| 凭链接可见 | `private` | `true` | **不出现** | **放行** |
+| 仅自己可见 | `private` | 不发 / `false` | 不出现 | 仅作者 |
+
+★★ **为什么不给 `visibility` 加第三个枚举值 `unlisted`**（这是这条设计的全部要害）：
+客户端**分不出新老**（请求里没有版本号），而老客户端的归一是
+`v.visibility === "private" ? "private" : "public"` —— 收到 `"unlisted"` 会把它当成
+**public**，之后用户在那台设备上随便改个标题保存，就把一条"只给链接看"的作品静默变成
+全站公开。那是**隐私泄漏方向**的失败。
+存成 `private + linkOnly` 之后：老客户端读到 `private`（**更严格**），而且它的 PATCH
+**不带 `linkOnly`** ⇒ `$set` 碰不到那一位 ⇒ 作品照旧凭链接可见。失败方向从"泄漏"翻成
+"过度保守"。（server 的用例 U4 专门钉这一条。）
+
+★ 这一档的定义就是**两处刻意不一致**：`readableFilter`（列表）不认它、`readableBy`
+（按 id）认它。⚠ 别"顺手统一"那两个函数 —— 统一哪一边都会毁掉一件事：要么这个功能没了，
+要么私密作品漏进首页。
+
+★ `visibility` 改回 `public` 时服务端会 **`$unset` 掉 `linkOnly`**（不是写成 `false`）：
+这个字段判**有值**，写 false 会让每条老作品凭空长出一个字段，而 `public + linkOnly:true`
+本身是个自相矛盾的状态。
+
+★ 客户端：三档与两个字段的映射**只有 `types.visibilityOf` / `visibilityWire` 两个函数**。
+⚠ 从「凭链接可见」改成「仅自己可见」时必须**显式发 `linkOnly: false`** —— 不发的话服务端
+碰不到那一位，界面显示收紧了而链接照样打得开（`visibilityWire` 里那条 ★）。
 
 挡的地方不止详情：`GET /videos`（含 `q` 搜索）、`GET /videos/:id`、`POST /:id/play`、
 `POST|DELETE /:id/like`、`GET|POST /:id/comments`、`DELETE /:id/comments/:commentId`、
