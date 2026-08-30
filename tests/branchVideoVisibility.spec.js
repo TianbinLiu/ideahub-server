@@ -280,6 +280,38 @@ describe("作品编辑（PATCH）", () => {
     await request(app).patch(`/api/branch/videos/${id}`).send({ title: "我改了" }).expect(401);
   });
 
+  // ★★ 卡组快照是**逐字段重建**的（controller 的 cards.push），少搬一行零报错 ——
+  //   views / realPerson 各漏过一次，idLine 是第三次（2026-08-31）。这条钉住"三处都在"：
+  //   zod 放行（.loose）、controller 搬、model 声明。任一处漏掉，读回来就是空串，
+  //   而观众装走这套卡只会得到一个"长得不太一样"的人物，没人查得到这里。
+  test("卡组快照要带上 idLine / realPerson / views —— 逐字段重建的那三处都在", async () => {
+    const author = await registerUser();
+    const id = String(
+      (
+        await publish(author.token, {
+          deck: {
+            name: "带身份句的卡组",
+            cards: [
+              {
+                id: "c_id",
+                name: "凛",
+                summary: "一个在雨夜里追查真相的少女",
+                idLine: "凛，红发单马尾，黑色高领风衣，右眼下有痣",
+                realPerson: false,
+                views: [{ url: "https://cdn.example.com/rin-body.jpg", kind: "body" }],
+              },
+            ],
+          },
+        })
+      ).body.video._id
+    );
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    const card = detail.body.video.deck.cards[0];
+    expect(card.idLine).toBe("凛，红发单马尾，黑色高领风衣，右眼下有痣");
+    expect(card.views).toHaveLength(1);
+    expect(card.realPerson).toBe(false);
+  });
+
   test("片段与卡组改不动：发布即定稿，这些字段一律被 strip", async () => {
     const author = await registerUser();
     const id = String(

@@ -65,6 +65,14 @@ const deckCardSchema = new mongoose.Schema(
     // 转存失败时可能残留 dataURL，同 segment 的帧字段，不设 maxlength
     cover: { type: String, default: "" },
     tags: { type: [String], default: [] },
+    /** 固定身份句（与 BranchCard.idLine / BranchDeck.idLine 同一位，2026-08-31 补）。
+     *  ★★ 这是**同一批搬运点里漏掉的第六处**：卡组快照走的是逐字段重建，
+     *  少写一行没有任何编译期或运行期症状，而观众「收入卡组」/「做同款」拿到的卡
+     *  `idLine` 为空 ⇒ 客户端 `idLineOf()` 静默兜底成"名字+简介前 40 字"（里面一个
+     *  视觉特征都没有）⇒ 发给 Seedance 的"长相/发色/服装必须完全一致"那句锚了个空。
+     *  观众花真钱出片，只会觉得"这套卡本来就不太稳"。同 views / realPerson 那两次。
+     *  上限 200 与 BranchCard.idLine 取同一个数。 */
+    idLine: { type: String, default: "", trim: true, maxlength: 200 },
     /** 真人声明。与 views 同一个理由入快照（modelUrl/genPrompt 是"卡主私有"才不入）：
      *  观众收入卡组后要按它分流出片档位，漏声明 = mongoose 落库时静默剥掉，
      *  真人卡经作品这条路走一遭就变回"非真人"，零报错 */

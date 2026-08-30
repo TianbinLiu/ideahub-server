@@ -207,6 +207,9 @@ async function transferDraftAssets(draft, userId) {
         summary: c.summary || "",
         cover: await transferImage(ctx, c.cover, `deck.cards[${i}]`),
         tags: Array.isArray(c.tags) ? c.tags : [],
+        // 固定身份句跟着快照走：观众装走这套卡组后靠它锚人物长相（理由见 model 的 ★★）。
+        // 尺子与 branchAsset.controller 那几处同一把（slice(0, 200)）
+        idLine: typeof c.idLine === "string" ? c.idLine.slice(0, 200) : "",
         // 真人声明跟着快照走：观众「收入卡组」拿到的就是这份卡对象，掉了它，
         // 真人卡经作品这条路洗一遍就变回"非真人"，出片档位分流静默失效
         realPerson: c.realPerson === true,
