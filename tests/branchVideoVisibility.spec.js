@@ -488,3 +488,78 @@ describe("按作者列作品", () => {
     expect(res.body.items).toEqual([]);
   });
 });
+
+// ── 话题标签（2026-08-30 新增）─────────────────────────────────────
+//
+// ★★ 这组用例盯的是与 V3（deck 被 strip 吃掉）**一模一样**的事故形状：
+//   客户端发了 → 服务端 201 → 读回来是空的，全程零报错。
+//   作品的 tags 此前三处都没有（zod / model / 回包），而客户端审计误把
+//   **卡组快照里那份卡的 tags** 当成了"作品的 tags 早就收了"。所以这里逐处钉死。
+describe("作品话题标签", () => {
+  test("T1 发布带的 tags 要真落库、真发回来（不是 201 之后悄悄变空）", async () => {
+    const author = await registerUser();
+    const created = await publish(author.token, { title: "带标签的", tags: ["赛博朋克", "雨夜"] }).expect(201);
+    expect(created.body.video.tags).toEqual(["赛博朋克", "雨夜"]);
+
+    const id = String(created.body.video._id);
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(detail.body.video.tags).toEqual(["赛博朋克", "雨夜"]);
+  });
+
+  test("T2 老作品（库里根本没有这个字段）读回来是空数组，不是 undefined", async () => {
+    // ★ 直接绕过 API 造一条"老数据"：后加字段的读侧一律判否定，
+    //   回 undefined 的话客户端 `video.tags.length` 会当场崩。
+    const author = await registerUser();
+    const created = await publish(author.token, { title: "老作品" }).expect(201);
+    const id = String(created.body.video._id);
+    await BranchVideo.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $unset: { tags: "" } }
+    );
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(detail.body.video.tags).toEqual([]);
+  });
+
+  test("T3 tags 可以 PATCH（属于壳，与标题、简介同类），且只改它不会清掉标题", async () => {
+    const author = await registerUser();
+    const created = await publish(author.token, { title: "原标题", tags: ["旧标签"] }).expect(201);
+    const id = String(created.body.video._id);
+
+    const patched = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ tags: ["新标签一", "新标签二"] })
+      .expect(200);
+    expect(patched.body.video.tags).toEqual(["新标签一", "新标签二"]);
+    expect(patched.body.video.title).toBe("原标题");
+  });
+
+  test("T4 超出上限要 400，不是悄悄截断", async () => {
+    const author = await registerUser();
+    // 21 个 > 20
+    await publish(author.token, { title: "太多标签", tags: Array.from({ length: 21 }, (_, i) => `t${i}`) }).expect(400);
+    // 单个 41 字 > 40
+    await publish(author.token, { title: "标签太长", tags: ["x".repeat(41)] }).expect(400);
+  });
+});
+
+describe("按标签搜索", () => {
+  test("T5 q 命中 tags（作品详情页那些芯片点了就是这条查询）", async () => {
+    const author = await registerUser();
+    const tag = `雨夜${Date.now().toString(36)}`;
+    const hit = String((await publish(author.token, { title: "标题里没有那个词", tags: [tag] }).expect(201)).body.video._id);
+    const miss = String((await publish(author.token, { title: "无关作品" }).expect(201)).body.video._id);
+
+    const res = await request(app).get(`/api/branch/videos?q=${encodeURIComponent(tag)}`).expect(200);
+    expect(idsOf(res.body)).toContain(hit);
+    expect(idsOf(res.body)).not.toContain(miss);
+  });
+
+  test("T6 按标签搜也不能漏出私密作品（q 占着顶层 $or，可见性必须仍然生效）", async () => {
+    const author = await registerUser();
+    const tag = `私密标签${Date.now().toString(36)}`;
+    await publish(author.token, { title: "私密的", visibility: "private", tags: [tag] }).expect(201);
+    const res = await request(app).get(`/api/branch/videos?q=${encodeURIComponent(tag)}`).expect(200);
+    expect(res.body.items).toEqual([]);
+  });
+});

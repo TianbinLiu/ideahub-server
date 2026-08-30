@@ -134,6 +134,14 @@ const branchVideoSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true, maxlength: 120 },
     category: { type: String, default: "", trim: true, maxlength: 40 },
     description: { type: String, default: "", trim: true, maxlength: 4000 },
+    /**
+     * 话题标签。★ 与卡组快照里那份 `tags` 同形不同物：那是**卡**的关键词，
+     *   这是**作品**的话题（发布页那一行输入）。两者都存在，别再混着看
+     *   —— 客户端的审计就把那份当成了"作品的 tags 早就收了"，
+     *   而作品这条链路当时三处都没有：zod strip、model 无字段、回包不发。
+     * ★ 缺省空数组：这个字段是后加的，读侧一律判否定（没有 = 老作品没打标签）。
+     */
+    tags: { type: [String], default: [] },
     cover: { type: String, default: "" },
     segments: { type: [segmentSchema], default: [] },
     branchTree: { type: branchTreeSchema, default: undefined },
