@@ -543,6 +543,21 @@ function isTakenDown(doc) {
  * ★ 传进来的 user 可能是"半个用户"（addComment 的提及闸门构造的是 `{_id: userId}`，
  *   没有 role）—— isAdmin 那时返回 false，方向是对的：拿不准就少给权限。
  */
+/**
+ * `readableBy` **读哪几列** —— 与它同生同灭的一份清单（2026-08-31 加）。
+ *
+ * ★★ 为什么非有不可：`assertVisible` 的 select 由调用方给，少一列的表现是
+ *   `doc.<那一列> === undefined` ⇒ 判据静默走成另一支，**一个错都不报**。
+ *   `linkOnly` 就这么漏过一次：`addComment` 的 select 是
+ *   `"_id author title visibility takedown"`（注释里还特意点名了 visibility 与 takedown，
+ *   而 linkOnly 是「凭链接可见」上线时才加的第三列）—— 于是拿到链接的人在那条作品下
+ *   @ 谁，通知**一条都发不出去**：提及落库了、回包里 mentions 齐全、客户端算出
+ *   droppedMentions === 0、连那句黄字警告都不出现。屏幕上一切正常，被 @ 的人永远收不到。
+ *   而同一发在公开作品下是好的，所以本地/公开环境测不出来。
+ * ⇒ `assertVisible` 现在**无条件并上这几列**，以后再加「仅粉丝可见」之类也不会再漏。
+ */
+const READABLE_FIELDS = "visibility linkOnly takedown author";
+
 function readableBy(doc, user) {
   if (ownedBy(doc, user) || isAdmin(user)) return true;
   if (isTakenDown(doc)) return false;
@@ -1309,12 +1324,11 @@ async function addComment(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
 
-    // ★ 这里必须把 visibility **和 takedown** 也 select 出来：下面 @提及的可见性闸门
-    //   要拿它们喂 readableBy。漏掉的表现是 doc.visibility === undefined →
-    //   `!== "private"` 恒真 → 私密作品里的 @ 照样把通知发出去（闸门静默失效，
-    //   且一个错都不报）。takedown 漏了是同一个形状：被下架的作品里 @ 一个人，
-    //   等于告诉他"这里有个你看不见的东西"。
-    const video = await assertVisible(id, req.user, "_id author title visibility takedown");
+    // ★ 可见性那几列（visibility / linkOnly / takedown）不用在这里列了 ——
+    //   `assertVisible` 现在无条件并上 `READABLE_FIELDS`（见那里的 ★★）。
+    //   这条注释以前手写了那份清单，而「凭链接可见」上线时加的 linkOnly 没跟上，
+    //   结果是那类作品下的 @ 提及通知一条都发不出去，零报错。
+    const video = await assertVisible(id, req.user, "_id author title");
 
     const parentId = req.body.parentId;
     let parent = null;
@@ -1617,7 +1631,10 @@ async function assertVisible(id, user, select = "_id") {
   // ★ 按 id 取 ⇒ 用**按 id 的**口径（认「凭链接可见」）。用列表口径的话，
   //   拿到链接的人点赞/评论/弹幕/播放全是静默 404 —— 见 readableByIdFilter 的 ★★。
   const filter = isAdmin(user) ? { _id: id } : { $and: [{ _id: id }, readableByIdFilter(user)] };
-  const doc = await BranchVideo.findOne(filter).select(select).lean();
+  // ★★ 无条件并上 readableBy 要读的那几列（见 READABLE_FIELDS 的 ★★）：调用方少给一列，
+  //   下游拿 undefined 去判可见性会静默走错分支，而这类错**一个日志都不留**。
+  //   多取三四列的代价是零，漏一列的代价是"被 @ 的人永远收不到通知"。
+  const doc = await BranchVideo.findOne(filter).select(`${select} ${READABLE_FIELDS}`).lean();
   if (!doc) notFound("Video not found");
   return doc;
 }
