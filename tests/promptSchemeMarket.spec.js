@@ -208,4 +208,75 @@ describe("提示词方案 · 库与广场", () => {
       .expect(200);
     expect(mine.body.schemes.find((x) => x.schemeId === s.schemeId).published).toBe(false);
   });
+
+  // ★★ 先来先占（2026-08-31 补）。在这之前广场排的是 updatedAt、去重留**最新**那份，
+  //   于是"装走 → 再发布一次"就能把原作者那一行顶掉：A 的方案从广场消失、A 的
+  //   「已分享」按钮仍是成功态、收不到任何提示，两边都是 200、零报错。
+  test("S6 别人装走之后再发布一次：整句拒，且广场那一行仍是原作者的", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const s = schemeOf({ title: "原版标题" });
+    await putScheme(author.token, s).expect(201);
+    await request(app)
+      .post(`/api/branch/schemes/${s.schemeId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    await request(app)
+      .post(`/api/branch/schemes/${s.schemeId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+
+    // 装走的人想把它也发到市场上 —— 整句拒
+    const denied = await request(app)
+      .post(`/api/branch/schemes/${s.schemeId}/publish`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(400);
+    // 第一道闸（sourceOwner）先命中，话说得更准：这是装来的副本
+    expect(String(denied.body.error || "")).toContain("装来的");
+
+    // 就算他改了标题（upsert 会刷新 updatedAt），广场那一行也还是原作者那份
+    await putScheme(taker.token, { ...s, title: "我改过的标题" }).expect(201);
+    const shared = await request(app).get("/api/branch/schemes/shared").expect(200);
+    const row = shared.body.schemes.filter((x) => x.schemeId === s.schemeId);
+    expect(row).toHaveLength(1);
+    expect(row[0].title).toBe("原版标题");
+
+    // install 与广场用同一把尺：看到的和装到手的必须是同一份
+    const third = await registerUser();
+    const got = await request(app)
+      .post(`/api/branch/schemes/${s.schemeId}/install`)
+      .set("Authorization", `Bearer ${third.token}`)
+      .expect(201);
+    expect(got.body.scheme.title).toBe("原版标题");
+  });
+
+  // 自己下架再上架不该被自己的闸挡在门外（publishedAt 只在第一次写）。
+  // ⚠ 这条是照着实测改的：第一版写成"下架期间别人装走再抢发"，可 install 只认
+  //   published 的那份，下架期间根本装不了（404）—— 真实的窗口是"先装走、作者再下架"。
+  test("S7 作者下架再上架：装走的人发不出去，位子还是作者的", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const s = schemeOf({ title: "原版标题" });
+    await putScheme(author.token, s).expect(201);
+    const pub = (tok) =>
+      request(app).post(`/api/branch/schemes/${s.schemeId}/publish`).set("Authorization", `Bearer ${tok}`);
+    await pub(author.token).expect(200);
+    await request(app)
+      .post(`/api/branch/schemes/${s.schemeId}/install`)
+      .set("Authorization", `Bearer ${taker.token}`)
+      .expect(201);
+    // 作者下架 —— 广场此刻没有权威那份
+    await request(app)
+      .delete(`/api/branch/schemes/${s.schemeId}/publish`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    // 装走的人想趁这个空当占位：仍然拒（sourceOwner 那道闸不看广场上有没有人）
+    await pub(taker.token).expect(400);
+    // 作者重新上架：**不能**被自己那道"已经有人先分享"的闸挡住
+    await pub(author.token).expect(200);
+    const shared = await request(app).get("/api/branch/schemes/shared").expect(200);
+    const row = shared.body.schemes.filter((x) => x.schemeId === s.schemeId);
+    expect(row).toHaveLength(1);
+    expect(row[0].title).toBe("原版标题");
+  });
 });
