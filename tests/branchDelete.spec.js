@@ -401,3 +401,70 @@ describe("删作品回收云端资产", () => {
     expect(row.lastError).toMatch(/cloudinary down/);
   });
 });
+
+// ── 欠账清扫（2026-08-30）─────────────────────────────────────────
+//
+// ★★ PendingAssetPurge 此前**只有写方、没有读方**：destroy 失败一次，那份成片就
+//   永久留在公网，而 App 的删除确认卡无条件承诺「云端存的视频与封面也会一并删除」。
+//   删除是隐私诉求，那句话必须是真的。
+describe("欠账清扫器", () => {
+  const cloudinaryMod = require("../src/config/cloudinary");
+  const PendingAssetPurge = require("../src/models/PendingAssetPurge");
+  const { sweepPendingPurges } = require("../src/services/assetPurge.service");
+
+  test("Z1 上一轮失败留下的欠账，下一轮会被重试并清掉", async () => {
+    await PendingAssetPurge.deleteMany({});
+    // 造一条"上次没删成"的欠账（attempts=1，updatedAt 拨到很久以前 → 过了退避窗口）
+    await PendingAssetPurge.create({
+      publicId: "ideahub/branch-videos/someone-1756500000000-seg",
+      resourceType: "video",
+      attempts: 1,
+      lastError: "cloudinary down",
+    });
+    await PendingAssetPurge.updateOne(
+      { publicId: /branch-videos/ },
+      { $set: { updatedAt: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+      { timestamps: false }
+    );
+
+    const spy = jest.spyOn(cloudinaryMod.cloudinary.uploader, "destroy").mockResolvedValue({ result: "ok" });
+    const r = await sweepPendingPurges();
+    expect(r.done).toBe(1);
+    expect(spy).toHaveBeenCalledWith(
+      "ideahub/branch-videos/someone-1756500000000-seg",
+      expect.objectContaining({ resource_type: "video" })
+    );
+    expect(await PendingAssetPurge.countDocuments({})).toBe(0);
+    spy.mockRestore();
+  });
+
+  test("Z2 还在退避窗口里的不重复捶；再失败一次要记 attempts 而**不是删行**", async () => {
+    await PendingAssetPurge.deleteMany({});
+    await PendingAssetPurge.create({
+      publicId: "ideahub/branch-frames/someone-1756500000000-1-x-2",
+      resourceType: "image",
+      attempts: 3, // 退避窗口 = 4 分钟，刚写进去 ⇒ 这一轮该跳过
+    });
+    const spy = jest.spyOn(cloudinaryMod.cloudinary.uploader, "destroy").mockResolvedValue({ result: "ok" });
+    const skipped = await sweepPendingPurges();
+    expect(skipped.tried).toBe(0);
+    expect(spy).not.toHaveBeenCalled();
+
+    // 把时间拨过退避窗口，让它真的试一次 —— 这次失败
+    await PendingAssetPurge.updateOne(
+      {},
+      { $set: { updatedAt: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+      { timestamps: false }
+    );
+    spy.mockRejectedValue(new Error("still down"));
+    const r = await sweepPendingPurges();
+    expect(r.tried).toBe(1);
+    expect(r.done).toBe(0);
+    // ★★ 失败**绝不删行**：句柄一丢，那份资产就再也找不到了
+    const row = await PendingAssetPurge.findOne({}).lean();
+    expect(row).toBeTruthy();
+    expect(row.attempts).toBe(4);
+    expect(row.lastError).toMatch(/still down/);
+    spy.mockRestore();
+  });
+});
