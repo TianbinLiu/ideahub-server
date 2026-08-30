@@ -77,6 +77,10 @@ const publishBody = z.object({
   title: z.string().trim().min(1).max(120),
   category: z.string().trim().max(40).optional().default(""),
   description: z.string().trim().max(4000).optional().default(""),
+  // ★ 作品的话题标签。**必须显式声明**，理由同下面 deck/pricing 那条 ★：
+  //   z.object 默认 strip 未声明字段 —— 客户端发了、这里 201 了、读回来永远是空的。
+  //   上限与 deckCardBody.tags 取同一组数（20 个 × 40 字），客户端也用同一组常量。
+  tags: z.array(z.string().trim().max(40)).max(20).optional().default([]),
   cover: assetUrl,
   segments: z.array(segmentBody).min(1).max(60),
   branchTree: branchTreeBody.optional(),
@@ -97,6 +101,8 @@ const updateBody = z
     title: z.string().trim().min(1).max(120).optional(),
     category: z.string().trim().max(40).optional(),
     description: z.string().trim().max(4000).optional(),
+    // 标签可改（属于"壳"，与标题/简介/分区同类）。★ 不给 default：见本对象顶部那条 ★
+    tags: z.array(z.string().trim().max(40)).max(20).optional(),
     visibility: visibility.optional(),
     // 封面可改（成片不可改，但"用哪一帧当封面"属于壳）。
     // ★ 只收 http(s) URL，**不收 dataURL**：客户端先把它传成永久 URL 再 PATCH

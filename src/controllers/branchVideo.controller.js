@@ -273,6 +273,8 @@ function toVideoPayload(doc, ctx = {}) {
     title: doc.title || "",
     category: doc.category || "",
     description: doc.description || "",
+    // 老作品没有这个字段 → 空数组（读侧判否定，见 model 里那条 ★）
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
     cover: doc.cover || "",
     segments: Array.isArray(doc.segments) ? doc.segments : [],
     author: toAuthorPayload(doc.author),
@@ -674,7 +676,10 @@ async function listVideos(req, res, next) {
 
     if (q) {
       const re = new RegExp(escapeRegExp(q), "i");
-      filter.$or = [{ title: re }, { description: re }];
+      // ★ tags 也进搜索：作品详情页的标签芯片是**可点的**，点了就跳到这条搜索。
+      //   不搜 tags 的话，用户点自己刚打的标签会得到"没有结果"——那比没有芯片更糟。
+      //   （Mongo 对数组字段用正则 = 任一元素匹配即命中，不需要 $elemMatch）
+      filter.$or = [{ title: re }, { description: re }, { tags: re }];
     }
 
     // ★ 可见性条件用 $and 拼，不能往 filter 上直接挂 $or ——
@@ -760,6 +765,7 @@ async function createVideo(req, res, next) {
         title: draft.title,
         category: draft.category || "",
         description: draft.description || "",
+        tags: Array.isArray(draft.tags) ? draft.tags : [],
         cover: cover || segments[0]?.firstFrame || "",
         segments,
         ...(branchTree ? { branchTree } : {}),
