@@ -639,6 +639,44 @@ describe("凭链接可见（linkOnly）", () => {
     expect(idsOf(list.body)).not.toContain(id);
   });
 
+  test("U1b 拿到链接的人**能互动**：点赞/评论/弹幕/播放计数都不能 404", async () => {
+    // ★★ 这条是发版前复核抓出来的（差点带着 bug 出包）：`assertVisible` 原来用的是
+    //   **列表**口径 readableFilter —— 于是"凭链接可见"的作品点得开、却点不了赞、
+    //   评不了论、发不了弹幕，全是静默 404，界面上表现为"点了没反应"。
+    //   功能看着上线了，实际只上线了一半。
+    const author = await registerUser();
+    const viewer = await registerUser();
+    const id = String((await publishLinkOnly(author.token, { title: "能互动吗" }).expect(201)).body.video._id);
+
+    // 播放计数：匿名也能记
+    await request(app).post(`/api/branch/videos/${id}/play`).expect(200);
+    // 点赞
+    await request(app).post(`/api/branch/videos/${id}/like`).set("Authorization", `Bearer ${viewer.token}`).expect(200);
+    // 评论：发 + 读
+    await request(app)
+      .post(`/api/branch/videos/${id}/comments`)
+      .set("Authorization", `Bearer ${viewer.token}`)
+      .send({ text: "拿链接进来的" })
+      .expect(201);
+    const cs = await request(app).get(`/api/branch/videos/${id}/comments`).expect(200);
+    expect((cs.body.items || []).some((c) => c.text === "拿链接进来的")).toBe(true);
+    // 弹幕
+    await request(app)
+      .post(`/api/branch/videos/${id}/danmaku`)
+      .set("Authorization", `Bearer ${viewer.token}`)
+      .send({ at: 1, text: "来了" })
+      .expect(201);
+
+    // ★ 而**纯私密**的这些子端点必须照旧 404 —— 别把两档一起放开
+    const secret = String((await publish(author.token, { title: "真私密", visibility: "private" }).expect(201)).body.video._id);
+    await request(app).post(`/api/branch/videos/${secret}/play`).expect(404);
+    await request(app)
+      .post(`/api/branch/videos/${secret}/comments`)
+      .set("Authorization", `Bearer ${viewer.token}`)
+      .send({ text: "不该进得来" })
+      .expect(404);
+  });
+
   test("U5 存量作品（库里根本没有 visibility 字段）照旧出现在列表里", async () => {
     // ★ 这是"后加字段判否定"那条规则的回归：readableFilter 用的是 $ne/$nin 而不是
     //   `= "public"` —— 用等值判会把所有老作品从首页上抹掉，而且一点错都不报。

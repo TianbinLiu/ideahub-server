@@ -528,6 +528,26 @@ function readableFilter(user) {
   return user ? { $or: [open, { author: user._id }] } : open;
 }
 
+/**
+ * **按 id 直取**用的可读条件 —— 与上面那条的差别只有一处：它认「凭链接可见」。
+ *
+ * ★★ 为什么必须单独有这一条（2026-08-30 发版前复核抓到，差点带着 bug 出包）：
+ *   `assertVisible` 原来用的是 `readableFilter`（**列表**口径）。加了「凭链接可见」之后
+ *   这两条口径**分家了** —— 于是拿到链接的人能打开作品（详情走 `readableBy`），
+ *   但点赞 / 评论 / 发弹幕 / 播放计数全部 **404**，而且是静默的：
+ *   界面上表现为"点了没反应"。功能看着上线了，实际只上线了一半。
+ * ★ 这是 `readableBy` 的 Mongo 版：**同一条规则的两种写法，改一处必须改另一处**
+ *   （与 readableFilter/readableBy 那对同样的约定）。
+ * ★ 管理员在这里同样不越权，理由见 readableBy。
+ */
+function readableByIdFilter(user) {
+  const open = {
+    $or: [{ visibility: { $ne: "private" } }, { visibility: "private", linkOnly: true }],
+    ...NOT_TAKEN_DOWN,
+  };
+  return user ? { $or: [open, { author: user._id }] } : open;
+}
+
 /** 当前用户在这批视频里点过赞的集合 */
 async function loadLikedSet(user, docs) {
   if (!user || !docs.length) return new Set();
@@ -1032,8 +1052,12 @@ async function addPlay(req, res, next) {
 
     // 可见性条件写进**更新的查询条件**里，而不是先查再改：
     // 拆成两步就多一个竞态窗口，而且白白多一次往返。
+    // ★ 这里是**按 id** 的路（不是列表），所以用 readableByIdFilter —— 用列表口径的话，
+    //   「凭链接可见」的作品播放量永远是 0，而作者会拿它判断作品受不受欢迎。
+    //   ⚠ 这一处是 readableFilter 的第 2 个调用点，容易在改口径时被漏掉
+    //   （它内联在 findOneAndUpdate 里，不经过 assertVisible）。
     const updated = await BranchVideo.findOneAndUpdate(
-      { $and: [{ _id: id }, readableFilter(req.user)] },
+      { $and: [{ _id: id }, readableByIdFilter(req.user)] },
       { $inc: { plays: 1 } },
       { returnDocument: "after", select: "plays" }
     ).lean();
@@ -1460,7 +1484,9 @@ async function removeComment(req, res, next) {
  *   列表那条路（readableFilter）**不给**这个特权 —— 管理员刷首页不该看到全站的私密作品。
  */
 async function assertVisible(id, user, select = "_id") {
-  const filter = isAdmin(user) ? { _id: id } : { $and: [{ _id: id }, readableFilter(user)] };
+  // ★ 按 id 取 ⇒ 用**按 id 的**口径（认「凭链接可见」）。用列表口径的话，
+  //   拿到链接的人点赞/评论/弹幕/播放全是静默 404 —— 见 readableByIdFilter 的 ★★。
+  const filter = isAdmin(user) ? { _id: id } : { $and: [{ _id: id }, readableByIdFilter(user)] };
   const doc = await BranchVideo.findOne(filter).select(select).lean();
   if (!doc) notFound("Video not found");
   return doc;
