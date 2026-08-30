@@ -893,4 +893,64 @@ describe("卡片/卡组发布到创意工坊", () => {
     const cardStats = await request(app).get(`/api/branch/assets/card/${deck._id}/stats`).expect(200);
     expect(cardStats.body.stats.heat).toBe(0);
   });
+
+  // ── 改卡（2026-08-30）────────────────────────────────────────────
+  //
+  // ★★ 为什么这组重要：此前 PATCH /cards/:cardId **只收 views** —— 名字打错一个字的
+  //   唯一出路是删了重铸，而铸卡是花钱的（顶档一张连带 3D 建模十几万 token）。
+  test("A15 能改名字/简介/关键词，且**只改这次给的字段**", async () => {
+    const author = await registerUser();
+    const card = cardOf({ name: "打错的名字", summary: "原简介", tags: ["旧"] });
+    await addCards(author.token, [card]).expect(201);
+    // 先挂两张参考图（下面要验"只改名字不会把它们清空"）
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ views: [{ kind: "body", url: "https://cdn.example.com/a.jpg" }, { kind: "face", url: "https://cdn.example.com/b.jpg" }] })
+      .expect(200);
+
+    const renamed = await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ name: "改好的名字" })
+      .expect(200);
+    expect(renamed.body.card.name).toBe("改好的名字");
+    // ★★ 这一条是本组的核心：只改名字**不许**把参考图清空（无条件 $set views 就会）
+    expect(renamed.body.card.views).toHaveLength(2);
+    expect(renamed.body.card.summary).toBe("原简介"); // 没给的字段一个都不动
+
+    const both = await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ summary: "新简介", tags: ["新一", "新二"] })
+      .expect(200);
+    expect(both.body.card.summary).toBe("新简介");
+    expect(both.body.card.tags).toEqual(["新一", "新二"]);
+    expect(both.body.card.name).toBe("改好的名字");
+    expect(both.body.card.views).toHaveLength(2);
+  });
+
+  test("A15b 空 PATCH 是 400（不是成功但什么都没改）；超长一律 400；别人的卡 404", async () => {
+    const author = await registerUser();
+    const stranger = await registerUser();
+    const card = cardOf();
+    await addCards(author.token, [card]).expect(201);
+
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({})
+      .expect(400);
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ name: "x".repeat(121) })
+      .expect(400);
+    // 陌生人改不动（404 不是 403：不该让人探出别人有哪些卡）
+    await request(app)
+      .patch(`/api/branch/cards/${card.cardId}`)
+      .set("Authorization", `Bearer ${stranger.token}`)
+      .send({ name: "抢过来" })
+      .expect(404);
+  });
 });
