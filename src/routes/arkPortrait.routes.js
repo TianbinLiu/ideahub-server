@@ -203,7 +203,16 @@ router.get("/portrait/assets/:id/image", requireAuth, async (req, res, next) => 
       return res.status(502).json({ ok: false, code: "ASSET_FETCH_FAILED", message: `素材源返回 HTTP ${up.status}（签名可能已过期，重试一次即可——每次都会现签）` });
     }
     const buf = Buffer.from(await up.arrayBuffer());
-    res.set("Content-Type", up.headers.get("content-type") || "image/jpeg");
+    // ★★ **不许原样透传上游的 Content-Type**（2026-09-01 实测定位）：方舟素材桶（TOS）
+    //   回的是 `binary/octet-stream` —— 而客户端 `new File([blob], …, { type: blob.type ||
+    //   "image/jpeg" })` 的兜底对它**不生效**（它是真值，只是不对），于是 File 带着
+    //   `binary/octet-stream` 进 `decodeImageFile`，那里第一行 `!type.startsWith("image/")`
+    //   当场 throw「请选择图片文件」。用户看到的是「没取到授权照片（请选择图片文件）」，
+    //   而那张照片一直好好地在方舟上 —— 是我们自己把它判成了"不是图片"。零报错、零日志。
+    // ★ 判**形状**不判真值：只有上游明确给了 `image/*` 才用它，否则一律 image/jpeg
+    //   （这条路按定义只服务 AssetType === "Image" 的素材）。
+    const upType = up.headers.get("content-type") || "";
+    res.set("Content-Type", upType.startsWith("image/") ? upType : "image/jpeg");
     // 私人肖像：任何一层都不许缓存
     res.set("Cache-Control", "private, no-store");
     res.send(buf);
