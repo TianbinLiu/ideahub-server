@@ -196,6 +196,19 @@ router.get("/file/:name", (req, res) => {
     }
     res.set("Content-Type", "application/vnd.android.package-archive");
     res.set("Cache-Control", "public, max-age=31536000, immutable");
+    // ★★ **必须把 `Vary` 拿掉**（2026-08-31 实测定位）：全局 CORS 中间件对每个响应都加
+    //   `Vary: Origin`，而**带 Vary 的响应 Cloudflare 不缓存** —— 于是每一次下载都在
+    //   回源拉 61MB。实测：源站本机读这个文件 141MB/s（磁盘/node 都不是瓶颈），
+    //   而客户端经 CF 整包只有 136KB/s；同一条链路上 3MB 的小片段（命中缓存那种）
+    //   却有 1.95MB/s —— 差的正是"有没有命中边缘缓存"。
+    //   源站在香港，海外用户 RTT 173ms，单条 TCP 流在长肥管道上就是这个量级；
+    //   缓存住之后用户从**离自己最近的边缘**拿，完全不碰这条跨洋链路。
+    // ★ 这一条路**不需要 CORS**：它是安卓原生 HttpURLConnection 下载的（见
+    //   AppUpdaterPlugin），不是浏览器 XHR —— 没有任何 JS 需要读它的响应头。
+    //   ⚠ 只对**这一条路由**去掉，别去动全局那份（那是安全设置）。
+    res.removeHeader("Vary");
+    // 断点续传要让客户端看得见（sendFile 本身支持 Range，但明说一句更稳）
+    res.set("Accept-Ranges", "bytes");
     res.sendFile(file, { dotfiles: "deny" }, (e) => {
       // 客户端中途断开是常态（用户取消/切后台），不当错误刷日志
       if (e && e.code !== "ECONNABORTED" && !res.headersSent) {

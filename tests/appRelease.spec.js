@@ -153,3 +153,54 @@ describe("App 下载跳转", () => {
     expect(res.body.code).toBe("BAD_MANIFEST");
   });
 });
+
+// ★★ 安装包这一路的**可缓存性**（2026-08-31 实测定位后钉住）。
+//   全局 CORS 中间件给每个响应加 `Vary: Origin`，而**带 Vary 的响应 Cloudflare 不缓存**
+//   ⇒ 每一次下载都回源拉 61MB。实测：源站本机读 141MB/s，客户端经 CF 整包只有 136KB/s，
+//   而同一条链路上命中缓存的小片段有 1.95MB/s —— 差的正是"有没有命中边缘缓存"。
+//   这条用例挡的是"以后有人给这条路加回 CORS / 加个 Vary"。
+describe("安装包镜像的可缓存性", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const cors = require("cors");
+
+  let dir;
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "apk-"));
+    fs.writeFileSync(path.join(dir, "qimeng-9.99.apk"), Buffer.alloc(1024, 7));
+  });
+
+  /** 带上全局那份 CORS —— 线上就是这么挂的，不带的话这条用例测了个寂寞 */
+  function appWithCors() {
+    jest.resetModules();
+    const saved = { ...process.env };
+    process.env.APP_APK_DIR = dir;
+    const router = require("../src/routes/appRelease.routes");
+    const app = express();
+    app.use(cors({ origin: true, credentials: false }));
+    app.use("/api/app", router);
+    process.env = saved;
+    return app;
+  }
+
+  test("F1 安装包响应**不带 Vary**（带了 CF 就不缓存），且 Cache-Control / MIME / Range 都对", async () => {
+    const res = await request(appWithCors())
+      .get("/api/app/file/qimeng-9.99.apk")
+      .set("Origin", "https://example.com")
+      .expect(200);
+    expect(res.headers.vary).toBeUndefined();
+    expect(res.headers["cache-control"]).toContain("immutable");
+    expect(res.headers["content-type"]).toContain("android.package-archive");
+    expect(res.headers["accept-ranges"]).toBe("bytes");
+  });
+
+  test("F2 断点续传可用（206 + Content-Range）—— 慢链路上断一次不用从头再来", async () => {
+    const res = await request(appWithCors())
+      .get("/api/app/file/qimeng-9.99.apk")
+      .set("Range", "bytes=0-99")
+      .expect(206);
+    expect(res.headers["content-range"]).toBe("bytes 0-99/1024");
+  });
+});
+
