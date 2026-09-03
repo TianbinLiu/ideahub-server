@@ -57,6 +57,17 @@ function collectConfigProblems(env = process.env) {
     if (!env.CORS_ORIGINS && !env.CLIENT_BASE_URL) {
       problems.push("CORS_ORIGINS / CLIENT_BASE_URL 均未设置，CORS 将对所有来源开放");
     }
+    // Runway 至今是**纯代理**：runway.routes.js 里两处 fetch 直连上游，一次扣费调用都没有
+    // （对照方舟那条走的是 billedForward）。生产配上这把钥匙 = 任何拿得到我们 token 的人
+    // 都能无计量地烧钱，而账上一分不记 —— 这类"配了就能跑、错了没人知道"正是本文件存在的理由。
+    // ★ 这条以前只是 backlog 与 .env.example 里的一句警告。2026-09-03 核过：生产 .env 与
+    //   进程环境里都没有它（约束一直被遵守），所以现在把它钉成硬闸不会影响任何在跑的东西。
+    // ★ 接上计费之后要连这条一起删 —— 留着它会让"已经接好了"的那天起不来。
+    if (env.RUNWAY_API_KEY) {
+      problems.push(
+        "生产配了 RUNWAY_API_KEY，但 Runway 的计费链路还没接（纯代理、零扣费）——接上之前不许在生产开这条出网",
+      );
+    }
   }
 
   return { problems, isProd };
