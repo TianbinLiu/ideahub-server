@@ -146,6 +146,7 @@ app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
 app.use("/api/tag-rank", tagRankRoutes);
 app.use("/api/users", usersRoutes);
 app.use("/api/messages", messagesRoutes);
+app.use("/api/blocks", require("./routes/blocks.routes"));
 // 首页看板娘数字人：GET /config 游客可探测、POST /chat 需登录且按用户限流（SSE）
 app.use("/api/companion", require("./routes/companion.routes"));
 app.use("/api/scraper", scraperRoutes);

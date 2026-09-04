@@ -928,8 +928,14 @@ async function getVideo(req, res, next) {
     // （作者与管理员除外，见 readableBy）。
     if (!readableBy(doc, req.user)) notFound("Video not found");
 
+    // ★★ 这 50 条内联评论**才是产品里评论的真实来源**（2026-09-03 复核抓到）：
+    //   App 侧 `listComments` 一个调用方都没有 —— 详情页与首页评论抽屉都走 getVideo。
+    //   所以拉黑过滤只加在 listComments 上的话，**真机上一次都不会执行**：
+    //   确认卡写着「你们不会再看见彼此的内容」，而他的评论一条不少地摆在那儿。
+    //   ⇒ 这里必须用与 listComments **同一把尺**（blockedAuthorFilter）。
+    const cmtBlock = await blockedAuthorFilter(req.user);
     const [comments, liked] = await Promise.all([
-      BranchComment.find({ video: id })
+      BranchComment.find(cmtBlock ? { $and: [{ video: id }, cmtBlock] } : { video: id })
         .sort({ createdAt: -1 })
         .limit(50)
         .populate("author", AUTHOR_FIELDS)
@@ -1238,9 +1244,24 @@ async function listMyCollects(req, res, next) {
       .select("video")
       .lean();
     const truncated = rows.length > LIMIT;
+    let ids = (truncated ? rows.slice(0, LIMIT) : rows).map((r) => String(r.video));
+    // ★★ 收藏页是产品内**用户自己点得到**的一条路（不是只有外部直链才够得着）：
+    //   拉黑之后首页干净了，收藏页里他那条还在、还能整条播完。
+    //   ⇒ 这里按作者滤一遍。⚠ 收藏表上只有 videoId，要回查一次作品才拿得到作者。
+    // ★ `getVideo` 那条直链**有意不滤**：对被拉黑作者回 404 等于用 404 确认了拉黑关系，
+    //   而且会让收藏页那四态里的「被作者删了」说谎。拉黑是「不主动推给我」，
+    //   不是「把这个人从互联网上抹掉」。
+    const collectBlock = await blockedAuthorFilter(req.user);
+    if (collectBlock && ids.length) {
+      const visible = await BranchVideo.find({ $and: [{ _id: { $in: ids } }, collectBlock] })
+        .select("_id")
+        .lean();
+      const keep = new Set(visible.map((v) => String(v._id)));
+      ids = ids.filter((x) => keep.has(x));
+    }
     res.json({
       ok: true,
-      ids: (truncated ? rows.slice(0, LIMIT) : rows).map((r) => String(r.video)),
+      ids,
       ...(truncated ? { truncated: true } : {}),
     });
   } catch (err) {
