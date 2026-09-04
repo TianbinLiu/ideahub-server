@@ -31,6 +31,7 @@
  * 导出方法:
  * @exports hasAiKey - 是否已配置 key；供各 service 决定「抛 501」还是「回退启发式」。
  * @exports aiComplete - 发一个 prompt，拿回 { text, model }。
+ * @exports aiChatStream - 流式对话（async generator），供 SSE 端点逐句转发。
  * @exports resolveModel - 解析模型名（env 优先，否则用传入的 fallback）。
  *
  * 外部依赖:
@@ -43,6 +44,7 @@
  * @used_in {services/workshopAi.service.js} - 工坊改版 / 全站改版草案
  * @used_in {services/speakingStyleAi.service.js} - 发言风格面板
  * @used_in {services/standpointAi.service.js} - 立场展开自动应答
+ * @used_in {routes/companion.routes.js} - 首页看板娘数字人的流式对话
  */
 
 const OpenAI = require("openai");
@@ -113,4 +115,52 @@ async function aiComplete(prompt, opts = {}) {
   return { text, model };
 }
 
-module.exports = { hasAiKey, aiComplete, resolveModel };
+/**
+ * 流式对话：以 async generator 逐段吐出增量文本（chat.completions 的 delta.content）。
+ *
+ * ★ 与 aiComplete 一样【不吞异常】，且同样只经由本文件拿 provider 配置（铁律六：一条规则一处实现）。
+ * ★ 为什么要处理 max_tokens/max_completion_tokens 两个名字：OpenAI 的 gpt-5 系列已经拒收
+ *   `max_tokens`（400 "Unsupported parameter"），而国内兼容端点（DeepSeek 等）只认 `max_tokens`。
+ *   先按兼容端点的写法发，撞到那条 400 再换名重发一次，两边都能跑，不用按 provider 写分支。
+ * ★ signal：调用方（SSE 路由）在客户端断开时 abort，否则上游会把整段话生成完、token 照扣。
+ *
+ * @param {Array<{role: string, content: string}>} messages - 含 system 的完整消息列表
+ * @param {object} [opts]
+ * @param {string} [opts.fallbackModel]
+ * @param {number} [opts.maxTokens]
+ * @param {number} [opts.temperature]
+ * @param {AbortSignal} [opts.signal]
+ * @returns {AsyncGenerator<string>}
+ */
+async function* aiChatStream(messages, opts = {}) {
+  const model = resolveModel(opts.fallbackModel || "gpt-5.2");
+  const maxTokens = Number(opts.maxTokens || process.env.AI_MAX_TOKENS || 1024);
+  const timeout = Number(process.env.AI_TIMEOUT_MS || 60_000);
+  const base = {
+    model,
+    messages,
+    stream: true,
+    ...(typeof opts.temperature === "number" ? { temperature: opts.temperature } : {}),
+  };
+  const reqOpts = { timeout, ...(opts.signal ? { signal: opts.signal } : {}) };
+  const client = getClient();
+
+  let stream;
+  try {
+    stream = await client.chat.completions.create({ ...base, max_tokens: maxTokens }, reqOpts);
+  } catch (e) {
+    const msg = String((e && e.message) || "");
+    if (e && e.status === 400 && /max_completion_tokens/.test(msg)) {
+      stream = await client.chat.completions.create({ ...base, max_completion_tokens: maxTokens }, reqOpts);
+    } else {
+      throw e;
+    }
+  }
+
+  for await (const chunk of stream) {
+    const delta = chunk && chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
+    if (delta) yield delta;
+  }
+}
+
+module.exports = { hasAiKey, aiComplete, aiChatStream, resolveModel };

@@ -349,7 +349,7 @@ ideahub/
     │   │   └── WorkshopTemplateLike.js
     │   │
     │   ├── controllers/              # 控制器（16个）
-    │   ├── routes/                   # 路由（16个）
+    │   ├── routes/                   # 路由（17个）
     │   ├── middleware/               # 中间件（5个）
     │   ├── schemas/                  # 验证模式（2个）
     │   ├── services/                 # 业务服务（5个）
@@ -1622,6 +1622,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshop.routes.js` - 工坊模板市场、编辑与全站 AI 改版
 - `minimax.routes.js` - 真人视频档供应商代理（MiniMax 海螺）。脚手架：未配 MINIMAX_API_KEY 全部 501；白名单转发，接上钱包扣费前不要在生产配真 key
 - `runway.routes.js` - 真人视频档供应商代理（Runway image_to_video）。同上；contentModeration 由服务端钉死不透传（合规决定，见文件头）
+- `companion.routes.js` - 首页看板娘数字人：`GET /config` 游客探测（有没有 AI/TTS、叫什么），`POST /chat` 登录 + 按用户限流的 **SSE 流式对话**——LLM 按「一句一组 `[情绪][face:x][action:y]` 标签」输出，服务端逐句切分、解析标签后以 `sentence` 事件下发（含给 `/api/tts` 用的情绪参数），前端按句合成语音并切表情/动作。客户端断开即 abort 上游，不白烧 token
 
 ---
 
@@ -1639,6 +1640,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `notification.service.js` - 通知创建
 - `aiReview.service.js` - AI评审队列
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
+- `companion.service.js` - 看板娘数字人的「演出协议」：人设提示词（9 种表情 × 11 种动作的标签规范）、流式切句器（标签跨 chunk / 句尾无标点也能切）、标签解析（未知值回退默认）、情绪 → 豆包 TTS 参数映射。纯函数、无 IO，`tests/companion.spec.js` 直接测
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
 - `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、**看几帧**（`visionFrameTimes`）、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
