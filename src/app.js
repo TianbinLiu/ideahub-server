@@ -155,6 +155,8 @@ app.use("/api/companion", require("./routes/companion.routes"));
 app.use("/api/support", require("./routes/support.routes").publicRouter);
 // 语音识别代理（客服页按住说话）：收音频二进制，自己 express.raw，不占全局 1MB JSON 阈值
 app.use("/api/asr", require("./routes/asr.routes"));
+// Live2D 模型市场（数字人套装：模型包 + 推荐人格 + 推荐嗓子）；解压落在 uploads/live2d-market/
+app.use("/api/live2d-models", require("./routes/live2dModel.routes"));
 app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);

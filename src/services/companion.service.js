@@ -39,7 +39,7 @@ const DEFAULT_NAME = "小梦";
  * 系统提示词。刻意写短：这段每轮都要发，DeepSeek 的缓存命中率靠它前缀稳定。
  * ★ 人设里明确"不知道就说不知道、不编站内功能"：看板娘挂在官网首页，说错功能就是客服事故。
  */
-function buildSystemPrompt({ name = DEFAULT_NAME, userName = "", lang = "zh" } = {}) {
+function buildSystemPrompt({ name = DEFAULT_NAME, userName = "", lang = "zh", personaLine = "" } = {}) {
   const who = userName ? `正在和你聊天的用户叫「${userName}」。` : "用户还没登录名字，用「你」称呼即可。";
   const langLine = lang === "en"
     ? "Reply in English unless the user writes Chinese."
@@ -51,11 +51,15 @@ function buildSystemPrompt({ name = DEFAULT_NAME, userName = "", lang = "zh" } =
     langLine,
     "说话要短：每次回复 1～3 句，每句不超过 40 个字，像面对面聊天，不用列表、不用 Markdown、不用表情符号。",
     "不知道的事直接说不知道；不要编造站内不存在的功能、价格或规则。",
+    // 用户从人格市场装了人格时多这一段（companionSetting.service.personaPromptLine）；没装 → 与从前逐字相同
+    personaLine || null,
     "【演出协议，必须遵守】每一句话的开头都要带三个标签，格式固定为 [情绪][face:表情][action:动作]，然后紧跟这句话的正文。",
     `情绪只能取：${EMOTIONS.join("/")}。表情只能取：${FACES.join("/")}。动作只能取：${ACTIONS.join("/")}。`,
     "示例：[happy][face:happy][action:wave] 欢迎来到启梦～ [neutral][face:normal][action:explain] 想找灵感的话可以先逛逛热门创意。",
     "标签只放在句首，不要在句中或句尾出现方括号。",
-  ].join("\n");
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
 }
 
 /**
@@ -157,7 +161,15 @@ function createSentenceSplitter(onSentence, { maxLen = 60 } = {}) {
  * 没有对应枚举的情绪（害羞/调皮/安慰）靠 instruct（context_texts 语气指令）补。
  * 出处：routes/tts.routes.js 的 expressive + instruct 两条通道。
  */
-function ttsParamsFor(emotion) {
+function ttsParamsFor(emotion, baseInstruct = "") {
+  const p = emotionParams(emotion);
+  // 用户/人格设定的语调指令（utils/voiceSettings 合并结果）排在情绪指令前面：人设是底色，情绪是这一句的变化
+  const base = String(baseInstruct || "").trim();
+  if (!base) return p;
+  return { ...p, instruct: [base, p.instruct].filter(Boolean).join("；").slice(0, 200) };
+}
+
+function emotionParams(emotion) {
   switch (emotion) {
     case "happy": return { emotion: "happy", instruct: "用开心明快的语气" };
     case "excited": return { emotion: "excited", instruct: "用兴奋、语速稍快的语气" };

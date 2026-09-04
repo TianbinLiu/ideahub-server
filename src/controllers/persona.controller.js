@@ -10,6 +10,7 @@ const PersonaPurchase = require("../models/PersonaPurchase");
 const { generatePersonaFromChat } = require("../services/personaAi.service");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
+const { normalizeVoiceSettings, serializeVoiceSettings } = require("../utils/voiceSettings");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -130,6 +131,8 @@ function toPersonaPayload(doc, ctx = {}) {
     // 拿到 undefined → 勾选框永远显示未勾选 → 用户编辑公开人格随手保存就把它静默改私有。
     shared: !!doc.shared,
     price: Number(doc.price || 0),
+    // 「音频」板块：null = 人格没带嗓子
+    voice: serializeVoiceSettings(doc.voice),
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
       downloadCount: Number(doc?.stats?.downloadCount || 0),
@@ -327,6 +330,7 @@ async function createPersona(req, res, next) {
       style: normalizeStyle(req.body.style),
       shared: Boolean(req.body.shared),
       price: toPrice(req.body.price),
+      voice: normalizeVoiceSettings(req.body.voice),
     });
 
     const populated = await Persona.findById(doc._id).populate("author", "_id username").lean();
@@ -352,6 +356,7 @@ async function updatePersona(req, res, next) {
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
+    if (req.body.voice !== undefined) doc.voice = normalizeVoiceSettings(req.body.voice);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）
     if (req.body.price !== undefined) doc.price = toPrice(req.body.price);
 

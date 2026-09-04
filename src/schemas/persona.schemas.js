@@ -1,6 +1,7 @@
 // src/schemas/persona.schemas.js
 // 人格下载（Persona）请求校验
 const { z } = require("../middleware/validate");
+const { voiceFieldSchema } = require("../utils/voiceSettings");
 
 // 风格能力子结构（复用阶段5 StyleStat 形状：key/label/value/grade）
 const statSchema = z.object({
@@ -30,6 +31,8 @@ const createBody = z.object({
   shared: z.boolean().optional().default(false),
   // 售价（赏金点数，0=免费）。上限与 Persona 模型/controller toPrice 一致。
   price: z.number().int().min(0).max(100000).optional().default(0),
+  // 「音频」板块（可选）：对象 = 设置，null/缺省 = 不设置
+  voice: voiceFieldSchema,
 });
 
 // 从聊天文本生成人格草稿（情景编辑器「✨从聊天记录生成」）。
@@ -48,6 +51,8 @@ const updateBody = z.object({
   style: styleBody.optional(),
   shared: z.boolean().optional(),
   price: z.number().int().min(0).max(100000).optional(),
+  // 对象 = 改成这个，null = 清掉，缺省 = 不动
+  voice: voiceFieldSchema,
 });
 
 const equipBody = z.object({

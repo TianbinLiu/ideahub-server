@@ -557,6 +557,10 @@ i18n.use(initReactI18next).init({
 /settings → SettingsPage
 /components → ComponentsPage
 /components/live2d → Live2DSettingsPage
+/live2d/market → Live2dMarketPage（Live2D 模型市场广场：全部/已收藏/我的、最新/最热、搜索；官方内置条目在最前）
+/live2d/market/new → Live2dModelEditorPage（上传：模型 zip → 推荐人格 → 推荐音频三步；ProtectedRoute）
+/live2d/market/:id → Live2dModelDetailPage（详情：模型包 / 推荐人格 / 推荐音色；使用 / 收藏 / 点赞 / 作者编辑删除）
+/live2d/market/:id/edit → Live2dModelEditorPage（作者改元数据 / 换绑人格 / 改推荐嗓子）
 /components/tag-rank → TagRankSettingsPage
 /admin/users → AdminUsersPage
 /feedback → FeedbackAdminPage
@@ -1581,6 +1585,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `Notification.js` - 通知（type 枚举含客服工单两类：SUPPORT_TICKET 给管理员、SUPPORT_REPLY 给用户）
 - `SupportFeedback.js` - AI 客服回答的 👍/👎，连问题与回答原文一起存（差评是改知识库的线索），管理员 `GET /api/admin/support/feedback` 看
 - `SupportTicket.js` - 客服工单：用户在 App「AI 客服」点「转人工」时的对话快照 + AI 归纳的标题/摘要/分类 + 人工与用户的后续往来；私有对象（只有本人与管理员可见），状态机 open → in_progress → resolved/closed 只允许管理员推进
+- `CompanionSetting.js` - 每个用户给数字人（官网看板娘 + App 客服，同一形象）做的三项选择：persona（人格市场）/ model（Live2D 模型市场，null = 官方内置）/ voice（豆包音频覆盖）。只存 id 不存快照，被删/取消分享读取时静默回退；与 `PersonaEquip`（Arena 发言风格）是两回事
+- `Live2dModel.js` - Live2D 模型市场条目：解压目录与入口 model3.json（相对 uploads/ 的路径，对外 URL 按请求 host 现拼）、推荐人格（引用 Persona）、推荐嗓子（voice）、shared、stats(view/download/like)
+- `Live2dModelInstall.js` / `Live2dModelLike.js` - 模型的收藏下载 / 点赞关系，{user,model} 唯一索引，与 PersonaInstall/PersonaLike 同款
 - `Interest.js` - 公司兴趣表达
 - `OtpToken.js` - 邮箱验证码
 - `AiJob.js` - AI评审任务队列
@@ -1627,9 +1634,10 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshop.routes.js` - 工坊模板市场、编辑与全站 AI 改版
 - `minimax.routes.js` - 真人视频档供应商代理（MiniMax 海螺）。脚手架：未配 MINIMAX_API_KEY 全部 501；白名单转发，接上钱包扣费前不要在生产配真 key
 - `runway.routes.js` - 真人视频档供应商代理（Runway image_to_video）。同上；contentModeration 由服务端钉死不透传（合规决定，见文件头）
-- `companion.routes.js` - 首页看板娘数字人：`GET /config` 游客探测（有没有 AI/TTS、叫什么），`POST /chat` 登录 + 按用户限流的 **SSE 流式对话**——LLM 按「一句一组 `[情绪][face:x][action:y]` 标签」输出，服务端逐句切分、解析标签后以 `sentence` 事件下发（含给 `/api/tts` 用的情绪参数），前端按句合成语音并切表情/动作。客户端断开即 abort 上游，不白烧 token
-- `support.routes.js` - App「AI 客服」（一个文件导出 publicRouter + adminRouter）：`GET /api/support/config`、`POST /api/support/chat`（SSE，事件与 companion 相同，多一个 `handoff`——模型在回复开头写 `[handoff:类别]` 即转人工判定）、`POST /api/support/tickets`（建单 → 通知所有管理员 + 邮件，10 分钟内复用）、`GET /tickets/mine`、`POST /tickets/:id/messages`；管理员 `/api/admin/support/tickets` 列表/详情/回复/改状态（回复与结单会给用户发 SUPPORT_REPLY 通知 + 邮件）。通知与邮件都是尽力而为，失败不影响 201；`POST /feedback` 满意度、管理员 `GET /feedback?rating=`
+- `companion.routes.js` - 首页看板娘数字人：`GET /config` 游客探测（有没有 AI/TTS、叫什么；登录用户还带自己的 `persona` / `model` / `voiceSettings` 解析结果），`GET|PUT /settings` 数字人三项选择（人格市场的人格 / Live2D 模型市场的模型 / 豆包音频覆盖；人格要能选用：公开或自己的，付费需已购，否则 403 带 `details.reason`），`POST /chat` 登录 + 按用户限流的 **SSE 流式对话**——LLM 按「一句一组 `[情绪][face:x][action:y]` 标签」输出，服务端逐句切分、解析标签后以 `sentence` 事件下发（含给 `/api/tts` 用的情绪参数），前端按句合成语音并切表情/动作。客户端断开即 abort 上游，不白烧 token
+- `support.routes.js` - App「AI 客服」（一个文件导出 publicRouter + adminRouter）：`GET /api/support/config`（登录用户同样带 `persona` / `model` / `voiceSettings`，与官网看板娘共用同一份 CompanionSetting）、`POST /api/support/chat`（SSE，事件与 companion 相同，多一个 `handoff`——模型在回复开头写 `[handoff:类别]` 即转人工判定）、`POST /api/support/tickets`（建单 → 通知所有管理员 + 邮件，10 分钟内复用）、`GET /tickets/mine`、`POST /tickets/:id/messages`；管理员 `/api/admin/support/tickets` 列表/详情/回复/改状态（回复与结单会给用户发 SUPPORT_REPLY 通知 + 邮件）。通知与邮件都是尽力而为，失败不影响 201；`POST /feedback` 满意度、管理员 `GET /feedback?rating=`
 - `asr.routes.js` - 语音识别代理（火山 openspeech「大模型录音文件识别·极速版」，resource `volc.bigasr.auc_turbo`，与 TTS 同一把 key 但商品要单独开通）：`POST /api/asr` 收音频二进制（自己 express.raw 6MB，不占全局 1MB JSON 阈值）→ `{ text, durationMs }`；识别结果不落库不留音频
+- `live2dModel.routes.js` - **Live2D 模型市场**（数字人套装 = 模型包 + 推荐人格 + 推荐嗓子），base `/api/live2d-models`：广场列表（sort=new|hot、q、tag、scope=all|installed|mine；第一页最前面是固定 id `official-mascot` 的官方内置条目，modelJsonUrl 留空 = 前端用自己打包的看板娘）、详情、上传（multipart：`bundle` zip ≤25MB + name/description/coverImageUrl/tags/shared/personaId/voice(JSON)，按用户 5 次/分钟）、作者改/删（删除连解压目录、收藏、点赞一起删，正在用它的用户回到官方）、收藏下载、点赞。解压白名单 / zip-bomb 记账 / model3.json 校验（只认 Cubism 4，引用的 moc3 与贴图必须在包里）在 `services/live2dBundle.service.js`，与 `/api/me/components/live2d/upload` 同一份；产物落在 `uploads/live2d-market/<uid>/`
 
 ---
 
@@ -1649,6 +1657,10 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
 - `companion.service.js` - 看板娘数字人的「演出协议」：人设提示词（9 种表情 × 11 种动作的标签规范）、流式切句器（标签跨 chunk / 句尾无标点也能切）、标签解析（未知值回退默认）、情绪 → 豆包 TTS 参数映射。纯函数、无 IO，`tests/companion.spec.js` 直接测
 - `support.service.js` - AI 客服的知识检索与提示词：读 `src/knowledge/support-kb.md`（由 app 仓 docs/support-knowledge-base.md 剥掉代码出处生成）按标题切节，按问题用字二元组重叠打分挑 5 节 + 固定带上「禁止承诺 36 条」「转人工判定」「联系方式」；客服人设提示词（依据知识库作答、不编造、满足条件在开头打 `[handoff:类别]`）；`parseHandoff`；转人工时 `summarizeTicket` 用 AI 归纳标题/摘要/分类（失败退回启发式，绝不因此建不了单）
+- `companionSetting.service.js` - 数字人三项选择的读取 / 合并 / 写入：人格 = 用户选的 → 模型作者推荐的 → 默认；音频 = 用户覆盖 > 人格自带 > 模型推荐 > `COMPANION_TTS_VOICE`（逐字段合并，见 `utils/voiceSettings.js`）；`personaPromptLine` 给两条聊天链路的系统提示词加一段【人设】（只改语气措辞，客服的依据/红线/转人工规则不动）
+- `personaAccess.service.js` - 「这个用户能不能选用这个人格」的唯一判定（公开或自己的；付费须有已结算的 PersonaPurchase）+ 数字人接口用的人格摘要（含 styleDescriptor、voice）
+- `live2dBundle.service.js` - Live2D 模型包的接收（multer 25MB zip）、安全解压（扩展名白名单、zip-bomb 记账、路径穿越剥离）、入口识别、model3.json 校验（Cubism 4 + 引用文件存在）、目录删除；组件中心与模型市场共用
+- `live2dMarket.service.js` - 模型市场的序列化（persona 只在看的人能用时带出）、官方内置条目 `official-mascot`、可用性判定（公开或自己的）
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
 - `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、**看几帧**（`visionFrameTimes`）、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
@@ -1922,6 +1934,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 | 日期 | 版本 | 更新内容 |
 |------|------|---------|
+| 2026-09-04 | — | **数字人的人格 / 音频 / Live2D 模型市场**：`Persona` 加「音频」板块 `voice`（豆包音色/语速/音高/语调指令，`utils/voiceSettings.js` 统一形状）；新增 `CompanionSetting`（用户给数字人选的人格 / 模型 / 音频覆盖，`GET|PUT /api/companion/settings`）；`/api/companion/config` 与 `/api/support/config` 带解析后的 `persona` / `model` / `voiceSettings`，两条聊天链路按人格注入【人设】段、每句 `tts.instruct` 前置人设语调；新增 **Live2D 模型市场** `/api/live2d-models`（`Live2dModel` + Install/Like，上传 = 模型包 + 推荐人格 + 推荐嗓子三板块，产物在 `uploads/live2d-market/`），zip 解压逻辑从 `components.controller.js` 抽到 `services/live2dBundle.service.js` 并补了 model3.json 校验；`GET /api/tts/voices` 音色目录（`config/voices.js`）。测试：`tests/live2dModel.spec.js`、`tests/companionSetting.spec.js`。 |
 | 2026-09-04 | — | **App「AI 客服」服务端**：新增 `SupportTicket` 模型、`/api/support`（SSE 问答 + 转人工工单）与 `/api/admin/support`（工单队列/回复/改状态）、`services/support.service.js`（知识检索 + 提示词 + 归纳）、`src/knowledge/support-kb.md`；`Notification` 枚举加 SUPPORT_TICKET / SUPPORT_REPLY；`email.service` 抽出通用 `sendEmail`；`.env.example` 加 `SUPPORT_AGENT_NAME`、`SUPPORT_NOTIFY_EMAIL`；评测脚本 `scripts/evalSupport.js`。 |
 | 2026-04-21 | 4.58 | **补充前端开发代理**：`client/vite.config.ts` 新增 `/api` 开发代理，默认转发到 `http://localhost:4000`，如显式设置 `VITE_API_BASE` 则改用对应目标；`client/src/config.ts` 改为开发环境优先使用同源相对路径，OAuth 跳转也统一复用同一 API 基址策略，减少本地联调时跨域和绝对地址心智负担。 |
 | 2026-04-21 | 4.57 | **修正前端本地开发 API 默认指向**：`client/src/config.ts` 在开发环境未显式配置 `VITE_API_BASE` 时，默认回落到当前主机的 `:4000`，避免本地联调误连线上 API；`client/.env.example` 同步改为本地开发默认值，并明确生产/预发需显式覆盖。 |
