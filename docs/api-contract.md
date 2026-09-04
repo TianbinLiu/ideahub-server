@@ -1672,6 +1672,7 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 |---|---|---|---|
 | GET | `/api/tts/health` | 无 | `{ ok, tts: boolean }` —— 这台服务器配没配 `TTS_API_KEY`。不回密钥本身 |
 | POST | `/api/tts` | **必须** | 合成一句台词，回 `audio/mpeg`。按用户限流 30 次/分钟 |
+| GET | `/api/tts/voices` | 无 | 音色目录 `{ ok, voices, mixable, defaultVoiceId, maxMixVoices: 3 }`：`voices` = 2.0 单音色（每条 `generation:"2.0"`、`mixable:false`），`mixable` = 23 个验证过的 1.0 音色（`{ id, name, gender, generation:"1.0", mixable:true }`），混音配方**只能**从 `mixable` 里选。声音市场 `/api/voice-templates` 的契约见 server 仓 `PROJECT_STRUCTURE.md` 路由章节 |
 
 请求体（除 `text` 外都可省）：
 
@@ -1679,7 +1680,7 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 {
   "text": "≤300 字，超出截断",
   "voice": "zh_female_gaolengyujie_uranus_bigtts",  // 只允许 [A-Za-z0-9_.-]{1,64}，非法值回落默认音色
-  "mix":   [{ "id": "…", "w": 0.6 }],               // 混音配方，权重服务端再归一化；只吃 1.0 音色
+  "mix":   [{ "id": "…", "w": 0.6 }],               // 混音配方（≤3 味；也收 [{ "voiceId", "weight" }] 即 VoiceSettings.mix），权重服务端归一到和 = 1；只吃 1.0 音色（GET /voices 的 mixable）
   "emotion": "happy", "instruct": "用更冷静的语气",
   "rate": 0,        // [-50,100]，0 = 1.0 倍
   "pitch": -1,      // [-12,12]

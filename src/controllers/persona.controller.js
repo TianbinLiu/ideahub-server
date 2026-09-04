@@ -10,7 +10,9 @@ const PersonaPurchase = require("../models/PersonaPurchase");
 const { generatePersonaFromChat } = require("../services/personaAi.service");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
-const { normalizeVoiceSettings, serializeVoiceSettings } = require("../utils/voiceSettings");
+const { serializeVoiceSettings } = require("../utils/voiceSettings");
+// 「音频」板块的写入口：完整 VoiceSettings 或 { templateId }（从声音市场的模板展开成快照）
+const { expandVoiceInput } = require("../services/voiceTemplate.service");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -330,7 +332,7 @@ async function createPersona(req, res, next) {
       style: normalizeStyle(req.body.style),
       shared: Boolean(req.body.shared),
       price: toPrice(req.body.price),
-      voice: normalizeVoiceSettings(req.body.voice),
+      voice: await expandVoiceInput(req.body.voice, req.user._id),
     });
 
     const populated = await Persona.findById(doc._id).populate("author", "_id username").lean();
@@ -356,7 +358,7 @@ async function updatePersona(req, res, next) {
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
-    if (req.body.voice !== undefined) doc.voice = normalizeVoiceSettings(req.body.voice);
+    if (req.body.voice !== undefined) doc.voice = await expandVoiceInput(req.body.voice, req.user._id);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）
     if (req.body.price !== undefined) doc.price = toPrice(req.body.price);
 

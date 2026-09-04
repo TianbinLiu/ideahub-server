@@ -93,7 +93,7 @@ describe("POST /api/live2d-models", () => {
     expect(m.shared).toBe(true);
     expect(m.official).toBe(false);
     expect(m.isOwner).toBe(true);
-    expect(m.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", rate: -10, pitch: null, instruct: "", expressive: true });
+    expect(m.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", mix: null, templateId: null, rate: -10, pitch: null, instruct: "", expressive: true });
     expect(m.persona).toBeNull();
     expect(m.modelJsonUrl).toMatch(new RegExp(`/uploads/live2d-market/${user._id}/\\d+-hiyori/hiyori/hiyori\\.model3\\.json$`));
     expect(m.fileCount).toBe(6); // model3 + moc3 + png + exp3 + readme.txt + 被剥掉 ../ 前缀后落在包内的 escape.png（白名单内）
@@ -232,5 +232,40 @@ describe("列表 / 详情 / 收藏 / 点赞 / 修改 / 删除", () => {
     const after = await request(app).get("/api/companion/settings").set(auth(b.token));
     expect(after.body.settings.modelId).toBeNull();
     expect(after.body.model).toBeNull();
+  });
+});
+
+describe("推荐嗓子来自声音市场的模板", () => {
+  const F = "zh_female_gaolengyujie_moon_bigtts";
+  const M = "zh_male_shaonianzixin_moon_bigtts";
+
+  it("上传 / 修改时 voice 只给 { templateId }（multipart 里是 JSON 字符串）→ 展开成快照；2.0 混音 400；删模板只摘 templateId", async () => {
+    const a = await createUser("va");
+    const tpl = await request(app)
+      .post("/api/voice-templates")
+      .set(auth(a.token))
+      .send({ name: "模型配套", recipe: [{ voiceId: F, weight: 1 }, { voiceId: M, weight: 3 }], rate: -5, shared: true });
+    expect(tpl.status).toBe(201);
+    const templateId = tpl.body.template._id;
+    const mix = [{ voiceId: F, weight: 0.25 }, { voiceId: M, weight: 0.75 }];
+
+    const up = await upload(a.token, { fields: { voice: JSON.stringify({ templateId }) } });
+    expect(up.status).toBe(201);
+    expect(up.body.model.voice).toEqual({ voiceId: "", mix, templateId, rate: -5, pitch: null, instruct: "", expressive: true });
+
+    const bad = await upload(a.token, { fields: { voice: JSON.stringify({ mix: [{ voiceId: "zh_female_vv_uranus_bigtts", weight: 1 }] }) } });
+    expect(bad.status).toBe(400);
+    expect(bad.body.message).toMatch(/1\.0/);
+    const missing = await upload(a.token, { fields: { voice: JSON.stringify({ templateId: new mongoose.Types.ObjectId().toString() }) } });
+    expect(missing.status).toBe(404);
+
+    const id = up.body.model._id;
+    const edit = await request(app).put(`/api/live2d-models/${id}`).set(auth(a.token)).send({ voice: { templateId, rate: 30 } });
+    expect(edit.status).toBe(200);
+    expect(edit.body.model.voice).toEqual({ voiceId: "", mix, templateId, rate: 30, pitch: null, instruct: "", expressive: true });
+
+    await request(app).delete(`/api/voice-templates/${templateId}`).set(auth(a.token)).expect(200);
+    const after = await request(app).get(`/api/live2d-models/${id}`).set(auth(a.token));
+    expect(after.body.model.voice).toEqual({ voiceId: "", mix, templateId: null, rate: 30, pitch: null, instruct: "", expressive: true });
   });
 });

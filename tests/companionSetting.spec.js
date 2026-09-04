@@ -71,7 +71,7 @@ describe("人格的「音频」板块", () => {
   it("创建/更新带 voice；非法音色 id 400；null 清掉", async () => {
     const { token } = await createUser();
     const p = await createPersona(token, { voice: { voiceId: "zh_female_vv_uranus_bigtts", rate: -20, pitch: 2, instruct: "轻一点", expressive: false } });
-    expect(p.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", rate: -20, pitch: 2, instruct: "轻一点", expressive: false });
+    expect(p.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", mix: null, templateId: null, rate: -20, pitch: 2, instruct: "轻一点", expressive: false });
     const got = await request(app).get(`/api/personas/${p._id}`);
     expect(got.body.persona.voice.voiceId).toBe("zh_female_vv_uranus_bigtts");
 
@@ -91,8 +91,13 @@ describe("人格的「音频」板块", () => {
     expect(res.status).toBe(200);
     expect(res.body.voices.length).toBeGreaterThan(10);
     expect(res.body.voices[0]).toMatchObject({ id: expect.any(String), name: expect.any(String) });
-    expect(res.body.voices.every((v) => /uranus/.test(v.id))).toBe(true);
+    expect(res.body.voices.every((v) => /uranus/.test(v.id) && v.generation === "2.0" && v.mixable === false)).toBe(true);
     expect(res.body.defaultVoiceId).toBe("zh_female_xiaohe_uranus_bigtts");
+    // 声音市场的原料：23 个验证过的 1.0 音色，分性别
+    expect(res.body.maxMixVoices).toBe(3);
+    expect(res.body.mixable).toHaveLength(23);
+    expect(res.body.mixable.every((v) => v.generation === "1.0" && v.mixable === true && ["female", "male"].includes(v.gender))).toBe(true);
+    expect(res.body.mixable.some((v) => /uranus/.test(v.id))).toBe(false);
   });
 });
 
@@ -106,7 +111,7 @@ describe("/api/companion/settings", () => {
     expect(res.body.settings).toEqual({ personaId: null, modelId: null, voice: null });
     expect(res.body.persona).toBeNull();
     expect(res.body.model).toBeNull();
-    expect(res.body.voice).toEqual({ voiceId: "zh_female_xiaohe_uranus_bigtts", rate: null, pitch: null, instruct: "", expressive: true });
+    expect(res.body.voice).toEqual({ voiceId: "zh_female_xiaohe_uranus_bigtts", mix: null, templateId: null, rate: null, pitch: null, instruct: "", expressive: true });
   });
 
   it("选人格：公开可选、别人私有 403、付费未购 403(unpaid)、不存在 404；嗓子按 用户覆盖 > 人格 > 默认 逐字段合并", async () => {
@@ -122,12 +127,12 @@ describe("/api/companion/settings", () => {
     expect(ok.body.persona).toMatchObject({ _id: pub._id, name: "温柔学姐" });
     expect(ok.body.persona.styleDescriptor).toBe("温柔学姐｜风格：轻声细语｜口头禅：没关系的");
     expect(ok.body.personaSource).toBe("user");
-    expect(ok.body.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", rate: -15, pitch: null, instruct: "温柔一点", expressive: true });
+    expect(ok.body.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", mix: null, templateId: null, rate: -15, pitch: null, instruct: "温柔一点", expressive: true });
 
     // 用户只改语速 → 音色/指令仍来自人格
     const override = await request(app).put("/api/companion/settings").set(auth(me.token)).send({ voice: { rate: 20 } });
-    expect(override.body.settings.voice).toEqual({ voiceId: "", rate: 20, pitch: null, instruct: "", expressive: true });
-    expect(override.body.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", rate: 20, pitch: null, instruct: "温柔一点", expressive: true });
+    expect(override.body.settings.voice).toEqual({ voiceId: "", mix: null, templateId: null, rate: 20, pitch: null, instruct: "", expressive: true });
+    expect(override.body.voice).toEqual({ voiceId: "zh_female_vv_uranus_bigtts", mix: null, templateId: null, rate: 20, pitch: null, instruct: "温柔一点", expressive: true });
 
     const forbidden = await request(app).put("/api/companion/settings").set(auth(me.token)).send({ personaId: priv._id });
     expect(forbidden.status).toBe(403);
@@ -209,5 +214,61 @@ describe("/api/companion/settings", () => {
     expect(sup.status).toBe(200);
     expect(mockLastMessages[0].content).toContain("【人设】");
     expect(mockLastMessages[0].content).toContain("【禁止承诺】");
+  });
+});
+
+describe("声音市场的混音配方进数字人设置", () => {
+  const F = "zh_female_gaolengyujie_moon_bigtts";
+  const M = "zh_male_shaonianzixin_moon_bigtts";
+  const C = "zh_female_cancan_mars_bigtts";
+
+  it("PUT voice { templateId } 展开成快照；mix 层整体压过人格的 voiceId（rate / instruct 仍逐字段）；序列化永远带 mix / templateId", async () => {
+    const me = await createUser("mx");
+    const other = await createUser("mo");
+    const persona = await createPersona(other.token, { voice: { voiceId: "zh_female_vv_uranus_bigtts", rate: -15, instruct: "温柔一点" } });
+    await request(app).put("/api/companion/settings").set(auth(me.token)).send({ personaId: persona._id }).expect(200);
+
+    const tpl = await request(app)
+      .post("/api/voice-templates")
+      .set(auth(other.token))
+      .send({ name: "御姐少年", recipe: [{ voiceId: F, weight: 3 }, { voiceId: M, weight: 1 }], pitch: 3, shared: true });
+    expect(tpl.status).toBe(201);
+    const templateId = tpl.body.template._id;
+    const mix = [{ voiceId: F, weight: 0.75 }, { voiceId: M, weight: 0.25 }];
+
+    const applied = await request(app).put("/api/companion/settings").set(auth(me.token)).send({ voice: { templateId } });
+    expect(applied.status).toBe(200);
+    expect(applied.body.settings.voice).toEqual({ voiceId: "", mix, templateId, rate: null, pitch: 3, instruct: "", expressive: true });
+    // 身份整体来自用户层的 mix —— 人格的 voiceId 不能漏进来；rate / instruct 逐字段仍取人格的
+    expect(applied.body.voice).toEqual({ voiceId: "", mix, templateId, rate: -15, pitch: 3, instruct: "温柔一点", expressive: true });
+    const cfg = await request(app).get("/api/companion/config").set(auth(me.token));
+    expect(cfg.body.voiceSettings).toEqual(applied.body.voice);
+    expect(cfg.body.voice).toBe("");
+    const support = await request(app).get("/api/support/config").set(auth(me.token));
+    expect(support.body.voiceSettings.mix).toEqual(mix);
+
+    // 直接给完整 VoiceSettings（含 mix）也行；2.0 音色进 mix → 400 且 message 说明只能混 1.0
+    const direct = await request(app).put("/api/companion/settings").set(auth(me.token)).send({ voice: { mix: [{ voiceId: C, weight: 1 }], rate: 5 } });
+    expect(direct.status).toBe(200);
+    expect(direct.body.settings.voice).toEqual({ voiceId: "", mix: [{ voiceId: C, weight: 1 }], templateId: null, rate: 5, pitch: null, instruct: "", expressive: true });
+    const bad = await request(app).put("/api/companion/settings").set(auth(me.token)).send({ voice: { mix: [{ voiceId: "zh_female_vv_uranus_bigtts", weight: 1 }] } });
+    expect(bad.status).toBe(400);
+    expect(bad.body.code).toBe("VALIDATION_ERROR");
+    expect(bad.body.message).toMatch(/1\.0/);
+    const four = await request(app)
+      .put("/api/companion/settings")
+      .set(auth(me.token))
+      .send({ voice: { mix: [F, M, C, "zh_female_meilinvyou_moon_bigtts"].map((voiceId) => ({ voiceId, weight: 1 })) } });
+    expect(four.status).toBe(400);
+
+    // 用户只改语速、人格带 mix → 身份落到人格的 mix；用户选了单音色 → 用户身份压过人格的 mix
+    const mixPersona = await createPersona(other.token, { name: "混音人格", voice: { mix: [{ voiceId: M, weight: 1 }] } });
+    expect(mixPersona.voice).toEqual({ voiceId: "", mix: [{ voiceId: M, weight: 1 }], templateId: null, rate: null, pitch: null, instruct: "", expressive: true });
+    await request(app).put("/api/companion/settings").set(auth(me.token)).send({ personaId: mixPersona._id, voice: { rate: 20 } }).expect(200);
+    const fall = await request(app).get("/api/companion/settings").set(auth(me.token));
+    expect(fall.body.voice).toEqual({ voiceId: "", mix: [{ voiceId: M, weight: 1 }], templateId: null, rate: 20, pitch: null, instruct: "", expressive: true });
+    await request(app).put("/api/companion/settings").set(auth(me.token)).send({ voice: { voiceId: "zh_female_gujie_uranus_bigtts" } }).expect(200);
+    const single = await request(app).get("/api/companion/settings").set(auth(me.token));
+    expect(single.body.voice).toEqual({ voiceId: "zh_female_gujie_uranus_bigtts", mix: null, templateId: null, rate: null, pitch: null, instruct: "", expressive: true });
   });
 });

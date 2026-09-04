@@ -31,7 +31,9 @@ const voiceString = z
     if (obj === null) return null;
     const parsed = voiceSettingsSchema.safeParse(obj);
     if (!parsed.success) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "invalid voice settings" });
+      // 里层自己写的人话（「只能混 1.0 音色」）要透出来，别一律糊成 "invalid voice settings"
+      const custom = parsed.error.issues.find((i) => i.code === "custom" && i.message);
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: custom ? custom.message : "invalid voice settings" });
       return z.NEVER;
     }
     return parsed.data;
