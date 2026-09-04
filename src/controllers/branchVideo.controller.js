@@ -37,7 +37,7 @@ const { createNotification } = require("../services/notification.service");
 const { parseMentionsWithSpans } = require("../utils/mentionParser");
 // 拉黑关系的权威判据。★ 全仓统一走它：messages.controller 用它拒私信、
 // users.controller 用它把拉黑对象从搜索结果里滤掉，通知这条路也必须认同一份判断。
-const { hasAnyBlockBetween } = require("../utils/blocking");
+const { hasAnyBlockBetween, listBlockedUserIds } = require("../utils/blocking");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）。这里三个用途：
 // 删除授权（assertCanDelete）、按 id 直取时越过可见性（assertVisible）、后台端点。
 const { isAdmin } = require("../utils/roles");
@@ -728,6 +728,29 @@ function cursorFilter(cursor) {
 // ── 端点 ─────────────────────────────────────────────────────────
 
 // GET /api/branch/videos
+/**
+ * 「把这个人拉黑之后，我就不该再看见他的东西」——**唯一实现**，三条读接口共用。
+ *
+ * ★★ 为什么放在**查询里**而不是对取回来那一页做后过滤：这几条接口都是游标分页
+ *   （多取一条判断 hasMore）。后过滤会让一页凭空变短、甚至整页空，而 `nextCursor`
+ *   还在说"后面还有" —— 用户看到的是"刷不动了"或"列表跳着走"，且零报错。
+ * ★ 双向：`listBlockedUserIds` 回的是「我拉黑的 ∪ 拉黑我的」。我拉黑了谁就不想再看见他，
+ *   而拉黑我的人也不该继续看见我 —— 与通知那条闸（hasAnyBlockBetween）同一口径。
+ * ★ 没登录（optionalAuth 下 req.user 为空）时返回 null：不过滤，也不多打一次库。
+ * ⚠ 这是**看不看得见**，不是**能不能发**：仓里已经定过「只挡通知，不挡评论本身」
+ *   （见 notifyBranch 的 ★），拉黑不该变成封别人的嘴，也不该让对方从 403 推断出被谁拉黑了。
+ * ★ 评论那条：顶层与回复在**同一个扁平列表**里返回（每条带 parentId，客户端分组），
+ *   所以这一个 `author` 过滤把两者一起罩住了。被拉黑者的顶层评论被滤掉时，
+ *   挂在它下面的**别人的回复**会成为孤儿、被客户端的分组丢弃 —— 这是**有意的**：
+ *   整条对话根在被拉黑的人身上，整条不见比留下半截更符合"我不想看见他"。
+ */
+async function blockedAuthorFilter(user, field = "author") {
+  if (!user) return null;
+  const ids = await listBlockedUserIds(user._id);
+  if (!ids.size) return null;
+  return { [field]: { $nin: [...ids].map((id) => new mongoose.Types.ObjectId(id)) } };
+}
+
 async function listVideos(req, res, next) {
   try {
     const { feed, category, q, cursor, limit, author } = listQuery.parse(req.query);
@@ -781,6 +804,9 @@ async function listVideos(req, res, next) {
     const parts = [filter, readableFilter(req.user)];
     if (authorFilter) parts.push(authorFilter);
     if (range) parts.push(range);
+    // 拉黑：与上面那条 ★★ 同一个理由 —— 首页/分区/搜索/他人主页全走这一个查询，加在这里就够
+    const blockPart = await blockedAuthorFilter(req.user);
+    if (blockPart) parts.push(blockPart);
     const query = { $and: parts };
 
     const docs = await BranchVideo.find(query)
@@ -1292,7 +1318,12 @@ async function listComments(req, res, next) {
     await assertVisible(id, req.user);
 
     const range = cursorFilter(cursor);
-    const query = range ? { $and: [{ video: id }, range] } : { video: id };
+    // 拉黑（见 blockedAuthorFilter 的 ★★：必须进查询，不能后过滤 —— 这条也是游标分页）
+    const blockPart = await blockedAuthorFilter(req.user);
+    const commentParts = [{ video: id }];
+    if (range) commentParts.push(range);
+    if (blockPart) commentParts.push(blockPart);
+    const query = commentParts.length > 1 ? { $and: commentParts } : commentParts[0];
 
     const docs = await BranchComment.find(query)
       .sort({ createdAt: -1, _id: -1 })
@@ -1669,7 +1700,10 @@ async function listDanmaku(req, res, next) {
     //   不是"按 at 取前 N 条" —— 那样一条爆火作品的前 10 秒会被塞满，
     //   后面永远是空的，新弹幕发出去也看不见。
     //   客户端拿到的必须是 at 升序：播放端是按游标扫时间轴的，乱序会漏放。
-    const docs = await BranchDanmaku.find({ video: id })
+    // 拉黑：见 blockedAuthorFilter 的 ★★。这条虽然不是游标分页，但同样必须进查询 ——
+    // 后过滤会让 truncated 说谎（取回 limit 条、滤掉几条，却仍然报"还有更多"）
+    const blockPart = await blockedAuthorFilter(req.user);
+    const docs = await BranchDanmaku.find(blockPart ? { $and: [{ video: id }, blockPart] } : { video: id })
       .sort({ createdAt: -1, _id: -1 })
       .limit(limit)
       .select("at text color author createdAt")
