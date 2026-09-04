@@ -10,7 +10,8 @@
  * @endpoint GET  /config - 这台服务器有没有配 AI/TTS、看板娘叫什么（游客可查，决定前端画不画对话框）；
  *                          登录用户还会拿到自己的数字人设置解析结果：persona / model / voiceSettings（见 companionSetting.service）
  * @endpoint GET  /settings - 登录用户的数字人三项选择（人格 / Live2D 模型 / 音频覆盖）+ 解析结果
- * @endpoint PUT  /settings - 改选择：{ personaId?, modelId?, voice? }，缺省不动、null 清掉；人格要能选用（公开/自己的，付费需已购）
+ * @endpoint PUT  /settings - 改选择：{ personaId?, modelId?, voice? }，缺省不动、null 清掉；人格要能选用（公开/自己的，付费需已购）；
+ *                           voice 可以是完整 VoiceSettings（含 mix / templateId），也可以只给 { templateId } 由服务端从声音市场的模板展开
  * @endpoint POST /chat   - 流式对话（text/event-stream）。事件：
  *   event: sentence  data: {index, text, emotion, face, action, tts:{emotion,instruct}}  ← 一句一条，前端按句调 /api/tts 并切表情
  *   event: token     data: {t}                                                            ← 原始增量，仅供"打字机"显示
@@ -104,7 +105,9 @@ router.get("/settings", requireAuth, async (req, res, next) => {
 router.put("/settings", requireAuth, async (req, res, next) => {
   const parsed = settingsBodySchema.safeParse(req.body || {});
   if (!parsed.success) {
-    return res.status(400).json({ message: "invalid settings", code: "VALIDATION_ERROR", details: parsed.error.issues });
+    // 自己写的人话（「只能混 1.0 音色」）直接当 message，与 middleware/error.js 对 ZodError 的处理一致
+    const custom = parsed.error.issues.find((i) => i.code === "custom" && i.message);
+    return res.status(400).json({ message: custom ? custom.message : "invalid settings", code: "VALIDATION_ERROR", details: parsed.error.issues });
   }
   try {
     res.json({ ok: true, ...(await updateCompanionSetting({ userId: req.user._id, req, patch: parsed.data })) });

@@ -12,7 +12,8 @@ const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const bundle = require("../services/live2dBundle.service");
 const market = require("../services/live2dMarket.service");
 const { checkPersonaAccess } = require("../services/personaAccess.service");
-const { normalizeVoiceSettings } = require("../utils/voiceSettings");
+// 「音频」板块的写入口：完整 VoiceSettings 或 { templateId }（从声音市场的模板展开成快照）
+const { expandVoiceInput } = require("../services/voiceTemplate.service");
 const { listQuery } = require("../schemas/live2dModel.schemas");
 
 const MAX_TAGS = 10;
@@ -167,6 +168,8 @@ async function createModel(req, res, next) {
     if (!req.file) badRequest("Upload the Live2D bundle (.zip) as the `bundle` field");
     const body = req.body;
     const personaId = await resolvePersonaBinding(body.personaId, req.user);
+    // 嗓子也在解压之前定下来：模板不存在 / 私有会 404 / 403，别白解一个包
+    const voice = await expandVoiceInput(body.voice, req.user._id);
     installed = await bundle.installBundle(req.file.buffer, {
       rootRelativeDir: `live2d-market/${String(req.user._id)}`,
       originalName: req.file.originalname,
@@ -183,7 +186,7 @@ async function createModel(req, res, next) {
       bundleBytes: installed.bytes,
       fileCount: installed.files,
       persona: personaId,
-      voice: normalizeVoiceSettings(body.voice),
+      voice,
       shared: Boolean(body.shared),
     });
     const populated = await Live2dModel.findById(doc._id).populate("author", "_id username").populate("persona").lean();
@@ -209,7 +212,7 @@ async function updateModel(req, res, next) {
     if (body.tags !== undefined) doc.tags = toTags(body.tags);
     if (body.shared !== undefined) doc.shared = Boolean(body.shared);
     if (body.personaId !== undefined) doc.persona = body.personaId === null ? null : await resolvePersonaBinding(body.personaId, req.user);
-    if (body.voice !== undefined) doc.voice = body.voice === null ? null : normalizeVoiceSettings(body.voice);
+    if (body.voice !== undefined) doc.voice = body.voice === null ? null : await expandVoiceInput(body.voice, req.user._id);
     await doc.save();
 
     const populated = await Live2dModel.findById(doc._id).populate("author", "_id username").populate("persona").lean();

@@ -6,7 +6,8 @@
  *
  * 合并规则（读取时现算，不存快照）：
  *   人格：用户选的 → 没选就用模型作者推荐的 → 都没有就是默认人设（提示词里不加人设段）
- *   音频：用户覆盖 > 人格自带 > 模型推荐 > 服务端默认（COMPANION_TTS_VOICE，空 = /api/tts 内置音色）
+ *   音频：用户覆盖 > 人格自带 > 模型推荐 > 服务端默认（COMPANION_TTS_VOICE，空 = /api/tts 内置音色）；
+ *         声音身份（混音配方 mix / 单音色 voiceId）整体取自第一个带身份的层，rate / pitch / instruct 逐字段取
  *   模型：用户选的（公开或自己的）→ 否则官方内置
  * 选的东西被删 / 取消分享 / 变成付费而没买 → 静默回退到下一层，绝不让聊天报错。
  */
@@ -15,7 +16,8 @@ const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { checkPersonaAccess, loadUsablePersona, personaSummary } = require("./personaAccess.service");
 const { OFFICIAL_MODEL_ID, isOfficialId, loadUsableModel, toLive2dModelPayload, authorIdOf } = require("./live2dMarket.service");
-const { resolveVoiceSettings, normalizeVoiceSettings, serializeVoiceSettings } = require("../utils/voiceSettings");
+const { resolveVoiceSettings, serializeVoiceSettings } = require("../utils/voiceSettings");
+const { expandVoiceInput } = require("./voiceTemplate.service");
 
 function defaultVoiceId() {
   return String(process.env.COMPANION_TTS_VOICE || "").trim();
@@ -50,6 +52,8 @@ async function loadCompanionSetup({ userId, req }) {
  * 写入（部分更新：缺省字段不动，null = 清掉）。
  * personaId 必须可选用（公开/自己的，付费的要已购），否则 403 PERSONA_NOT_AVAILABLE；
  * modelId 必须公开或自己的，"official-mascot"/null 都表示官方内置。
+ * voice 可以是完整 VoiceSettings（含 mix / templateId），也可以只给 { templateId } 由服务端从声音市场的模板展开成快照
+ * （模板不存在 404、私有他人的 403，见 voiceTemplate.service.expandVoiceInput）。
  */
 async function updateCompanionSetting({ userId, req, patch }) {
   const $set = {};
@@ -79,7 +83,7 @@ async function updateCompanionSetting({ userId, req, patch }) {
     }
   }
   if (patch.voice !== undefined) {
-    $set.voice = patch.voice === null ? null : normalizeVoiceSettings(patch.voice);
+    $set.voice = patch.voice === null ? null : await expandVoiceInput(patch.voice, userId);
   }
   if (Object.keys($set).length) {
     await CompanionSetting.findOneAndUpdate({ user: userId }, { $set, $setOnInsert: { user: userId } }, { upsert: true, new: true });

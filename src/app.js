@@ -157,6 +157,8 @@ app.use("/api/support", require("./routes/support.routes").publicRouter);
 app.use("/api/asr", require("./routes/asr.routes"));
 // Live2D 模型市场（数字人套装：模型包 + 推荐人格 + 推荐嗓子）；解压落在 uploads/live2d-market/
 app.use("/api/live2d-models", require("./routes/live2dModel.routes"));
+// 声音市场（豆包 1.0 混音模板：1～3 味音色按权重调一把嗓子）；「使用」= 配方快照进数字人 / 人格 / 模型的 voice
+app.use("/api/voice-templates", require("./routes/voiceTemplate.routes"));
 app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);

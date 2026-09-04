@@ -28,8 +28,13 @@ function errorHandler(err, req, res, next) {
   if (err.name === "ZodError") {
     status = 400;
     code = CODES.VALIDATION_ERROR;
-    message = "Validation error";
-    details = err.errors;
+    // zod 4 把问题列表放在 issues（v3 的 errors 已经没有了，此前 details 一直是 undefined）。
+    // superRefine / transform 里 addIssue 的 custom 是我们自己写的人话（「只能混 1.0 音色」「world is reserved」），
+    // 直接当 message 回给前端；zod 自带的英文（"Too big: …"）留在 details 里
+    const issues = Array.isArray(err.issues) ? err.issues : Array.isArray(err.errors) ? err.errors : [];
+    const custom = issues.find((i) => i && i.code === "custom" && i.message);
+    message = custom ? custom.message : "Validation error";
+    details = issues;
   }
 
   // Mongo duplicate key

@@ -23,8 +23,9 @@
  *
  * ★ resource id 决定**用哪代模型、也决定计费商品**，两代要在控制台各自开通：
  *     seed-tts-2.0 → 只能调 2.0 音色（*_uranus_*）
- *     seed-tts-1.0 → 只能调 1.0 音色（*_moon_* / *_mars_*）
- *   本账号实测 1.0 **未开通**（45000030），2.0 可用。音色清单（app 仓 studio/voices.ts）只收 2.0。
+ *     seed-tts-1.0 → 只能调 1.0 音色（*_moon_* / *_mars_*）；混音（custom_mix_bigtts）也走这一代
+ *   2026-09-04 实测本账号两代都已开通：混音与 1.0 单音色都能出声（早先 1.0 报 45000030 是没开通）。
+ *   音色目录在 config/voices.js：2.0 单音色 + 23 个验证过的 1.0 可混音音色（声音市场的原料）。
  *
  * 没配密钥就 501，前端据此把云端合成整段关掉、退回浏览器合成器（见 app 的 studio/speech.ts）。
  */
@@ -32,7 +33,8 @@ const express = require("express");
 const crypto = require("crypto");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
-const { VOICE_CATALOG } = require("../config/voices");
+const { VOICE_CATALOG, MIXABLE_VOICES, MAX_MIX_VOICES } = require("../config/voices");
+const { parseMixEntries, normalizeWeights } = require("../utils/voiceSettings");
 
 const router = express.Router();
 
@@ -58,11 +60,20 @@ router.get("/health", (_req, res) => {
 
 /**
  * GET /api/tts/voices —— 数字人可选的豆包音色目录（config/voices.js），给人格市场「音频」板块、
- * 模型市场上传表单、App 客服声音面板做下拉。目录之外的 id 也能用（表单有自定义项），这里只是"有名字的那些"。
+ * 模型市场上传表单、App 客服声音面板、声音市场的配方编辑器做下拉。
+ *   voices       2.0 单音色（每条 generation:"2.0"、mixable:false）；目录之外的 id 也能用（表单有自定义项），这里只是"有名字的那些"
+ *   mixable      23 个验证过的 1.0 音色（{ id, name, gender, generation:"1.0", mixable:true }），混音配方**只能**从这里选
+ *   maxMixVoices 一次最多混几味（3）
  */
 router.get("/voices", (_req, res) => {
   res.setHeader("Cache-Control", "public, max-age=300");
-  res.json({ ok: true, voices: VOICE_CATALOG, defaultVoiceId: String(process.env.COMPANION_TTS_VOICE || "").trim() || DEFAULT_VOICE });
+  res.json({
+    ok: true,
+    voices: VOICE_CATALOG,
+    mixable: MIXABLE_VOICES,
+    defaultVoiceId: String(process.env.COMPANION_TTS_VOICE || "").trim() || DEFAULT_VOICE,
+    maxMixVoices: MAX_MIX_VOICES,
+  });
 });
 
 /**
@@ -81,15 +92,14 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
   if (!line.trim()) return res.status(400).json({ message: "text required" });
 
   // ★ 混音只吃 **1.0** 音色，speaker 要固定写成 custom_mix_bigtts，真正的音色放进
-  //   mix_speaker。2.0 的 uranus 混不进去（55000000）。反直觉的一点：本账号 1.0
-  //   **单音色**调不动（45000030），混音却调得动。
-  const recipe = Array.isArray(mix)
-    ? mix.map((m) => ({ id: safeId(m && m.id), w: Number(m && m.w) || 0 })).filter((m) => m.id && m.w > 0).slice(0, 4)
-    : [];
+  //   mix_speaker。2.0 的 uranus 混不进去（55000000）。
+  //   mix 两种形状都认：{ id, w }（app 仓早期的调用方）与 { voiceId, weight }（utils/voiceSettings 的
+  //   VoiceSettings.mix，数字人设置里的配方直接展开过来）；最多 3 味，权重在这里归一到和 = 1。
+  //   目录外的 id 不在这里拦（与单音色同一条规矩：只收口字符集，念不念得出由上游决定）。
+  const recipe = normalizeWeights(parseMixEntries(mix).slice(0, MAX_MIX_VOICES));
   const mixed = recipe.length > 0;
   const speaker = mixed ? "custom_mix_bigtts" : safeId(voice) || DEFAULT_VOICE;
   const is20 = !mixed && /uranus/.test(speaker);
-  const sum = mixed ? recipe.reduce((a, m) => a + m.w, 0) || 1 : 1;
 
   const speechRate = num(rate, -50, 100);
   const pitchShift = num(pitch, -12, 12);
@@ -102,7 +112,7 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
       speaker,
       ...(wantsTags ? { model: "seed-tts-2.0-expressive" } : {}),
       ...(mixed
-        ? { mix_speaker: { speakers: recipe.map((m) => ({ source_speaker: m.id, mix_factor: +(m.w / sum).toFixed(3) })) } }
+        ? { mix_speaker: { speakers: recipe.map((m) => ({ source_speaker: m.voiceId, mix_factor: m.weight })) } }
         : {}),
       audio_params: {
         format: "mp3",
