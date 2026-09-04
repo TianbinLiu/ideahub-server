@@ -247,6 +247,9 @@ ideahub/
 │   │   │   ├── SettingsComponentsPanel.tsx # 组件设置复用面板
 │   │   │   ├── SiteLive2D.tsx        # 全站 Live2D 看板娘挂载器
 │   │   │   ├── SiteLive2D.css        # 看板娘右下角与移动端覆盖样式
+│   │   │   ├── CompanionStage.tsx    # 首页看板娘舞台（Live2D 画布，压在内容卡片之下）
+│   │   │   ├── CompanionChat.tsx     # 首页看板娘对话框（SSE 流式对话 → 逐句 TTS → 表情/动作/口型）
+│   │   │   ├── SceneBackgroundPicker.tsx # 首页场景背景选择弹窗
 │   │   │   ├── TagRankAccessGate.tsx # Tag Rank 组件访问门禁
 │   │   │   ├── SiteGlobalAiAssistant.tsx # 全站编辑 AI 助手面板
 │   │   │   ├── SiteTemplateEditOverlay.tsx # 全站编辑覆盖层
@@ -349,7 +352,7 @@ ideahub/
     │   │   └── WorkshopTemplateLike.js
     │   │
     │   ├── controllers/              # 控制器（16个）
-    │   ├── routes/                   # 路由（16个）
+    │   ├── routes/                   # 路由（17个）
     │   ├── middleware/               # 中间件（5个）
     │   ├── schemas/                  # 验证模式（2个）
     │   ├── services/                 # 业务服务（5个）
@@ -1622,6 +1625,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `workshop.routes.js` - 工坊模板市场、编辑与全站 AI 改版
 - `minimax.routes.js` - 真人视频档供应商代理（MiniMax 海螺）。脚手架：未配 MINIMAX_API_KEY 全部 501；白名单转发，接上钱包扣费前不要在生产配真 key
 - `runway.routes.js` - 真人视频档供应商代理（Runway image_to_video）。同上；contentModeration 由服务端钉死不透传（合规决定，见文件头）
+- `companion.routes.js` - 首页看板娘数字人：`GET /config` 游客探测（有没有 AI/TTS、叫什么），`POST /chat` 登录 + 按用户限流的 **SSE 流式对话**——LLM 按「一句一组 `[情绪][face:x][action:y]` 标签」输出，服务端逐句切分、解析标签后以 `sentence` 事件下发（含给 `/api/tts` 用的情绪参数），前端按句合成语音并切表情/动作。客户端断开即 abort 上游，不白烧 token
 
 ---
 
@@ -1639,6 +1643,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `notification.service.js` - 通知创建
 - `aiReview.service.js` - AI评审队列
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
+- `companion.service.js` - 看板娘数字人的「演出协议」：人设提示词（9 种表情 × 11 种动作的标签规范）、流式切句器（标签跨 chunk / 句尾无标点也能切）、标签解析（未知值回退默认）、情绪 → 豆包 TTS 参数映射。纯函数、无 IO，`tests/companion.spec.js` 直接测
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
 - `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、**看几帧**（`visionFrameTimes`）、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
@@ -1808,6 +1813,23 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 ---
 
+#### `client/src/components/CompanionStage.tsx` / `CompanionChat.tsx` / `SceneBackgroundPicker.tsx`
+**功能**: 首页看板娘数字人（会说话的 Live2D 陪聊）。详细说明见 client 仓 `docs/COMPANION.md`。
+**职责**:
+- `CompanionStage`：按需加载自托管的 Live2D 运行时（`public/live2d/runtime/`：Cubism Core + pixi 7 + pixi-live2d-display lipsync 补丁版），
+  把 `public/live2d/mascot/` 的看板娘模型"站"到首页左列的留白区域；画布铺满左列 z-0，内容卡片在 z-10 之上
+- `CompanionChat`：调用 `POST /api/companion/chat`（SSE）逐句拿到 `[情绪][face][action]` 标签，按句调 `POST /api/tts` 合成语音，
+  串行"演出队列"驱动表情/动作/口型/字幕；未登录只拦发送（弹登录框）；语音开关与场景偏好只存 localStorage
+- `SceneBackgroundPicker`：场景背景弹窗（默认深蓝 / 酒馆 / 卧室 / 书房 / 露台 / 咖啡馆 / 画室，`public/backgrounds/`）
+- 配套纯逻辑模块在 `client/src/live2d/`（loader、companionModel）与 `client/src/companion/`（protocol、sse、speech、bus、scenes）
+
+**实现备注**:
+- 前端 face/action 枚举必须与服务端 `services/companion.service.js` 一字不差；未知值回退 normal/none
+- 首页（`/`）上 `SiteLive2D` 主动卸载右下角挂件，避免两个模型同屏
+- 模型本身的生成链路（Seedream 立绘 → See-through 拆层 → Cubism 自动脸部变形器 → 4096 贴图 → moc3）记录在 client 仓 `docs/COMPANION.md`
+
+---
+
 #### `client/src/components/SiteLive2D.tsx`
 **功能**: 全站 Live2D 看板娘挂载器（挂载于 `App.tsx`）  
 **职责**:
@@ -1816,6 +1838,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - 使用 `ideahub-waifu-tips.json` 提供适配 IdeaHub 导航和按钮的自定义提示语
 - 启用基础工具按钮（随机一言、切换模型、截图、隐藏）并允许拖拽
 - 通过 `SiteLive2D.css` 将看板娘固定到右下角，并在移动端缩放避免过度遮挡页面
+- 首页（`/`）不挂载：首页由 `CompanionStage` 展示看板娘舞台，两者不同屏
 
 **实现备注**:
 - 按 `live2d-widget-master/README.md` 的自托管思路集成，不直接使用写死 CDN 路径的 `autoload.js`
