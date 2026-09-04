@@ -92,10 +92,15 @@ const reportSchema = new mongoose.Schema(
     /**
      * 队列插队位。**只由 reason 推导**（见下面的 pre("validate")），不接受调用方传值 ——
      * 能传的话，举报者就能把自己那条顶到队首，而队首正是最稀缺的资源。
-     * ★ 存量数据没有这个键。`{priority:-1}` 降序下**缺字段排在所有数字之后**，
-     *   而队列本来就是 createdAt 降序（新的在前）、存量记录本来就在底部 ——
-     *   所以不写迁移也不会让任何一条待处理举报"往下掉"，唯一的变化就是 csae 顶上来。
-     *   （这条推理是刻意写下来的：换成升序、或改成"老的在前"，它立刻不成立。）
+     * ★★ 存量数据没有这个键，而**这次不写迁移是安全的，只因为三件事同时成立**
+     *   （复核实测确认；把它当通则用会出事，所以逐条写下来）：
+     *   ① `{priority:-1}` 降序下缺字段排在所有数字之后；
+     *   ② 队列本来就是 createdAt 降序（新的在前），存量记录本来就在底部；
+     *   ③ **`csae` 是一个全新的 key** —— 存量里一条都没有，所以"该插队却缺字段"的
+     *      文档根本不存在。
+     *   ⇒ 以后往 `URGENT_REASONS` 里加一个**已经在用的**理由（比如把 `porn` 也算紧急），
+     *   ③ 立刻不成立：存量里那些 porn 举报缺 priority，会被排到**所有**普通举报之后，
+     *   正好和意图相反。那种时候**必须写迁移**（`updateMany({priority:{$exists:false}}, ...)`）。
      */
     priority: { type: Number, default: 0 },
     /** 补充说明（可选）。500 字是契约值，客户端输入框上限必须与它相等 */
@@ -132,9 +137,16 @@ reportSchema.index({ reporter: 1, targetType: 1, targetId: 1 }, { unique: true }
 // 主查询：管理端「按状态取待处理队列，插队的在最前，其余最新的在前」。
 // 复合顺序是 status 在前、再 priority、最后 createdAt —— 反过来（{createdAt:-1, status:1}）
 // 等值筛选吃不上前缀，队列一长就变成全表扫。
-// ★ 三列的顺序必须与 report.controller 的 sort **逐字一致**，否则排序落到内存里做
-//   （零报错，只是慢，且 32MB 上限一到就整条查询抛错）。
-reportSchema.index({ status: 1, priority: -1, createdAt: -1 });
+// ★★ 索引的键序必须与 report.controller 的 sort **逐字一致，一列都不能少**。
+//   2026-09-03 复核实测：第一版索引写成 `{status, priority, createdAt}`，而 sort 是
+//   `{priority, createdAt, _id}` —— 多出来的 `_id` 让 explain 里仍然出现阻塞 SORT 阶段。
+//   零报错，只是慢；而一旦堆到 MongoDB 的阻塞排序内存上限（版本相关，别在注释里写死一个数），
+//   会**整条查询抛错**，
+//   而那时屏幕上只会显示"举报列表没拉到"。
+reportSchema.index({ status: 1, priority: -1, createdAt: -1, _id: -1 });
+
+// 「全部」页：不筛状态、也不按 priority 插队（见 controller 的 sort 注释），单独一条。
+reportSchema.index({ createdAt: -1, _id: -1 });
 
 // 「这个对象一共被举报了多少次 / 还有几条没处理」：管理端最重要的信号
 // （30 个人举报同一条 ≠ 1 个人举报 30 条），以及下架后把同对象的其余举报一并收尾。

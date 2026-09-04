@@ -301,7 +301,8 @@ async function unbanUser(req, res, next) {
  *      但那边是同步 destroy、这边是欠账重试 —— 一个管理员操作不该被一次云端抖动挡住。
  *   ⑦.6 BranchCollect（他收藏别人的那些）→ deleteMany。别人收藏他作品的那些行
  *      随①的 purgeVideo 一起删。
- *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany。指向的内容随①②③一起没了，
+ *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
+ *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
  *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany。
  *      token 是对外采购的算力额度，**没有对手方**，删他自己的流水不破坏任何不变量。
@@ -437,9 +438,18 @@ async function purgeUserCascade(userId) {
   //     "别人收藏了他的作品"那些行随①的 purgeVideo 一起删掉了。
   removed.collects = (await BranchCollect.deleteMany({ user: uid })).deletedCount;
 
-  // ⑧ 举报
+  // ⑧ 举报。
+  // ★★ **儿童安全（csae）那些一条都不删** —— 这是删号权利的一个**法定义务例外**，
+  //   不是疏漏。对外承诺写在 <https://ideahubs.org/child-safety>：
+  //   「保存与该事件有关的记录与证据以配合调查，不因删除操作而一并销毁」。
+  //   不留这个口子的话，那句话是假的，而且是最坏的一种假：被举报的人只要自己注销，
+  //   指向他的儿童安全举报就全没了 —— 注销是产品里人人可点的一颗按钮。
+  //   ⚠ 留下来的是**举报记录本身**（reason/detail/targetId/时间/举报人 id），
+  //   内容与账号仍然照删；这一条也写进了 /privacy 的「注销」那一节。
+  //   ⚠ 判据走 `Report.URGENT_REASONS` 一处，别在这儿手写 "csae"。
   removed.reports = (
     await Report.deleteMany({
+      reason: { $nin: Report.URGENT_REASONS },
       $or: [
         { reporter: uid },
         { targetType: "video", targetId: { $in: videoIds } },
@@ -448,6 +458,15 @@ async function purgeUserCascade(userId) {
       ],
     })
   ).deletedCount;
+  removed.reportsKeptForChildSafety = await Report.countDocuments({
+    reason: { $in: Report.URGENT_REASONS },
+    $or: [
+      { reporter: uid },
+      { targetType: "video", targetId: { $in: videoIds } },
+      { targetType: "comment", targetId: { $in: commentIds } },
+      { targetType: "danmaku", targetId: { $in: danmakuIds } },
+    ],
+  });
 
   // ⑨ 钱包流水与订单
   removed.tokenLedger = (await TokenLedger.deleteMany({ user: uid })).deletedCount;

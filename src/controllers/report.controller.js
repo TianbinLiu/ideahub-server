@@ -93,6 +93,9 @@ function toReportPayload(doc, ctx = {}) {
     reason: doc.reason,
     detail: doc.detail || "",
     status: doc.status || "pending",
+    // ★ 把 priority 发出去，客户端就不用自己再维护一份「哪些理由算紧急」（铁律六）。
+    //   老客户端读不到它 → 退回它自己那份判断，两边都不会崩。
+    priority: typeof doc.priority === "number" ? doc.priority : 0,
     reporter: toUserPayload(doc.reporter),
     handler: toUserPayload(doc.handler),
     handledAt: doc.handledAt || null,
@@ -320,9 +323,20 @@ async function listReports(req, res, next) {
       ...(rawType ? { targetType: rawType } : {}),
     };
 
+    // ★★ 插队**只在待处理队列里**生效。
+    //   「全部」页是翻历史，那里要的是时间顺序 —— 无条件按 priority 排的话，
+    //   处理完很久的 csae 会永久钉在第一页顶上，把真正新发生的事压下去。
+    //   ★ 键序与 models/Report 的两条索引逐字对应（少一列就退化成内存排序，实测过）。
+    // ⚠ 客户端**不许再排一遍**：app 的管理页原来按 createdAt 重排，把这里整个丢掉，
+    //   而那是唯一的人工复核界面（2026-09-03 复核抓到，已改）。顺序只有这一处。
+    const sort =
+      rawStatus === "pending"
+        ? { priority: -1, createdAt: -1, _id: -1 }
+        : { createdAt: -1, _id: -1 };
+
     const [rows, total] = await Promise.all([
       Report.find(filter)
-        .sort({ priority: -1, createdAt: -1, _id: -1 })
+        .sort(sort)
         .skip((page - 1) * limit)
         .limit(limit)
         .populate("reporter", USER_FIELDS)
