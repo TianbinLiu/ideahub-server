@@ -557,6 +557,10 @@ i18n.use(initReactI18next).init({
 /settings → SettingsPage
 /components → ComponentsPage
 /components/live2d → Live2DSettingsPage
+/live2d/market → Live2dMarketPage（Live2D 模型市场广场：全部/已收藏/我的、最新/最热、搜索；官方内置条目在最前）
+/live2d/market/new → Live2dModelEditorPage（上传：模型 zip → 推荐人格 → 推荐音频三步；ProtectedRoute）
+/live2d/market/:id → Live2dModelDetailPage（详情：模型包 / 推荐人格 / 推荐音色；使用 / 收藏 / 点赞 / 作者编辑删除）
+/live2d/market/:id/edit → Live2dModelEditorPage（作者改元数据 / 换绑人格 / 改推荐嗓子）
 /components/tag-rank → TagRankSettingsPage
 /admin/users → AdminUsersPage
 /feedback → FeedbackAdminPage
