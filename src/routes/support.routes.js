@@ -39,6 +39,7 @@ const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
 const SupportTicket = require("../models/SupportTicket");
+const SupportFeedback = require("../models/SupportFeedback");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
 const { createNotification } = require("../services/notification.service");
@@ -77,6 +78,12 @@ const ticketBodySchema = z.object({
 
 const messageBodySchema = z.object({ content: z.string().trim().min(1).max(SupportTicket.REPLY_MAX_CHARS) });
 const statusBodySchema = z.object({ status: z.enum(SupportTicket.STATUSES) });
+const feedbackBodySchema = z.object({
+  question: z.string().trim().min(1).max(1000),
+  answer: z.string().trim().min(1).max(4000),
+  rating: z.enum(SupportFeedback.RATINGS),
+  reason: z.string().trim().max(200).optional().default(""),
+});
 
 function invalid(res, message, details) {
   return res.status(400).json({ ok: false, message, code: "VALIDATION_ERROR", ...(details ? { details } : {}) });
@@ -200,6 +207,8 @@ publicRouter.get("/config", optionalAuth, (req, res) => {
     name: support.agentName(),
     enabled: hasAiKey(),
     tts: Boolean(process.env.TTS_API_KEY),
+    // 语音输入走 /api/asr，与 TTS 同一把 key（同一个 openspeech 应用；商品是否开通要真调一次才知道）
+    asr: Boolean(process.env.TTS_API_KEY),
     voice: String(process.env.COMPANION_TTS_VOICE || "").trim(),
     loginRequired: true,
     quickQuestions: support.QUICK_QUESTIONS,
@@ -372,8 +381,46 @@ publicRouter.post("/tickets/:id/messages", requireAuth, userRateLimit({ max: 10,
   res.json({ ok: true, ticket: toTicketPayload(ticket) });
 });
 
+/** 👍 / 👎：连问题和回答原文一起存，差评是改知识库最直接的线索 */
+publicRouter.post("/feedback", requireAuth, userRateLimit({ max: 30, scope: "support-feedback" }), async (req, res) => {
+  const parsed = feedbackBodySchema.safeParse(req.body || {});
+  if (!parsed.success) return invalid(res, "invalid feedback", parsed.error.issues);
+  const doc = await SupportFeedback.create({ userId: req.user._id, ...parsed.data });
+  res.status(201).json({ ok: true, id: String(doc._id) });
+});
+
 // ── 管理员侧 ──────────────────────────────────────────────────────────
 adminRouter.use(requireAuth, requireRole(ADMIN_ROLE));
+
+adminRouter.get("/feedback", async (req, res) => {
+  const rating = req.query.rating ? String(req.query.rating) : "";
+  if (rating && !SupportFeedback.RATINGS.includes(rating)) return invalid(res, "invalid rating");
+  const page = Math.max(parseInt(String(req.query.page || "1"), 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit || "20"), 10) || 20, 1), 50);
+  const filter = rating ? { rating } : {};
+  const [items, total, up, down] = await Promise.all([
+    SupportFeedback.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).populate("userId", "username displayName").lean(),
+    SupportFeedback.countDocuments(filter),
+    SupportFeedback.countDocuments({ rating: "up" }),
+    SupportFeedback.countDocuments({ rating: "down" }),
+  ]);
+  res.json({
+    ok: true,
+    items: items.map((f) => ({
+      id: String(f._id),
+      rating: f.rating,
+      question: f.question,
+      answer: f.answer,
+      reason: f.reason,
+      createdAt: f.createdAt,
+      user: f.userId && f.userId.username ? { id: String(f.userId._id), username: f.userId.username, displayName: f.userId.displayName || "" } : null,
+    })),
+    total,
+    page,
+    limit,
+    stats: { up, down },
+  });
+});
 
 adminRouter.get("/tickets", async (req, res) => {
   const status = req.query.status ? String(req.query.status) : "";

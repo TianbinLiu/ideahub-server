@@ -153,6 +153,8 @@ app.use("/api/blocks", require("./routes/blocks.routes"));
 app.use("/api/companion", require("./routes/companion.routes"));
 // App「AI 客服」：GET /config 游客可探测、POST /chat 流式问答、/tickets 转人工工单（用户侧）
 app.use("/api/support", require("./routes/support.routes").publicRouter);
+// 语音识别代理（客服页按住说话）：收音频二进制，自己 express.raw，不占全局 1MB JSON 阈值
+app.use("/api/asr", require("./routes/asr.routes"));
 app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);

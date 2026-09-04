@@ -270,3 +270,31 @@ describe("support.service 纯函数", () => {
     expect(svc.categoryFromText("打开就闪退")).toBe("bug");
   });
 });
+
+describe("满意度 👍👎", () => {
+  it("用户存一条，管理员能按 rating 看并拿到统计", async () => {
+    const { token } = await createUser();
+    const admin = await createUser("admin");
+    const bad = await request(app).post("/api/support/feedback").set("Authorization", `Bearer ${token}`).send({ question: "x", answer: "y", rating: "meh" });
+    expect(bad.status).toBe(400);
+    const up = await request(app)
+      .post("/api/support/feedback")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ question: "怎么取回？", answer: "点取回。", rating: "up" });
+    expect(up.status).toBe(201);
+    const down = await request(app)
+      .post("/api/support/feedback")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ question: "有 iOS 吗", answer: "没有。", rating: "down", reason: "太简短" });
+    expect(down.status).toBe(201);
+
+    expect((await request(app).get("/api/admin/support/feedback").set("Authorization", `Bearer ${token}`)).status).toBe(403);
+    const list = await request(app).get("/api/admin/support/feedback?rating=down").set("Authorization", `Bearer ${admin.token}`);
+    expect(list.status).toBe(200);
+    expect(list.body.total).toBe(1);
+    expect(list.body.items[0]).toMatchObject({ rating: "down", question: "有 iOS 吗", reason: "太简短" });
+    expect(list.body.items[0].user.username).toMatch(/^sup_/);
+    expect(list.body.stats).toEqual({ up: 1, down: 1 });
+    expect((await request(app).get("/api/admin/support/feedback?rating=nope").set("Authorization", `Bearer ${admin.token}`)).status).toBe(400);
+  });
+});
