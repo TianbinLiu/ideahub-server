@@ -92,6 +92,15 @@ describe("POST /api/asr", () => {
     expect(calls[0].init.headers["X-Api-Sequence"]).toBe("-1");
   });
 
+  it("上游判定静音（20000003）→ 200 空文本，不是 502", async () => {
+    process.env.TTS_API_KEY = "test-key";
+    fakeUpstream({ status: 200, apiCode: "20000003", body: {} });
+    const { token } = await createUser();
+    const res = await request(app).post("/api/asr").set("Authorization", `Bearer ${token}`).set("Content-Type", "audio/wav").send(wav);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, text: "", durationMs: 0, silent: true });
+  });
+
   it("?format=mp3 也能指定格式；上游报错 → 502 带 code，不透传提示", async () => {
     process.env.TTS_API_KEY = "test-key";
     fakeUpstream({ status: 200, apiCode: "45000030", body: {} });

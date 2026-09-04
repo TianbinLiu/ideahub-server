@@ -96,6 +96,12 @@ router.post(
     } catch {
       j = {};
     }
+    // 20000003 = 上游判定整段是静音（"no valid speech in audio"）：这不是故障，是用户按住了没说话 / 离麦太远，
+    // 按"识别到空文本"回 200，让客户端提示"没听到声音"而不是"服务不可用"（真机实测第一次就撞上）
+    if (up.ok && statusCode === "20000003") {
+      res.setHeader("Cache-Control", "no-store");
+      return res.json({ ok: true, text: "", durationMs: 0, silent: true });
+    }
     const ok = up.ok && (!statusCode || statusCode === "20000000");
     if (!ok) {
       const code = statusCode || String(up.status);
