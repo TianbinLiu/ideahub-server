@@ -106,7 +106,11 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
   };
 
   const abort = new AbortController();
-  req.on("close", () => {
+  // ★ 必须监听 res 而不是 req 的 close：Node ≥16 里 IncomingMessage 的 'close' 在请求体读完就触发
+  //   （不是连接断开），挂在 req 上会在第一句话还没生成时就把上游 abort 掉、所有事件静默丢弃 —— 表现为
+  //   HTTP 200 + 空 body。res 的 'close' 在正常 end() 之后也会触发，所以要用 writableFinished 区分"客户端跑了"。
+  res.on("close", () => {
+    if (res.writableFinished) return;
     closed = true;
     abort.abort();
   });

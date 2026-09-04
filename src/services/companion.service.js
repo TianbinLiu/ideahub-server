@@ -130,7 +130,8 @@ function createSentenceSplitter(onSentence, { maxLen = 60 } = {}) {
         buf = buf.slice(m.index + 1);
         continue;
       }
-      if (!bracketOpen && buf.length > maxLen) {
+      // 只算正文长度：句首那串标签有 30 多个字符，算进去会把 40 字的正常句子在逗号处腰斩
+      if (!bracketOpen && buf.length - leadEnd > maxLen) {
         const cut = Math.max(buf.lastIndexOf("，"), buf.lastIndexOf(","), buf.lastIndexOf(" "));
         if (cut > 8) {
           emit(buf.slice(0, cut + 1));

@@ -11,10 +11,15 @@ jest.mock('../src/services/aiClient', () => {
   return {
     ...actual,
     hasAiKey: () => true,
-    // 故意把一句话切得七零八落，模拟真实流式：标签跨 chunk、句号后面跟着下一句的标签
+    // 故意把一句话切得七零八落，模拟真实流式：标签跨 chunk、句号后面跟着下一句的标签。
+    // ★ chunk 之间必须真的异步等一下：曾经的 bug 是路由监听了 req 的 'close'（Node 里请求体读完就触发），
+    //   同步 yield 的假流测不出来——事件全在 close 之前写完了；线上模型每个 token 都要等，一上线就全丢。
     aiChatStream: async function* () {
       const chunks = ['[happy][fa', 'ce:happy][action:wave] 欢迎来到启梦～ ', '[neutral][face:normal][action:explain] 想找灵感可以先逛逛热门创意。', '[shy][face:shy][action:shy]谢谢夸奖…'];
-      for (const c of chunks) yield c;
+      for (const c of chunks) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        yield c;
+      }
     },
   };
 });
@@ -115,6 +120,14 @@ describe('companion.service 纯函数', () => {
     expect(svc.parseTags('[action:wave][face:tease][excited] 嘿！')).toEqual({ emotion: 'excited', face: 'tease', action: 'wave', text: '嘿！' });
     expect(svc.parseTags('[face:banana][action:fly][zzz] 正文')).toEqual({ emotion: 'neutral', face: 'normal', action: 'none', text: '正文' });
     expect(svc.parseTags('[happy]')).toMatchObject({ text: '' });
+  });
+
+  it('createSentenceSplitter 的长度阈值不把句首标签算进去（40 字正常句不该在逗号处被腰斩）', () => {
+    const out = [];
+    const sp = svc.createSentenceSplitter((s) => out.push(s));
+    sp.push('[neutral][face:normal][action:explain] 这里是一个把灵感变成作品的地方，你可以发想法、聊场景，也能看看大家的标签排行。');
+    sp.flush();
+    expect(out).toHaveLength(1);
   });
 
   it('createSentenceSplitter 超长无标点时在逗号处切', () => {
