@@ -322,7 +322,7 @@ async function listReports(req, res, next) {
 
     const [rows, total] = await Promise.all([
       Report.find(filter)
-        .sort({ createdAt: -1, _id: -1 })
+        .sort({ priority: -1, createdAt: -1, _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .populate("reporter", USER_FIELDS)

@@ -29,12 +29,28 @@ const TARGET_TYPES = ["video", "comment", "danmaku"];
  * `other` 存在的意义是让 `detail` 有地方落：分类枚举永远盖不全，
  *   没有兜底项的话用户只能随便挑一个不对的，管理员看到的分类反而更脏。
  *
- * ★★ 这六个 id 与 app 仓 `src/api/admin.ts` 的 `REPORT_REASONS` **逐字相等**
+ * ★★ 这七个 id 与 app 仓 `src/api/admin.ts` 的 `REPORT_REASONS` **逐字相等**
  *   （契约见 docs/api-contract.md「举报」）。两仓不在一个 CI 里，对不上的表现是
  *   用户选了「人身攻击」而服务端 400，或者管理员看到一个认不出来的 key ——
  *   而那恰恰是他判断要不要下架的主要依据。
+ *   ★ 加新取值时**服务端先上**：客户端那份是子集时只是少一项可选，反过来则是用户选了一个
+ *   服务端不认的 key → 400，而他正要报的可能是最紧急的那一类。
  */
-const REASONS = ["porn", "violence", "abuse", "spam", "infringe", "other"];
+const REASONS = ["csae", "porn", "violence", "abuse", "spam", "infringe", "other"];
+
+/**
+ * 要**插队**的理由。
+ *
+ * ★★ `csae`（涉及未成年人的性剥削 / 性虐待）不是 `porn` 的一个子类，两者的处理不是一回事：
+ *   porn 是"这条要下架"，csae 是"这条要下架、账号要封、证据要留存、还要依法报告主管机关"。
+ *   分成两个 key 是为了让**队列**分得开 —— 合进 porn 的话它就躺在几十条刷屏举报中间，
+ *   而这正是唯一一类"晚一天处理后果完全不同"的举报。
+ * ★★ 这一项同时是 **Google Play 上架的硬要求**（UGC 儿童安全标准：应用内要有让人报告
+ *   CSAE 的入口），并且对外承诺写在 ideahub-client 的 /child-safety 上
+ *   （「这一类举报优先于其他所有举报进入人工复核」）—— 那句话靠下面的 priority 兑现，
+ *   不是靠管理员自己留意。改这里之前先读那一页。
+ */
+const URGENT_REASONS = ["csae"];
 
 /**
  * 管理员能做的处置，以及它各自落到哪个状态。
@@ -72,6 +88,16 @@ const reportSchema = new mongoose.Schema(
     targetId: { type: mongoose.Schema.Types.ObjectId, required: true },
 
     reason: { type: String, enum: REASONS, required: true },
+
+    /**
+     * 队列插队位。**只由 reason 推导**（见下面的 pre("validate")），不接受调用方传值 ——
+     * 能传的话，举报者就能把自己那条顶到队首，而队首正是最稀缺的资源。
+     * ★ 存量数据没有这个键。`{priority:-1}` 降序下**缺字段排在所有数字之后**，
+     *   而队列本来就是 createdAt 降序（新的在前）、存量记录本来就在底部 ——
+     *   所以不写迁移也不会让任何一条待处理举报"往下掉"，唯一的变化就是 csae 顶上来。
+     *   （这条推理是刻意写下来的：换成升序、或改成"老的在前"，它立刻不成立。）
+     */
+    priority: { type: Number, default: 0 },
     /** 补充说明（可选）。500 字是契约值，客户端输入框上限必须与它相等 */
     detail: { type: String, trim: true, maxlength: 500, default: "" },
 
@@ -90,12 +116,25 @@ const reportSchema = new mongoose.Schema(
 //   真正需要人看的那些被埋在下面 —— 而这不需要任何漏洞，只要一个合法账号。
 //   controller 里那次 findOne 预检只是为了给出一句人话的 409；**并发下真正兜住的是这条索引**
 //   （两个请求同时到达时预检会双双扑空），所以两处缺一不可。
+// ★ priority 只由 reason 推导，写在 pre("validate") 而不是 controller 里：
+//   落库入口将来可能不止一个（后台补录、迁移脚本），而"忘了一起写"零症状 ——
+//   表现只是那条 csae 举报安安静静排在队尾。
+// ⚠ 这个钩子只在**文档保存**时跑，`findByIdAndUpdate` 不触发它。现在无害：
+//   reason 是**写一次就不再改**的（处置举报只 $set status/handler/handledAt/handleNote）。
+//   哪天真要让管理员改分类，**必须同时补一个 pre("findOneAndUpdate")** ——
+//   否则把一条 porn 改成 csae 之后它依旧排在队尾，而屏幕上写着"优先处理"。
+reportSchema.pre("validate", function setPriority() {
+  this.priority = URGENT_REASONS.includes(this.reason) ? 1 : 0;
+});
+
 reportSchema.index({ reporter: 1, targetType: 1, targetId: 1 }, { unique: true });
 
-// 主查询：管理端「按状态取待处理队列，最新的在前」。
-// 复合顺序是 status 在前、createdAt 在后 —— 反过来（{createdAt:-1, status:1}）
+// 主查询：管理端「按状态取待处理队列，插队的在最前，其余最新的在前」。
+// 复合顺序是 status 在前、再 priority、最后 createdAt —— 反过来（{createdAt:-1, status:1}）
 // 等值筛选吃不上前缀，队列一长就变成全表扫。
-reportSchema.index({ status: 1, createdAt: -1 });
+// ★ 三列的顺序必须与 report.controller 的 sort **逐字一致**，否则排序落到内存里做
+//   （零报错，只是慢，且 32MB 上限一到就整条查询抛错）。
+reportSchema.index({ status: 1, priority: -1, createdAt: -1 });
 
 // 「这个对象一共被举报了多少次 / 还有几条没处理」：管理端最重要的信号
 // （30 个人举报同一条 ≠ 1 个人举报 30 条），以及下架后把同对象的其余举报一并收尾。
@@ -106,6 +145,7 @@ module.exports = mongoose.model("Report", reportSchema);
 // 「模型收得下、接口不认」或反过来（两种都不报错，只是某个取值悄悄消失）。
 module.exports.TARGET_TYPES = TARGET_TYPES;
 module.exports.REASONS = REASONS;
+module.exports.URGENT_REASONS = URGENT_REASONS;
 module.exports.STATUSES = STATUSES;
 module.exports.ACTIONS = ACTIONS;
 module.exports.ACTION_STATUS = ACTION_STATUS;

@@ -467,3 +467,80 @@ describe("举报 · 管理端处理", () => {
   });
 });
 
+describe("举报 · 儿童安全（csae）插队", () => {
+  // ★★ 这一组盯的是一条**对外承诺**：ideahub-client 的 /child-safety 上写着
+  //   「这一类举报优先于其他所有举报进入人工复核」。那句话是给 Google Play 审核
+  //   与用户看的，兑现它的是 Report.priority + listReports 的 sort ——
+  //   而这两处任一被改回去都**零报错**：队列照常返回 200，只是最该先看的那条
+  //   静静沉在下面，而页面上仍然写着"优先"。
+
+  test("R12 csae 是合法理由，且哪怕最先提交（最老），也排在待处理队列最前", async () => {
+    const author = await registerUser();
+    const videoId = await publish(author.token, { title: "插队测试作品" });
+
+    // ① 先提交 csae —— 故意让它成为**最老**的那一条。
+    //   队列默认按 createdAt 降序（新的在前），所以不插队的话它必然在后面。
+    const early = await registerUser();
+    const csae = await report(early.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "csae",
+      detail: "画面里是未成年人",
+    }).expect(201);
+    expect(csae.body.report.reason).toBe("csae");
+
+    // ② 再灌一批更新的普通举报（每条换一个人：唯一索引是 reporter+target）
+    for (const reason of ["spam", "abuse", "porn"]) {
+      const later = await registerUser();
+      await report(later.token, { targetType: "video", targetId: videoId, reason }).expect(201);
+    }
+
+    const admin = await registerUser();
+    await promoteToAdmin(admin.userId);
+    const list = await request(app)
+      .get("/api/admin/branch/reports?status=pending&limit=50")
+      .set("Authorization", `Bearer ${admin.token}`)
+      .expect(200);
+
+    // 认 id 不认下标之外的任何东西：队列里还有别的用例留下的 pending
+    expect(String(list.body.items[0]._id)).toBe(String(csae.body.report._id));
+    expect(list.body.items[0].reason).toBe("csae");
+  });
+
+  test("R13 priority 由 reason 推导，举报者传什么都不算数", async () => {
+    const author = await registerUser();
+    const viewer = await registerUser();
+    const videoId = await publish(author.token, { title: "插队参数测试" });
+
+    // 能自己填 priority 的话，任何人都能把自己那条顶到队首 —— 队首是最稀缺的资源
+    const res = await report(viewer.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "spam",
+      priority: 99,
+    }).expect(201);
+
+    const row = await Report.findById(res.body.report._id).lean();
+    expect(row.priority).toBe(0);
+
+    // 反过来：csae 不用传任何东西也会被推成 1
+    const other = await registerUser();
+    const res2 = await report(other.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "csae",
+    }).expect(201);
+    const row2 = await Report.findById(res2.body.report._id).lean();
+    expect(row2.priority).toBe(1);
+  });
+
+  test("R14 客户端那份理由表是服务端的子集（对不上就是用户选了却发不出去）", () => {
+    // ★ 跨仓契约：app 仓 src/api/admin.ts 的 REPORT_REASONS。两仓不在一个 CI 里，
+    //   这里只能钉住**服务端这一侧**：csae 必须在枚举里、且必须被标成要插队的那一类。
+    expect(Report.REASONS).toContain("csae");
+    expect(Report.URGENT_REASONS).toEqual(["csae"]);
+    // porn 与 csae 是两个 key，不是父子：合并会让 csae 沉进刷屏举报里
+    expect(Report.REASONS).toContain("porn");
+    expect(Report.URGENT_REASONS).not.toContain("porn");
+  });
+});
