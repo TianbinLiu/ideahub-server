@@ -7,7 +7,10 @@
  * 🔄 [AI] 修改后必须: 同步更新 PROJECT_STRUCTURE.md 路由章节
  *
  * API端点:
- * @endpoint GET  /config - 这台服务器有没有配 AI/TTS、看板娘叫什么（游客可查，决定前端画不画对话框）
+ * @endpoint GET  /config - 这台服务器有没有配 AI/TTS、看板娘叫什么（游客可查，决定前端画不画对话框）；
+ *                          登录用户还会拿到自己的数字人设置解析结果：persona / model / voiceSettings（见 companionSetting.service）
+ * @endpoint GET  /settings - 登录用户的数字人三项选择（人格 / Live2D 模型 / 音频覆盖）+ 解析结果
+ * @endpoint PUT  /settings - 改选择：{ personaId?, modelId?, voice? }，缺省不动、null 清掉；人格要能选用（公开/自己的，付费需已购）
  * @endpoint POST /chat   - 流式对话（text/event-stream）。事件：
  *   event: sentence  data: {index, text, emotion, face, action, tts:{emotion,instruct}}  ← 一句一条，前端按句调 /api/tts 并切表情
  *   event: token     data: {t}                                                            ← 原始增量，仅供"打字机"显示
@@ -34,6 +37,8 @@ const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
+const { loadCompanionSetup, updateCompanionSetting, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
+const { voiceFieldSchema, resolveVoiceSettings } = require("../utils/voiceSettings");
 
 const router = express.Router();
 
@@ -55,20 +60,57 @@ const chatBodySchema = z.object({
   lang: z.enum(["zh", "en"]).optional(),
 });
 
+const settingsBodySchema = z.object({
+  personaId: z.string().trim().max(64).nullable().optional(),
+  modelId: z.string().trim().max(64).nullable().optional(),
+  voice: voiceFieldSchema,
+});
+
 function companionName() {
   return String(process.env.COMPANION_NAME || "").trim() || companion.DEFAULT_NAME;
 }
 
-router.get("/config", optionalAuth, (req, res) => {
-  res.json({
-    ok: true,
-    name: companionName(),
-    enabled: hasAiKey(),
-    tts: Boolean(process.env.TTS_API_KEY),
-    // 豆包音色 id；不配就用 tts.routes.js 的默认音色。留给运维换嗓子用，不进代码。
-    voice: String(process.env.COMPANION_TTS_VOICE || "").trim(),
-    loginRequired: true,
-  });
+router.get("/config", optionalAuth, async (req, res, next) => {
+  try {
+    // 游客只有服务端默认；登录用户带上自己的人格 / 模型 / 嗓子（读取时解析，被删的选择静默回退）
+    const setup = req.user ? await loadCompanionSetup({ userId: req.user._id, req }) : null;
+    const voiceSettings = setup ? setup.voice : resolveVoiceSettings([], { defaultVoiceId: defaultVoiceId() });
+    res.json({
+      ok: true,
+      name: companionName(),
+      enabled: hasAiKey(),
+      tts: Boolean(process.env.TTS_API_KEY),
+      // 豆包音色 id（老字段，= voiceSettings.voiceId）：不配就用 tts.routes.js 的默认音色
+      voice: voiceSettings.voiceId,
+      voiceSettings,
+      persona: setup ? setup.persona : null,
+      personaSource: setup ? setup.personaSource : "",
+      model: setup ? setup.model : null,
+      loginRequired: true,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.get("/settings", requireAuth, async (req, res, next) => {
+  try {
+    res.json({ ok: true, ...(await loadCompanionSetup({ userId: req.user._id, req })) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.put("/settings", requireAuth, async (req, res, next) => {
+  const parsed = settingsBodySchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ message: "invalid settings", code: "VALIDATION_ERROR", details: parsed.error.issues });
+  }
+  try {
+    res.json({ ok: true, ...(await updateCompanionSetting({ userId: req.user._id, req, patch: parsed.data })) });
+  } catch (e) {
+    next(e);
+  }
 });
 
 router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), async (req, res) => {
@@ -86,10 +128,13 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
     return res.status(400).json({ message: "last message must be from user", code: "VALIDATION_ERROR" });
   }
 
+  // 装了人格 → 提示词多一段人设、每句的 TTS 指令带上人设的语调；没装 → 与从前逐字相同
+  const setup = await loadCompanionSetup({ userId: req.user._id, req });
   const system = companion.buildSystemPrompt({
     name: companionName(),
     userName: req.user.displayName || req.user.username || "",
     lang: parsed.data.lang || "zh",
+    personaLine: personaPromptLine(setup.persona),
   });
 
   res.status(200);
@@ -121,7 +166,7 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
     const p = companion.parseTags(sentence);
     if (!p.text) return; // 纯标签、没正文：不念也不演
     plainParts.push(p.text);
-    send("sentence", { index: index++, ...p, tts: companion.ttsParamsFor(p.emotion) });
+    send("sentence", { index: index++, ...p, tts: companion.ttsParamsFor(p.emotion, setup.voice.instruct) });
   });
 
   try {

@@ -38,6 +38,8 @@ const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
+const { loadCompanionSetup, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
+const { resolveVoiceSettings } = require("../utils/voiceSettings");
 const SupportTicket = require("../models/SupportTicket");
 const SupportFeedback = require("../models/SupportFeedback");
 const User = require("../models/User");
@@ -201,20 +203,32 @@ async function notifyUserAboutTicket(ticket, { kind, preview = "", status = "" }
 }
 
 // ── 用户侧 ─────────────────────────────────────────────────────────────
-publicRouter.get("/config", optionalAuth, (req, res) => {
-  res.json({
-    ok: true,
-    name: support.agentName(),
-    enabled: hasAiKey(),
-    tts: Boolean(process.env.TTS_API_KEY),
-    // 语音输入走 /api/asr，与 TTS 同一把 key（同一个 openspeech 应用；商品是否开通要真调一次才知道）
-    asr: Boolean(process.env.TTS_API_KEY),
-    voice: String(process.env.COMPANION_TTS_VOICE || "").trim(),
-    loginRequired: true,
-    quickQuestions: support.QUICK_QUESTIONS,
-    categories: SupportTicket.CATEGORIES,
-    knowledgeSections: support.loadKnowledge().total,
-  });
+publicRouter.get("/config", optionalAuth, async (req, res, next) => {
+  try {
+    // 与官网看板娘同一份数字人设置（人格 / Live2D 模型 / 嗓子）：登录用户带上解析结果，游客只有服务端默认
+    const setup = req.user ? await loadCompanionSetup({ userId: req.user._id, req }) : null;
+    const voiceSettings = setup ? setup.voice : resolveVoiceSettings([], { defaultVoiceId: defaultVoiceId() });
+    res.json({
+      ok: true,
+      name: support.agentName(),
+      enabled: hasAiKey(),
+      tts: Boolean(process.env.TTS_API_KEY),
+      // 语音输入走 /api/asr，与 TTS 同一把 key（同一个 openspeech 应用；商品是否开通要真调一次才知道）
+      asr: Boolean(process.env.TTS_API_KEY),
+      // 老字段（= voiceSettings.voiceId）；完整的音频参数在 voiceSettings，App 直接展开进 /api/tts 的 body
+      voice: voiceSettings.voiceId,
+      voiceSettings,
+      persona: setup ? setup.persona : null,
+      personaSource: setup ? setup.personaSource : "",
+      model: setup ? setup.model : null,
+      loginRequired: true,
+      quickQuestions: support.QUICK_QUESTIONS,
+      categories: SupportTicket.CATEGORIES,
+      knowledgeSections: support.loadKnowledge().total,
+    });
+  } catch (e) {
+    next(e);
+  }
 });
 
 publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" }), async (req, res) => {
@@ -228,10 +242,13 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
   // 检索用最近两条用户消息：追问往往只有"那要多久"三个字，单看这一句什么都召回不到
   const userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
   const knowledge = support.selectKnowledge(userTurns.slice(-2).join("\n"));
+  // 装了人格 → 语气跟人设走、每句 TTS 指令带上人设的语调；客服的事实与红线不受影响
+  const setup = await loadCompanionSetup({ userId: req.user._id, req });
   const system = support.buildSupportSystemPrompt({
     userName: req.user.displayName || req.user.username || "",
     knowledge,
     lang: parsed.data.lang || "zh",
+    personaLine: personaPromptLine(setup.persona),
   });
 
   res.status(200);
@@ -271,7 +288,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     const text = h.text.replace(/\[handoff[^\]]*\]\s*/gi, "").trim();
     if (!text) return;
     plainParts.push(text);
-    send("sentence", { index: index++, ...p, text, tts: companion.ttsParamsFor(p.emotion) });
+    send("sentence", { index: index++, ...p, text, tts: companion.ttsParamsFor(p.emotion, setup.voice.instruct) });
   });
 
   // 回复开头可能是 [handoff:xxx]：攒到能判定为止（有 "]" 或已经不像这个前缀），再决定是标记还是正文

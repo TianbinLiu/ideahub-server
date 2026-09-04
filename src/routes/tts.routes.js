@@ -32,6 +32,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
+const { VOICE_CATALOG } = require("../config/voices");
 
 const router = express.Router();
 
@@ -53,6 +54,15 @@ const safeId = (v) => (typeof v === "string" && /^[a-zA-Z0-9_.-]{1,64}$/.test(v)
  */
 router.get("/health", (_req, res) => {
   res.json({ ok: true, tts: Boolean(process.env.TTS_API_KEY) });
+});
+
+/**
+ * GET /api/tts/voices —— 数字人可选的豆包音色目录（config/voices.js），给人格市场「音频」板块、
+ * 模型市场上传表单、App 客服声音面板做下拉。目录之外的 id 也能用（表单有自定义项），这里只是"有名字的那些"。
+ */
+router.get("/voices", (_req, res) => {
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.json({ ok: true, voices: VOICE_CATALOG, defaultVoiceId: String(process.env.COMPANION_TTS_VOICE || "").trim() || DEFAULT_VOICE });
 });
 
 /**

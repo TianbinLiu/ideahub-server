@@ -2,6 +2,7 @@
 // 人格下载（Persona）——用户把自己的发言风格（来自阶段5 SpeakingProfile）发布为可分享的「人格」。
 // 其他用户可浏览/下载收藏/点赞/装备；装备后驱动浏览器插件在其它平台生成三条方案。
 const mongoose = require("mongoose");
+const { voiceSettingsSchema } = require("./CompanionSetting");
 
 // 风格能力子文档（复用阶段5 StyleStat 形状：key/label/value/grade）
 const personaStatSchema = new mongoose.Schema(
@@ -40,6 +41,9 @@ const personaSchema = new mongoose.Schema(
     // 【选用】：绑进情景 / 装备。收藏（install）保持免费——那只是书签。
     // 私有人格存价无意义但无害：只在 shared 时展示与生效。
     price: { type: Number, default: 0, min: 0, max: 100000 },
+    // 「音频」板块：人格自带的豆包嗓子（音色 / 语速 / 音高 / 语调指令），null = 没设置、跟随数字人默认。
+    // 形状与合并规则见 utils/voiceSettings.js；数字人（首页看板娘 / App 客服）装上这个人格就按它说话。
+    voice: { type: voiceSettingsSchema, default: null },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },

@@ -190,7 +190,7 @@ const CANONICAL_FAQ = [
 // ── 提示词 ───────────────────────────────────────────────────────────
 const HANDOFF_RE = /^\s*\[handoff(?::([a-z_]+))?(?::([^\]]{0,60}))?\]\s*/i;
 
-function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh" } = {}) {
+function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "" } = {}) {
   const who = userName ? `正在咨询的用户叫「${userName}」。` : "";
   const langLine = lang === "en" ? "Reply in English unless the user writes Chinese." : "默认用中文回复；用户用英文就用英文。";
   return [
@@ -200,6 +200,8 @@ function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge
     "【依据】只根据下面「知识库」里的事实回答；知识库里没有的功能、价格、时限、政策一律说「这个我不确定，我帮你转人工核实」，绝不编造。",
     "【禁止承诺】知识库末尾的「客服禁止承诺的事项」是红线：涉及其中任何一条，只能如实说明现状，不能答应、不能暗示以后会有。",
     "【表达】口语、直接、先给结论再给一步步的操作；每次回复 2～5 句，每句不超过 40 字；不用 Markdown 标记、不用列表符号、不用表情符号。涉及钱和时限的数字要和知识库一字不差。",
+    // 用户给客服装了人格市场的人格：只改语气与措辞，【依据】【禁止承诺】【转人工】一条不松（companionSetting.service.personaPromptLine）
+    personaLine || null,
     "【转人工】出现以下任一情况，回复的最开头先写 [handoff:类别]，然后用一两句话说明你会转接人工、并告诉用户需要补充什么（如任务号、订单时间、截图）：",
     "  1) 用户要求退款/补偿、余额对不上、充值没到账、取回过期后要求处理；类别 billing",
     "  2) 注销后要恢复、要求彻底删除数据、封禁申诉、账号被盗；类别 account",
