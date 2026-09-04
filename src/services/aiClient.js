@@ -58,6 +58,22 @@ function resolveBaseUrl() {
   return process.env.AI_BASE_URL || process.env.OPENAI_BASE_URL || "";
 }
 
+/**
+ * 额外请求字段（JSON），原样并进每次 chat.completions 请求。
+ * 用途：按供应商开关特性，例如方舟豆包 2.0 关思维链 `{"thinking":{"type":"disabled"}}`（客服要首句快），
+ * 或 DeepSeek 的 `{"response_format":...}`。配错 JSON 直接启动即报，不静默忽略。
+ */
+function extraBody() {
+  const raw = process.env.AI_EXTRA_BODY;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    throw new Error(`AI_EXTRA_BODY is not valid JSON: ${e.message}`);
+  }
+}
+
 function resolveModel(fallback) {
   return process.env.AI_MODEL || process.env.OPENAI_MODEL || fallback;
 }
@@ -100,6 +116,7 @@ async function aiComplete(prompt, opts = {}) {
       model,
       messages: [{ role: "user", content: String(prompt || "") }],
       max_tokens: Number(process.env.AI_MAX_TOKENS || 2048),
+      ...extraBody(),
     },
     { timeout: Number(process.env.AI_TIMEOUT_MS || 60_000) },
   );
@@ -140,6 +157,7 @@ async function* aiChatStream(messages, opts = {}) {
     model,
     messages,
     stream: true,
+    ...extraBody(),
     ...(typeof opts.temperature === "number" ? { temperature: opts.temperature } : {}),
   };
   const reqOpts = { timeout, ...(opts.signal ? { signal: opts.signal } : {}) };

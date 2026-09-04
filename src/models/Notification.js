@@ -33,6 +33,12 @@ const NotificationSchema = new mongoose.Schema(
         //   未知类型**必须降级显示（画成「系统通知 + 原样文本」之类），不许崩、不许吞 ——
         //   老包收到新类型是常态，不是异常（铁律七；契约见 docs/api-contract.md）。
         "ADMIN_NOTICE",
+        // 客服工单（App「AI 客服」转人工）：
+        //   SUPPORT_TICKET → 发给管理员：有新工单/用户追加了消息，payload { ticketId, subject, category, username }
+        //   SUPPORT_REPLY  → 发给用户：人工回复了 / 工单状态变了，payload { ticketId, kind: reply|status, preview, status }
+        //   两条都不带 actorId 之外的身份信息给对方：用户看不到是哪个管理员在处理（与 ADMIN_NOTICE 同口径）。
+        "SUPPORT_TICKET",
+        "SUPPORT_REPLY",
       ],
       index: true,
     },

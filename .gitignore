@@ -14,3 +14,6 @@ uploads/
 #   加进 .gitignore 免得下次又被卷进来。要删它本身请人工确认后再动。
 ideahub-server/
 releases/
+
+# scripts/evalSupport.js 的本地评测输出（结论性的报告另存到 app 仓 docs/）
+eval-out/
