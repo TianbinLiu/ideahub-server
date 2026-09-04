@@ -467,3 +467,135 @@ describe("举报 · 管理端处理", () => {
   });
 });
 
+describe("举报 · 儿童安全（csae）插队", () => {
+  // ★★ 这一组盯的是一条**对外承诺**：ideahub-client 的 /child-safety 上写着
+  //   「这一类举报优先于其他所有举报进入人工复核」。那句话是给 Google Play 审核
+  //   与用户看的，兑现它的是 Report.priority + listReports 的 sort ——
+  //   而这两处任一被改回去都**零报错**：队列照常返回 200，只是最该先看的那条
+  //   静静沉在下面，而页面上仍然写着"优先"。
+
+  test("R15 csae 是合法理由，且哪怕最先提交（最老），也排在待处理队列最前", async () => {
+    const author = await registerUser();
+    const videoId = await publish(author.token, { title: "插队测试作品" });
+
+    // ① 先提交 csae —— 故意让它成为**最老**的那一条。
+    //   队列默认按 createdAt 降序（新的在前），所以不插队的话它必然在后面。
+    const early = await registerUser();
+    const csae = await report(early.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "csae",
+      detail: "画面里是未成年人",
+    }).expect(201);
+    expect(csae.body.report.reason).toBe("csae");
+
+    // ② 再灌一批更新的普通举报（每条换一个人：唯一索引是 reporter+target）
+    for (const reason of ["spam", "abuse", "porn"]) {
+      const later = await registerUser();
+      await report(later.token, { targetType: "video", targetId: videoId, reason }).expect(201);
+    }
+
+    const admin = await registerUser();
+    await promoteToAdmin(admin.userId);
+    const list = await request(app)
+      .get("/api/admin/branch/reports?status=pending&limit=50")
+      .set("Authorization", `Bearer ${admin.token}`)
+      .expect(200);
+
+    // 认 id 不认下标之外的任何东西：队列里还有别的用例留下的 pending
+    expect(String(list.body.items[0]._id)).toBe(String(csae.body.report._id));
+    expect(list.body.items[0].reason).toBe("csae");
+  });
+
+  test("R16 priority 由 reason 推导，举报者传什么都不算数", async () => {
+    const author = await registerUser();
+    const viewer = await registerUser();
+    const videoId = await publish(author.token, { title: "插队参数测试" });
+
+    // 能自己填 priority 的话，任何人都能把自己那条顶到队首 —— 队首是最稀缺的资源
+    const res = await report(viewer.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "spam",
+      priority: 99,
+    }).expect(201);
+
+    const row = await Report.findById(res.body.report._id).lean();
+    expect(row.priority).toBe(0);
+
+    // ② 文档层：**这一半才证伪得了 pre("validate") 钩子**。
+    //   只测 ① 的话，controller 本来就不透传 body，把钩子整个删掉这条用例照样绿 ——
+    //   一条不会红的断言比没有断言更坏，它给的是虚假的安心（2026-09-03 复核指出）。
+    // ★ 换一个 targetId：上面那发已经占了 {reporter,targetType,targetId} 那条唯一索引，
+    //   沿用会撞 E11000，测到的就不是钩子而是索引了。
+    const forged = new Report({
+      reporter: viewer.userId,
+      targetType: "video",
+      targetId: new mongoose.Types.ObjectId(),
+      reason: "spam",
+      priority: 99,
+    });
+    await forged.save();
+    expect((await Report.findById(forged._id).lean()).priority).toBe(0);
+
+    // 反过来：csae 不用传任何东西也会被推成 1
+    const other = await registerUser();
+    const res2 = await report(other.token, {
+      targetType: "video",
+      targetId: videoId,
+      reason: "csae",
+    }).expect(201);
+    const row2 = await Report.findById(res2.body.report._id).lean();
+    expect(row2.priority).toBe(1);
+  });
+
+  test("R17 客户端那份理由表是服务端的子集（对不上就是用户选了却发不出去）", () => {
+    // ★ 跨仓契约：app 仓 src/api/admin.ts 的 REPORT_REASONS。两仓不在一个 CI 里，
+    //   这里只能钉住**服务端这一侧**：csae 必须在枚举里、且必须被标成要插队的那一类。
+    expect(Report.REASONS).toContain("csae");
+    expect(Report.URGENT_REASONS).toEqual(["csae"]);
+    // porn 与 csae 是两个 key，不是父子：合并会让 csae 沉进刷屏举报里
+    expect(Report.REASONS).toContain("porn");
+    expect(Report.URGENT_REASONS).not.toContain("porn");
+  });
+});
+
+describe("举报 · 删号级联要放过儿童安全那些", () => {
+  // ★★ 对外承诺（ideahubs.org/child-safety）：处置之后**保留举报与处置记录**，
+  //   不因内容删除或账号注销一并清掉。而"注销"是产品里人人可点的一颗按钮 ——
+  //   不留这个口子的话，被举报的人只要自己走一次删号，指向他的儿童安全举报就全没了。
+  //   这是删号权利的**法定义务例外**，不是疏漏。
+  test("R18 URGENT_REASONS 是这条豁免的唯一判据，且它确实只放过 csae", () => {
+    expect(Report.URGENT_REASONS).toEqual(["csae"]);
+    // 普通理由一个都不在豁免名单里 —— 否则删号权利会被悄悄架空
+    for (const r of ["porn", "violence", "abuse", "spam", "infringe", "other"]) {
+      expect(Report.URGENT_REASONS).not.toContain(r);
+    }
+  });
+
+  test("R19 删号之后：普通举报被清掉，csae 那条还在", async () => {
+    const author = await registerUser();
+    const videoId = await publish(author.token, { title: "删号级联测试" });
+
+    const a = await registerUser();
+    const b = await registerUser();
+    const spam = await report(a.token, { targetType: "video", targetId: videoId, reason: "spam" }).expect(201);
+    const csae = await report(b.token, { targetType: "video", targetId: videoId, reason: "csae" }).expect(201);
+
+    const admin = await registerUser();
+    await promoteToAdmin(admin.userId);
+    await request(app)
+      .delete(`/api/admin/branch/users/${author.userId}`)
+      .set("Authorization", `Bearer ${admin.token}`)
+      .expect(200);
+
+    // 判据是**记录还在不在**，不是接口回了什么
+    expect(await Report.findById(spam.body.report._id).lean()).toBeNull();
+    const kept = await Report.findById(csae.body.report._id).lean();
+    expect(kept).not.toBeNull();
+    // 留下来的要答得出"报的是什么、谁报的、指向哪一条"
+    expect(kept.reason).toBe("csae");
+    expect(String(kept.reporter)).toBe(b.userId);
+    expect(String(kept.targetId)).toBe(videoId);
+  });
+});
