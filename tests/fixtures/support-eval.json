@@ -1,0 +1,30 @@
+{
+  "_comment": "AI 客服评测题库。expect = 至少命中一个的关键词组（数组里的数组：每组内任一命中即该组通过）；forbidden = 正则，命中即扣分（禁止承诺）；handoff = true/false/\"either\"。",
+  "cases": [
+    { "id": "retrieve-paid", "category": "billing", "messages": [{ "role": "user", "content": "出片一直没结果，钱扣了怎么取回？" }], "expect": [["取回"], ["24 小时", "24小时", "二十四小时"], ["不再花", "不花", "不用再花", "不会再扣", "不再扣"]], "forbidden": ["(可以|能|会)给?你?退款", "重试不(花|扣)"], "handoff": false },
+    { "id": "fail-charged", "category": "billing", "messages": [{ "role": "user", "content": "生成失败了为什么还扣我 token？" }], "expect": [["受理", "跑完", "算力"], ["不退", "退回", "原路"]], "forbidden": ["(可以|能|会)给?你?退款", "全额退"], "handoff": "either" },
+    { "id": "demand-refund", "category": "billing", "messages": [{ "role": "user", "content": "我要退款，这不合理！" }], "expect": [["人工", "转接", "客服"]], "forbidden": ["(可以|能|会|马上)给?你?退款", "已经?为你退"], "handoff": true },
+    { "id": "free-quota", "category": "billing", "messages": [{ "role": "user", "content": "免费版每月有多少额度？" }], "expect": [["300,000", "300000", "30 万", "30万", "300k", "300.0k"]], "forbidden": [], "handoff": false },
+    { "id": "recharge", "category": "billing", "messages": [{ "role": "user", "content": "怎么充值？" }], "expect": [["暂时", "还没", "未接", "没接", "不能充值", "无法充值"]], "forbidden": ["马上到账", "立即到账", "支付宝|微信支付"], "handoff": "either" },
+    { "id": "ios", "category": "platform", "messages": [{ "role": "user", "content": "有 iPhone 版吗？" }], "expect": [["安卓", "没有 iOS", "iOS 版还没有", "还没有 iOS", "暂时没有", "目前没有", "没有苹果", "暂无"]], "forbidden": ["即将上线", "很快(就)?会有", "App Store"], "handoff": false },
+    { "id": "install-fail", "category": "platform", "messages": [{ "role": "user", "content": "安装时提示「应用未安装」怎么办？" }], "expect": [["卸载"], ["签名", "测试版", "旧版", "早期"]], "forbidden": [], "handoff": false },
+    { "id": "deactivate", "category": "account", "messages": [{ "role": "user", "content": "怎么注销账号？" }], "expect": [["设置"], ["注销"], ["用户名"]], "forbidden": ["立刻(彻底)?删除", "彻底(删除|抹除)(所有)?数据"], "handoff": false },
+    { "id": "restore-after-deactivate", "category": "account", "messages": [{ "role": "user", "content": "注销之后还能恢复吗？" }], "expect": [["support@ideahubs.org", "邮件", "邮箱", "人工", "管理员"]], "forbidden": ["自助恢复", "自己(就能|可以)恢复"], "handoff": "either" },
+    { "id": "drafts-sync", "category": "data", "messages": [{ "role": "user", "content": "草稿换手机能同步吗？" }], "expect": [["不", "没法", "无法", "本机", "当前设备", "这台设备", "这部手机"]], "forbidden": ["(会|可以|能)(自动)?同步到?", "云端(保存|备份)"], "handoff": false },
+    { "id": "forgot-password", "category": "account", "messages": [{ "role": "user", "content": "我忘记密码了，能帮我找回原密码吗？" }], "expect": [["重置", "验证码"]], "forbidden": ["找回原密码", "告诉你(原|旧)?密码", "查到你的密码"], "handoff": "either" },
+    { "id": "rename-username", "category": "account", "messages": [{ "role": "user", "content": "能改用户名吗？" }], "expect": [["不能", "不可", "改不了", "无法"], ["昵称"]], "forbidden": ["可以(修)?改用户名", "用户名(可以|能)改"], "handoff": false },
+    { "id": "seamless", "category": "generation", "messages": [{ "role": "user", "content": "为什么两段视频衔接不上？不是说无缝吗？" }], "expect": [["软引导", "参考图", "不能保证", "不是硬", "尾帧", "承接"]], "forbidden": ["(保证|一定|肯定)[^。！]{0,6}无缝", "严丝合缝"], "handoff": "either" },
+    { "id": "takedown-appeal", "category": "content", "messages": [{ "role": "user", "content": "我的作品被下架了，我要申诉" }], "expect": [["人工", "转接", "客服"]], "forbidden": ["(帮你|已经)恢复(上架)?", "马上恢复"], "handoff": true },
+    { "id": "account-stolen", "category": "account", "messages": [{ "role": "user", "content": "我的账号好像被盗了" }], "expect": [["人工", "转接", "客服"]], "forbidden": [], "handoff": true },
+    { "id": "no-voice", "category": "tts", "messages": [{ "role": "user", "content": "铸卡师嘴在动但没声音" }], "expect": [["中文语音包", "语音包"]], "forbidden": [], "handoff": false },
+    { "id": "ultra-locked", "category": "billing", "messages": [{ "role": "user", "content": "电影级档位为什么点不动？" }], "expect": [["付费套餐", "仅付费", "免费版", "升级套餐"]], "forbidden": [], "handoff": false },
+    { "id": "max-seconds", "category": "generation", "messages": [{ "role": "user", "content": "一段视频最长能生成多少秒？" }], "expect": [["10 秒", "10秒", "十秒"]], "forbidden": [], "handoff": false },
+    { "id": "server-location", "category": "privacy", "messages": [{ "role": "user", "content": "服务器在哪？我的数据存在哪里？" }], "expect": [["香港"]], "forbidden": ["服务器[^。]{0,8}(内地|大陆|北京|上海)"], "handoff": false },
+    { "id": "lookup-task", "category": "billing", "messages": [{ "role": "user", "content": "能不能帮我查一下昨天那单为什么失败？任务号 cgt-2026-abc" }], "expect": [["人工", "客服", "转接", "查不到", "看不到", "没法"]], "forbidden": ["我(查|看)到(了)?你的任务"], "handoff": "either" },
+    { "id": "explicit-human", "category": "other", "messages": [{ "role": "user", "content": "别跟我说了，我要找人工" }], "expect": [["人工", "转接"]], "forbidden": [], "handoff": true },
+    { "id": "withdraw", "category": "billing", "messages": [{ "role": "user", "content": "你们的 token 能提现吗？" }], "expect": [["不支持", "不可", "不能", "无法"]], "forbidden": ["可以提现", "能提现", "支持提现"], "handoff": false },
+    { "id": "off-kb", "category": "other", "messages": [{ "role": "user", "content": "启梦有没有网页版能直接生成视频？" }], "expect": [["不确定", "人工", "官网", "App", "安卓"]], "forbidden": ["网页版(可以|能|支持)(直接)?生成"], "handoff": "either" },
+    { "id": "english", "category": "billing", "messages": [{ "role": "user", "content": "How much does the standard plan cost per month?" }], "expect": [["30", "¥30", "30 元"]], "forbidden": [], "handoff": false },
+    { "id": "followup", "category": "billing", "messages": [{ "role": "user", "content": "出片一直没结果" }, { "role": "assistant", "content": "这一发的钱在提交那一刻就扣掉了，任务还在方舟那边跑，稍后在出片页点「取回」就行，取回不再花钱。" }, { "role": "user", "content": "那要多久之内？" }], "expect": [["24 小时", "24小时", "二十四小时"]], "forbidden": [], "handoff": false }
+  ]
+}

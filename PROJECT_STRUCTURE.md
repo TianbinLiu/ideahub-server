@@ -1578,7 +1578,9 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `Comment.js` - 评论（支持回复、imageUrls）
 - `Like.js` - 点赞
 - `Bookmark.js` - 收藏
-- `Notification.js` - 通知
+- `Notification.js` - 通知（type 枚举含客服工单两类：SUPPORT_TICKET 给管理员、SUPPORT_REPLY 给用户）
+- `SupportFeedback.js` - AI 客服回答的 👍/👎，连问题与回答原文一起存（差评是改知识库的线索），管理员 `GET /api/admin/support/feedback` 看
+- `SupportTicket.js` - 客服工单：用户在 App「AI 客服」点「转人工」时的对话快照 + AI 归纳的标题/摘要/分类 + 人工与用户的后续往来；私有对象（只有本人与管理员可见），状态机 open → in_progress → resolved/closed 只允许管理员推进
 - `Interest.js` - 公司兴趣表达
 - `OtpToken.js` - 邮箱验证码
 - `AiJob.js` - AI评审任务队列
@@ -1626,6 +1628,8 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `minimax.routes.js` - 真人视频档供应商代理（MiniMax 海螺）。脚手架：未配 MINIMAX_API_KEY 全部 501；白名单转发，接上钱包扣费前不要在生产配真 key
 - `runway.routes.js` - 真人视频档供应商代理（Runway image_to_video）。同上；contentModeration 由服务端钉死不透传（合规决定，见文件头）
 - `companion.routes.js` - 首页看板娘数字人：`GET /config` 游客探测（有没有 AI/TTS、叫什么），`POST /chat` 登录 + 按用户限流的 **SSE 流式对话**——LLM 按「一句一组 `[情绪][face:x][action:y]` 标签」输出，服务端逐句切分、解析标签后以 `sentence` 事件下发（含给 `/api/tts` 用的情绪参数），前端按句合成语音并切表情/动作。客户端断开即 abort 上游，不白烧 token
+- `support.routes.js` - App「AI 客服」（一个文件导出 publicRouter + adminRouter）：`GET /api/support/config`、`POST /api/support/chat`（SSE，事件与 companion 相同，多一个 `handoff`——模型在回复开头写 `[handoff:类别]` 即转人工判定）、`POST /api/support/tickets`（建单 → 通知所有管理员 + 邮件，10 分钟内复用）、`GET /tickets/mine`、`POST /tickets/:id/messages`；管理员 `/api/admin/support/tickets` 列表/详情/回复/改状态（回复与结单会给用户发 SUPPORT_REPLY 通知 + 邮件）。通知与邮件都是尽力而为，失败不影响 201；`POST /feedback` 满意度、管理员 `GET /feedback?rating=`
+- `asr.routes.js` - 语音识别代理（火山 openspeech「大模型录音文件识别·极速版」，resource `volc.bigasr.auc_turbo`，与 TTS 同一把 key 但商品要单独开通）：`POST /api/asr` 收音频二进制（自己 express.raw 6MB，不占全局 1MB JSON 阈值）→ `{ text, durationMs }`；识别结果不落库不留音频
 
 ---
 
@@ -1638,12 +1642,13 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 ---
 
 #### `server/src/services/`
-- `email.service.js` - 邮件发送
+- `email.service.js` - 邮件发送：通用 `sendEmail({to, subject, html, text})`（Resend / dev 打日志）+ `sendEmailOtp`
 - `otp.service.js` - OTP生成/验证
 - `notification.service.js` - 通知创建
 - `aiReview.service.js` - AI评审队列
 - `workshopAi.service.js` - 工坊模板与全站编辑 AI 草案生成
 - `companion.service.js` - 看板娘数字人的「演出协议」：人设提示词（9 种表情 × 11 种动作的标签规范）、流式切句器（标签跨 chunk / 句尾无标点也能切）、标签解析（未知值回退默认）、情绪 → 豆包 TTS 参数映射。纯函数、无 IO，`tests/companion.spec.js` 直接测
+- `support.service.js` - AI 客服的知识检索与提示词：读 `src/knowledge/support-kb.md`（由 app 仓 docs/support-knowledge-base.md 剥掉代码出处生成）按标题切节，按问题用字二元组重叠打分挑 5 节 + 固定带上「禁止承诺 36 条」「转人工判定」「联系方式」；客服人设提示词（依据知识库作答、不编造、满足条件在开头打 `[handoff:类别]`）；`parseHandoff`；转人工时 `summarizeTicket` 用 AI 归纳标题/摘要/分类（失败退回启发式，绝不因此建不了单）
 - `tokenWallet.service.js` - AI token 钱包（所有 token 变动的唯一入口；W1 并发不超付 / W2 上游没受理就退 / W3 月度刷新）
 - `arkGateway.service.js` - 方舟出口 +「一次方舟调用怎么收钱」的唯一实现（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退）。`/api/ark` 代理与服务端自发的调用（白模化）共用它，避免两套记账
 - `blockoutize.service.js` - 白模化（任意视频 → 带编号白模）：Cloudinary 变换预热、**看几帧**（`visionFrameTimes`）、两段提示词（先看/点名）、方舟任务状态的**一次性核实**与产物转存。★ 2026-08-16 起**服务端不再轮询**（原 `pollTask` 已删）：白模化拆成两阶段，轮询归客户端，理由见 `models/BlockoutJob.js` 文件头
@@ -1917,6 +1922,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 | 日期 | 版本 | 更新内容 |
 |------|------|---------|
+| 2026-09-04 | — | **App「AI 客服」服务端**：新增 `SupportTicket` 模型、`/api/support`（SSE 问答 + 转人工工单）与 `/api/admin/support`（工单队列/回复/改状态）、`services/support.service.js`（知识检索 + 提示词 + 归纳）、`src/knowledge/support-kb.md`；`Notification` 枚举加 SUPPORT_TICKET / SUPPORT_REPLY；`email.service` 抽出通用 `sendEmail`；`.env.example` 加 `SUPPORT_AGENT_NAME`、`SUPPORT_NOTIFY_EMAIL`；评测脚本 `scripts/evalSupport.js`。 |
 | 2026-04-21 | 4.58 | **补充前端开发代理**：`client/vite.config.ts` 新增 `/api` 开发代理，默认转发到 `http://localhost:4000`，如显式设置 `VITE_API_BASE` 则改用对应目标；`client/src/config.ts` 改为开发环境优先使用同源相对路径，OAuth 跳转也统一复用同一 API 基址策略，减少本地联调时跨域和绝对地址心智负担。 |
 | 2026-04-21 | 4.57 | **修正前端本地开发 API 默认指向**：`client/src/config.ts` 在开发环境未显式配置 `VITE_API_BASE` 时，默认回落到当前主机的 `:4000`，避免本地联调误连线上 API；`client/.env.example` 同步改为本地开发默认值，并明确生产/预发需显式覆盖。 |
 | 2026-04-21 | 4.56 | **补充 Group 社交生态与动态发布链路**：新增 `/api/groups`、`Group` 模型、用户 `joinedGroupSlugs` 与 Idea `groupSlug/groupName`；前端新增 `/groups` 页面、首页 group 过滤、新建想法 group 选择与 `dynamic` 发布类型；Profile 页新增 `home / ideas / dynamics` 视图并支持总览预览入口。 |

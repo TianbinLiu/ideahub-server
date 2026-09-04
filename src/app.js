@@ -141,6 +141,8 @@ app.use("/api/branch/reports", reportRoutes.publicRouter);
 // ★ 与上面那条同一个 base（`/api/admin/branch`），后台控制台只用记一个前缀；
 //   同样必须排在 `app.use("/api/admin", adminRoutes)` **之前**，理由与上面逐字相同。
 app.use("/api/admin/branch", require("./routes/branchAdmin.routes"));
+// 客服工单（管理员侧）：同样要排在 /api/admin 之前，理由同上
+app.use("/api/admin/support", require("./routes/support.routes").adminRouter);
 app.use("/api/admin", adminRoutes);
 app.use("/api/ai-jobs", require("./routes/aiJobs.routes"));
 app.use("/api/tag-rank", tagRankRoutes);
@@ -149,6 +151,10 @@ app.use("/api/messages", messagesRoutes);
 app.use("/api/blocks", require("./routes/blocks.routes"));
 // 首页看板娘数字人：GET /config 游客可探测、POST /chat 需登录且按用户限流（SSE）
 app.use("/api/companion", require("./routes/companion.routes"));
+// App「AI 客服」：GET /config 游客可探测、POST /chat 流式问答、/tickets 转人工工单（用户侧）
+app.use("/api/support", require("./routes/support.routes").publicRouter);
+// 语音识别代理（客服页按住说话）：收音频二进制，自己 express.raw，不占全局 1MB JSON 阈值
+app.use("/api/asr", require("./routes/asr.routes"));
 app.use("/api/scraper", scraperRoutes);
 app.use("/api/uploads", uploadsRoutes);
 app.use("/api/workshop", workshopRoutes);
