@@ -58,6 +58,18 @@ function errorHandler(err, req, res, next) {
     message = "Uploaded file is too large";
   }
 
+  // ★★ 500 必须落堆栈（2026-09-05 主人真机：发布「仅链接可看」的作品回「Server error」，
+  //   而 pm2 两份日志里**一个字都没有** —— 生产把 message 压成 Server error 是对的（不泄露
+  //   内部），但压掉之前不记下来，就是把唯一的线索一起压没了。本机用同形状草稿复现不出来，
+  //   只能等它再发生一次；没有这一行，再发生一百次也还是一句 Server error。
+  //   4xx 是用户可纠正的错，本来就整句回给了客户端，不在这里刷屏。
+  if (status >= 500) {
+    console.error(
+      `[http] ${status} ${req.method} ${req.originalUrl} user=${req.user ? String(req.user._id) : "-"}:`,
+      err && err.stack ? err.stack : err,
+    );
+  }
+
   res.status(status).json({
     ok: false,
     code,
