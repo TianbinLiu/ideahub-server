@@ -3101,6 +3101,28 @@ describe("人偶多维描述（单元）—— 三项属性 + 唯一性自证", 
     expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/像人却读不出来/);
   });
 
+  test("★★ 四个数用空格/逗号分隔也读得出来（2026-09-05 实拍：整帧因此被扔掉）", () => {
+    // 模型原文：`1|96 602 187 703|纯白|身体前倾右臂前伸|踩在左侧黑台子上`——数对、人全，只是没用 `|`
+    const rows = blockout.parseRosterBoxes(
+      ["1|96 602 187 703|纯白|身体前倾右臂前伸|踩在左侧黑台子上", "2|473, 499, 114, 643|纯白|身体前倾右臂前指|在红墙左灯的前方"].join("\n"),
+    );
+    expect(rows.map((r) => r.cx)).toEqual([96, 473]);
+    expect(rows[0]).toMatchObject({ cy: 602, w: 187, h: 703, color: "纯白", act: "身体前倾右臂前伸" });
+    expect(warnSpy.mock.calls.flat().join(" ")).not.toMatch(/像人却读不出来/);
+    // 老格式一个字不变
+    expect(blockout.parseBoxes("1|96 602 187 703\n2|473,499,114,643", 2).map((b) => b.cx)).toEqual([96, 473]);
+  });
+
+  test("★★ 超过角色位上限的群戏不按「中心太近」整帧否决；上限之内照旧否决", () => {
+    // 10 个人，第 3、4 个中心只差 29（2026-09-05 实拍那一帧的形状；旧阈值 33 → 整帧丢）
+    const ten = Array.from({ length: 10 }, (_, i) => `${i + 1}|${100 + i * 90 + (i === 3 ? -61 : 0)}|500|100|400|纯白|站着|在台上`);
+    expect(blockout.parseRosterBoxes(ten.join("\n"))).toHaveLength(10);
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/密集群戏不按中心间距否决/);
+    // 7 个人、第 5、6 个中心只差 34（阈值 48）→ 回归表那条，仍然拒
+    const seven = Array.from({ length: 7 }, (_, i) => `${i + 1}|${120 + i * 140 + (i === 5 ? -106 : 0)}|500|140|800|纯白|跳舞|在台上`);
+    expect(blockout.parseRosterBoxes(seven.join("\n"))).toEqual([]);
+  });
+
   test("★ 寒暄与代码围栏**不**算坏行（否则 5 个候选帧会全白花）", () => {
     // ★ 判据是「以 `数字|` 开头」而不是「不匹配就算坏」：每否决一帧就是一发计费 chat。
     const rows = blockout.parseRosterBoxes(
