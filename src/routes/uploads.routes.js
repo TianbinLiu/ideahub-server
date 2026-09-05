@@ -15,6 +15,10 @@ const {
   templateRefIssue,
   TEMPLATE_REF_RULES,
 } = require("../middleware/upload");
+
+/** /media 那一跳交给 Cloudinary 的等待上限（理由写在路由里那条 ★★）。
+ *  ★ 必须 < Cloudflare 对源站的 125s 读超时，减掉 nginx 收完请求体那段。 */
+const MEDIA_UPLOAD_TIMEOUT_MS = 100_000;
 const { cloudinary } = require("../config/cloudinary");
 const BranchTemplate = require("../models/BranchTemplate");
 const MaterialRefVideo = require("../models/MaterialRefVideo");
@@ -132,20 +136,41 @@ router.post("/media", requireAuth, uploadLimit, uploadMedia.single("media"), asy
 
     const resourceType = String(req.file.mimetype || "").startsWith("video/") ? "video" : "image";
 
-    const mediaUrl = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          folder: "ideahub/workshop-media",
-          public_id: `${req.user._id.toString()}-${Date.now()}`,
-          resource_type: resourceType,
-        },
-        (error, result) => {
-          if (error) return reject(error);
-          resolve(result.secure_url);
-        }
+    let mediaUrl;
+    try {
+      mediaUrl = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: "ideahub/workshop-media",
+            public_id: `${req.user._id.toString()}-${Date.now()}`,
+            resource_type: resourceType,
+            // ★★ SDK 默认 60s（2026-09-05 主人真机：发布成片回「Server error」，Cloudinary 上
+            //   一个字节都没到）。ECS → Cloudinary 跨境传 10~20MB 的成片常过一分钟，60s 掐死在
+            //   半途就是一个未记录的 500。上限取 100s 不取转存路的 300s：这条请求是用户在线等的，
+            //   Cloudflare 对源站的读超时是 125s（CLAUDE.md 量过），再长也是 CF 先掐。
+            timeout: MEDIA_UPLOAD_TIMEOUT_MS,
+          },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result.secure_url);
+          }
+        );
+        stream.end(req.file.buffer);
+      });
+    } catch (err) {
+      // ★ 说清是哪一跳、为什么（铁律八）：以前这里直接 next(err) → 生产压成一句 Server error，
+      //   pm2 里一行日志都没有，用户与开发者都只能猜。502 = 上游（Cloudinary）没接住，不是 App 的错。
+      const reason = (err && (err.message || (err.error && err.error.message))) || String(err);
+      console.error(
+        `[uploads] media 转存 Cloudinary 失败 user=${req.user._id} type=${resourceType} bytes=${req.file.size}:`,
+        reason
       );
-      stream.end(req.file.buffer);
-    });
+      return res.status(502).json({
+        ok: false,
+        code: "UPSTREAM_UPLOAD_FAILED",
+        message: `成片没能存到云端（${String(reason).slice(0, 120)}）——这不是作品的问题，稍后在「我的」页点「立即重试」即可`,
+      });
+    }
 
     res.json({
       ok: true,
