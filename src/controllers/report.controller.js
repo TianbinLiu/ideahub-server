@@ -430,7 +430,9 @@ async function resolveReport(req, res, next) {
         targetType: report.targetType,
         targetId: report.targetId,
         operatorId: req.user._id,
-        reason: report.reason,
+        // ★ 给作者看的是人话，不是理由 key：这一句会原样出现在他的作品页上
+        //   （Report.REASON_LABELS 的 ★）。表里没有的 key 退回原值，别变成空串。
+        reason: Report.REASON_LABELS[report.reason] || report.reason,
         hard: action === "delete",
       });
     }
