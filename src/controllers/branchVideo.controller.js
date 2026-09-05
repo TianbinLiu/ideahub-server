@@ -1833,14 +1833,38 @@ const TAKEDOWN_REASON_MAX = 500;
  * @param {boolean} on true = 下架；false = 撤销
  * @returns {Promise<object|null>} 更新后的文档（已 populate 作者）；作品不存在 → null
  */
+/**
+ * 下架 / 恢复之后给作者发一条平台通知（ADMIN_NOTICE，只带一句话、不透操作人）。
+ * ★★ 为什么必须有（2026-09-05 App 巡检）：下架之前作者一个字都收不到，只有主动打开
+ *   自己的作品才发现；而他最可能的下一步是原样重发一遍 —— 正是下架想避免的。
+ * ★ 挂在 applyTakedown 里而不是某个入口：举报队列（takedown.service）与作品列表
+ *   （takedownVideo）两条路都走它，通知只此一处。
+ * ★ 不能让通知失败拖垮下架本身：通知是善后，下架是主链路，所以 catch 住只 warn。
+ */
+async function notifyTakedown(doc, { reason = "", on = true } = {}) {
+  const authorId = doc && doc.author && (doc.author._id || doc.author);
+  if (!authorId) return;
+  const title = String((doc && doc.title) || "").slice(0, 40) || "（无标题）";
+  const text = on
+    ? `你的作品「${title}」已被平台下架${reason ? `：${reason}` : ""}。目前只有你自己能看到它；如有异议，请联系 support@ideahubs.org。`
+    : `你的作品「${title}」已重新上架。`;
+  try {
+    await createNotification({ userId: authorId, videoId: doc._id, type: "ADMIN_NOTICE", payload: { text } });
+  } catch (err) {
+    console.warn(`[branch] 下架通知没发出去 video=${doc._id} on=${on}:`, err && err.message ? err.message : err);
+  }
+}
+
 async function applyTakedown(videoId, { by, reason = "", on = true } = {}) {
   // ★ 撤销必须 $unset（整个子文档删掉），不能 $set null —— 理由见 TAKEN_DOWN 的说明
   const update = on
     ? { $set: { takedown: { by, at: new Date(), reason: String(reason).slice(0, TAKEDOWN_REASON_MAX) } } }
     : { $unset: { takedown: "" } };
-  return BranchVideo.findByIdAndUpdate(videoId, update, { returnDocument: "after" })
+  const doc = await BranchVideo.findByIdAndUpdate(videoId, update, { returnDocument: "after" })
     .populate("author", AUTHOR_FIELDS)
     .lean();
+  if (doc) await notifyTakedown(doc, { reason, on });
+  return doc;
 }
 
 /**

@@ -253,6 +253,41 @@ describe("举报 · 管理端队列", () => {
     expect(String(onDanmaku.target.author._id)).toBe(reporterA.userId);
   });
 
+  test("R7b 从举报队列下架：作者看到的原因是人话，并收到一条平台通知", async () => {
+    const author = await registerUser();
+    const reporter = await registerUser();
+    const admin = await registerUser();
+    await promoteToAdmin(admin.userId);
+
+    const videoId = await publish(author.token, { title: "会被下架的作品" });
+    const created = await report(reporter.token, { targetType: "video", targetId: videoId, reason: "porn" }).expect(201);
+    const reportId = created.body.report?._id || created.body.report?.id || created.body.id;
+
+    await request(app)
+      .patch(`/api/admin/branch/reports/${reportId}`)
+      .set("Authorization", `Bearer ${admin.token}`)
+      .send({ action: "takedown" })
+      .expect(200);
+
+    // 作者自己仍看得到这条，且 takedown.reason 是标签不是 key（此前是 "porn"）
+    const mine = await request(app)
+      .get(`/api/branch/videos/${videoId}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(mine.body.video.takedown.reason).toBe("色情低俗");
+
+    // 作者收到一条 ADMIN_NOTICE，正文点名作品与原因
+    const notes = await request(app)
+      .get("/api/notifications?limit=20")
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    const list = notes.body.items || notes.body.notifications || notes.body.data || [];
+    const hit = list.find((n) => n.type === "ADMIN_NOTICE");
+    expect(hit).toBeTruthy();
+    expect(String(hit.payload && hit.payload.text)).toContain("会被下架的作品");
+    expect(String(hit.payload && hit.payload.text)).toContain("色情低俗");
+  });
+
   test("R8 对象已经没了，也要如实说 exists:false，而不是把这一项省掉", async () => {
     const author = await registerUser();
     const viewer = await registerUser();

@@ -157,6 +157,21 @@ module.exports = mongoose.model("Report", reportSchema);
 // 「模型收得下、接口不认」或反过来（两种都不报错，只是某个取值悄悄消失）。
 module.exports.TARGET_TYPES = TARGET_TYPES;
 module.exports.REASONS = REASONS;
+/**
+ * 举报理由的人话（与 App `api/admin.ts` 的 REPORT_REASONS 标签逐条相同）。
+ * ★ 用途只有一个：从举报队列下架时写进 `takedown.reason` 给**作者**看。此前写的是
+ *   理由 key（"porn"），作者的作品页上就显示「已被平台下架 porn」（2026-09-05 App 巡检抓到）。
+ *   加新理由时这张表要跟着补 —— 缺了那一项作者看到的又是 key。
+ */
+module.exports.REASON_LABELS = Object.freeze({
+  csae: "涉及未成年人",
+  porn: "色情低俗",
+  violence: "血腥暴力",
+  abuse: "人身攻击 / 辱骂",
+  spam: "垃圾营销 / 刷屏",
+  infringe: "侵权 / 冒用他人作品",
+  other: "其他",
+});
 module.exports.URGENT_REASONS = URGENT_REASONS;
 module.exports.STATUSES = STATUSES;
 module.exports.ACTIONS = ACTIONS;
