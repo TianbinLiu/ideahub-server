@@ -1994,6 +1994,19 @@ App `src/data/economy.ts` 是**报价**口径。不一致的后果是"报价 216
   `omni_reference_task_type` 的行为）与账单都没核过，没核过的价不进表；促销价（4 折）
   一律不写，价目只记刊例。
 
+### 视频任务登记与找回（`GET /api/ark/video-tasks`，2026-09-06）
+
+`POST /api/ark/contents/generations/tasks` 被受理的 **Seedance** 任务，服务端记一条 `{ userId, taskId, model, durationSec, ratio,
+resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL）。`GET /api/ark/video-tasks` 回
+`{ ok, tasks: [{ taskId, createdAt, model, durationSec, ratio, resolution, prompt, r2v }] }`（最近 24 小时、新的在前、最多 50 条，
+走轮询限流桶、不计费）。
+
+- 为什么：客户端的取回凭据只在 localStorage；App 被系统回收 / 重装 / 出包重启两次，就可能把一发**已经付过钱**的成片弄丢
+  （2026-09-06 真机：钱已扣、方舟侧好好存着、App 里一颗按钮都没有）。App 冷启动 / 进创作入口时拉这张表，把本机不认识、
+  也没取回过的任务补成「待取回」凭据，再走同一条「取回」（`GET tasks/:id`，不计费）。
+- 服务端不知道客户端取没取回：去重由客户端做（取回 / 正常收到结果 / 「知道了」都记进本机的已处理名单）。
+- 与 `BranchTemplateTrial` 不是一回事：那条是试炼闸，任务一出结果就删。
+
 ## 真人肖像授权（方舟可信素材）
 
 挂载点：`/api/ark/portrait/*`（`routes/arkPortrait.routes.js`），全部 `requireAuth`。
