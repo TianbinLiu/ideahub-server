@@ -316,7 +316,8 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
 
   try {
     const stream = aiChatStream(
-      [{ role: "system", content: system }, ...history.map((m) => ({ role: m.role, content: m.content }))],
+      // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
+      [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona), ...history.map((m) => ({ role: m.role, content: m.content }))],
       { maxTokens: MAX_REPLY_TOKENS, temperature: 0.3, signal: abort.signal },
     );
     for await (const delta of stream) {

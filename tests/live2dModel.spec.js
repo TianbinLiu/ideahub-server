@@ -54,7 +54,7 @@ function makeBundle({ withEvil = false, cubism2 = false, missingTexture = false,
     FileReferences: { Moc: "hiyori.moc3", Textures: ["hiyori.4096/texture_00.png"], Expressions: [{ Name: "smile", File: "smile.exp3.json" }] },
   };
   zip.addFile(`${dir}/hiyori.model3.json`, Buffer.from(JSON.stringify(model3)));
-  zip.addFile(`${dir}/hiyori.moc3`, Buffer.alloc(4096, 7));
+  zip.addFile(`${dir}/hiyori.moc3`, Buffer.concat([Buffer.from("MOC3"), Buffer.alloc(4092, 7)])); // 真 moc3 前 4 字节是 "MOC3"，服务器现在校验
   if (!missingTexture) zip.addFile(`${dir}/hiyori.4096/texture_00.png`, Buffer.alloc(2048, 3));
   zip.addFile(`${dir}/smile.exp3.json`, Buffer.from(JSON.stringify({ Type: "Live2D Expression", Parameters: [] })));
   zip.addFile(`${dir}/readme.txt`, Buffer.from("thanks"));

@@ -28,6 +28,14 @@ const live2dModelSchema = new mongoose.Schema(
     persona: { type: mongoose.Schema.Types.ObjectId, ref: "Persona", default: null },
     voice: { type: voiceSettingsSchema, default: null },
     shared: { type: Boolean, default: false, index: true },
+    // 运营下架（举报处置）：true 时市场不列、他人不可用（loadUsableModel 回 null → 使用者退回官方），作者列表里带标记
+    takenDown: { type: Boolean, default: false },
+    // 能力档案（services/live2dCapabilities.service.js extractCapabilities）：动作组 / 表情 / 命中区 / 参数 / 物理 → 市场角标 + 映射校验
+    capabilities: { type: mongoose.Schema.Types.Mixed, default: null },
+    // 我们协议层的映射（与包里 companion.json 同一份内容）：动作槽 / 表情槽 / 触摸区 / 参数槽 → 模型自己的名字；运行时读文件，这里存一份给市场页显示与编辑
+    mapping: { type: mongoose.Schema.Types.Mixed, default: null },
+    // 授权勾选：上传者声明是作者或已获授权（agreedAt = 勾选时间）
+    license: { selfMade: { type: Boolean, default: false }, agreedAt: { type: Date, default: null }, _id: false },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },

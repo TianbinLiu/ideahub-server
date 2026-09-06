@@ -36,7 +36,7 @@ const express = require("express");
 const { z } = require("zod");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
-const { hasAiKey, aiChatStream } = require("../services/aiClient");
+const { hasAiKey } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const { loadCompanionSetup, updateCompanionSetting, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
 const { voiceFieldSchema, resolveVoiceSettings } = require("../utils/voiceSettings");
@@ -45,8 +45,6 @@ const router = express.Router();
 
 const MAX_HISTORY = 20;
 const MAX_MESSAGE_CHARS = 1000;
-/** 回复上限：人设要求 1～3 句，600 token 足够；再大就是模型跑偏，早点截断省钱也省前端排队 */
-const MAX_REPLY_TOKENS = 600;
 
 const chatBodySchema = z.object({
   messages: z
@@ -140,60 +138,17 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
     personaLine: personaPromptLine(setup.persona),
   });
 
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  if (typeof res.flushHeaders === "function") res.flushHeaders();
-
-  let closed = false;
-  const send = (event, data) => {
-    if (closed) return;
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
-
-  const abort = new AbortController();
-  // ★ 必须监听 res 而不是 req 的 close：Node ≥16 里 IncomingMessage 的 'close' 在请求体读完就触发
-  //   （不是连接断开），挂在 req 上会在第一句话还没生成时就把上游 abort 掉、所有事件静默丢弃 —— 表现为
-  //   HTTP 200 + 空 body。res 的 'close' 在正常 end() 之后也会触发，所以要用 writableFinished 区分"客户端跑了"。
-  res.on("close", () => {
-    if (res.writableFinished) return;
-    closed = true;
-    abort.abort();
+  // SSE 流式回复的实现在 companion.service.streamCompanionReply（与人格向导的试聊共用）；
+  // 人格卡带示例对话时插几组 few-shot（personaExampleMessages），模型更像 TA
+  await companion.streamCompanionReply({
+    res,
+    messages: [
+      { role: "system", content: system },
+      ...companion.personaExampleMessages(setup.persona),
+      ...history.map((m) => ({ role: m.role, content: m.content })),
+    ],
+    ttsInstruct: setup.voice.instruct,
   });
-
-  let index = 0;
-  const plainParts = [];
-  const splitter = companion.createSentenceSplitter((sentence) => {
-    const p = companion.parseTags(sentence);
-    if (!p.text) return; // 纯标签、没正文：不念也不演
-    plainParts.push(p.text);
-    send("sentence", { index: index++, ...p, tts: companion.ttsParamsFor(p.emotion, setup.voice.instruct) });
-  });
-
-  try {
-    const stream = aiChatStream(
-      [{ role: "system", content: system }, ...history.map((m) => ({ role: m.role, content: m.content }))],
-      { maxTokens: MAX_REPLY_TOKENS, temperature: 0.8, signal: abort.signal },
-    );
-    for await (const delta of stream) {
-      if (closed) break;
-      splitter.push(delta);
-      send("token", { t: delta });
-    }
-    splitter.flush();
-    send("done", { text: plainParts.join(" ") });
-  } catch (e) {
-    // 客户端主动断开时 abort 会抛错，这不是故障，静默收场即可；其余照实告诉前端并记日志
-    if (!closed) {
-      console.error("[companion] stream failed:", (e && e.message) || e);
-      send("error", { message: "companion upstream failed" });
-    }
-  } finally {
-    closed = true;
-    res.end();
-  }
 });
 
 module.exports = router;

@@ -5,9 +5,9 @@
 // （段数不同，Express 不会匹配），挂在末尾即可，不影响上面的顺序约束。
 const router = require("express").Router();
 const { requireAuth, optionalAuth } = require("../middleware/auth");
-const { rateLimit } = require("../middleware/rateLimit");
+const { rateLimit, aiRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
-const { createBody, updateBody, equipBody, generateBody } = require("../schemas/persona.schemas");
+const { createBody, updateBody, equipBody, generateBody, analyzeBody, previewChatBody } = require("../schemas/persona.schemas");
 const { createBody: commentCreateBody } = require("../schemas/arenaComment.schemas");
 const { makeCommentHandlers } = require("../controllers/arenaComment.controller");
 const Persona = require("../models/Persona");
@@ -15,6 +15,8 @@ const {
   listPersonas,
   getPersona,
   generatePersona,
+  analyzePersona,
+  previewChat,
   createPersona,
   updatePersona,
   removePersona,
@@ -37,6 +39,9 @@ router.post("/equip", requireAuth, validate({ body: equipBody }), equipPersona);
 // AI 生成入口要限流（评审实锤）：登录用户脚本循环打 12000 字 prompt 的成本无上限。
 // 与 OTP 同款 in-memory limiter（按 IP）；5 次/分钟对真人现场生成绰绰有余。
 router.post("/generate", requireAuth, rateLimit({ windowMs: 60 * 1000, max: 5 }), validate({ body: generateBody }), generatePersona);
+// 人格制作向导（2026-09-05）：素材分析 / 草稿试聊 —— 都是 AI 出口，按用户限流（aiRateLimit）；generate 扩参见 schemas
+router.post("/analyze", requireAuth, aiRateLimit({ max: 5, scope: "persona-analyze" }), validate({ body: analyzeBody }), analyzePersona);
+router.post("/preview-chat", requireAuth, aiRateLimit({ max: 20, scope: "persona-preview" }), validate({ body: previewChatBody }), previewChat);
 router.post("/", requireAuth, validate({ body: createBody }), createPersona);
 router.get("/:id", optionalAuth, getPersona);
 router.put("/:id", requireAuth, validate({ body: updateBody }), updatePersona);

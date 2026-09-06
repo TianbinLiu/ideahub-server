@@ -39,6 +39,23 @@ const voiceString = z
     return parsed.data;
   });
 
+/** multipart 里 mapping（companion.json 内容）是 JSON 字符串；空串/缺省 = 让服务器自动映射。形状与引用在控制器里按能力档案校验 */
+const mappingString = z
+  .union([z.string(), z.object({}).passthrough(), z.null()])
+  .optional()
+  .transform((v, ctx) => {
+    if (v === undefined || v === null || v === "") return null;
+    if (typeof v !== "string") return v;
+    try {
+      const obj = JSON.parse(v);
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("not an object");
+      return obj;
+    } catch {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "mapping must be a JSON object" });
+      return z.NEVER;
+    }
+  });
+
 const createBody = z.object({
   name: z.string().trim().min(1).max(120),
   description: z.string().trim().max(1000).optional().default(""),
@@ -47,6 +64,11 @@ const createBody = z.object({
   shared: boolString,
   personaId: objectIdOrEmpty,
   voice: voiceString,
+  mapping: mappingString,
+  // 包里有多个 model3.json 时指定入口（相对包根的 posix 路径，来自 /inspect 的 entries）
+  entry: z.string().trim().max(300).optional().default(""),
+  // 授权勾选：我是作者或已获授权
+  selfMade: boolString,
 });
 
 const updateBody = z.object({
@@ -57,6 +79,9 @@ const updateBody = z.object({
   shared: z.boolean().optional(),
   personaId: z.string().trim().max(64).nullable().optional(),
   voice: voiceFieldSchema,
+  // 对象 = 改成这份映射（按能力档案校验后重写 companion.json），null = 恢复自动映射，缺省 = 不动
+  mapping: z.union([z.object({}).passthrough(), z.null()]).optional(),
+  selfMade: z.boolean().optional(),
 });
 
 const listQuery = z.object({

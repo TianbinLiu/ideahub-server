@@ -7,7 +7,11 @@ const PersonaInstall = require("../models/PersonaInstall");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
 const PersonaPurchase = require("../models/PersonaPurchase");
-const { generatePersonaFromChat } = require("../services/personaAi.service");
+const { generatePersonaDraft, analyzeMaterials } = require("../services/personaAi.service");
+const { styleDescriptorOf } = require("../services/personaAccess.service");
+const { personaPromptLine } = require("../services/companionSetting.service");
+const companion = require("../services/companion.service");
+const { hasAiKey } = require("../services/aiClient");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const { serializeVoiceSettings } = require("../utils/voiceSettings");
@@ -63,6 +67,10 @@ function toTags(raw) {
   )].slice(0, 12);
 }
 
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function normalizeStyle(raw) {
   const style = raw && typeof raw === "object" ? raw : {};
   return {
@@ -81,20 +89,25 @@ function normalizeStyle(raw) {
         })).filter((s) => s.key)
       : [],
     stanceHint: String(style.stanceHint || "").trim().slice(0, 500),
+    // 向导生成的字段（2026-09-05）；上限与 schemas 的 styleBody / personaAi.service LIMITS 对齐
+    tone: String(style.tone || "").trim().slice(0, 300),
+    addressUser: String(style.addressUser || "").trim().slice(0, 60),
+    greeting: String(style.greeting || "").trim().slice(0, 300),
+    examples: Array.isArray(style.examples)
+      ? style.examples
+          .map((e) => ({ user: String(e?.user || "").trim().slice(0, 300), reply: String(e?.reply || "").trim().slice(0, 300) }))
+          .filter((e) => e.user && e.reply)
+          .slice(0, 12)
+      : [],
+    boundaries: Array.isArray(style.boundaries)
+      ? style.boundaries.map((x) => String(x || "").trim().slice(0, 120)).filter(Boolean).slice(0, 12)
+      : [],
   };
 }
 
-// styleDescriptor：从 name+style 拼一段文本供插件当作 personaText 用，截断到 ~600 字。
-function computeStyleDescriptor(name, style) {
-  const summary = String(style?.summary || "").trim();
-  const catchphrases = Array.isArray(style?.catchphrases) ? style.catchphrases.filter(Boolean) : [];
-  const stanceHint = String(style?.stanceHint || "").trim();
-  const parts = [String(name || "").trim()];
-  if (summary) parts.push(`风格：${summary}`);
-  if (catchphrases.length) parts.push(`口头禅：${catchphrases.join("、")}`);
-  if (stanceHint) parts.push(`倾向：${stanceHint}`);
-  return parts.join("｜").slice(0, 600);
-}
+// styleDescriptor：从 name+style 拼一段人设文本（插件 personaText / 数字人【人设】段）。
+// 唯一实现在 personaAccess.service.styleDescriptorOf；这里保留别名是因为 scenario.controller 还从本模块 require。
+const computeStyleDescriptor = styleDescriptorOf;
 
 // ── 序列化（严格对齐冻结契约 Persona）─────────────────────────────
 function serializeStat(s) {
@@ -112,6 +125,11 @@ function serializeStyle(style) {
     catchphrases: Array.isArray(style?.catchphrases) ? style.catchphrases : [],
     stats: Array.isArray(style?.stats) ? style.stats.map(serializeStat) : [],
     stanceHint: String(style?.stanceHint || ""),
+    tone: String(style?.tone || ""),
+    addressUser: String(style?.addressUser || ""),
+    greeting: String(style?.greeting || ""),
+    examples: Array.isArray(style?.examples) ? style.examples.map((e) => ({ user: String(e?.user || ""), reply: String(e?.reply || "") })) : [],
+    boundaries: Array.isArray(style?.boundaries) ? style.boundaries : [],
   };
 }
 
@@ -132,6 +150,7 @@ function toPersonaPayload(doc, ctx = {}) {
     // shared 一直漏序列化（client Persona 类型早已声明）：编辑器回填 setShared(!!p.shared)
     // 拿到 undefined → 勾选框永远显示未勾选 → 用户编辑公开人格随手保存就把它静默改私有。
     shared: !!doc.shared,
+    takenDown: !!doc.takenDown,
     price: Number(doc.price || 0),
     // 「音频」板块：null = 人格没带嗓子
     voice: serializeVoiceSettings(doc.voice),
@@ -181,7 +200,7 @@ async function listPersonas(req, res, next) {
     const page = Math.max(parseInt(req.query.page || "1", 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit || "12", 10) || 12, 1), 40);
     const sort = String(req.query.sort || "new").toLowerCase();
-    const q = String(req.query.q || "").trim().toLowerCase();
+    const q = String(req.query.q || "").trim();
     const tag = String(req.query.tag || "").trim().toLowerCase();
 
     let scope = String(req.query.scope || "all").toLowerCase();
@@ -194,42 +213,36 @@ async function listPersonas(req, res, next) {
       filter = { author: req.user._id };
     } else if (scope === "installed") {
       const installs = await PersonaInstall.find({ user: req.user._id }).select("persona").lean();
-      // 只列【仍可用】的收藏（公开的，或自己发布的）。作者取消分享后 install 记录还在，
+      // 只列【仍可用】的收藏（公开且未下架的，或自己发布的）。作者取消分享后 install 记录还在，
       // 但收藏者连详情都打不开（getPersona 对 !shared && !owner 是 403）——列表里留着
       // 只会产出「点不开的卡」，而情景编辑器的人格选择器也走这个接口：选了一个
       // play 时永远不生效（resolveParticipantPersonas 判不可用）的人格 = 绑定即死链。
       filter = {
         _id: { $in: installs.map((x) => x.persona) },
-        $or: [{ shared: true }, { author: req.user._id }],
+        $or: [{ shared: true, takenDown: { $ne: true } }, { author: req.user._id }],
       };
     } else {
-      filter = { shared: true };
+      filter = { shared: true, takenDown: { $ne: true } };
     }
     if (tag) filter.tags = tag;
-
-    let items = await Persona.find(filter).populate("author", "_id username").lean();
-
+    // 2026-09-05 起搜索 / 排序 / 分页都在数据库做（此前是全量 find 再 JS 过滤，市场一长就先死在这）
     if (q) {
-      items = items.filter((item) => {
-        const hay = `${item.name || ""} ${item.description || ""} ${(item.tags || []).join(" ")}`.toLowerCase();
-        return hay.includes(q);
-      });
+      const re = new RegExp(escapeRegex(q), "i");
+      const textOr = [{ name: re }, { description: re }, { tags: re }];
+      if (filter.$or) {
+        filter.$and = [{ $or: filter.$or }, { $or: textOr }];
+        delete filter.$or;
+      } else {
+        filter.$or = textOr;
+      }
     }
-
-    if (sort === "hot") {
-      items.sort((a, b) => {
-        const ha = Number(a?.stats?.downloadCount || 0) + Number(a?.stats?.likeCount || 0);
-        const hb = Number(b?.stats?.downloadCount || 0) + Number(b?.stats?.likeCount || 0);
-        if (hb !== ha) return hb - ha;
-        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
-      });
-    } else {
-      items.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-    }
-
-    const total = items.length;
+    // 热度按 下载 → 点赞 → 时间 依次排（与模型市场同款；Mongo 排序做不了字段相加）
+    const sortSpec = sort === "hot" ? { "stats.downloadCount": -1, "stats.likeCount": -1, createdAt: -1 } : { createdAt: -1 };
+    const [total, paged] = await Promise.all([
+      Persona.countDocuments(filter),
+      Persona.find(filter).sort(sortSpec).skip((page - 1) * limit).limit(limit).populate("author", "_id username").lean(),
+    ]);
     const totalPages = Math.max(Math.ceil(total / limit), 1);
-    const paged = items.slice((page - 1) * limit, page * limit);
 
     const { installedSet, likedSet, equippedId, purchasedSet } = await loadUserContext(req.user, paged);
 
@@ -297,9 +310,14 @@ async function getPersona(req, res, next) {
 // 用户取消不会留孤儿人格。归一复用 create 同款 helper，保证草稿即创建合法入参。
 async function generatePersona(req, res, next) {
   try {
-    const draft = await generatePersonaFromChat({
+    const draft = await generatePersonaDraft({
       chatText: req.body.chatText,
       hint: req.body.hint,
+      basics: req.body.basics,
+      questionnaire: req.body.questionnaire,
+      analysis: req.body.analysis,
+      only: req.body.only,
+      draft: req.body.draft,
     });
     res.json({
       ok: true,
@@ -311,6 +329,46 @@ async function generatePersona(req, res, next) {
         style: normalizeStyle(draft.style),
       },
       model: draft.model,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** 人格向导第 2 步：素材 → 说话风格分析（不落库，结果由客户端原样带回 generate） */
+async function analyzePersona(req, res, next) {
+  try {
+    const { analysis, model, sampledChars } = await analyzeMaterials({ materials: req.body.materials, speaker: req.body.speaker });
+    res.json({ ok: true, analysis, model, sampledChars });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 人格向导第 5 步：拿草稿试聊（SSE：sentence / token / done / error，与首页看板娘同一套事件与实现）。
+ * 草稿随请求带上、不落库；人设段用 personaPromptLine 同一份措辞，示例对话作 few-shot。
+ */
+async function previewChat(req, res, next) {
+  try {
+    if (!hasAiKey()) return res.status(501).json({ ok: false, message: "AI not configured", code: "AI_NOT_CONFIGURED" });
+    const history = req.body.messages;
+    if (history[history.length - 1].role !== "user") badRequest("last message must be from user");
+    const draft = req.body.draft;
+    const style = normalizeStyle(draft.style);
+    const system = companion.buildSystemPrompt({
+      userName: req.user.displayName || req.user.username || "",
+      lang: req.body.lang || "zh",
+      personaLine: personaPromptLine({ name: String(draft.name || "").trim().slice(0, 120), styleDescriptor: styleDescriptorOf(draft.name, style) }),
+    });
+    await companion.streamCompanionReply({
+      res,
+      messages: [
+        { role: "system", content: system },
+        ...companion.personaExampleMessages({ examples: style.examples }),
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+      ],
+      tag: "persona-preview",
     });
   } catch (err) {
     next(err);
@@ -675,6 +733,8 @@ module.exports = {
   listPersonas,
   getPersona,
   generatePersona,
+  analyzePersona,
+  previewChat,
   createPersona,
   updatePersona,
   removePersona,

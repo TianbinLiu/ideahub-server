@@ -15,16 +15,25 @@ const Persona = require("../models/Persona");
 const PersonaPurchase = require("../models/PersonaPurchase");
 const { serializeVoiceSettings } = require("../utils/voiceSettings");
 
-/** 与 persona.controller.computeStyleDescriptor 同一份拼法（那边不便 require 进 service，复制一份并加测试钉住） */
+/**
+ * 人设文本的唯一拼法（persona.controller.computeStyleDescriptor 是它的别名；插件 personaText / 数字人【人设】段 / 试聊都用它）。
+ * 2026-09-05 起多拼 语气 / 称呼用户 / 边界（向导生成的字段，老人格没有就不出现），上限 600 → 900 字。
+ */
 function styleDescriptorOf(name, style) {
   const summary = String(style?.summary || "").trim();
   const catchphrases = Array.isArray(style?.catchphrases) ? style.catchphrases.filter(Boolean) : [];
   const stanceHint = String(style?.stanceHint || "").trim();
+  const tone = String(style?.tone || "").trim();
+  const addressUser = String(style?.addressUser || "").trim();
+  const boundaries = Array.isArray(style?.boundaries) ? style.boundaries.filter(Boolean) : [];
   const parts = [String(name || "").trim()];
   if (summary) parts.push(`风格：${summary}`);
+  if (tone) parts.push(`语气：${tone}`);
   if (catchphrases.length) parts.push(`口头禅：${catchphrases.join("、")}`);
   if (stanceHint) parts.push(`倾向：${stanceHint}`);
-  return parts.join("｜").slice(0, 600);
+  if (addressUser) parts.push(`称呼用户：${addressUser}`);
+  if (boundaries.length) parts.push(`边界：${boundaries.join("；")}`);
+  return parts.join("｜").slice(0, 900);
 }
 
 /**
@@ -66,6 +75,11 @@ function personaSummary(doc) {
     coverImageUrl: doc.coverImageUrl || "",
     tags: Array.isArray(doc.tags) ? doc.tags : [],
     styleDescriptor: styleDescriptorOf(doc.name, doc.style),
+    // 开场白 / 示例对话：数字人第一句用 greeting，聊天链路把 examples 当 few-shot（companion.service.personaExampleMessages）
+    greeting: String(doc.style?.greeting || ""),
+    examples: Array.isArray(doc.style?.examples)
+      ? doc.style.examples.slice(0, 8).map((e) => ({ user: String(e?.user || ""), reply: String(e?.reply || "") }))
+      : [],
     voice: serializeVoiceSettings(doc.voice),
     price: Number(doc.price || 0),
     shared: !!doc.shared,
