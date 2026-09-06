@@ -58,6 +58,7 @@ z.object 默认 strip，塞进去会被丢掉。★ 这条靠的是 strip 语义
   modelUrl?, genPrompt?,                       // 3D 建模指针 / 生成蓝图
   realPerson?,                                 // 真人声明（布尔），见下
   views?: [{ url, kind, note? }],              // 形象参考图（0~3 张），见下
+  portrait?: { assetId, scope, note, boundAt }, // 肖像授权绑定（只有卡主读得到），见下
   published?, publishedAt?, description?,      // 分享到创意工坊
   createdAt }
 // imageTier?  —— 客户端 Card 上有，服务端**目前不存**，见下面单独一节
@@ -173,7 +174,7 @@ z.object 默认 strip，塞进去会被丢掉。★ 这条靠的是 strip 语义
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| PATCH | `/api/branch/cards/:cardId` | required | 改自己的一张卡，body `{ views }`（**必填**，其余字段一律 strip）。返回 `{ ok, card }`；卡不在（别人的 / 只存在于本地）→ 404 |
+| PATCH | `/api/branch/cards/:cardId` | required | 改自己的一张卡：body 至少一个字段 `{ views?, name?, summary?, tags?, realPerson?, portrait? }`（**定向 $set，不带的字段一律不动**；空对象 400；未声明的字段 strip）。`portrait: { assetId, note? }` = 绑上肖像授权、`portrait: null` = 解绑（`$unset`）；`assetId` 认不出 → 400。返回 `{ ok, card }`；卡不在（别人的 / 只存在于本地）→ 404 |
 
 ★ **为什么不能复用 `POST /cards`**：那条是**新增**语义，controller 用的是
 `$setOnInsert`（"已存在的字段一个不动"）。拿它去改卡会 201 得漂漂亮亮、库里一个字节
@@ -184,6 +185,20 @@ z.object 默认 strip，塞进去会被丢掉。★ 这条靠的是 strip 语义
 ★ `views` 必填而不是可选：可选的话，一个拼错字段名的调用会拿到 200 +「改好了」，
 而库里什么都没发生。客户端必须 await 并把失败显示出来（`data/cardViews.ts` 不吞错）——
 全 app 没有任何地方监听 `emitApiError`，fire-and-forget 在这里等于静默丢数据。
+
+#### `portrait` —— 肖像授权绑定（2026-09-05 加）
+
+真人卡做完方舟肖像授权后拿到的可信素材 id（`asset-20260905120000-ab12c`，出片时拼成
+`asset://<id>` 当参考图发，绕开人脸审核）。**属于账号，不属于卡**：
+
+- 只出现在**卡主自己**的 `GET /cards` 与 PATCH 回执里；`GET /cards/shared`、`GET /cards/:cardId`、
+  `POST /cards/:cardId/install` 的回执与装到别人名下的那份**一律不带**——资产绑死在平台的火山账号下、
+  背后是某个真人的授权，跟着卡走出去等于替被授权人做了一个他没同意的授权。
+- 缺省 = 没绑过（读侧判否定）；解绑是 `$unset`，不会留下空对象。
+- 为什么要存服务端（此前只在 app 本机 IndexedDB 侧库）：换机 / 重装 / 并排装 debug 包再登录，卡从服务端
+  回来了、绑定却没有，用户看到的是「退出再登录，授权就失效了」。app 侧库现在是它的本机镜像：
+  登录时以服务端为准装回（`account.syncCardAssets`），本机独有的补传上去。用例钉在 server 的
+  `branchAssetPublish.spec.js` A16。
 
 ⚠ **`hot` 不是热度**。它是客户端发上来的种子值（`mock/ai.ts` 里手打的 18 个数字），
 没有任何东西会去加它。真热度看下面的「卡片/卡组的互动与热度」。保留这个字段只为向下兼容。

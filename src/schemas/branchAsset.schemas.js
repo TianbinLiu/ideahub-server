@@ -154,6 +154,16 @@ const updateCardBody = z
     // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
     //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。
     realPerson: z.boolean().optional(),
+    // ★ 肖像授权绑定（2026-09-05）：{ assetId, note? } = 绑上、null = 解绑、不带 = 不动。
+    //   assetId 的形状与 app 的 data/cardAsset.ASSET_ID_RE 同源（方舟资产 id：asset-时间戳-短串），
+    //   收得不算太紧 —— 真错了方舟出片那一刻会回 400 asset not found，那一句才是权威判据。
+    portrait: z
+      .object({
+        assetId: z.string().trim().regex(/^asset-\d{8,14}-[A-Za-z0-9]{3,16}$/, "invalid asset id"),
+        note: z.string().trim().max(200).optional(),
+      })
+      .nullable()
+      .optional(),
   })
   // ★ 空对象要 400，不能"成功但什么都没改"（与作品的 updateBody 同一条）
   .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });

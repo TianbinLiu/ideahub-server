@@ -11,6 +11,17 @@ const { CARD_TYPES } = require("../schemas/branchAsset.schemas");
 // 多图参考的子文档形状与 BranchDeck 的快照共用同一份（见那个文件的文件头）
 const { cardViewSchema } = require("./cardView.schema");
 
+// 肖像授权绑定的子文档（字段释义见下面 portrait 那条注释）
+const portraitSchema = new mongoose.Schema(
+  {
+    assetId: { type: String, required: true, trim: true, maxlength: 64 },
+    scope: { type: String, enum: ["private", "public"], default: "private" },
+    note: { type: String, default: "", trim: true, maxlength: 200 },
+    boundAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const branchCardSchema = new mongoose.Schema(
   {
     owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
@@ -45,6 +56,19 @@ const branchCardSchema = new mongoose.Schema(
      *    补了就是同一条规则的第二处实现，两边一旦分叉，用户看到的参考图和真正喂给
      *    AI 的参考图会不是同一批，而这种偏差在结果里根本看不出来。 */
     views: { type: [cardViewSchema], default: [] },
+    /**
+     * 肖像授权绑定（方舟可信素材 `asset://<id>`）—— **随账号走，不随卡走**（2026-09-05）。
+     * ★★ 为什么放在服务端：这条绑定原来只在 app 的本机侧库（IndexedDB）里 —— "授权给的是
+     *   这个账号"，却落在"这一台设备的这一个安装"上。换机 / 重装 / 并排装了 debug 包再登录，
+     *   卡从服务端回来了、绑定却没有，用户读到的是「退出再登录，授权就失效了」（2026-09-05
+     *   主人真机）。app 侧库现在只是它的本机镜像（登录时以这一份为准装回去）。
+     * ★★ 只有卡主自己读得到：toCardPayload（我的列表 / PATCH 回执）带它；
+     *   toSharedCardPayload（广场）与 installCard（装到别人名下）**刻意不带** —— 资产绑死在
+     *   平台的火山账号下、背后是某个真人的肖像授权，跟着卡走出去就是替被授权人做了一个
+     *   他没同意的授权（与 realPerson 卡不许发布是同一条产品决定）。
+     * ★ 缺省 undefined = 没绑过（读侧判否定，老文档没有这个字段）。解绑是 $unset，不是写空对象。
+     */
+    portrait: { type: portraitSchema, default: undefined },
 
     // ── 发布到创意工坊（与 BranchDeck 同一套语义）──
     /**

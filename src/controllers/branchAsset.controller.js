@@ -135,6 +135,18 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     idLine: doc.idLine || "",
     // 真人声明：老文档没有这个字段 → false（与"声明过不是"同义，读侧判否定）
     realPerson: doc.realPerson === true,
+    // ★ 肖像授权绑定只在**卡主自己**这份回执里（toSharedCardPayload / installCard 刻意不带，
+    //   理由见 models/BranchCard.js 的 portrait）。老文档没有 → 不发这个键（读侧判否定）
+    ...(doc.portrait && doc.portrait.assetId
+      ? {
+          portrait: {
+            assetId: doc.portrait.assetId,
+            scope: doc.portrait.scope || "private",
+            note: doc.portrait.note || "",
+            boundAt: doc.portrait.boundAt,
+          },
+        }
+      : {}),
     // ★ 老卡这里是空数组。**不在服务端补"拿 cover 当唯一一张图"** —— 那份归一
     //   只在 app 的 viewsOf() 一处做（理由见 models/BranchCard.js 的字段注释）。
     views: shareableViews(doc.views),
@@ -453,7 +465,23 @@ async function updateCard(req, res, next) {
     // 真人声明只在这次真给了布尔时才动：PATCH 是定向 $set，不带 = 保留库里原值。
     // （当前客户端不发它；schema 里声明是留门，见 schemas 里 updateCardBody 的注释）
     if (typeof req.body.realPerson === "boolean") $set.realPerson = req.body.realPerson;
-    const doc = await BranchCard.findOneAndUpdate({ owner, cardId }, { $set }, { new: true }).lean();
+    // 肖像授权绑定：对象 = 绑上（整份替换，boundAt 取现在）、null = 解绑（$unset，不留空对象）、
+    // 不带 = 不动。只收 assetId/note，scope 服务端钉 private（public 那条产品上还没开）
+    const $unset = {};
+    if (req.body.portrait === null) $unset.portrait = 1;
+    else if (req.body.portrait && typeof req.body.portrait === "object") {
+      $set.portrait = {
+        assetId: req.body.portrait.assetId,
+        scope: "private",
+        note: typeof req.body.portrait.note === "string" ? req.body.portrait.note : "",
+        boundAt: new Date(),
+      };
+    }
+    // 空的 $set / $unset 不发：老版本 Mongo 对空操作符整句拒（"'$set' is empty"）
+    const update = {};
+    if (Object.keys($set).length) update.$set = $set;
+    if (Object.keys($unset).length) update.$unset = $unset;
+    const doc = await BranchCard.findOneAndUpdate({ owner, cardId }, update, { new: true }).lean();
     if (!doc) notFound("card not found");
 
     res.json({ ok: true, card: toCardPayload(doc) });
@@ -853,6 +881,8 @@ function findAuthoritativeCard(cardId) {
 /** 分享出去的卡长什么样：私有字段（如设备本地的 modelUrl）在这里被剥掉 */
 function toSharedCardPayload(doc, stats = EMPTY_STATS) {
   if (!doc) return null;
+  // ⚠ portrait（肖像授权绑定）**刻意不在**这份里：它属于卡主的账号，不随分享/安装走
+  //   （models/BranchCard.js 的 portrait 注释）。加字段时别顺手把它"统一"进来。
   return {
     _id: doc._id,
     id: doc.cardId,

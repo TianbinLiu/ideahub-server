@@ -930,6 +930,54 @@ describe("卡片/卡组发布到创意工坊", () => {
     expect(both.body.card.views).toHaveLength(2);
   });
 
+  test("A16 肖像授权绑定随账号走：PATCH 存得下、我的列表读得回、广场与安装都不带、null 解绑", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const card = cardOf({ name: "绑过授权的卡" });
+    await addCards(author.token, [card]).expect(201);
+    const patch = (token, body) =>
+      request(app).patch(`/api/branch/cards/${card.cardId}`).set("Authorization", `Bearer ${token}`).send(body);
+
+    // 绑上：回执带 portrait，别的字段一个不动（定向 $set）
+    const bound = await patch(author.token, { portrait: { assetId: "asset-20260905120000-ab12c", note: "本人授权" } }).expect(200);
+    expect(bound.body.card.portrait).toMatchObject({ assetId: "asset-20260905120000-ab12c", scope: "private", note: "本人授权" });
+    expect(bound.body.card.name).toBe("绑过授权的卡");
+
+    // ★★ 我的列表读得回 —— 换台设备 / 重装 / 重新登录靠的就是这一跳（原来只在 app 本机侧库里）
+    const listed = await auth(request(app).get("/api/branch/cards"), author.token).expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).portrait.assetId).toBe("asset-20260905120000-ab12c");
+
+    // 只改名字不许把绑定清掉（与 A15 的 views 同一条：定向 $set）
+    const renamed = await patch(author.token, { name: "改了名" }).expect(200);
+    expect(renamed.body.card.portrait.assetId).toBe("asset-20260905120000-ab12c");
+
+    // ★★ 广场与装到别人名下都**不带**：绑定属于卡主的账号，不是卡的内容属性
+    await auth(request(app).post(`/api/branch/cards/${card.cardId}/publish`), author.token).send({}).expect(200);
+    const shared = await request(app).get("/api/branch/cards/shared").expect(200);
+    expect(shared.body.cards.find((c) => c.cardId === card.cardId).portrait).toBeUndefined();
+    const one = await request(app).get(`/api/branch/cards/${card.cardId}`).expect(200);
+    expect(one.body.card.portrait).toBeUndefined();
+    const installed = await auth(request(app).post(`/api/branch/cards/${card.cardId}/install`), taker.token).expect(201);
+    expect(installed.body.card.portrait).toBeUndefined();
+    const takerList = await auth(request(app).get("/api/branch/cards"), taker.token).expect(200);
+    expect(takerList.body.cards.find((c) => c.cardId === card.cardId).portrait).toBeUndefined();
+    // 装走的人给自己那份绑一个，不会碰到原主那份
+    await patch(taker.token, { portrait: { assetId: "asset-20260905130000-zz9yx" } }).expect(200);
+    const authorAgain = await auth(request(app).get("/api/branch/cards"), author.token).expect(200);
+    expect(authorAgain.body.cards.find((c) => c.cardId === card.cardId).portrait.assetId).toBe("asset-20260905120000-ab12c");
+
+    // 认不出的 id 一律 400（不是悄悄存一个出片必 400 的串）；别人的卡 404
+    await patch(author.token, { portrait: { assetId: "not-an-asset" } }).expect(400);
+    await patch((await registerUser()).token, { portrait: { assetId: "asset-20260905120000-ab12c" } }).expect(404);
+
+    // null = 解绑（$unset）：键整个消失，别的字段仍不动
+    const unbound = await patch(author.token, { portrait: null }).expect(200);
+    expect(unbound.body.card.portrait).toBeUndefined();
+    expect(unbound.body.card.name).toBe("改了名");
+    const afterUnbind = await auth(request(app).get("/api/branch/cards"), author.token).expect(200);
+    expect(afterUnbind.body.cards.find((c) => c.cardId === card.cardId).portrait).toBeUndefined();
+  });
+
   test("A15b 空 PATCH 是 400（不是成功但什么都没改）；超长一律 400；别人的卡 404", async () => {
     const author = await registerUser();
     const stranger = await registerUser();
