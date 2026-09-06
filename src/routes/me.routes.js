@@ -94,7 +94,7 @@ router.post("/avatar", requireAuth, upload.single('avatar'), async (req, res, ne
     const user = await User.findByIdAndUpdate(
       req.user._id,
       { $set: { avatarUrl } },
-      { new: true, runValidators: true }
+      { returnDocument: "after", runValidators: true }
     ).select('username displayName bio avatarUrl role createdAt');
 
     res.json({ ok: true, user, avatarUrl });
@@ -136,7 +136,7 @@ router.put("/profile", requireAuth, async (req, res, next) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $set: updates },
-      { new: true, runValidators: true }
+      { returnDocument: "after", runValidators: true }
     ).select('username displayName bio avatarUrl role createdAt');
 
     res.json({ ok: true, user });

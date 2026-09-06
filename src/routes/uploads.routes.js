@@ -31,6 +31,8 @@ const {
   clipTransform,
   // 直传要在服务端拼 public_id，落点必须与归属判据认的那个 folder 是**同一个字符串**
   TEMPLATE_VIDEO_FOLDER,
+  WORKSHOP_MEDIA_FOLDER,
+  ownWorkshopMediaPublicId,
 } = require("../utils/templateVideoAsset");
 
 // ★ 上传此前**一个限流器都没有**（2026-08-14 复查发现）：每一发都真实占用
@@ -141,7 +143,7 @@ router.post("/media", requireAuth, uploadLimit, uploadMedia.single("media"), asy
       mediaUrl = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           {
-            folder: "ideahub/workshop-media",
+            folder: WORKSHOP_MEDIA_FOLDER,
             public_id: `${req.user._id.toString()}-${Date.now()}`,
             resource_type: resourceType,
             // ★★ SDK 默认 60s（2026-09-05 主人真机：发布成片回「Server error」，Cloudinary 上
@@ -179,6 +181,109 @@ router.post("/media", requireAuth, uploadLimit, uploadMedia.single("media"), asy
       mimeType: req.file.mimetype,
       size: req.file.size,
       resourceType,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── 发布成片：签名直传 Cloudinary + 分块（2026-09-06 加）──────────────────────
+//
+// ★★ 为什么 /media 那条老路不够（2026-09-06 主人真机）：发布一条作品时，6 张图几秒钟就传完了，
+//   10.3MB 的成片却在 180 秒的客户端上限里连一个字节都没到 Node（pm2 里没有那一跳的任何日志）。
+//   老路是 **整份 multipart 经 Cloudflare → nginx 收完整个 body → Node 再同步等 Cloudinary 吃完**：
+//   CF 对源站的 125 秒读超时、nginx 的整体缓冲、Node 里 100 秒的 upload_stream 三段串在一起，
+//   慢网上任何一段慢一点就整发作废，而且是**整份从头再来**。模板视频 2026-08-22 已经为同一个
+//   原因改走了直传（见下面「直传 Cloudinary」那一大段 ★★★），成片这条路只是当时没一起改。
+// ★ 与模板那套完全同形（同一份 DIRECT_UPLOAD_CHUNK_BYTES、同一条 public_id 由服务端签死、
+//   同一条「元数据以服务端向 Cloudinary 取回为准」），只有两点不同：
+//   ① 目录是 WORKSHOP_MEDIA_FOLDER（与老路落点同一个字符串，回收那套照常认得出）；
+//   ② 格式收 mp4 / webm / mov（剪辑页 MediaRecorder 导出的是 webm，方舟那条 mp4/mov 的白名单不适用），
+//      体积上限放到 100MB —— 老路的 20MB 是 multer 内存缓冲 + 那三段串行超时逼出来的，直传没有这两条。
+// ★ 老路 `POST /media` **保留不删**：装在用户手机上的旧版 App 只认它。
+const DIRECT_MEDIA_FORMATS = ["mp4", "webm", "mov"];
+const MAX_DIRECT_MEDIA_BYTES = 100 * 1024 * 1024;
+/** 每次都打一发 Cloudinary Admin API（免费档全局 500 次/小时），与模板 confirm 同一个量级 */
+const mediaConfirmLimit = userRateLimit({ max: 5, windowMs: 60 * 1000, scope: "uploads:mediaConfirm" });
+
+router.post("/media/sign", requireAuth, uploadLimit, async (req, res, next) => {
+  try {
+    const { cloud_name, api_key, api_secret } = cloudinary.config();
+    if (!cloud_name || !api_key || !api_secret) {
+      return res.status(503).json({ ok: false, message: "服务器还没配好视频存储，暂时不能上传。" });
+    }
+    // public_id 在这里生成，形状必须与 ownWorkshopMediaPublicId 的 `^<userId>-\d+$` 完全吻合
+    const publicId = `${WORKSHOP_MEDIA_FOLDER}/${req.user._id.toString()}-${Date.now()}`;
+    const timestamp = Math.round(Date.now() / 1000);
+    // ★ 与模板那张票同一份签名纪律：overwrite:false（防事后原地换内容）、allowed_formats（防拿 /video 的票往 /raw 传任意文件）
+    const params = {
+      allowed_formats: DIRECT_MEDIA_FORMATS.join(","),
+      overwrite: false,
+      public_id: publicId,
+      timestamp,
+    };
+    const signature = cloudinary.utils.api_sign_request(params, api_secret);
+    res.json({
+      ok: true,
+      uploadUrl: `https://api.cloudinary.com/v1_1/${cloud_name}/video/upload`,
+      publicId,
+      params: { ...params, api_key, signature },
+      chunkBytes: DIRECT_UPLOAD_CHUNK_BYTES,
+      maxSizeBytes: MAX_DIRECT_MEDIA_BYTES,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 直传完成后的服务端验收：客户端只报 public_id，地址 / 体积 / 格式都以 Cloudinary 那份为准
+router.post("/media/confirm", requireAuth, mediaConfirmLimit, async (req, res, next) => {
+  try {
+    const raw = String(req.body?.publicId ?? "").slice(0, 300);
+    const publicId = ownWorkshopMediaPublicId(raw, req.user._id.toString());
+    if (!publicId) {
+      return res.status(400).json({ ok: false, message: "这段成片不是本账号传的（或者地址被改过），不能用来发布。" });
+    }
+    let resource;
+    try {
+      resource = await cloudinary.api.resource(publicId, { resource_type: "video" });
+    } catch (e) {
+      const code = e?.error?.http_code ?? e?.http_code;
+      if (code === 404) {
+        return res.status(404).json({
+          ok: false,
+          message: "没在服务器上找到这段成片——多半是上传没真的完成（中途断了）。请重试一次。",
+        });
+      }
+      console.error(`[uploads] 成片直传验收取资源失败 public_id=${publicId}:`, e?.message || e);
+      return res.status(502).json({ ok: false, message: "视频存储暂时取不到这段成片的信息，请稍后重试。" });
+    }
+    const format = String(resource?.format || "").toLowerCase();
+    const bytes = Number(resource?.bytes) || 0;
+    const issue = !DIRECT_MEDIA_FORMATS.includes(format)
+      ? `成片只收 ${DIRECT_MEDIA_FORMATS.join(" / ")} 格式，这份是 ${format || "未知格式"}。`
+      : bytes > MAX_DIRECT_MEDIA_BYTES
+        ? `成片最大 ${Math.round(MAX_DIRECT_MEDIA_BYTES / 1024 / 1024)}MB（这份约 ${Math.round(bytes / 1024 / 1024)}MB），请先压小再传。`
+        : null;
+    if (issue) {
+      // 验收不过就回收：不回收的话每一次被拒的上传都永久占着配额（零症状）。成片没有第二种引用，直接删
+      try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
+      } catch (e) {
+        console.error(`[uploads] 成片直传验收不过、回收失败 public_id=${publicId}:`, e?.message || e);
+      }
+      return res.status(400).json({ ok: false, message: issue });
+    }
+    console.log(`[uploads] 成片直传验收通过 user=${req.user._id} public_id=${publicId} bytes=${bytes} format=${format}`);
+    res.json({
+      ok: true,
+      mediaUrl: resource.secure_url,
+      publicId: resource.public_id,
+      bytes,
+      duration: Number(resource?.duration) || 0,
+      width: Number(resource?.width) || 0,
+      height: Number(resource?.height) || 0,
+      maxSizeBytes: MAX_DIRECT_MEDIA_BYTES,
     });
   } catch (err) {
     next(err);
@@ -502,7 +607,7 @@ router.post("/material-video/register", requireAuth, materialRegisterLimit, asyn
         width: meta.width,
         height: meta.height,
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
     );
     res.json({ ok: true, url: doc.url, durationSec: doc.durationSec });
   } catch (err) {

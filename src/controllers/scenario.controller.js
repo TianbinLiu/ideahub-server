@@ -819,7 +819,7 @@ async function playScenario(req, res, next) {
               messages: [],
             },
           },
-          { new: true, upsert: true, setDefaultsOnInsert: true }
+          { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
         );
       } catch (e) {
         if (e && e.code === 11000) {

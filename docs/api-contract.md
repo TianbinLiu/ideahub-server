@@ -1008,6 +1008,22 @@ UI 把它显示出来 —— 「删了个寂寞」必须有症状。
 上传口的话，一段 3 分钟的素材连传都传不上来，而它裁出来的 8 秒完全合格 —— 用户根本没法开始。
 App 侧 `src/api/uploads.ts` 的预检是省用户一次白传的**镜像**，改窗口两边一起改。
 
+### 发布成片直传（`POST /api/uploads/media/sign` + `/confirm`，2026-09-06）
+
+发布作品时的成片（剪辑页导出的 webm/mp4）不再整份经服务器：客户端先 `POST /api/uploads/media/sign`
+拿票（`{ uploadUrl, publicId, params, chunkBytes, maxSizeBytes }`，形状与 `/template-video/sign` 完全一致），
+按 `chunkBytes` 分块直传 `api.cloudinary.com`，再 `POST /api/uploads/media/confirm { publicId }` 验收，
+回 `{ ok, mediaUrl, publicId, bytes, duration, width, height }`，作品里 `segments[].videoUrl` 填 `mediaUrl`。
+
+- 为什么：老路 `POST /uploads/media` 是整份 multipart 经 Cloudflare（125 秒读超时）→ nginx 收完整个
+  body → Node 同步等 Cloudinary（100 秒），慢网上 10MB 级成片经常一个字节都到不了 Node，而客户端只能
+  在 180 秒上限上放弃（2026-09-06 真机）。分块直传后每块各自超时、断了只重传那一块。
+- 安全面与模板直传同一套：`public_id` 服务端生成并签进签名（目录 `ideahub/workshop-media`，形状
+  `<userId>-<ts>`，归属判据 `ownWorkshopMediaPublicId`）、`overwrite:false`、`allowed_formats=mp4,webm,mov`、
+  元数据以服务端 `api.resource` 取回为准；验收不过（格式 / 超过 100MB）当场 destroy 并 400。
+- 限流：`/sign` 走 uploads 通用桶（20/分），`/confirm` 5/分（每发打一次 Admin API）。
+- 老路 `POST /uploads/media` 保留（旧版 App 只认它，上限仍 20MB）；新版 App 在 `/sign` 回 404 时退回老路。
+
 ### 素材上传与回收
 
 #### 默认路：客户端签名直传 Cloudinary + 分块（2026-08-22 起）

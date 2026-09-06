@@ -840,7 +840,7 @@ async function submitRecommendationFeedback(req, res, next) {
     const feedback = await IdeaRecommendationFeedback.findOneAndUpdate(
       { user: req.user._id, idea: id },
       { $set: { reason } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     ).lean();
 
     res.json({ ok: true, feedback });

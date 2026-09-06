@@ -60,7 +60,7 @@ async function debitUser(userId, amount) {
   const updated = await User.findOneAndUpdate(
     { _id: userId, points: { $gte: amount } },
     { $inc: { points: -amount } },
-    { new: true }
+    { returnDocument: "after" }
   )
     .select("points")
     .lean();
@@ -72,7 +72,7 @@ async function debitUser(userId, amount) {
  * @returns {Promise<number|null>} 入账后余额；用户不存在 → null
  */
 async function creditUser(userId, amount) {
-  const updated = await User.findOneAndUpdate({ _id: userId }, { $inc: { points: amount } }, { new: true })
+  const updated = await User.findOneAndUpdate({ _id: userId }, { $inc: { points: amount } }, { returnDocument: "after" })
     .select("points")
     .lean();
   return updated ? Number(updated.points) : null;

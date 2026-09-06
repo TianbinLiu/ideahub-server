@@ -83,7 +83,7 @@ async function upsertScheme(req, res) {
   const doc = await PromptScheme.findOneAndUpdate(
     { ownerId: req.user._id, schemeId: b.schemeId },
     { $set, $setOnInsert: { ownerId: req.user._id, schemeId: b.schemeId, published: false } },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
+    { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
   ).lean();
   res.status(201).json({ ok: true, scheme: toSchemePayload(doc) });
 }
@@ -149,7 +149,7 @@ async function publishScheme(req, res) {
   const doc = await PromptScheme.findOneAndUpdate(
     { ownerId: req.user._id, schemeId: req.params.schemeId },
     { $set: { published: true, ...(own.publishedAt ? {} : { publishedAt: new Date() }) } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (!doc) return res.status(404).json({ ok: false, error: "scheme not found" });
   res.json({ ok: true, scheme: toSchemePayload(doc) });
@@ -160,7 +160,7 @@ async function unpublishScheme(req, res) {
   const doc = await PromptScheme.findOneAndUpdate(
     { ownerId: req.user._id, schemeId: req.params.schemeId },
     { $set: { published: false } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (!doc) return res.status(404).json({ ok: false, error: "scheme not found" });
   res.json({ ok: true, scheme: toSchemePayload(doc) });
