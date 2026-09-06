@@ -10,7 +10,7 @@ async function pickOneJob() {
   return AiJob.findOneAndUpdate(
     { status: "pending", attempts: { $lt: MAX_ATTEMPTS } },
     { $set: { status: "running", startedAt: new Date() }, $inc: { attempts: 1 } },
-    { new: true }
+    { returnDocument: "after" }
   );
 }
 

@@ -481,7 +481,7 @@ async function updateCard(req, res, next) {
     const update = {};
     if (Object.keys($set).length) update.$set = $set;
     if (Object.keys($unset).length) update.$unset = $unset;
-    const doc = await BranchCard.findOneAndUpdate({ owner, cardId }, update, { new: true }).lean();
+    const doc = await BranchCard.findOneAndUpdate({ owner, cardId }, update, { returnDocument: "after" }).lean();
     if (!doc) notFound("card not found");
 
     res.json({ ok: true, card: toCardPayload(doc) });

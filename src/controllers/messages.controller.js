@@ -175,7 +175,7 @@ async function sendMessageRequest(req, res, next) {
           respondedAt: null,
           responseMessage: null,
         },
-        { new: true }
+        { returnDocument: "after" }
       );
       request = await request.populate("fromUserId", "username displayName avatarUrl");
       request = await request.populate("toUserId", "username displayName avatarUrl");
@@ -635,7 +635,7 @@ async function blockDmUser(req, res, next) {
     await DmRequestBlock.findOneAndUpdate(
       { blockerUserId, blockedUserId: userId },
       { $set: { blockerUserId, blockedUserId: userId } },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: "after" }
     );
 
     await MessageRequest.updateMany(

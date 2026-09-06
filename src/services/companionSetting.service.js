@@ -86,7 +86,7 @@ async function updateCompanionSetting({ userId, req, patch }) {
     $set.voice = patch.voice === null ? null : await expandVoiceInput(patch.voice, userId);
   }
   if (Object.keys($set).length) {
-    await CompanionSetting.findOneAndUpdate({ user: userId }, { $set, $setOnInsert: { user: userId } }, { upsert: true, new: true });
+    await CompanionSetting.findOneAndUpdate({ user: userId }, { $set, $setOnInsert: { user: userId } }, { upsert: true, returnDocument: "after" });
   }
   return loadCompanionSetup({ userId, req });
 }

@@ -91,7 +91,7 @@ async function markOneRead(req, res, next) {
     const item = await Notification.findOneAndUpdate(
       { _id: id, userId, readAt: null },
       { $set: { readAt: new Date() } },
-      { new: true }
+      { returnDocument: "after" }
     ).lean();
 
     res.json({ ok: true, item });

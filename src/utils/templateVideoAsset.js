@@ -29,15 +29,31 @@ function ownBaseRe(userId) {
  * @returns {string|null} 归一化后的 public_id（不带扩展名）；null = 不是
  */
 function ownTemplateVideoPublicId(rawPublicId, userId) {
+  return ownFolderPublicId(rawPublicId, userId, TEMPLATE_VIDEO_FOLDER);
+}
+
+/**
+ * 发布成片的托管目录：`POST /uploads/media` 老路与直传新路（/media/sign + /confirm）都落这里，
+ * public_id 形状同模板视频（`${userId}-${Date.now()}`），所以 RECYCLABLE_FOLDERS 那套回收照常认得出。
+ */
+const WORKSHOP_MEDIA_FOLDER = "ideahub/workshop-media";
+
+/** 「本账号直传到成片目录」的归属判据（与模板视频同一条严格形状，见 ownBaseRe 的 ★） */
+function ownWorkshopMediaPublicId(rawPublicId, userId) {
+  return ownFolderPublicId(rawPublicId, userId, WORKSHOP_MEDIA_FOLDER);
+}
+
+/** 两个目录共用的一份实现：folder 后正好一个 `${userId}-${ts}` 段，别的形状一律 null */
+function ownFolderPublicId(rawPublicId, userId, folder) {
   const publicId = String(rawPublicId || "").slice(0, 300);
-  const marker = `${TEMPLATE_VIDEO_FOLDER}/`;
+  const marker = `${folder}/`;
   if (!publicId.startsWith(marker)) return null;
   const base = publicId.slice(marker.length);
   // folder 后必须正好一个文件段（多一层斜杠 = 伪造的形状，不是我们生成的）
   if (!base || base.includes("/")) return null;
   const clean = base.replace(/\.[A-Za-z0-9]+$/, "");
   if (!ownBaseRe(userId).test(clean)) return null;
-  return `${TEMPLATE_VIDEO_FOLDER}/${clean}`;
+  return `${folder}/${clean}`;
 }
 
 /**
@@ -270,6 +286,8 @@ module.exports = {
   ownedRecyclableAsset,
   TEMPLATE_VIDEO_FOLDER,
   ownTemplateVideoPublicId,
+  WORKSHOP_MEDIA_FOLDER,
+  ownWorkshopMediaPublicId,
   parseOwnTemplateVideoUrl,
   ownedCloudinaryAsset,
   clipTransform,

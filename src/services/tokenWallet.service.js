@@ -64,7 +64,7 @@ async function ensureWallet(userId, now = new Date()) {
         tokenWallet: { plan: planOf(DEFAULT_PLAN_ID).monthlyTokens, addon: 0, planId: DEFAULT_PLAN_ID, cycle },
       },
     },
-    { new: true },
+    { returnDocument: "after" },
   )
     .select(SELECT)
     .lean();
@@ -82,7 +82,7 @@ async function ensureWallet(userId, now = new Date()) {
   const rolled = await User.findOneAndUpdate(
     { _id: userId, "tokenWallet.cycle": cur.tokenWallet.cycle },
     { $set: { "tokenWallet.plan": grant, "tokenWallet.cycle": cycle } },
-    { new: true },
+    { returnDocument: "after" },
   )
     .select(SELECT)
     .lean();
@@ -155,7 +155,7 @@ async function debit(userId, amount, memo = "", now = new Date()) {
     //   （"Cannot pass an array to query updates unless the `updatePipeline` option is set"）。
     //   漏了它不是静默降级，是直接抛 —— 但抛在这一层会被 500 兜住，看起来像"服务器炸了"，
     //   完全看不出是扣费那一步。
-    { new: true, updatePipeline: true },
+    { returnDocument: "after", updatePipeline: true },
   )
     .select(SELECT)
     .lean();
@@ -174,7 +174,7 @@ async function credit(userId, amount, reason, memo = "", now = new Date()) {
   const n = toTokens(amount);
   if (n === null || n === 0) return getWallet(userId, now);
   await ensureWallet(userId, now);
-  const updated = await User.findOneAndUpdate({ _id: userId }, { $inc: { "tokenWallet.addon": n } }, { new: true })
+  const updated = await User.findOneAndUpdate({ _id: userId }, { $inc: { "tokenWallet.addon": n } }, { returnDocument: "after" })
     .select(SELECT)
     .lean();
   if (!updated) return null;
@@ -220,7 +220,7 @@ async function buyPlan(userId, planId, now = new Date()) {
       $inc: { "tokenWallet.plan": plan.monthlyTokens },
       $set: { "tokenWallet.planId": plan.id, "tokenWallet.cycle": currentCycle(now) },
     },
-    { new: true },
+    { returnDocument: "after" },
   )
     .select(SELECT)
     .lean();

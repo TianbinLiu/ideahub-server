@@ -324,7 +324,7 @@ async function installModel(req, res, next) {
     }
     let downloadCount = Number(doc?.stats?.downloadCount || 0);
     if (created) {
-      const updated = await Live2dModel.findByIdAndUpdate(doc._id, { $inc: { "stats.downloadCount": 1 } }, { new: true }).select("stats").lean();
+      const updated = await Live2dModel.findByIdAndUpdate(doc._id, { $inc: { "stats.downloadCount": 1 } }, { returnDocument: "after" }).select("stats").lean();
       downloadCount = Number(updated?.stats?.downloadCount || downloadCount + 1);
     }
     res.json({ ok: true, installed: true, downloadCount });
@@ -339,7 +339,7 @@ async function uninstallModel(req, res, next) {
     const removed = await Live2dModelInstall.deleteOne({ user: req.user._id, model: doc._id });
     let downloadCount = Number(doc?.stats?.downloadCount || 0);
     if (removed.deletedCount) {
-      const updated = await Live2dModel.findByIdAndUpdate(doc._id, { $inc: { "stats.downloadCount": -1 } }, { new: true }).select("stats").lean();
+      const updated = await Live2dModel.findByIdAndUpdate(doc._id, { $inc: { "stats.downloadCount": -1 } }, { returnDocument: "after" }).select("stats").lean();
       downloadCount = Math.max(0, Number(updated?.stats?.downloadCount || 0));
     }
     res.json({ ok: true, installed: false, downloadCount });

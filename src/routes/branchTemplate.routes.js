@@ -1045,7 +1045,7 @@ router.post(
           $or: [{ status: "pending" }, { status: "claimed", claimedAt: { $lt: staleBefore } }],
         },
         { $set: { status: "claimed", claimedAt: now } },
-        { new: true },
+        { returnDocument: "after" },
       );
       if (!claimed) {
         // 抢输了（另一发刚刚认领/刚刚取完）。重读一次照实说，别猜
@@ -1589,7 +1589,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
         $or: [{ detectingAt: { $exists: false } }, { detectingAt: null }, { detectingAt: { $lt: new Date(now - DETECT_LOCK_MS) } }],
       },
       { $set: { detectingAt: now } },
-      { new: true },
+      { returnDocument: "after" },
     ).lean();
     if (!claimed) {
       return res.status(409).json({
@@ -1696,7 +1696,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
         update.$unset = { markBoxes: "", markBoxAtSec: "" };
       }
     }
-    const saved = await BranchTemplate.findByIdAndUpdate(found._id, update, { new: true }).lean();
+    const saved = await BranchTemplate.findByIdAndUpdate(found._id, update, { returnDocument: "after" }).lean();
 
     // ★ 三档结果都要说清楚：全成 / 有角色位没框 / 一个都没认出来。
     //   不说的话作者只能靠"面板怎么不出现"去猜，而那与"功能坏了"长得一模一样。

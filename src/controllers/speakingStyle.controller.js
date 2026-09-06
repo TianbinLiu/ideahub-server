@@ -155,7 +155,7 @@ async function generate(req, res, next) {
     };
 
     const doc = await SpeakingProfile.findOneAndUpdate({ user: userId }, update, {
-      new: true,
+      returnDocument: "after",
       upsert: true,
       setDefaultsOnInsert: true,
     }).lean();

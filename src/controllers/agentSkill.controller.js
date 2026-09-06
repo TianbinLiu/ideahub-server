@@ -57,7 +57,7 @@ async function upsertSkill(req, res) {
   const doc = await AgentSkill.findOneAndUpdate(
     { ownerId: req.user._id, skillId: b.skillId },
     { $set, $setOnInsert: { ownerId: req.user._id, skillId: b.skillId, published: false } },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
+    { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
   ).lean();
   res.status(201).json({ ok: true, skill: toSkillPayload(doc) });
 }
@@ -119,7 +119,7 @@ async function publishSkill(req, res) {
   const doc = await AgentSkill.findOneAndUpdate(
     { ownerId: req.user._id, skillId: req.params.skillId },
     { $set: { published: true, ...(own.publishedAt ? {} : { publishedAt: new Date() }) } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (!doc) return res.status(404).json({ ok: false, error: "skill not found" });
   res.json({ ok: true, skill: toSkillPayload(doc) });
@@ -130,7 +130,7 @@ async function unpublishSkill(req, res) {
   const doc = await AgentSkill.findOneAndUpdate(
     { ownerId: req.user._id, skillId: req.params.skillId },
     { $set: { published: false } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (!doc) return res.status(404).json({ ok: false, error: "skill not found" });
   res.json({ ok: true, skill: toSkillPayload(doc) });

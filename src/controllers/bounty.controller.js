@@ -409,7 +409,7 @@ async function updateBounty(req, res, next) {
       const bumped = await Bounty.findOneAndUpdate(
         { _id: id, refundedAt: null },
         { $set, $inc: { escrowPoints: diff } },
-        { new: true }
+        { returnDocument: "after" }
       ).lean();
       if (!bumped) {
         // 窄竞态：补扣成功的同时悬赏被结算了 → 把刚扣的原样退回，别把用户的点数吞在一个终态悬赏里
@@ -427,7 +427,7 @@ async function updateBounty(req, res, next) {
       const claimed = await Bounty.findOneAndUpdate(
         { _id: id, refundedAt: null, escrowPoints: { $gte: -diff } },
         { $set, $inc: { escrowPoints: diff } },
-        { new: true }
+        { returnDocument: "after" }
       ).lean();
       if (!claimed) badRequest("托管点数状态已变化，请刷新后重试");
       await refundEscrowToPoster({
@@ -646,7 +646,7 @@ async function approveSubmission(res, id, sid) {
       },
     ],
     // updatePipeline: true —— mongoose 9 要求显式声明"这个 update 是聚合管道"，不写会直接抛错
-    { new: true, updatePipeline: true }
+    { returnDocument: "after", updatePipeline: true }
   )
     .select("reward slots approvedCount escrowPoints refundedAt")
     .lean();
@@ -691,7 +691,7 @@ async function rejectSubmission(res, id, sid) {
   const rejected = await BountySubmission.findOneAndUpdate(
     { _id: sid, bounty: id, status: { $ne: "approved" } },
     { $set: { status: "rejected" } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
 
   if (!rejected) {

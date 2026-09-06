@@ -185,7 +185,7 @@ async function createLeaderboard(req, res, next) {
     const board = await TagLeaderboard.findOneAndUpdate(
       { tagsKey },
       { $set: updateData },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: "after" }
     );
 
     res.json({ ok: true, _id: board._id, tags, tagsKey, entriesCount: entries.length });

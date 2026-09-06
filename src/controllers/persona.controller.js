@@ -676,7 +676,7 @@ async function equipPersona(req, res, next) {
       await PersonaEquip.findOneAndUpdate(
         { user: req.user._id },
         { $set: { persona: null } },
-        { new: true, upsert: true, setDefaultsOnInsert: true }
+        { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
       );
       return res.json({ ok: true, equipped: null });
     }
@@ -709,7 +709,7 @@ async function equipPersona(req, res, next) {
     await PersonaEquip.findOneAndUpdate(
       { user: req.user._id },
       { $set: { persona: personaId } },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
+      { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
     );
 
     const populated = await Persona.findById(personaId).populate("author", "_id username").lean();
