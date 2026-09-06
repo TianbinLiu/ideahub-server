@@ -11,6 +11,8 @@ const CODES = require("../utils/errorCodes");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
 const bundle = require("../services/live2dBundle.service");
 const market = require("../services/live2dMarket.service");
+// 能力档案（模型会什么）与 companion.json 映射（对到我们的动作 / 表情 / 触摸槽）
+const caps = require("../services/live2dCapabilities.service");
 const { checkPersonaAccess } = require("../services/personaAccess.service");
 // 「音频」板块的写入口：完整 VoiceSettings 或 { templateId }（从声音市场的模板展开成快照）
 const { expandVoiceInput } = require("../services/voiceTemplate.service");
@@ -106,9 +108,10 @@ async function listModels(req, res, next) {
       const rows = await Live2dModelInstall.find({ user: user._id }).select("model").lean();
       filter._id = { $in: rows.map((r) => r.model) };
       // 收藏过但作者已取消分享的：作者本人还能看到，别人看不到（死链过滤，与人格同款）
-      filter.$or = [{ shared: true }, { author: user._id }];
+      filter.$or = [{ shared: true, takenDown: { $ne: true } }, { author: user._id }];
     } else {
       filter.shared = true;
+      filter.takenDown = { $ne: true }; // 运营下架的不进市场（作者在 scope=mine 里仍看得到）
     }
     if (q) {
       const re = new RegExp(escapeRegex(q), "i");
@@ -152,6 +155,7 @@ async function getModel(req, res, next) {
     if (!doc) notFound("Live2D model not found");
     const user = req.user || null;
     const isOwner = !!user && market.authorIdOf(doc) === String(user._id);
+    if (doc.takenDown && !isOwner) notFound("Live2D model not found"); // 下架 = 对外不存在
     if (!doc.shared && !isOwner) forbidden("This model is private");
     await Live2dModel.updateOne({ _id: doc._id }, { $inc: { "stats.viewCount": 1 } });
     doc.stats = { ...(doc.stats || {}), viewCount: Number(doc?.stats?.viewCount || 0) + 1 };
@@ -173,7 +177,14 @@ async function createModel(req, res, next) {
     installed = await bundle.installBundle(req.file.buffer, {
       rootRelativeDir: `live2d-market/${String(req.user._id)}`,
       originalName: req.file.originalname,
+      entry: body.entry || "",
     });
+    // 映射：向导给了就按能力档案校验（引用的动作组 / 表情 / 命中区必须真的在包里），没给就自动映射；
+    // 写成包里 model3.json 旁边的 companion.json，运行时按相对路径读，没这个文件的老包行为不变
+    const mapped = body.mapping
+      ? caps.validateMapping(body.mapping, installed.capabilities)
+      : { mapping: caps.suggestMapping(installed.capabilities), warnings: [] };
+    await bundle.writeCompanionJson(installed.modelJsonPath, mapped.mapping);
     const doc = await Live2dModel.create({
       author: req.user._id,
       name: body.name,
@@ -188,11 +199,45 @@ async function createModel(req, res, next) {
       persona: personaId,
       voice,
       shared: Boolean(body.shared),
+      capabilities: installed.capabilities,
+      mapping: mapped.mapping,
+      license: { selfMade: Boolean(body.selfMade), agreedAt: body.selfMade ? new Date() : null },
     });
     const populated = await Live2dModel.findById(doc._id).populate("author", "_id username").populate("persona").lean();
-    res.status(201).json({ ok: true, model: market.toLive2dModelPayload(populated, req, { viewerId: req.user._id }) });
+    res.status(201).json({
+      ok: true,
+      model: market.toLive2dModelPayload(populated, req, { viewerId: req.user._id }),
+      warnings: [...installed.warnings, ...mapped.warnings],
+      entries: installed.entries,
+    });
   } catch (err) {
     if (installed) await bundle.removeBundleDir(installed.bundleDir);
+    next(err);
+  }
+}
+
+/**
+ * 只看不存（向导第 3 步）：解到临时目录 → 入口候选 / 能力档案 / 自动映射 / 完成度 / 警告，返回前删目录。
+ * multipart：bundle=zip（≤25MB）+ 可选 entry（多个 model3.json 时指定哪个）
+ */
+async function inspectModel(req, res, next) {
+  try {
+    if (!req.file) badRequest("Upload the Live2D bundle (.zip) as the `bundle` field");
+    const entry = String((req.body && req.body.entry) || "").trim().slice(0, 300);
+    const result = await bundle.inspectBundleBuffer(req.file.buffer, { originalName: req.file.originalname, entry });
+    const mapping = caps.suggestMapping(result.capabilities);
+    res.json({
+      ok: true,
+      entries: result.entries,
+      entry: result.entry,
+      capabilities: result.capabilities,
+      mapping,
+      completeness: caps.completenessOf(mapping, result.capabilities),
+      warnings: result.warnings,
+      bundleBytes: result.bytes,
+      fileCount: result.files,
+    });
+  } catch (err) {
     next(err);
   }
 }
@@ -213,11 +258,23 @@ async function updateModel(req, res, next) {
     if (body.shared !== undefined) doc.shared = Boolean(body.shared);
     if (body.personaId !== undefined) doc.persona = body.personaId === null ? null : await resolvePersonaBinding(body.personaId, req.user);
     if (body.voice !== undefined) doc.voice = body.voice === null ? null : await expandVoiceInput(body.voice, req.user._id);
+    if (body.selfMade !== undefined) doc.license = { selfMade: Boolean(body.selfMade), agreedAt: body.selfMade ? new Date() : null };
+    let warnings = [];
+    if (body.mapping !== undefined) {
+      // 老数据没有能力档案：按已落盘的入口文件补一次（不改文件）
+      if (!doc.capabilities) doc.capabilities = (await bundle.reinspect(doc.modelJsonPath)).capabilities;
+      const mapped = body.mapping === null
+        ? { mapping: caps.suggestMapping(doc.capabilities), warnings: [] }
+        : caps.validateMapping(body.mapping, doc.capabilities);
+      doc.mapping = mapped.mapping;
+      warnings = mapped.warnings;
+      await bundle.writeCompanionJson(doc.modelJsonPath, mapped.mapping);
+    }
     await doc.save();
 
     const populated = await Live2dModel.findById(doc._id).populate("author", "_id username").populate("persona").lean();
     const ctx = await loadUserContext(req.user, [populated]);
-    res.json({ ok: true, model: payloadWith(populated, req, req.user, ctx) });
+    res.json({ ok: true, model: payloadWith(populated, req, req.user, ctx), warnings });
   } catch (err) {
     next(err);
   }
@@ -316,4 +373,4 @@ async function toggleLike(req, res, next) {
   }
 }
 
-module.exports = { listModels, getModel, createModel, updateModel, removeModel, installModel, uninstallModel, toggleLike, toTags };
+module.exports = { listModels, getModel, inspectModel, createModel, updateModel, removeModel, installModel, uninstallModel, toggleLike, toTags };

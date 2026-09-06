@@ -22,6 +22,12 @@ const personaStyleSchema = new mongoose.Schema(
     catchphrases: { type: [String], default: [] },
     stats: { type: [personaStatSchema], default: [] },
     stanceHint: { type: String, default: "", maxlength: 500 },
+    // 2026-09-05 人格向导新增（全部可选）：语气 / 称呼用户 / 开场白 / 示例对话（few-shot）/ 该人格自己的边界
+    tone: { type: String, default: "", maxlength: 300 },
+    addressUser: { type: String, default: "", maxlength: 60 },
+    greeting: { type: String, default: "", maxlength: 300 },
+    examples: { type: [new mongoose.Schema({ user: { type: String, maxlength: 300 }, reply: { type: String, maxlength: 300 } }, { _id: false })], default: [] },
+    boundaries: { type: [String], default: [] },
   },
   { _id: false }
 );
@@ -37,6 +43,8 @@ const personaSchema = new mongoose.Schema(
     tags: { type: [String], default: [] },
     style: { type: personaStyleSchema, default: () => ({}) },
     shared: { type: Boolean, default: false, index: true },
+    // 运营下架（举报处置）：true 时市场不列、他人不可用、作者也不能再公开；作者自己的列表里仍能看到并带标记
+    takenDown: { type: Boolean, default: false },
     // 售价（虚拟点数，整数；0=免费）。>0 时其他用户需购买（PersonaPurchase）才能
     // 【选用】：绑进情景 / 装备。收藏（install）保持免费——那只是书签。
     // 私有人格存价无意义但无害：只在 shared 时展示与生效。

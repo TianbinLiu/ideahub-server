@@ -33,6 +33,8 @@ const FACES = ["normal", "happy", "laughing", "angry", "sad", "crying", "shy", "
 const ACTIONS = ["none", "acknowledge", "disagree", "think", "explain", "excited", "wave", "shy", "surprised", "comfort", "playful"];
 const EMOTIONS = ["neutral", "happy", "excited", "sad", "angry", "shy", "surprised", "tease", "comfort"];
 
+const { aiChatStream } = require("./aiClient");
+
 const DEFAULT_NAME = "小梦";
 
 /**
@@ -183,4 +185,101 @@ function emotionParams(emotion) {
   }
 }
 
-module.exports = { FACES, ACTIONS, EMOTIONS, DEFAULT_NAME, buildSystemPrompt, parseTags, createSentenceSplitter, ttsParamsFor };
+/** 回复上限：人设要求 1～3 句，600 token 足够；再大就是模型跑偏，早点截断省钱也省前端排队 */
+const MAX_REPLY_TOKENS = 600;
+
+/**
+ * 人格卡里的示例对话（style.examples）→ few-shot 轮次，插在 system 之后、真实历史之前。
+ * 助手那一侧若没带演出标签就补一个中性标签：模型看到没标签的示范会学着不打标签，前端就解析不到表情。
+ * @param {{examples?: {user: string, reply: string}[]}|null} persona personaSummary 或人格草稿的 style
+ */
+function personaExampleMessages(persona, { max = 6 } = {}) {
+  const examples = Array.isArray(persona && persona.examples) ? persona.examples : [];
+  const out = [];
+  for (const ex of examples.slice(0, max)) {
+    const user = String((ex && ex.user) || "").trim();
+    const reply = String((ex && ex.reply) || "").trim();
+    if (!user || !reply) continue;
+    out.push({ role: "user", content: user });
+    out.push({ role: "assistant", content: /^\s*\[/.test(reply) ? reply : `[neutral][face:normal][action:none] ${reply}` });
+  }
+  return out;
+}
+
+/**
+ * 把一次 LLM 流式回复按 SSE 推给前端：sentence / token / done / error 四种事件（形状见 companion.routes.js 文件头）。
+ * 首页看板娘 /api/companion/chat 与人格向导的试聊 /api/personas/preview-chat 共用这一份；
+ * 客服 /api/support/chat 因为多了 [handoff] 前缀解析仍是自己的一份（见 support.routes.js）。
+ * @param {object} opts
+ * @param {import("express").Response} opts.res
+ * @param {{role: string, content: string}[]} opts.messages 已含 system（与 few-shot）的完整消息列表
+ * @param {string} [opts.ttsInstruct] 人设语调，前置到每句的 tts.instruct
+ * @param {string} [opts.tag] 日志 / error 事件里的前缀
+ */
+async function streamCompanionReply({ res, messages, ttsInstruct = "", maxTokens = MAX_REPLY_TOKENS, temperature = 0.8, tag = "companion" }) {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  let closed = false;
+  const send = (event, data) => {
+    if (closed) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const abort = new AbortController();
+  // ★ 必须监听 res 而不是 req 的 close：Node ≥16 里 IncomingMessage 的 'close' 在请求体读完就触发
+  //   （不是连接断开），挂在 req 上会在第一句话还没生成时就把上游 abort 掉、所有事件静默丢弃 —— 表现为
+  //   HTTP 200 + 空 body。res 的 'close' 在正常 end() 之后也会触发，所以要用 writableFinished 区分"客户端跑了"。
+  res.on("close", () => {
+    if (res.writableFinished) return;
+    closed = true;
+    abort.abort();
+  });
+
+  let index = 0;
+  const plainParts = [];
+  const splitter = createSentenceSplitter((sentence) => {
+    const p = parseTags(sentence);
+    if (!p.text) return; // 纯标签、没正文：不念也不演
+    plainParts.push(p.text);
+    send("sentence", { index: index++, ...p, tts: ttsParamsFor(p.emotion, ttsInstruct) });
+  });
+
+  try {
+    const stream = aiChatStream(messages, { maxTokens, temperature, signal: abort.signal });
+    for await (const delta of stream) {
+      if (closed) break;
+      splitter.push(delta);
+      send("token", { t: delta });
+    }
+    splitter.flush();
+    send("done", { text: plainParts.join(" ") });
+  } catch (e) {
+    // 客户端主动断开时 abort 会抛错，这不是故障，静默收场即可；其余照实告诉前端并记日志
+    if (!closed) {
+      console.error(`[${tag}] stream failed:`, (e && e.message) || e);
+      send("error", { message: `${tag} upstream failed` });
+    }
+  } finally {
+    closed = true;
+    res.end();
+  }
+}
+
+module.exports = {
+  FACES,
+  ACTIONS,
+  EMOTIONS,
+  DEFAULT_NAME,
+  MAX_REPLY_TOKENS,
+  buildSystemPrompt,
+  parseTags,
+  createSentenceSplitter,
+  ttsParamsFor,
+  personaExampleMessages,
+  streamCompanionReply,
+};

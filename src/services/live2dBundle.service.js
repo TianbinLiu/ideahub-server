@@ -20,6 +20,7 @@ const multer = require("multer");
 const AdmZip = require("adm-zip");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
+const { extractCapabilities } = require("./live2dCapabilities.service");
 
 const UPLOADS_ROOT = path.join(__dirname, "..", "..", "uploads");
 const MAX_BUNDLE_SIZE_BYTES = 25 * 1024 * 1024;
@@ -96,10 +97,36 @@ function buildPublicUrl(req, absoluteFilePath) {
   return publicUrlFor(req, relativeToUploads(absoluteFilePath));
 }
 
-function findModelEntryFile(files) {
-  const normalized = files.map((filePath) => filePath.split(path.sep).join("/"));
-  const preferredPatterns = [/\.model3\.json$/i, /\/index\.json$/i, /\.model\.json$/i, /\.json$/i];
+/** 包里所有 model3.json（posix 路径，按名字排序）—— 多个时让上传者在 /inspect 的 entries 里选 */
+function listModelEntryCandidates(files) {
+  return files
+    .map((filePath) => filePath.split(path.sep).join("/"))
+    .filter((f) => /\.model3\.json$/i.test(f))
+    .sort();
+}
 
+/** 候选入口相对包根的 posix 路径（给客户端显示 / 回传 entry 用） */
+function entriesRelative(bundleDirAbs, files) {
+  const root = bundleDirAbs.split(path.sep).join("/").replace(/\/+$/, "");
+  return listModelEntryCandidates(files).map((f) => (f.startsWith(root + "/") ? f.slice(root.length + 1) : f));
+}
+
+/**
+ * 选入口文件：优先上传者指定的 entry（必须是候选之一），否则按名字排序的第一个 model3.json；
+ * 没有 model3.json 时沿用老的宽松级联（index.json / *.model.json / 任意 .json）—— Cubism 2 包靠它拿到"这是 Cubism 2"的报错。
+ * 返回 posix 风格路径（与 files 同基准）；找不到 → ""
+ */
+function findModelEntryFile(files, preferred = "") {
+  const candidates = listModelEntryCandidates(files);
+  if (preferred) {
+    const want = String(preferred).replace(/\\/g, "/").replace(/^\/+/, "");
+    const hit = candidates.find((c) => c === want || c.endsWith(`/${want}`));
+    if (!hit) throw validationError(`The requested entry is not a model3.json inside the bundle: ${preferred}`);
+    return hit;
+  }
+  if (candidates.length) return candidates[0];
+  const normalized = files.map((filePath) => filePath.split(path.sep).join("/"));
+  const preferredPatterns = [/\/index\.json$/i, /\.model\.json$/i, /\.json$/i];
   for (const pattern of preferredPatterns) {
     const found = normalized.find((filePath) => {
       if (!pattern.test(filePath)) return false;
@@ -107,11 +134,8 @@ function findModelEntryFile(files) {
       if (/model_list\.json$/i.test(filePath)) return false;
       return true;
     });
-    if (found) {
-      return found;
-    }
+    if (found) return found;
   }
-
   return "";
 }
 
@@ -211,6 +235,15 @@ async function inspectModel3Json(absoluteEntryPath) {
   await fs.access(mocPath).catch(() => {
     throw validationError(`The moc3 file referenced by model3.json is missing: ${moc}`);
   });
+  // Cubism 3/4/5 的 moc3 前 4 字节固定是 "MOC3"；改了后缀的别的东西（或者损坏的包）到这里就挡住，别等用户装完看到空舞台
+  const head = Buffer.alloc(4);
+  const fh = await fs.open(mocPath, "r");
+  try {
+    await fh.read(head, 0, 4, 0);
+  } finally {
+    await fh.close();
+  }
+  if (head.toString("ascii") !== "MOC3") throw validationError("The .moc3 file is not a valid Cubism moc3 (bad MOC3 header)");
   const textures = Array.isArray(refs.Textures) ? refs.Textures.filter((t) => typeof t === "string") : [];
   if (!textures.length) throw validationError("model3.json lists no textures");
   for (const tex of textures) {
@@ -219,28 +252,77 @@ async function inspectModel3Json(absoluteEntryPath) {
       throw validationError(`A texture referenced by model3.json is missing: ${tex}`);
     });
   }
-  return { moc, textures };
+  return { moc, textures, json, entryAbs: absoluteEntryPath };
+}
+
+/**
+ * 只看不存：解到临时目录 → 入口候选 → 校验 → 能力档案，返回前把目录删掉。向导第 3 步用。
+ * @returns {Promise<{ entries: string[], entry: string, capabilities: object, warnings: string[], bytes: number, files: number }>}
+ */
+async function inspectBundleBuffer(buffer, { originalName = "bundle.zip", entry = "" } = {}) {
+  const tmpAbs = path.join(UPLOADS_ROOT, "tmp-inspect", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeSlug(originalName)}`);
+  try {
+    const { bytes, files } = await extractZipToDirectory(buffer, tmpAbs);
+    const all = await walkFiles(tmpAbs);
+    const chosen = findModelEntryFile(all, entry);
+    if (!chosen) throw validationError("No Live2D model json file was found in the uploaded bundle");
+    const entryAbs = chosen.replace(/\//g, path.sep);
+    const inspected = await inspectModel3Json(entryAbs);
+    const { capabilities, warnings } = await extractCapabilities(inspected.json, entryAbs);
+    const entries = entriesRelative(tmpAbs, all);
+    return { entries, entry: entriesRelative(tmpAbs, [chosen])[0] || entries[0] || "", capabilities, warnings, bytes, files };
+  } finally {
+    await removeDirectoryIfExists(tmpAbs);
+  }
+}
+
+/** 老数据没有 capabilities：按已落盘的入口文件重新提取（不改文件） */
+async function reinspect(modelJsonPathRel) {
+  const entryAbs = path.join(UPLOADS_ROOT, ...String(modelJsonPathRel).split("/"));
+  const inspected = await inspectModel3Json(entryAbs);
+  return extractCapabilities(inspected.json, entryAbs);
+}
+
+const COMPANION_JSON = "companion.json";
+/**
+ * 把映射写成 model3.json 旁边的 companion.json（运行时按 new URL("companion.json", modelJsonUrl) 读）；
+ * mapping 为 null → 删文件。返回相对 uploads/ 的 posix 路径（删除时为 ""）。
+ */
+async function writeCompanionJson(modelJsonPathRel, mapping) {
+  const entryAbs = path.join(UPLOADS_ROOT, ...String(modelJsonPathRel).split("/"));
+  const target = path.join(path.dirname(entryAbs), COMPANION_JSON);
+  if (!mapping) {
+    await fs.rm(target, { force: true });
+    return "";
+  }
+  await fs.writeFile(target, JSON.stringify(mapping, null, 1), "utf8");
+  return relativeToUploads(target);
 }
 
 /**
  * 一条龙：解压 → 找入口 → 校验 model3.json。失败时目录已清理。
  * @returns {{ bundleDir: string, modelJsonPath: string, bytes: number, files: number }} 路径都是相对 uploads/ 的 posix 路径
  */
-async function installBundle(buffer, { rootRelativeDir, originalName }) {
+async function installBundle(buffer, { rootRelativeDir, originalName, entry = "" }) {
   const bundleDirName = `${Date.now()}-${safeSlug(originalName)}`;
   const bundleDirAbs = path.join(UPLOADS_ROOT, ...rootRelativeDir.split("/"), bundleDirName);
   await removeDirectoryIfExists(bundleDirAbs);
   try {
     const { bytes, files } = await extractZipToDirectory(buffer, bundleDirAbs);
-    const entry = findModelEntryFile(await walkFiles(bundleDirAbs));
-    if (!entry) throw validationError("No Live2D model json file was found in the uploaded bundle");
-    const entryAbs = entry.replace(/\//g, path.sep);
-    await inspectModel3Json(entryAbs);
+    const all = await walkFiles(bundleDirAbs);
+    const chosen = findModelEntryFile(all, entry);
+    if (!chosen) throw validationError("No Live2D model json file was found in the uploaded bundle");
+    const entryAbs = chosen.replace(/\//g, path.sep);
+    const inspected = await inspectModel3Json(entryAbs);
+    const { capabilities, warnings } = await extractCapabilities(inspected.json, entryAbs);
     return {
       bundleDir: relativeToUploads(bundleDirAbs),
       modelJsonPath: relativeToUploads(entryAbs),
       bytes,
       files,
+      capabilities,
+      warnings,
+      entries: entriesRelative(bundleDirAbs, all),
     };
   } catch (err) {
     await removeDirectoryIfExists(bundleDirAbs);
@@ -268,6 +350,11 @@ module.exports = {
   publicUrlFor,
   buildPublicUrl,
   findModelEntryFile,
+  listModelEntryCandidates,
+  inspectBundleBuffer,
+  reinspect,
+  writeCompanionJson,
+  COMPANION_JSON,
   extractZipToDirectory,
   inspectModel3Json,
   installBundle,

@@ -9,8 +9,9 @@
  * API端点:
  * @endpoint GET    /            - 广场列表（?page&limit&sort=new|hot&q&tag&scope=all|installed|mine）；scope=all 第一页最前面是官方内置条目
  * @endpoint GET    /:id         - 详情（$inc viewCount）；"official-mascot" 回官方内置条目
- * @endpoint POST   /            - 上传（multipart：bundle=zip ≤25MB + name/description/coverImageUrl/tags/shared/personaId/voice(JSON)）
- * @endpoint PUT    /:id         - 作者改元数据 / 换绑人格 / 改推荐嗓子（JSON）
+ * @endpoint POST   /inspect     - 只看不存（向导第 3 步）：bundle=zip → { entries, entry, capabilities, mapping(自动), completeness, warnings }；按用户 10 次/分钟
+ * @endpoint POST   /            - 上传（multipart：bundle=zip ≤25MB + name/description/coverImageUrl/tags/shared/personaId/voice(JSON) + mapping(JSON, companion.json 内容，缺省自动映射) + entry + selfMade）；回包多 warnings / entries
+ * @endpoint PUT    /:id         - 作者改元数据 / 换绑人格 / 改推荐嗓子 / 改映射 mapping（对象 = 校验后重写 companion.json，null = 恢复自动映射）/ selfMade（JSON）
  * @endpoint DELETE /:id         - 作者删除：连解压目录、收藏、点赞一起删；正在用它的用户回到官方看板娘
  * @endpoint POST   /:id/install / DELETE /:id/install - 收藏下载（downloadCount）
  * @endpoint POST   /:id/like    - 点赞开关
@@ -18,6 +19,7 @@
  * ★ 上传顺序：requireAuth → 按用户限流（5 次/分钟，解压是 CPU + 磁盘活）→ multer 收 zip → zod 校验文本字段 → 控制器。
  *   zod 必须排在 multer 之后：multipart 的文本字段要 multer 解析完才在 req.body 里。
  * ★ 解压白名单 / zip-bomb 记账 / model3.json 校验都在 services/live2dBundle.service.js，与 /api/me/components/live2d/upload 同一份。
+ * ★ 能力档案（动作组 / 表情 / 命中区 / 参数 / 物理）与 companion.json 映射的提取、自动映射、校验在 services/live2dCapabilities.service.js（唯一实现，客户端不自己猜）。
  *
  * @uses {controllers/live2dModel.controller.js}
  * @uses {services/live2dBundle.service.js} - uploadLive2dBundle（multer）
@@ -41,6 +43,8 @@ router.post(
   validate({ body: createBody }),
   ctrl.createModel
 );
+// 只看不存：向导第 3 步用它拿能力档案 + 自动映射 + 入口候选（解到 uploads/tmp-inspect/ 临时目录，返回前删掉）
+router.post("/inspect", requireAuth, userRateLimit({ max: 10, scope: "live2d-inspect" }), uploadLive2dBundle.single("bundle"), ctrl.inspectModel);
 router.get("/:id", optionalAuth, ctrl.getModel);
 router.put("/:id", requireAuth, validate({ body: updateBody }), ctrl.updateModel);
 router.delete("/:id", requireAuth, ctrl.removeModel);

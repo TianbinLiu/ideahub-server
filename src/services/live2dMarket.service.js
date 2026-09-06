@@ -42,6 +42,10 @@ function officialModelPayload() {
     persona: null,
     voice: null,
     shared: true,
+    takenDown: false,
+    capabilities: null,
+    mapping: null,
+    license: null,
     stats: { viewCount: 0, downloadCount: 0, likeCount: 0 },
     installed: true,
     liked: false,
@@ -79,6 +83,11 @@ function toLive2dModelPayload(doc, req, ctx = {}) {
     persona: personaUsable ? personaSummary(personaDoc) : null,
     voice: serializeVoiceSettings(doc.voice),
     shared: !!doc.shared,
+    takenDown: !!doc.takenDown,
+    // 能力档案 / 我们协议层的映射 / 授权勾选（2026-09-05 创作中心）；老数据三者都是 null
+    capabilities: doc.capabilities || null,
+    mapping: doc.mapping || null,
+    license: doc.license ? { selfMade: !!doc.license.selfMade, agreedAt: doc.license.agreedAt || null } : null,
     stats: {
       viewCount: Number(doc?.stats?.viewCount || 0),
       downloadCount: Number(doc?.stats?.downloadCount || 0),
@@ -97,7 +106,7 @@ async function loadUsableModel(modelId, userId) {
   const id = String(modelId || "");
   if (!mongoose.isValidObjectId(id)) return null;
   const doc = await Live2dModel.findById(id).populate("author", "_id username").populate("persona").lean();
-  if (!doc) return null;
+  if (!doc || doc.takenDown) return null; // 下架的谁都不能用（作者也不行）：使用者退回官方
   if (!doc.shared && (!userId || authorIdOf(doc) !== String(userId))) return null;
   return doc;
 }
