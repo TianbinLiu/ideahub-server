@@ -38,6 +38,7 @@ const arkTransfer = require("../services/arkTransfer.service");
 const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
+const arkVideoTask = require("../services/arkVideoTask.service");
 const MaterialRefVideo = require("../models/MaterialRefVideo");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const { cloudinary } = require("../config/cloudinary");
@@ -163,6 +164,11 @@ function billedForward(kind, path, timeoutMs) {
       //   拿 null 去 create 会抛 ValidationError，而那时任务已受理、钱已扣。
       // ★ 落库失败不打断响应（任务已受理、钱已扣，此时 5xx 会让客户端误以为没受理去重试），
       //   但必须吼：追踪丢了 = 作者这一发试炼白跑，他会看到"出片成功却还是不能发布"。
+      // ★★ 视频任务受理即在服务端记一条（models/ArkVideoTask 的 ★★）：客户端那份凭据只在 localStorage，
+      //   App 被重启两次就可能把一发已经付过钱的成片弄丢；有了这条，冷启动 GET /video-tasks 就能补回凭据。
+      if (out.accepted && kind === "task") {
+        await arkVideoTask.recordVideoTask({ userId: req.user._id, body: req.body, responseText: out.text, r2v: req.r2v ?? null });
+      }
       if (out.accepted && req.r2v?.templateId) {
         try {
           const parsed = JSON.parse(out.text || "{}");
@@ -587,6 +593,19 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
       }
     }
     return res.status(status).type("application/json").send(out);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * GET /api/ark/video-tasks —— 这个账号最近 24 小时提交过的视频任务（服务端登记，见 models/ArkVideoTask）。
+ * App 冷启动拿它把本机不认识的任务补成「待取回」凭据；取回本身仍走 GET tasks/:id（不计费）。
+ * ★ 不计费、走轮询那个限流桶：它与轮询同一量级（冷启动一次、进创作入口一次）。
+ */
+router.get("/video-tasks", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    res.json({ ok: true, tasks: await arkVideoTask.listVideoTasks(req.user._id) });
   } catch (err) {
     return next(err);
   }
