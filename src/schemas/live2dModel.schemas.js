@@ -67,6 +67,10 @@ const createBody = z.object({
   mapping: mappingString,
   // 包里有多个 model3.json 时指定入口（相对包根的 posix 路径，来自 /inspect 的 entries）
   entry: z.string().trim().max(300).optional().default(""),
+  // 走签名直传时代替 bundle 文件：/bundle/sign 签出去的 public_id（归属由控制器校验）
+  bundleRef: z.string().trim().max(300).optional().default(""),
+  // 直传时原始文件名只有客户端知道（服务端拿到的是 <userId>-<ts>.zip），只做展示用
+  bundleName: z.string().trim().max(200).optional().default(""),
   // 授权勾选：我是作者或已获授权
   selfMade: boolString,
 });

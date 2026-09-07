@@ -13,6 +13,8 @@ const bundle = require("../services/live2dBundle.service");
 const market = require("../services/live2dMarket.service");
 // 能力档案（模型会什么）与 companion.json 映射（对到我们的动作 / 表情 / 触摸槽）
 const caps = require("../services/live2dCapabilities.service");
+const { LIVE2D_BUNDLE_FOLDER, ownLive2dBundlePublicId } = require("../utils/templateVideoAsset");
+const { cloudinaryReady, signDirectUpload } = require("../services/directUpload.service");
 const { checkPersonaAccess } = require("../services/personaAccess.service");
 // 「音频」板块的写入口：完整 VoiceSettings 或 { templateId }（从声音市场的模板展开成快照）
 const { expandVoiceInput } = require("../services/voiceTemplate.service");
@@ -168,15 +170,17 @@ async function getModel(req, res, next) {
 
 async function createModel(req, res, next) {
   let installed = null;
+  let bundleRef = "";
   try {
-    if (!req.file) badRequest("Upload the Live2D bundle (.zip) as the `bundle` field");
     const body = req.body;
     const personaId = await resolvePersonaBinding(body.personaId, req.user);
     // 嗓子也在解压之前定下来：模板不存在 / 私有会 404 / 403，别白解一个包
     const voice = await expandVoiceInput(body.voice, req.user._id);
-    installed = await bundle.installBundle(req.file.buffer, {
+    const got = await bundleBytesOf(req);
+    bundleRef = got.ref;
+    installed = await bundle.installBundle(got.buffer, {
       rootRelativeDir: `live2d-market/${String(req.user._id)}`,
-      originalName: req.file.originalname,
+      originalName: got.originalName,
       entry: body.entry || "",
     });
     // 映射：向导给了就按能力档案校验（引用的动作组 / 表情 / 命中区必须真的在包里），没给就自动映射；
@@ -193,7 +197,7 @@ async function createModel(req, res, next) {
       tags: toTags(body.tags),
       bundleDir: installed.bundleDir,
       modelJsonPath: installed.modelJsonPath,
-      bundleName: String(req.file.originalname || "").slice(0, 200),
+      bundleName: String(body.bundleName || (req.file && req.file.originalname) || "").slice(0, 200),
       bundleBytes: installed.bytes,
       fileCount: installed.files,
       persona: personaId,
@@ -213,7 +217,48 @@ async function createModel(req, res, next) {
   } catch (err) {
     if (installed) await bundle.removeBundleDir(installed.bundleDir);
     next(err);
+  } finally {
+    // 成功也好失败也好，直传的那份 zip 都不必再留：包已经解压落盘（或这次根本没成），
+    // 留着只占 Cloudinary 配额。失败时用户重来会重新出票，不会卡住。
+    await bundle.destroyDirectBundle(bundleRef);
   }
+}
+
+/**
+ * 出一张 zip 直传票（创作中心的 App 上传向导第 ③ 步用）。
+ * ★ 为什么 App 必须走直传而官网可以不走：25MB 的 multipart 经 Cloudflare 有 125 秒读超时，
+ *   手机 5G 上行实测 0.126MB/s ⇒ 老路真实上限约 15MB。详见 services/directUpload.service.js 的 ★★★。
+ * ★ 格式白名单只给 zip：这是把这张票钉死在 raw/zip 上的**唯一**手段（resource_type 不进签名）。
+ */
+async function signBundleUpload(req, res, next) {
+  try {
+    if (!cloudinaryReady()) {
+      return res.status(503).json({ ok: false, message: "服务器还没配好文件存储，暂时不能上传。" });
+    }
+    const publicId = `${LIVE2D_BUNDLE_FOLDER}/${req.user._id.toString()}-${Date.now()}`;
+    res.json({
+      ok: true,
+      ...signDirectUpload({ resourceType: "raw", publicId, allowedFormats: ["zip"], maxSizeBytes: bundle.MAX_BUNDLE_SIZE_BYTES }),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * 拿到 zip 的字节：要么是 multipart 直接传上来的（官网 / 小包），要么客户端只报一个 `bundleRef`
+ * （signBundleUpload 签出去的 public_id，文件已经直传到 Cloudinary）。
+ * ★ bundleRef 一律过归属校验再用：客户端能自选 public_id = 能读走别人的资产。
+ * @returns {Promise<{buffer: Buffer, originalName: string, ref: string}>} ref 非空 = 用完要回收的直传资产
+ */
+async function bundleBytesOf(req) {
+  if (req.file) return { buffer: req.file.buffer, originalName: String(req.file.originalname || "bundle.zip"), ref: "" };
+  const raw = String((req.body && req.body.bundleRef) || "").trim();
+  if (!raw) badRequest("Upload the Live2D bundle (.zip) as the `bundle` field, or pass `bundleRef` from /bundle/sign");
+  const ref = ownLive2dBundlePublicId(raw, String(req.user._id));
+  if (!ref) badRequest("这份模型包不是本账号传的（或者地址被改过），不能用。");
+  const buffer = await bundle.downloadDirectBundle(ref);
+  return { buffer, originalName: ref.split("/").pop(), ref };
 }
 
 /**
@@ -222,9 +267,11 @@ async function createModel(req, res, next) {
  */
 async function inspectModel(req, res, next) {
   try {
-    if (!req.file) badRequest("Upload the Live2D bundle (.zip) as the `bundle` field");
     const entry = String((req.body && req.body.entry) || "").trim().slice(0, 300);
-    const result = await bundle.inspectBundleBuffer(req.file.buffer, { originalName: req.file.originalname, entry });
+    // ★ inspect **不回收** bundleRef：紧接着的 createModel 还要用同一份直传资产（不然用户得再传一遍 25MB）。
+    //   用户看完能力档案就退出 = 那份 raw 资产留在 Cloudinary 上（每人每天最多 20 张票，损失有上限）。
+    const got = await bundleBytesOf(req);
+    const result = await bundle.inspectBundleBuffer(got.buffer, { originalName: got.originalName, entry });
     const mapping = caps.suggestMapping(result.capabilities);
     res.json({
       ok: true,
@@ -373,4 +420,4 @@ async function toggleLike(req, res, next) {
   }
 }
 
-module.exports = { listModels, getModel, inspectModel, createModel, updateModel, removeModel, installModel, uninstallModel, toggleLike, toTags };
+module.exports = { listModels, getModel, signBundleUpload, inspectModel, createModel, updateModel, removeModel, installModel, uninstallModel, toggleLike, toTags };

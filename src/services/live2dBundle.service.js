@@ -19,6 +19,9 @@ const path = require("path");
 const multer = require("multer");
 const AdmZip = require("adm-zip");
 const AppError = require("../utils/AppError");
+const axios = require("axios");
+const { cloudinary } = require("../config/cloudinary");
+const { directDeliveryUrl } = require("./directUpload.service");
 const CODES = require("../utils/errorCodes");
 const { extractCapabilities } = require("./live2dCapabilities.service");
 
@@ -337,6 +340,64 @@ async function removeBundleDir(relativeDir) {
   await removeDirectoryIfExists(abs);
 }
 
+/**
+ * 取回一份**签名直传**上来的模型包（App 走这条路：25MB 的 zip 过我们自己的服务器必被 Cloudflare 的
+ * 125 秒读超时掐断，理由见 services/directUpload.service.js 的 ★★★；官网桌面端仍走 multipart 老路）。
+ * ★ 走公开投递地址而不是 `cloudinary.api.resource()`：后者是 Admin API（免费档全局 500 次/小时），
+ *   而这一步挂在 inspect（10 次/分钟/人）后面，单个账号就能把全站 Admin 预算打空。理由见 directDeliveryUrl 的 ★。
+ * ★★ 体积闸必须在这里补回来：直传那条路上 **multer 不在链上**，`limits.fileSize` 这道闸自动消失了。
+ *   不补的话两条路的验收标准就不一样，而松的那条零症状 —— 一个几百 MB 的 zip 能进来，
+ *   直到解压记账时才在磁盘上炸。
+ * @param {string} publicIdWithExt 已经过归属校验的 public_id（带 .zip）
+ * @returns {Promise<Buffer>}
+ */
+async function downloadDirectBundle(publicIdWithExt) {
+  const url = directDeliveryUrl("raw", publicIdWithExt);
+  if (!url) throw new AppError({ code: CODES.SERVER_ERROR, status: 503, message: "服务器还没配好文件存储，暂时不能上传。" });
+  let res;
+  try {
+    res = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 60_000,
+      maxContentLength: MAX_BUNDLE_SIZE_BYTES,
+      maxBodyLength: MAX_BUNDLE_SIZE_BYTES,
+      // 404 交给下面翻成人话，别让 axios 抛一句「Request failed with status code 404」
+      validateStatus: (status) => status === 200 || status === 404,
+    });
+  } catch (e) {
+    const msg = String((e && e.message) || "");
+    if (/maxContentLength|maxBodyLength/i.test(msg)) {
+      throw validationError(`模型包超过 ${Math.round(MAX_BUNDLE_SIZE_BYTES / 1024 / 1024)}MB，传不了。`);
+    }
+    console.error(`[live2d] 取回直传模型包失败 public_id=${publicIdWithExt}:`, msg);
+    throw new AppError({ code: CODES.SERVER_ERROR, status: 502, message: "文件存储暂时取不到这份模型包，请稍后重试。" });
+  }
+  if (res.status === 404) {
+    throw validationError("没在服务器上找到这份模型包——多半是上传没真的完成（中途断了）。请重新选一次文件再传。");
+  }
+  const buffer = Buffer.from(res.data);
+  if (buffer.length > MAX_BUNDLE_SIZE_BYTES) {
+    throw validationError(`模型包超过 ${Math.round(MAX_BUNDLE_SIZE_BYTES / 1024 / 1024)}MB，传不了。`);
+  }
+  return buffer;
+}
+
+/**
+ * 用完就删：包已经解压落盘了，Cloudinary 上那份原样留着只是占配额（零症状，只有月底的用量报表知道）。
+ * ★★ raw 资产的 public_id **带扩展名**，destroy 也必须带 —— 不带的话 Cloudinary 回 not found，
+ *   而我们还以为删掉了。（本仓 2026-08-22 踩过同一个坑：三处 destroy 写死 resource_type:"video" 且不带扩展名，
+ *   于是误传进 raw 的资产我们自己永远回收不到。）
+ * ★ 失败只记日志不抛：回收失败不该让一次成功的上传变成失败。
+ */
+async function destroyDirectBundle(publicIdWithExt) {
+  if (!publicIdWithExt) return;
+  try {
+    await cloudinary.uploader.destroy(publicIdWithExt, { resource_type: "raw", invalidate: true });
+  } catch (e) {
+    console.error(`[live2d] 回收直传模型包失败 public_id=${publicIdWithExt}:`, (e && e.message) || e);
+  }
+}
+
 module.exports = {
   UPLOADS_ROOT,
   MAX_BUNDLE_SIZE_BYTES,
@@ -359,4 +420,6 @@ module.exports = {
   inspectModel3Json,
   installBundle,
   removeBundleDir,
+  downloadDirectBundle,
+  destroyDirectBundle,
 };
