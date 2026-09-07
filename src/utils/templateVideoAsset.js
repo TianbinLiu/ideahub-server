@@ -43,7 +43,28 @@ function ownWorkshopMediaPublicId(rawPublicId, userId) {
   return ownFolderPublicId(rawPublicId, userId, WORKSHOP_MEDIA_FOLDER);
 }
 
-/** 两个目录共用的一份实现：folder 后正好一个 `${userId}-${ts}` 段，别的形状一律 null */
+/**
+ * Live2D 模型包（创作中心的 zip 直传）的家。★ 它是 **raw** 资产，与上面两个 video 目录有一处关键不同：
+ *   Cloudinary 对 raw 会把**扩展名并进 public_id**（实测 `…-<ts>.zip`），而 destroy / 投递地址都要用
+ *   带扩展名的那一份。所以这里不复用 ownFolderPublicId（它会把扩展名剥掉），单写一条并**回带 .zip**。
+ * ★ 格式白名单已经把它钉死成 zip（见 services/directUpload.service.js 的 ★★③），所以扩展名只可能是 zip；
+ *   客户端报什么都不影响 —— 我们只按自己签出去的形状重建。
+ */
+const LIVE2D_BUNDLE_FOLDER = "ideahub/live2d-bundles";
+
+/** @returns {string|null} 带 `.zip` 的 public_id；null = 不是本账号直传到模型包目录的东西 */
+function ownLive2dBundlePublicId(rawPublicId, userId) {
+  const publicId = String(rawPublicId || "").slice(0, 300);
+  const marker = `${LIVE2D_BUNDLE_FOLDER}/`;
+  if (!publicId.startsWith(marker)) return null;
+  const base = publicId.slice(marker.length);
+  if (!base || base.includes("/")) return null;
+  const clean = base.replace(/\.zip$/i, "");
+  if (!ownBaseRe(userId).test(clean)) return null;
+  return `${LIVE2D_BUNDLE_FOLDER}/${clean}.zip`;
+}
+
+/** 两个 video 目录共用的一份实现：folder 后正好一个 `${userId}-${ts}` 段，别的形状一律 null */
 function ownFolderPublicId(rawPublicId, userId, folder) {
   const publicId = String(rawPublicId || "").slice(0, 300);
   const marker = `${folder}/`;
@@ -288,6 +309,8 @@ module.exports = {
   ownTemplateVideoPublicId,
   WORKSHOP_MEDIA_FOLDER,
   ownWorkshopMediaPublicId,
+  LIVE2D_BUNDLE_FOLDER,
+  ownLive2dBundlePublicId,
   parseOwnTemplateVideoUrl,
   ownedCloudinaryAsset,
   clipTransform,
