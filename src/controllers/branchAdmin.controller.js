@@ -20,6 +20,9 @@ const BranchLike = require("../models/BranchLike");
 const BranchDanmaku = require("../models/BranchDanmaku");
 const BranchCard = require("../models/BranchCard");
 const BranchCollect = require("../models/BranchCollect");
+// 工坊工程（画布快照）。★★ 新表**必须两处都落**：purgeVideo（删一条作品）与这里
+//   （删号）。漏了哪一处都零症状，模板那次就是这么漏的。
+const BranchProject = require("../models/BranchProject");
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
@@ -301,6 +304,8 @@ async function unbanUser(req, res, next) {
  *      但那边是同步 destroy、这边是欠账重试 —— 一个管理员操作不该被一次云端抖动挡住。
  *   ⑦.6 BranchCollect（他收藏别人的那些）→ deleteMany。别人收藏他作品的那些行
  *      随①的 purgeVideo 一起删。
+ *   ⑦.7 BranchProject（他留存的工坊工程画布）→ deleteMany（按 owner 兜底：
+ *      挂在还在的作品上的那些已随①删掉，这里收的是孤儿）。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
  *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
@@ -437,6 +442,12 @@ async function purgeUserCascade(userId) {
   // ⑦.6 他的收藏（关系表，纯私有数据）。⚠ 只删**他收藏别人的**那些；
   //     "别人收藏了他的作品"那些行随①的 purgeVideo 一起删掉了。
   removed.collects = (await BranchCollect.deleteMany({ user: uid })).deletedCount;
+
+  // ⑦.7 他留存的工坊工程（画布快照，纯私有数据）。
+  //     ⚠ 挂在他**还在的作品**上的那些已经随①的 purgeVideo 删掉了；这一句收的是
+  //     剩下的孤儿（作品早先被管理员删过、而工程当时没跟着走的历史数据）。
+  //     按 owner 兜底删干净，否则库里会留下一批谁也查不到、也再删不掉的画布。
+  removed.projects = (await BranchProject.deleteMany({ owner: uid })).deletedCount;
 
   // ⑧ 举报。
   // ★★ **儿童安全（csae）那些一条都不删** —— 这是删号权利的一个**法定义务例外**，

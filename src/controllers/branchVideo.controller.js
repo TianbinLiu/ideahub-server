@@ -23,14 +23,21 @@ const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
 const BranchCollect = require("../models/BranchCollect");
+// 工坊工程（画布快照）。这里只用于**级联删除**与回炉后对齐版次；
+// 读写端点在 controllers/branchProject.controller.js。
+const BranchProject = require("../models/BranchProject");
 const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurge.service");
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
 const { ownedRecyclableAsset, RECYCLABLE_FOLDERS } = require("../utils/templateVideoAsset");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
+// ★ 回炉的四种拒绝要带**自定义 code + 整句中文**（客户端按 code 分档、把 message 原样
+//   显示给用户），utils/http 那几个函数的 code 是固定枚举值，兜不住这四档
+const AppError = require("../utils/AppError");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
-// 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用
-const { shareableViews } = require("./branchAsset.controller");
+// 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用；
+// mapWithConcurrency 是仓里唯一一份"有上限的并发 map"，回炉给收藏者扇出通知时复用它
+const { shareableViews, mapWithConcurrency } = require("./branchAsset.controller");
 const { createNotification } = require("../services/notification.service");
 // @提及解析全仓只有这一份（ideas 那两个 controller 走同一个模块的另一个入口），
 // 别在这里另写一个正则、更别在这里另写一遍 span 的核对规则
@@ -180,17 +187,33 @@ async function transferSegment(ctx, segment, label) {
 }
 
 /**
- * 把整份草稿里的外链资源转存到 Cloudinary。
+ * 把 input 里的外链资源转存到 Cloudinary —— **只处理 input 里真的带了的那几个键**。
  * 串行执行：Cloudinary 有并发/速率限制，且缓存命中依赖前一次结果。
+ *
+ * ★★ 这是发布与回炉**共用的同一份实现**（铁律六）：发布走"四件都给"，
+ *   回炉走"给了哪几件处理哪几件"。抄一份的结果一定是其中一条路少收 aspect/videoTier
+ *   或少剥 realPerson 的 views，而且零报错。
+ * ★★ 返回值**只含真的处理过的键**，这一点是 PATCH 那条路的正确性关键：
+ *   `transferDraftAssets` 返回的是 `{cover, segments, branchTree, deck}` **整份重建**，
+ *   把它直接 `$set` 进一条「只改了 segments」的 PATCH，会拿到 `cover: ""`
+ *   （transferImage 对空值 `return ""`）和 `deck: undefined` —— 封面和卡组当场被清空，
+ *   200 成功、零报错。
+ * ★ 顺带修掉一个现存 500：老实现无条件读 `draft.segments.length`，
+ *   请求体里没有 segments 时抛 TypeError。
  */
-async function transferDraftAssets(draft, userId) {
+async function transferAssetsFor(input, userId) {
   const ctx = createTransferContext(userId);
+  const draft = input || {};
+  const out = {};
 
-  const cover = await transferImage(ctx, draft.cover, "cover");
+  if (draft.cover !== undefined) out.cover = await transferImage(ctx, draft.cover, "cover");
 
-  const segments = [];
-  for (let i = 0; i < draft.segments.length; i += 1) {
-    segments.push(await transferSegment(ctx, draft.segments[i], `segments[${i}]`));
+  if (Array.isArray(draft.segments)) {
+    const segments = [];
+    for (let i = 0; i < draft.segments.length; i += 1) {
+      segments.push(await transferSegment(ctx, draft.segments[i], `segments[${i}]`));
+    }
+    out.segments = segments;
   }
 
   // 卡组快照的卡面同样可能是 dataURL。
@@ -220,10 +243,9 @@ async function transferDraftAssets(draft, userId) {
         views: shareableViews(c.views),
       });
     }
-    deck = { name: draft.deck.name || "", cards };
+    out.deck = { name: draft.deck.name || "", cards };
   }
 
-  let branchTree;
   if (draft.branchTree && draft.branchTree.nodes) {
     const nodes = {};
     for (const [nodeId, node] of Object.entries(draft.branchTree.nodes)) {
@@ -233,7 +255,7 @@ async function transferDraftAssets(draft, userId) {
         choices: Array.isArray(node.choices) ? node.choices : [],
       };
     }
-    branchTree = {
+    out.branchTree = {
       rootId: draft.branchTree.rootId,
       ...(draft.branchTree.startChoices ? { startChoices: draft.branchTree.startChoices } : {}),
       nodes,
@@ -244,7 +266,21 @@ async function transferDraftAssets(draft, userId) {
     `[branch] 资源转存完成 user=${userId} uploaded=${ctx.uploaded} kept=${ctx.kept} failed=${ctx.failed}`
   );
 
-  return { cover, segments, branchTree, deck };
+  return out; // ★ 只含真的处理过的键
+}
+
+/**
+ * 发布路径的薄封装：行为与返回形状与从前**一字不变**（四个键恒在）。
+ * ★ 留着它是为了 createVideo 与 tests 的既有解构写法不动；实现只有 transferAssetsFor 一份。
+ */
+async function transferDraftAssets(draft, userId) {
+  const out = await transferAssetsFor(draft, userId);
+  return {
+    cover: out.cover ?? "",
+    segments: out.segments ?? [],
+    branchTree: out.branchTree,
+    deck: out.deck,
+  };
 }
 
 // ── 序列化 ───────────────────────────────────────────────────────
@@ -326,6 +362,17 @@ function toVideoPayload(doc, ctx = {}) {
     ...(doc.linkOnly === true && doc.visibility === "private" ? { linkOnly: true } : {}),
     liked: !!ctx.liked,
     isOwner: !!ctx.isOwner,
+    /**
+     * 回炉次数。★ 恒发（缺失归一成 0），因为客户端拿它做两件事：
+     *   ① 提交回炉时报 `baseRevision`；② **判"这台服务端支不支持回炉"** ——
+     *   老服务端的 z.object 会把 segments/branchTree/deck 全 strip 掉并返回 200
+     *   且内容一字未改，客户端唯一的识别手段就是"回包的 revision 是不是 base+1"。
+     *   漏发这一行的后果不是"看不到版次"，而是**每一次成功的回炉都被判成失败**。
+     */
+    revision: Number(doc.revision || 0),
+    // ★ 只在有值时发（老作品不该凭空长出一个"重新剪辑过"的日期）。
+    //   观众侧那行「N 月 N 日重新剪辑过 · 第 N 版」按它出现。
+    ...(doc.revisedAt ? { revisedAt: doc.revisedAt } : {}),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -652,6 +699,18 @@ const NOTIF_DEDUP_WINDOW_MS = Number(process.env.BRANCH_NOTIF_DEDUP_MS || 24 * 6
 const NOTIF_DEDUP_KEYS = {
   BRANCH_LIKE: [],
   BRANCH_COMMENT_LIKE: ["commentId"],
+  /**
+   * 回炉重做 → 通知收藏者。**要去重**（按 {userId, actorId, type, videoId}，无额外维度）。
+   *
+   * ★★ 这一行**不能漏**：`alreadyNotified` 第一句是
+   *   `const extraKeys = NOTIF_DEDUP_KEYS[type]; if (!extraKeys || …) return false;`
+   *   —— **不在这张表里的类型一律不去重**。漏了的表现不是报错，而是"作者下午调了五版，
+   *   每个收藏者收到五条一模一样的『你收藏的作品重新剪辑过了』"。
+   * ★ 按本表顶上那条 ⚠ 的要求回答"重复做同一件事会怎样"：回炉是**可重复**的动作
+   *   （改一版、看一眼、再改一版是正常创作节奏），与"取消赞→再点赞"同类，
+   *   不是"每一条都是一段新的话"的评论那类。24 小时窗口内只提醒一次。
+   */
+  BRANCH_REVISED: [],
 };
 
 /** 这条通知是不是「窗口内已经发过的同一件事」 */
@@ -888,6 +947,14 @@ async function createVideo(req, res, next) {
         plays: 0,
         likes: 0,
         commentCount: 0,
+        // ★ in-use 反查的索引面（见 model 里 assetUrls 的 ★★）。发布这一刻就写上，
+        //   否则新作品在反查里**查不到**，而回炉/删除会据此 destroy 掉它还在用的资产。
+        //   ⚠ 与下面 create 的正文用**同一批值**（不是回读一遍），漏一处都零报错。
+        assetUrls: assetUrlsOfVideo({
+          cover: cover || segments[0]?.firstFrame || "",
+          segments,
+          branchTree,
+        }),
       });
     } catch (err) {
       // 两次重发几乎同时到达：上面的查重都扑空，唯一索引在这里兜底
@@ -960,18 +1027,327 @@ async function getVideo(req, res, next) {
   }
 }
 
+/** 带自定义 code 的 4xx。★ utils/http 里那几个函数的 code 是固定的枚举值，
+ *  而回炉的四种拒绝要把 code **和整句中文**一起交给客户端原样显示（铁律八）。 */
+function failWith(status, code, message, details) {
+  throw new AppError({ status, code, message, details });
+}
+
 /**
- * PATCH /api/branch/videos/:id —— 作品编辑（仅作者）。
+ * 「这条地址还被**别的**作品引用着吗」—— **唯一实现**（铁律六），
+ * `purgeVideo`（删作品）与 `recycleGoneAssets`（回炉的 diff 回收）共用。
  *
- * ★ 只改**元信息**：标题 / 简介 / 分区 / 可见性。
- *   片段、分支树、卡组一概不收 —— 那些是「发布那一刻的样子」，改了就意味着
- *   已经看过、已经收藏过这条作品的人看到的东西会变。要换内容请重新发一条。
- *   （产品上也已经定了：作品一经发布不能回炉。）
+ * ★★ 为什么必须有它：本特性之前，跨作品共享同一个 Cloudinary 地址"基本不存在"
+ *   （每次发布都从 24h 方舟链接现转存一份新的）。回炉把它变成了**常态** ——
+ *   新旧两版必然共享绝大多数未改动段落的 URL（客户端 publishAssets 对非 `idb:` 原样返回，
+ *   服务端 transferVideo/transferImage 对非 dataURL、非方舟一律 `ctx.kept += 1; return raw`）。
+ *   没有这一道，删掉/回炉掉其中任意一条，另一条的对应画面立刻 404：
+ *   观众端零提示、作者也查不出原因，而且不可逆。
+ * ★★ 查的是 `assetUrls` 数组而**不是** `"segments.videoUrl"` 这种点号路径：
+ *   `branchTree.nodes` 在模型里是 **Map**，按点号路径查**永远拿到空**且零报错，
+ *   而互动作品的分支段恰恰只挂在那儿（utils/branchAssetRefs.js:29-35 的 ⚠ 是同一条），
+ *   首尾帧与封面也不在那个路径上。
+ * ⚠ 依赖 `assetUrls` 的一次性回填（scripts/backfillAssetUrls.js）：没回填过的老作品
+ *   在这里查不到，于是"删一条新作品会打掉一条老互动作品的分支段"。
+ *   上线顺序是**服务端 → 立刻跑回填 → 才发 App**。
+ */
+async function assetInUseByOthers(url, exceptVideoId) {
+  const raw = String(url || "").trim();
+  if (!raw) return false;
+  return !!(await BranchVideo.exists({ assetUrls: raw, _id: { $ne: exceptVideoId } }));
+}
+
+/**
+ * 回炉的**差量**资产回收：只回收「旧的有、新的没有、且没有别的作品在用」的那些。
+ *
+ * ⛔ **不许复用 purgeVideo 的全删**：5 段只改 1 段时另外 4 条 URL 逐字相同，
+ *   全删会当场删掉这条作品自己还在用的段（200 成功、画面 404）。
+ * ⛔ **卡组资产一条都不回收**：`assetUrlsOfVideo` 刻意不含 deck（见那个文件的 ⚠⚠）——
+ *   卡面是按 URL 复制进别人库里的，动它等于让全站装过这套卡组的人卡面变裂图。
+ *   这里全程只吃 assetUrlsOfVideo 的输出，所以天然不会碰到 deck。
+ * ★ 落 PendingAssetPurge → destroy → 成功即删句柄行，这一层与 purgeVideo 逐字同形
+ *   （句柄先落库：地址只存在于那份正文里，正文一改就再也找不回来）。
+ * ★ 失败**不抛**：作品内容已经替换成功了，这时候报错只会让客户端以为回炉失败并重试，
+ *   而那一遍会带着陈旧的 baseRevision 撞 409。欠着的行留给清扫器重试。
+ */
+async function recycleGoneAssets(oldUrls, newUrls, owner, videoId) {
+  const keep = new Set((newUrls || []).map((u) => String(u || "").trim()).filter(Boolean));
+  const gone = (oldUrls || []).map((u) => String(u || "").trim()).filter((u) => u && !keep.has(u));
+  if (!gone.length || !owner) return { recycled: 0, shared: 0 };
+
+  const handles = [];
+  let shared = 0;
+  for (const url of gone) {
+    // 认不出的一律不动（外链、别人的资产、模板目录）——判据只有 ownedRecyclableAsset 一处
+    const own = ownedRecyclableAsset(url, String(owner), RECYCLABLE_FOLDERS);
+    if (!own) continue;
+    // ★ 这一道就是"删一条打死另一条"的门（见 assetInUseByOthers 的 ★★）
+    if (await assetInUseByOthers(url, videoId)) {
+      shared += 1;
+      continue;
+    }
+    handles.push({ ...own, owner, source: String(videoId) });
+  }
+  if (shared) {
+    console.log(`[branch] 回炉回收跳过 ${shared} 条仍被别的作品引用的资产 video=${videoId}`);
+  }
+  if (!handles.length) return { recycled: 0, shared };
+
+  try {
+    await PendingAssetPurge.bulkWrite(
+      handles.map((h) => ({
+        updateOne: { filter: { publicId: h.publicId }, update: { $setOnInsert: h }, upsert: true },
+      })),
+      { ordered: false }
+    );
+  } catch (err) {
+    if (!err || err.code !== 11000) console.warn("[branch] 回炉资产句柄落库失败:", err?.message || err);
+  }
+
+  await Promise.all(
+    handles.map(async (h) => {
+      try {
+        await cloudinary.uploader.destroy(h.publicId, { resource_type: h.resourceType, invalidate: true });
+        await PendingAssetPurge.deleteOne({ publicId: h.publicId });
+      } catch (err) {
+        await PendingAssetPurge.updateOne(
+          { publicId: h.publicId },
+          { $inc: { attempts: 1 }, $set: { lastError: String(err?.message || err).slice(0, 500) } }
+        ).catch(() => {});
+      }
+    })
+  );
+  return { recycled: handles.length, shared };
+}
+
+/** 一次回炉最多给多少个收藏者发通知。超了只发前 N 个并留痕 —— 一次 PATCH 后面挂
+ *  几千次通知写入会把这条请求拖成分钟级，而通知是附加物，不能反过来拖垮主操作。 */
+const REVISE_FANOUT_MAX = 500;
+
+/**
+ * 回炉成功后给**收藏者**广播一条 BRANCH_REVISED。
+ *
+ * ★ `void` 调用、不 await、自己吞掉所有异常：广播失败**不影响回炉成败**
+ *   （内容已经换完了，这时候 500 只会让客户端以为没成功）。但不许空 catch（铁律八）。
+ * ★ 不逐条串行：500 个收藏者 × 每条 3 次往返（拉黑判定 / 去重 exists / create）
+ *   = 1500 次串行 DB 操作。并发 8 与 branchAsset 那边的上传并发同一个量级。
+ * ★ 正文走 `payload.commentText`（复用 ADMIN_NOTICE 已经走通的那条通道，见
+ *   models/Notification.js 里 BRANCH_REVISED 的 ★）。
+ * ★ actorId = 作者本人；createNotification 自己会跳过"给自己发"，
+ *   所以作者收藏了自己的作品也不会收到。
+ */
+async function broadcastRevised(video) {
+  try {
+    const rows = await BranchCollect.find({ video: video._id })
+      .select("user")
+      .limit(REVISE_FANOUT_MAX + 1)
+      .lean();
+    if (!rows.length) return;
+    let users = rows;
+    if (rows.length > REVISE_FANOUT_MAX) {
+      users = rows.slice(0, REVISE_FANOUT_MAX);
+      console.warn("[branch] 回炉广播超过 500 个收藏者，只发了前 500", {
+        videoId: String(video._id),
+        total: rows.length,
+      });
+    }
+    await mapWithConcurrency(users, 8, (row) =>
+      notifyBranch("reviseVideo", {
+        userId: row.user,
+        actorId: video.author && video.author._id ? video.author._id : video.author,
+        videoId: video._id,
+        type: "BRANCH_REVISED",
+        payload: {
+          videoId: String(video._id),
+          videoTitle: video.title || "",
+          commentText: "这条作品重新剪辑过了",
+        },
+      })
+    );
+  } catch (err) {
+    console.error("[branch] revise 通知广播失败:", err?.message || err);
+  }
+}
+
+/**
+ * 回炉分支（`updateVideo` 的 ② 档）。顺序是这段代码的核心，不许调换：
+ *
+ *   ① 读作品（只读判权与并发要用的那几个字段 + 旧正文，供 diff 回收）
+ *   ② 四道拒绝（每一句都是要**原样显示给用户**的中文）
+ *   ③ 资产转存（只转 patch 里真的带了的那几个键）
+ *   ④ **条件更新**（唯一的并发支点：`revision`），匹配不上 = 409，一个字都没写进去
+ *   ⑤ 差量回收旧资产（带 in-use 反查）
+ *   ⑥ 清弹幕
+ *   ⑦ 广播（void，不 await，失败不影响成败）
+ *   ⑧ 把工程的 videoRevision 对上（画布正文由客户端随后 PUT 覆盖）
+ *
+ * ★ ④ 之后才动 ⑤⑥⑦⑧：条件更新没匹配上意味着"这一版没提交"，
+ *   那就一条弹幕都不该删、一条通知都不该发。
+ */
+async function reviseVideoContent({ req, res, id, body, baseRevision }) {
+  // ① 旧正文要留着做 diff 回收（地址只存在于那份正文里，一 $set 就找不回来了）
+  const before = await BranchVideo.findById(id)
+    .select("_id author pricing takedown revision cover segments branchTree")
+    .lean();
+  if (!before) notFound("Video not found");
+  if (String(before.author) !== String(req.user._id)) forbidden("Forbidden");
+
+  // ② 四道拒绝
+  if (before.pricing && before.pricing.mode === "paid") {
+    failWith(400, "REVISE_PAID", "这条作品设为按分集收费，不能换内容。");
+  }
+  if (isTakenDown(before)) {
+    failWith(400, "REVISE_TAKEN_DOWN", "这条作品已被平台下架，下架期间不能改内容。");
+  }
+  // ★ 复核期间不许换内容：Report 不存被举报内容的快照（models/Report.js 的 ★），
+  //   管理员看的是**现在**的正文 —— 被举报的人在复核窗口里把内容换掉，那条举报就废了。
+  // ★★ 措辞里**刻意不出现「举报」「复核」**：一旦告诉作者"你正在被复核"，
+  //   他的最优解不是回炉（已被挡）而是**直接删掉作品**，管理员打开只剩
+  //   `target.exists=false` —— 那比回炉规避更糟。
+  const Report = loadReportModel();
+  if (Report && (await Report.exists({ targetType: "video", targetId: id, status: "pending" }))) {
+    failWith(400, "REVISE_LOCKED", "这条作品暂时不能改内容，请稍后再试。");
+  }
+  if (baseRevision === undefined) {
+    failWith(400, "REVISE_NO_BASE", "请求缺少版本号，请更新 App 后再试。");
+  }
+
+  // ③ 只转存 patch 里真的带了的那几个键（cover 由 updateBody 限成 http(s)，
+  //    transferImage 对它是 kept，原样返回）
+  const transferred = await transferAssetsFor(body, String(req.user._id));
+
+  // 壳字段：把内容三件与 cover 摘掉（cover 已经在 transferred 里了，写两遍就会分叉）
+  const shell = { ...body };
+  delete shell.segments;
+  delete shell.branchTree;
+  delete shell.deck;
+  delete shell.cover;
+  // 「凭链接可见」的清理规则与改壳那条路**同一份判据**（见 updateVideo 里的 ★★）
+  const $unset = {};
+  if (shell.visibility !== undefined && shell.linkOnly === undefined) $unset.linkOnly = "";
+  if (shell.visibility === "public") delete shell.linkOnly;
+
+  // ★★ `assetUrls` 必须按**合并之后**的正文算，不是按 patch 算：
+  //   只换 segments 的回炉，branchTree 与 cover 还是旧的，漏了它们等于把还在用的
+  //   地址从反查面上摘掉 —— 下一次删除会 destroy 掉这条作品自己的分支画面。
+  const nextContent = {
+    cover: transferred.cover !== undefined ? transferred.cover : before.cover,
+    segments: transferred.segments !== undefined ? transferred.segments : before.segments,
+    branchTree: transferred.branchTree !== undefined ? transferred.branchTree : before.branchTree,
+  };
+  const nextAssetUrls = assetUrlsOfVideo(nextContent);
+
+  // ④ 条件更新 —— **整套回炉唯一的并发支点**。
+  //   ★ 老作品没有 revision 字段：baseRevision=0 时要同时认 `{revision:0}` 与 `{$exists:false}`
+  //     （判否定：没有这个字段 = 从没回炉过）。写成 `{revision: 0}` 会让所有老作品永远 409。
+  const revFilter =
+    Number(baseRevision) === 0
+      ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
+      : { revision: Number(baseRevision) };
+  //   ★ `$set` **只放真的带了的那几个键**：transferAssetsFor 已经保证只回处理过的键，
+  //     这里再展开一次就是全部（不会有 `cover: ""` / `deck: undefined` 那种误清）。
+  const $set = {
+    ...shell,
+    ...transferred,
+    revisedAt: new Date(),
+    assetUrls: nextAssetUrls,
+  };
+  const update = {
+    $set,
+    $inc: { revision: 1 },
+    ...(Object.keys($unset).length ? { $unset } : {}),
+  };
+  const updated = await BranchVideo.findOneAndUpdate(
+    { _id: id, author: req.user._id, ...revFilter },
+    update,
+    { returnDocument: "after" }
+  )
+    .populate("author", AUTHOR_FIELDS)
+    .lean();
+
+  if (!updated) {
+    // 没匹配上只可能是版本对不上（作者与 id 上面已经验过了）。把**当前**版次一起回去，
+    // 客户端才说得出"服务器上已经是第 N 版"（铁律八：失败要响，而且要说得出为什么）。
+    const now = await BranchVideo.findById(id).select("revision").lean();
+    const currentRevision = Number((now && now.revision) || 0);
+    console.log("[branch] 回炉冲突", { videoId: String(id), base: Number(baseRevision), current: currentRevision });
+    failWith(
+      409,
+      "REVISE_CONFLICT",
+      `这条作品在别的设备上也改过（服务器上已经是第 ${currentRevision + 1} 版）。你这一版没有提交。`,
+      { currentRevision }
+    );
+  }
+
+  // ⑤ 差量回收。★ 用 before 的**正文**现算 oldUrls，而不是读 before.assetUrls ——
+  //    老作品可能还没回填过那个字段，读它会得到空集、于是一条旧资产都收不回来（零报错的泄漏）。
+  const gone = await recycleGoneAssets(
+    assetUrlsOfVideo(before),
+    nextAssetUrls,
+    before.author,
+    id
+  );
+
+  // ⑥ 弹幕：换了画面就清（判据见 updateVideo 的 ★）。只换卡组不清。
+  let danmakuCleared = 0;
+  if (body.segments !== undefined || body.branchTree !== undefined) {
+    danmakuCleared = (await BranchDanmaku.deleteMany({ video: id })).deletedCount || 0;
+  }
+
+  console.log(
+    `[branch] 回炉完成 video=${id} user=${req.user._id} rev=${baseRevision}→${updated.revision} ` +
+      `danmaku=-${danmakuCleared} assets=-${gone.recycled} shared=${gone.shared}`
+  );
+
+  // ⑦ 广播（void：失败不影响回炉成败）
+  void broadcastRevised(updated);
+
+  // ⑧ 让工程与作品的版次对上（画布正文由客户端随后 PUT 覆盖）。
+  //   ★ 不 await 也行，但这一步很便宜，await 掉能让"回炉之后立刻再回炉"读到对的版次。
+  try {
+    await BranchProject.updateOne({ video: id }, { $set: { videoRevision: updated.revision } });
+  } catch (err) {
+    // 工程对不上版次只会让下一次回炉多走一次"取回最新工程"，不该拖垮这次回炉
+    console.warn("[branch] 工程版次对齐失败:", err?.message || err);
+  }
+
+  res.json({ ok: true, video: toVideoPayload(updated, { isOwner: true }) });
+}
+
+/**
+ * PATCH /api/branch/videos/:id —— 作品编辑（仅作者）+ **回炉重做**。
+ *
+ * 两条分支，判据只有一条：**patch 里带了 segments / branchTree / deck 任意一个 = 回炉**。
+ *
+ * ① 改壳（一个都没带）：标题 / 简介 / 分区 / 标签 / 可见性 / 封面。行为一字未变。
+ * ② 回炉（带了）：作者本人 + 乐观并发（`revision` 是唯一支点）+ 替换内容 +
+ *    差量回收旧资产 + **清空该作品的弹幕** + 给收藏者发通知 + `revisedAt` / `revision++`。
+ *    这是**唯一的内容写入通道**（除了 POST /videos 的首次发布）。
+ *
+ * ★ 弹幕为什么必须清（这是产品拍板，理由写在这里免得下一个人以为是偷懒）：
+ *   `BranchDanmaku.at` 是**全片累计秒**、没有段落锚点（models/BranchDanmaku.js），
+ *   而互动作品根本没有单一时间轴 —— 换了内容之后每一条弹幕都会盖在对不上的画面上，
+ *   且**零报错**。一个"只有 durationSec 变了才清"的精细判据在 DAG 上直接失效。
+ *   ⇒ 判据故意粗：带了 segments 或 branchTree 就清；只带 deck（换卡组）不清。
  */
 async function updateVideo(req, res, next) {
   try {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
+
+    const body = { ...req.body };
+    const baseRevision = body.baseRevision;
+    delete body.baseRevision;
+    const isRevise =
+      body.segments !== undefined || body.branchTree !== undefined || body.deck !== undefined;
+
+    if (isRevise) {
+      await reviseVideoContent({ req, res, id, body, baseRevision });
+      return;
+    }
+    // ★ 只报了 baseRevision、一个真字段都没改 —— zod 的 refine 数的是键个数，放行了，
+    //   但 `$set: {}` 会静默成功并回一条"改过了"的作品。整句拒（铁律八）。
+    if (!Object.keys(body).length) badRequest("no fields to update");
 
     const doc = await BranchVideo.findById(id).select("_id author").lean();
     if (!doc) notFound("Video not found");
@@ -988,7 +1364,9 @@ async function updateVideo(req, res, next) {
     //   或者把 takedown 声明进去，那条会红。
     //   ⚠ 这里**刻意不再写一遍 `delete patch.takedown`**：同一条规则写两处，
     //     以后只会有人改一处（铁律六）。真正的门在 schema 上。
-    const patch = { ...req.body };
+    // ★ 用上面那份已经摘掉 baseRevision 的 body（它不是壳字段，$set 进去就是往库里
+    //   写一个模型都没有的路径 —— mongoose strict 会静默丢掉，但别指望它兜底）
+    const patch = { ...body };
     // ★★ 「凭链接可见」只有在 private 下才成立。改回 public 时**必须把它清掉**，
     //   否则库里留下 `public + linkOnly:true` 这种自相矛盾的状态 —— 今天没人读它，
     //   但下一个人写判据时会撞上，而它不报错、只是行为诡异。
@@ -1059,7 +1437,8 @@ async function removeVideo(req, res, next) {
 }
 
 /**
- * 硬删一条作品要连带清掉的**五样东西**。少清一样都不报错，只是留下垃圾。
+ * 硬删一条作品要连带清掉的**八样东西**（Mongo 七张表 + 云端资产）。
+ * 少清一样都不报错，只是留下垃圾。
  *
  * ★ 提成函数是因为它现在有**两个**调用方：作者/管理员直接删（removeVideo），
  *   以及举报处理里的 action=delete（services/takedown.service）。
@@ -1071,11 +1450,11 @@ async function purgeVideo(videoId) {
   // 否则删完作品那些 BranchCommentLike 会永远留在库里（谁也再查不到、也删不掉）。
   const commentIds = (await BranchComment.find({ video: videoId }).select("_id").lean()).map((c) => c._id);
 
-  // ★★ 云端资产的**句柄先落库**（2026-08-30 补）。此前这个函数只清六张 Mongo 表，
+  // ★★ 云端资产的**句柄先落库**（2026-08-30 补）。此前这个函数只清那几张 Mongo 表、
   //   `uploader.destroy` 一次都没有 —— 用户删掉作品之后，成片与封面那几个 https 地址
   //   **仍然人人可访问**。删除是隐私诉求，这是它没被满足。
   //   顺序是这条改动的核心：① 读正文拿地址 → ② 句柄落 PendingAssetPurge →
-  //   ③ 删六张表 → ④ 逐条 destroy，成功即删句柄行。任何一步失败，句柄都还在；
+  //   ③ 删七张表 → ④ 逐条 destroy，成功即删句柄行。任何一步失败，句柄都还在；
   //   而地址**只存在于那份正文里**，正文一删就再也找不回来（见 PendingAssetPurge 的 ★★）。
   const doc = await BranchVideo.findById(videoId).select("author cover segments branchTree").lean();
   const owner = doc && doc.author;
@@ -1085,7 +1464,16 @@ async function purgeVideo(videoId) {
       // 认不出的一律不动（外链、别人的资产、模板目录）—— 回收范围写宽一点，
       // 删一个号就会顺手 destroy 掉别人还在用的东西，且零报错
       const own = ownedRecyclableAsset(url, String(owner), RECYCLABLE_FOLDERS);
-      if (own) handles.push({ ...own, owner, source: String(videoId) });
+      if (!own) continue;
+      // ★★ in-use 反查（2026-09-07 补，判据只有 assetInUseByOthers 一处）：
+      //   回炉之后新旧两版**必然共享**绝大多数未改动段落的地址（服务端对非 dataURL、
+      //   非方舟的 http 一律 `ctx.kept += 1; return raw`），此前这里**一道判定都没有** ——
+      //   删掉其中任意一条，另一条的对应画面当场 404，观众端零提示、不可逆。
+      if (await assetInUseByOthers(url, videoId)) {
+        console.log(`[branch] 删除跳过一条仍被别的作品引用的资产 video=${videoId}`);
+        continue;
+      }
+      handles.push({ ...own, owner, source: String(videoId) });
     }
   }
   if (handles.length) {
@@ -1120,6 +1508,11 @@ async function purgeVideo(videoId) {
     // 指向这条作品的通知也一并清掉：点进去只会得到一条"作品不存在"，
     // 而红点却实实在在地亮着 —— 用户没有任何办法让它消下去。
     Notification.deleteMany({ videoId }),
+    // ★ 留存的工坊工程（画布快照）跟着作品一起删：作品没了，这份工程谁也取不回来
+    //   （GET /projects/by-video/:id 要先验作品的作者），也再删不掉，就永远躺在库里
+    //   还占着这个人的配额。★★ 新表**必须两处都落**（这里 + branchAdmin.purgeUserCascade）——
+    //   漏了哪一处都零症状，模板那次就是这么漏的。
+    BranchProject.deleteMany({ video: videoId }),
   ]);
 
   // ④ 库删干净了才去动云端。失败**不抛**：作品已经没了，这时候报错只会让调用方
@@ -2070,5 +2463,10 @@ module.exports = {
   AUTHOR_FIELDS,
   // 导出给测试/其它模块复用
   transferDraftAssets,
+  // ★ 「只转存真的带了的那几个键」的实现，回炉与发布共用（铁律六）
+  transferAssetsFor,
+  // ★ 「这条地址还被别的作品引用着吗」——唯一实现，导出给 branchProject / 测试复用，
+  //   别在别处照着 assetUrls 再写一遍查询
+  assetInUseByOthers,
   isArkVideoUrl,
 };

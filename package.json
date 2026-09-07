@@ -13,6 +13,7 @@
     "backfill:points": "node scripts/backfillPoints.js",
     "backfill:uid": "node scripts/backfillUid.js",
     "backfill:template-duration": "node scripts/backfillTemplateRealDuration.js",
+    "backfill:asset-urls": "node scripts/backfillAssetUrls.js",
     "seed:chat-scenarios": "node scripts/seedChatScenarioTemplates.js",
     "test": "jest --runInBand"
   },

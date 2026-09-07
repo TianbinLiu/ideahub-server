@@ -185,6 +185,45 @@ const branchVideoSchema = new mongoose.Schema(
     // 客户端幂等键：转存要几十秒，客户端超时重发时第一次可能已经落库了。
     // 认这个键去重，否则同一部作品会在库里存两份。老数据没有这个字段，故 sparse。
     clientId: { type: String, default: undefined, trim: true, maxlength: 120 },
+
+    /**
+     * 回炉（「重做」）次数，同时是**乐观并发的唯一支点**：PATCH 带内容字段时
+     * 必须报上 `baseRevision`，条件更新 `{ _id, author, revision: baseRevision }`
+     * 匹配不上就是 409（别的设备已经改过了）。0 / 缺失 = 从没回炉过。
+     *
+     * ★★ 这三个字段**必须写进 schema**：mongoose 默认 `strict`，对 update 同样过滤
+     *   未声明路径 —— 不声明的话 `$inc: { revision: 1 }` 会被**无声丢掉**：版本号永远是空、
+     *   详情页那行「第 2 版」永远不出现、而且乐观并发那道门等于没装（每次条件更新都
+     *   匹配 revision:0，两台设备并发提交各成功一次，后一次静默覆盖前一次）。
+     *   本仓已经为这个形状留了两条疤，注释里都写着同一句话：
+     *   `models/BranchTemplate.js:294`（那把锁写不进去、每次抢都成功，两发并发各扣一次钱）
+     *   与 `models/BranchCard.js:50`（zod 放行了、strict 模式落库时剥掉，零报错）。
+     */
+    revision: { type: Number, default: 0 },
+    /**
+     * 最近一次回炉的时间。观众侧那行「9 月 7 日重新剪辑过 · 第 2 版」按它出现。
+     * ★ 不给 default：老作品不该凭空长出一个"重新剪辑过"的日期（同 pricing / aspect /
+     *   takedown 那几处的理由）。判**有值**。
+     */
+    revisedAt: { type: Date, default: undefined },
+    /**
+     * 这条作品占用的**全部**云端资产地址（= `utils/branchAssetRefs.assetUrlsOfVideo(doc)`
+     * 的结果），在每一次 create 与每一次 revise 时整份重写。
+     *
+     * ★★ 它存在的唯一理由是 **in-use 反查**（「这条地址还被别的作品引用着吗」，
+     *   branchVideo.controller 的 assetInUseByOthers）：`branchTree.nodes` 在模型里是
+     *   **Map**，按 `"branchTree.nodes.xxx.segment.videoUrl"` 这种点号路径查**永远拿到空**
+     *   且零报错，而互动作品的分支段恰恰只挂在那儿。把地址摊平成一个带索引的数组，
+     *   一次 `exists({ assetUrls: url, _id: { $ne: me } })` 就能覆盖封面 / 各段首尾帧与成片 /
+     *   分支树里的每一段。
+     * ★ 体积代价是**明确接受**的：典型 ≈ 20 条 × 120B ≈ 2.4KB/文档，listVideos 每页 12 条
+     *   多搬约 29KB —— 与画布快照（20–400KB/条）差三个量级。**不为它补 `.select()`**：
+     *   那就是同一条规则要写进 listVideos / getVideo / updateVideo 三处（铁律六）。
+     * ★ 存量作品缺这个字段，靠 `scripts/backfillAssetUrls.js` 一次性回填。
+     *   判否定：`assetUrls` 缺失 = 这条作品还没回填过，反查查不到它 ——
+     *   所以回填必须在 App 发版**之前**跑完（见 PROJECT_STRUCTURE 的上线顺序）。
+     */
+    assetUrls: { type: [String], default: undefined, index: true },
   },
   { timestamps: true }
 );

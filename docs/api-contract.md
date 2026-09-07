@@ -19,10 +19,23 @@
   branchTree?: { rootId, startChoices?, nodes },
   takedown?: { by: ObjectId(User), at: Date, reason: String },   // 见下「平台下架」
   author: ObjectId(User), plays, likes, commentCount,
+  revision,        // 回炉次数。**恒发**（缺失归一成 0）。同时是回炉的乐观并发支点，见下「回炉重做」
+  revisedAt?,      // 最近一次回炉的时间。**只在有值时发**（老作品不该凭空长出一个日期）
+  assetUrls?,      // 这条作品占用的全部云端地址（in-use 反查用）。客户端不读它，读侧判否定
   createdAt, updatedAt
 }
 ```
-索引：`{ author: 1, createdAt: -1 }`、`{ category: 1, createdAt: -1 }`、`{ createdAt: -1 }`
+索引：`{ author: 1, createdAt: -1 }`、`{ category: 1, createdAt: -1 }`、`{ createdAt: -1 }`、`{ assetUrls: 1 }`
+
+### BranchProject（工坊工程 / 画布快照）
+```
+{ owner, video, videoRevision, title, bytes, canvas, lostCount, createdAt, updatedAt }
+```
+按 `video` 唯一的**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 `lean()`，
+挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）。
+**不加 TTL**（工程是用户资产，不是任务行）。`canvas` 形状由客户端定义，服务端只当 Mixed 存，
+但强制两条不变量：**不许出现** `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`，
+且单份 ≤ 2MB。端点见下「端点」表的 `/api/branch/projects*` 四行，语义见「回炉重做」。
 
 #### 平台下架（`takedown`）
 
@@ -47,6 +60,10 @@
 作者**改不掉**它：`PATCH /videos/:id` 的 zod（`updateBody`）没有声明 `takedown`，
 z.object 默认 strip，塞进去会被丢掉。★ 这条靠的是 strip 语义，所以
 **谁给那个 schema 加 `.loose()` 就会静默打开这个后门** —— 服务端有用例从外面钉住它。
+⚠ 2026-09-07 起 `updateBody` 有 **10 个键**（多了回炉那四个），这条纪律**不随键数放松**：
+**仍然绝不许 `.loose()`**，也不许把 `takedown` 声明进去、更不许在 controller 里
+补一句 `delete patch.takedown`（同一条规则写两处，以后只会有人改一处）。
+另外：**已下架的作品不许回炉**（400 `REVISE_TAKEN_DOWN`），下架期间作者改不动内容。
 
 客户端判据一律是"这个键在不在"，不是 `takedown.xxx === 某值`：
 `takedown: null` 这类坏数据的失败方向必须是"作品照常显示"，
@@ -266,7 +283,7 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | GET | `/api/branch/videos` | optional | 列表。query：`feed=recommend\|following`、`category`、`q`（对 **title / description / tags** 三者做不区分大小写的子串匹配）、`author`(用户 id)、`cursor`、`limit`(默认 12)。返回 `{ ok, items, nextCursor, author? }`；`items[].liked` 表示当前用户是否已赞。**只返回公开作品 + 自己的作品**（见下「可见性」）。★ `author` 生效时会**原样回显**在响应里 —— 老服务端会把这个 query strip 掉然后照常回推荐流，客户端只能靠"这个键在不在"分辨"按作者筛过、这人没作品"与"压根没筛"，判内容或判状态码都分不出来 |
 | POST | `/api/branch/videos` | required | 发布。body=DraftVideo（title/category/description/**tags**/cover/segments/branchTree/**deck**/**visibility**/**linkOnly**/**clientId**）。**服务端负责把 body 里的外链资源转存**（见下）。带 `clientId` 时按 `{author, clientId}` 幂等：重发返回首次那条、状态码 200（首发是 201） |
 | GET | `/api/branch/videos/:id` | optional | 详情（含 comments 前 50 条）。非作者访问 private 作品返回 **404**（不是 403） |
-| PATCH | `/api/branch/videos/:id` | required | 作品编辑，仅作者。body `{ title?, category?, description?, tags?, visibility?, linkOnly?, cover? }`，**至少给一个字段**（空对象 400）。segments / branchTree / deck 一律被 strip —— 发布即定稿 |
+| PATCH | `/api/branch/videos/:id` | required | 作品编辑 **+ 回炉重做**，仅作者。body `{ title?, category?, description?, tags?, visibility?, linkOnly?, cover?, segments?, branchTree?, deck?, baseRevision? }`，**至少给一个字段**（空对象 400；只给 `baseRevision` 也 400）。限流 **6/分钟按账号**（`branch:revise` 桶）。★ **带了 `segments` / `branchTree` / `deck` 任意一个 = 回炉**（换内容），否则是改壳，行为一字未变。回炉详见下「回炉重做」 |
 | DELETE | `/api/branch/videos/:id` | required | 仅作者可删 |
 | POST | `/api/branch/videos/:id/play` | optional | 播放计数 +1，返回 `{ ok, plays }` |
 | POST | `/api/branch/videos/:id/like` | required | 点赞，返回 `{ ok, likes, liked: true }` |
@@ -279,6 +296,10 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | DELETE | `/api/branch/videos/:id/danmaku/:danmakuId` | required | 删弹幕。**弹幕作者本人 或 作品作者**。→ `{ ok: true }`。限流 30/分钟按账号。★ 无权时回**裸 403**，回包与文案里**绝不能出现作者信息** —— 否则对每条弹幕试删一次，就等于给整面匿名弹幕墙开了一个逐条查作者的接口 |
 | GET | `/api/branch/videos/:id/danmaku` | optional | 弹幕列表（见下「弹幕」）。query `limit`(默认 200，上限 500)。返回 `{ ok, items, truncated }` |
 | POST | `/api/branch/videos/:id/danmaku` | required | 发弹幕 `{ at, text, color? }` → 201 `{ ok, danmaku }`。限流 **30/分钟**（按账号） |
+| GET | `/api/branch/projects` | required | 我留存的工坊工程列表 → `{ ok, items: [{ video, title, bytes, videoRevision, lostCount, updatedAt }] }`，最多 200 条。⛔ **绝不回 `canvas`**（那是"有没有"的问题；回正文等于每次进个人页下载几十 MB） |
+| GET | `/api/branch/projects/by-video/:videoId` | required | 取回画布（**仅作者**）→ `{ ok, project: { video, title, canvas, videoRevision, lostCount, updatedAt } }`。没有 → **404** `{ code: "PROJECT_NOT_FOUND", message: "这条作品没有留存工坊工程。" }`（客户端据此把「回炉重做」画成灰键 + 一句原因，不许摆没有原因的灰） |
+| PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。四种 400：画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`（「画布里还有本机地址…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）、作品不是你的（403）/ 不存在（404） |
+| DELETE | `/api/branch/projects/by-video/:videoId` | required | 放弃留存（**仅作者**）。作品本身不受影响 |
 | GET | `/api/branch/cards` | required | 我的卡片 |
 | POST | `/api/branch/cards` | required | 批量新增 `{ cards: Card[] }`（按 cardId 幂等） |
 | DELETE | `/api/branch/cards/:cardId` | required | 删除一张 |
@@ -334,6 +355,16 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   对不认识的类型显示成通用的「系统通知」行（标题给类型名或"通知"，正文尽力取
   `payload.text`）。老包收到新类型是常态 —— 白名单过滤器只该决定**归到哪个 tab**，
   不该决定**存不存在**；把未知类型直接 filter 掉的话，用户的红点数与列表条数永远对不上。
+- `Notification.type` 另增 **`BRANCH_REVISED`**（2026-09-07）：**你收藏的作品被作者回炉重做了**。
+  收件人 = 这条作品的收藏者（`BranchCollect`）；`actorId` = 作者；deeplink 目标是 **`videoId`**（`/video/:id`）。
+  正文走 **`payload.commentText`**（`"这条作品重新剪辑过了"`）—— 刻意复用 `ADMIN_NOTICE` 已经走通的
+  那条通道，而不是新开一个 `payload.text`：新开就要同时改 App 的 `data/notifications` 映射，
+  而「服务端发了、App 静默丢掉」正是那张白名单存在要防的事故形态。
+  扇出上限 **500** 个收藏者（超了只发前 500 并 `console.warn` 留痕），并发 8，`void` 调用 ——
+  广播失败**不影响回炉成败**。
+  ⚠⚠ **老 App（≤v2.45）收不到这一类**：它的 `BRANCH_NOTIFICATION_TYPES` 是**请求层白名单**
+  （列表筛选 / 未读数 / 全部已读三处从它派生），老包压根不会把这个 type 放进查询。
+  ⇒ 对未升级用户，**观众知情为零**。这不是"降级显示"，别写成降级显示。
 - `Notification.videoId`（ref `BranchVideo`）。★ **不要复用 `ideaId`** —— 它 ref 的是 `Idea`，
   塞一个 BranchVideo 的 id 进去不会报错，只会 populate 成 `null`，标题和跳转地址一起没了，全程零日志。
 - 列表接口的 `actorId` 现在 populate `username displayName avatarUrl role`，并额外 populate
@@ -346,6 +377,10 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
 - `BRANCH_LIKE` 按 `{userId, actorId, videoId, type}` 24 小时内只发一条 —— 点赞是幂等 upsert，
   但「取消再点」会删行再插行，不去重的话一个循环就能把对方的通知箱刷爆。
 - `BRANCH_COMMENT_LIKE` 的去重键额外带 `commentId`（否则赞了同一作品下的第二条评论就不通知了）。
+- `BRANCH_REVISED` **要去重**，键与 `BRANCH_LIKE` 同形（`{userId, actorId, videoId, type}`，24 小时）：
+  回炉是可重复的动作（改一版、看一眼、再改一版是正常创作节奏），不去重的话作者下午调五版，
+  每个收藏者就收五条一模一样的。⚠ 漏了 `NOTIF_DEDUP_KEYS` 里那一行不会报错 ——
+  `alreadyNotified` 对**不在那张表里的类型一律不去重**。
 - 评论与回复**不去重**：每一条都是新内容，压掉就是真的丢消息。
 - **弹幕不发通知**。弹幕的回包刻意不带作者（只有一个 `mine` 布尔），发通知等于把它去匿名化。
 - **`BRANCH_MENTION` 不去重**：@ 永远搭在一条**新评论**上，按 24 小时去重的话，一段正常对话
@@ -910,6 +945,69 @@ UI 把它显示出来 —— 「删了个寂寞」必须有症状。
 （环境变量 `BRANCH_INLINE_FALLBACK_MAX`，默认 512KB）：小于阈值的 dataURL 原样内联落库，
 超过就丢弃置空——否则没配 Cloudinary 时每条记录都带着 MB 级 base64，
 `GET /cards` 一次性返回全部卡面会撑出几十 MB 的响应体。
+
+## 回炉重做（已发布作品换内容）
+
+一句话：作者把发布时那份**工坊画布**留在服务端（`BranchProject`），之后能取回工坊改一改，
+再走 `PATCH /api/branch/videos/:id` **替换原作品的内容** —— 同一个链接、同一批互动数据。
+
+### 判据与并发
+
+- **带了 `segments` / `branchTree` / `deck` 任意一个 = 回炉**；一个都没带 = 改壳（行为一字未变）。
+- 回炉必须报 `baseRevision`（客户端手上那份内容基于作品的哪一版）。
+- **并发支点只有一个：`BranchVideo.revision`**。条件更新 `{ _id, author, revision: baseRevision }`
+  匹配不上就是 409，**一个字都没写进去**（弹幕不清、通知不发、资产不回收）。
+  ★ 老作品库里没有这个字段：`baseRevision = 0` 时同时认 `{revision: 0}` 与 `{revision: {$exists:false}}`。
+- 成功后 `revision` 自增、`revisedAt` 置为当下，两者都在回包的 `video` 里。
+
+### 错误码（`message` 都是给用户看的整句中文，客户端**原样显示**）
+
+| 状态 | code | message | 说明 |
+|---|---|---|---|
+| 400 | `REVISE_PAID` | 这条作品设为按分集收费，不能换内容。 | 付费作品 |
+| 400 | `REVISE_TAKEN_DOWN` | 这条作品已被平台下架，下架期间不能改内容。 | |
+| 400 | `REVISE_LOCKED` | 这条作品暂时不能改内容，请稍后再试。 | 有待处理的举报。★ 措辞里**刻意不出现「举报」「复核」**：告诉作者"你正在被复核"，他的最优解不是回炉（已被挡）而是**直接删掉作品**，管理员打开只剩 `target.exists=false` —— 比回炉规避更糟 |
+| 400 | `REVISE_NO_BASE` | 请求缺少版本号，请更新 App 后再试。 | 带了内容字段却没报 `baseRevision` |
+| 409 | `REVISE_CONFLICT` | 这条作品在别的设备上也改过（服务器上已经是第 N 版）。你这一版没有提交。 | 回包带 `details.currentRevision` |
+
+### 服务端顺带做的四件事
+
+1. **资产差量回收**：`gone = 旧地址 - 新地址`，逐条过归属判定与 **in-use 反查**，才落 `PendingAssetPurge` + destroy。
+   ⛔ 不是「全删再重来」：5 段只改 1 段时另外 4 条 URL 逐字相同，全删会当场删掉还在用的段。
+   ⛔ 卡组资产**一条都不回收**（卡面是按 URL 复制进别人库里的）。
+2. **清空该作品的弹幕**（带了 `segments` 或 `branchTree` 时；只带 `deck` 不清）。
+   `BranchDanmaku.at` 是**全片累计秒**、没有段落锚点，换内容后每一条都会盖在对不上的画面上且零报错。
+   ★ 客户端必须在确认卡上**提前**告诉用户会删掉多少条，不是事后。
+3. **`BRANCH_REVISED` 通知收藏者**（见上「通知」）。
+4. 把 `BranchProject.videoRevision` 对上（画布正文由客户端随后 PUT 覆盖）。
+
+### in-use 反查与 `assetUrls`（**上线顺序的硬要求**）
+
+`BranchVideo.assetUrls` = 这条作品占用的全部云端地址（封面 + 各段首尾帧与成片 + 分支树里的每一段），
+在每一次 create 与每一次 revise 时整份重写，带索引。
+它存在的唯一理由是反查「这条地址还被别的作品引用着吗」——
+`branchTree.nodes` 在模型里是 **Map**，按 `"branchTree.nodes.x.segment.videoUrl"` 这种点号路径查
+**永远拿到空且零报错**，而互动作品的分支段恰恰只挂在那儿。
+
+⚠⚠ **上线顺序**：① 服务端上线（新端点对老 App 是死代码）→ ② **立刻**跑
+`npm run backfill:asset-urls` 并确认 `countDocuments({ assetUrls: { $exists: false } }) === 0`
+→ ③ App 发版 → ④ 官网发版。
+漏了 ② 的后果：删掉/回炉一条新作品会 destroy 掉一条老互动作品分支段还在用的资产，
+**老作品当场黑屏、观众端零提示、不可逆**。
+
+### 新旧版本兼容
+
+| 组合 | 行为 |
+|---|---|
+| 老 App（≤v2.45）× 新服务端 | 老 App 的 PATCH 只有七个壳字段，`$set` 碰不到 `segments` —— **不会误改内容**（安全）。它读到 `revision` / `revisedAt` / `assetUrls` 只是多几个不认识的键。⚠ 但它**收不到** `BRANCH_REVISED`（见上），对未升级用户观众知情为零 |
+| 新 App × 老服务端 | 老服务端的 `z.object` 把 `segments/branchTree/deck/baseRevision` 全 strip，返回 **200 且内容一字未改**。⇒ 客户端**必须**用回包的 `revision` 是否等于 `baseRevision + 1` 来判整发失败，不能只看状态码 |
+| 新 App × 新服务端 × 老作品（无 `revision`） | `baseRevision = 0`，走 `$or` 那条分支。判否定：没有 `revision` = 从没回炉过 |
+
+### 本版明确不做
+
+不做版本历史（只留一份最新工程 + 一个计数）、不做三方合并、不做举报内容快照
+（只把 `revision` / `revisedAt` 露给管理员：知道"改过 N 次"，看不到改了什么）、
+不做「把我这一版另发成新作品」的逃生门（那会让两条作品逐字共享同一批资产）。
 
 ## 白模模板（blockout r2v）
 

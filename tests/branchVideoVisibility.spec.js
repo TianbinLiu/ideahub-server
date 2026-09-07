@@ -362,27 +362,79 @@ describe("作品编辑（PATCH）", () => {
     expect(card.realPerson).toBe(false);
   });
 
-  test("片段与卡组改不动：发布即定稿，这些字段一律被 strip", async () => {
+  // ── 内容字段（segments / branchTree / deck）现在**收**了：那是「回炉重做」这条路
+  //    （2026-09-07）。原来那条「一律被 strip」的用例按四条改写，**留在这个 describe 里**
+  //    —— 拆走之后，下一个给 updateBody 加字段的人不会看到它们。
+  //    ⛔ 最后一条（takedown 仍然被 strip）是**安全边界**，永远不许删。
+  test("回炉：非作者改不动内容", async () => {
+    const author = await registerUser();
+    const other = await registerUser();
+    const id = String((await publish(author.token)).body.video._id);
+
+    await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${other.token}`)
+      .send({
+        segments: [{ title: "偷换的段", firstFrame: "https://evil.example.com/x.jpg" }],
+        baseRevision: 0,
+      })
+      .expect(403);
+
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(detail.body.video.segments[0].title).toBe("第一段");
+  });
+
+  test("回炉：付费作品改不动内容（400 REVISE_PAID，整句中文）", async () => {
     const author = await registerUser();
     const id = String(
-      (await publish(author.token, { deck: { name: "原卡组", cards: [{ id: "c1", name: "原卡" }] } })).body
-        .video._id
+      (await publish(author.token, { pricing: { mode: "paid", partPrices: [100] } })).body.video._id
     );
+
+    const res = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ segments: [{ title: "换一段", firstFrame: "https://cdn.example.com/b.jpg" }], baseRevision: 0 })
+      .expect(400);
+    expect(res.body.code).toBe("REVISE_PAID");
+    expect(res.body.message).toContain("按分集收费");
+
+    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
+    expect(detail.body.video.segments[0].title).toBe("第一段");
+  });
+
+  test("回炉：已下架的作品改不动内容（400 REVISE_TAKEN_DOWN）", async () => {
+    const author = await registerUser();
+    const id = String((await publish(author.token)).body.video._id);
+    await BranchVideo.updateOne(
+      { _id: id },
+      { $set: { takedown: { by: new mongoose.Types.ObjectId(), at: new Date(), reason: "测试下架" } } }
+    );
+
+    const res = await request(app)
+      .patch(`/api/branch/videos/${id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ segments: [{ title: "换一段", firstFrame: "https://cdn.example.com/b.jpg" }], baseRevision: 0 })
+      .expect(400);
+    expect(res.body.code).toBe("REVISE_TAKEN_DOWN");
+
+    const doc = await BranchVideo.findById(id).lean();
+    expect(doc.segments[0].title).toBe("第一段");
+    expect(Number(doc.revision || 0)).toBe(0);
+  });
+
+  test("takedown 仍然被 strip：作者 PATCH 不动它（安全边界，永远不许删这条）", async () => {
+    const author = await registerUser();
+    const id = String((await publish(author.token)).body.video._id);
 
     await request(app)
       .patch(`/api/branch/videos/${id}`)
       .set("Authorization", `Bearer ${author.token}`)
-      .send({
-        title: "只有标题会生效",
-        segments: [{ title: "偷换的段", firstFrame: "https://evil.example.com/x.jpg" }],
-        deck: { name: "偷换的卡组", cards: [] },
-      })
+      .send({ title: "只有标题会生效", takedown: { by: author.userId, at: new Date(), reason: "自己下架自己" } })
       .expect(200);
 
-    const detail = await request(app).get(`/api/branch/videos/${id}`).expect(200);
-    expect(detail.body.video.title).toBe("只有标题会生效");
-    expect(detail.body.video.segments[0].title).toBe("第一段");
-    expect(detail.body.video.deck.name).toBe("原卡组");
+    const doc = await BranchVideo.findById(id).lean();
+    expect(doc.title).toBe("只有标题会生效");
+    expect(doc.takedown).toBeUndefined();
   });
 
   test("空 patch 与非法可见性都要 400", async () => {

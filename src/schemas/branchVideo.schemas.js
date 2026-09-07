@@ -101,9 +101,19 @@ const publishBody = z.object({
   clientId: z.string().trim().min(1).max(120).optional(),
 });
 
-// PATCH /api/branch/videos/:id —— 作品编辑（仅作者）
+// PATCH /api/branch/videos/:id —— 作品编辑（仅作者）+ **回炉重做**（唯一的内容写入通道）
 // ★ 全部 optional，且**不给 default**：给了 default 的字段会凭空出现在 patch 里，
 //   于是「只改可见性」的请求会顺手把标题清成空串。
+//
+// ★★ 判据：带了 `segments` / `branchTree` / `deck` 任意一个 = **回炉**（controller 走
+//   乐观并发 + 资产 diff 回收 + 清弹幕 + 通知收藏者那条分支）；一个都没带 = 「改壳」，
+//   行为与从前一字不变。
+//
+// ⛔⛔ **这个对象绝不能改成 `.loose()`**，也绝不许把 `takedown` 声明进来：
+//   平台下架必须是作者**改不动**的（见 models/BranchVideo.js 的 takedownSchema ★★），
+//   而第一道门就是「`updateBody` 里根本没有这个键」、第二道才是 z.object 的 strip。
+//   tests/branchAdmin.spec.js 有一条「作者 PATCH takedown 无效」从外面钉着它。
+//   现在这个对象有 10 个键了，这条纪律不随键数放松。
 const updateBody = z
   .object({
     title: z.string().trim().min(1).max(120).optional(),
@@ -115,11 +125,15 @@ const updateBody = z
     // ★ 老客户端**不发**这个键 ⇒ $set 碰不到它 ⇒ 它们的编辑不会把"凭链接可见"改掉。
     //   这正是把它做成独立字段（而不是 visibility 的第三个枚举值）想要的效果。
     linkOnly: z.boolean().optional(),
-    // 封面可改（成片不可改，但"用哪一帧当封面"属于壳）。
+    // 封面可改（"用哪一帧当封面"属于壳）。
     // ★ 只收 http(s) URL，**不收 dataURL**：客户端先把它传成永久 URL 再 PATCH
     //   （app 的 EditPage 走 publishAssets.imageToUrl，与发布路径同一条）。
-    //   收 dataURL 的话请求体是 MB 级的，会撞上网关 1MB 的 client_max_body_size，
-    //   而且撞了只表现成 fetch failed，看不出是因为太大。
+    //   ⚠ 理由**不是**"会撞网关上限"（那句话是错的，2026-09-07 核实后改口）：
+    //     nginx 是 `client_max_body_size 110m`（ALIYUN_HK_DEPLOYMENT_RUNBOOK.md），
+    //     而 `/api/branch` 对持有效签名 token 的请求走 middleware/bigJson.js 的 jsonGate，
+    //     上限是 `BRANCH_JSON_LIMIT` 默认 **50mb**（app.js 里挂的那一行）。MB 级封面进得来。
+    //     真正的理由是**既有约定**：封面先传成永久 URL 再 PATCH，与发布路径同一条上传实现
+    //     （铁律六）。收 dataURL 等于在 PATCH 上再开一条上传通道。
     //   ⚠ 不能用 z.url()：`data:image/...;base64,xxx` 也是**合法 URI**，zod 会放行
     //     （用例实测：期望 400，实得 200）。必须显式钉住 http/https 协议。
     cover: z
@@ -128,6 +142,25 @@ const updateBody = z
       .max(2000)
       .regex(/^https?:\/\//i, "cover must be an http(s) URL")
       .optional(),
+
+    // ── 回炉重做（替换内容）。带了下面任意一个 = 回炉 ──────────────
+    // ★ 三个内容字段**复用 publishBody 已经有的那三个子 schema**，不另抄一份形状
+    //   （铁律六）：抄一份的结果是发布收 aspect/videoTier、回炉不收，而且零报错。
+    // ★ 复用意味着回炉也**接受 dataURL**（与发布路径同一口径，controller 的
+    //   transferAssetsFor 会转存）。这不是新增暴露面：POST /videos 今天就是这样，
+    //   而 /api/branch 的 body 上限本来就是 50MB（见上面 cover 那条 ⚠）。
+    // ★ `.min(1)` 与 publishBody 同一把尺：一条 0 段的作品是**黑屏**，
+    //   而它会带着 200 + revision 递增回来 —— 观众端零报错地打不开（本案最怕的形状）。
+    segments: z.array(segmentBody).min(1).max(60).optional(),
+    branchTree: branchTreeBody.optional(),
+    deck: deckBody.optional(),
+    /**
+     * 客户端手上那份内容基于作品的哪一版。**回炉时必填**（controller 里判，不在这里判：
+     * 「只改标题」的 PATCH 不该被迫报版本号）。
+     * ★ 老作品没有 revision 字段 ⇒ 客户端报 0，controller 用 `$or: [{revision:0},{revision:{$exists:false}}]`
+     *   兜住（判否定：没有这个字段 = 从没回炉过）。
+     */
+    baseRevision: z.coerce.number().int().min(0).max(100000).optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 
