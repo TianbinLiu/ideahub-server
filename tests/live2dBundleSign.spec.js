@@ -132,9 +132,13 @@ describe("bundleRef：inspect 与 create 都能用直传的包", () => {
     const res = await request(app).post("/api/live2d-models/inspect").set(auth(token)).send({ bundleRef: ref }).expect(200);
     expect(res.body.capabilities.hitAreas).toEqual(["Head"]);
     expect(res.body.mapping.idle).toBe("Idle");
-    // 取回走的是公开投递地址（不花 Admin API 配额），且 raw 的 public_id 带扩展名
+    // ★ 取回必须走**签名下载地址**：raw 的公开投递在本账号上是 401（2026-09-07 线上实测），
+    //   而且 public_id 要带扩展名、format 传空（拆成 base+zip 会 404）。签名是本地算的，不花 Admin API 配额。
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toBe(`https://res.cloudinary.com/${cloudinary.config().cloud_name}/raw/upload/${ref}.zip`);
+    expect(seen[0]).toContain(`https://api.cloudinary.com/v1_1/${cloudinary.config().cloud_name}/raw/download`);
+    expect(seen[0]).toContain(encodeURIComponent(`${ref}.zip`));
+    expect(seen[0]).toMatch(/[?&]signature=/);
+    expect(seen[0]).not.toContain("res.cloudinary.com");
     expect(destroy).not.toHaveBeenCalled();
   });
 

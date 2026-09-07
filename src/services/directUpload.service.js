@@ -86,18 +86,32 @@ function signDirectUpload({ resourceType, publicId, allowedFormats, maxSizeBytes
 }
 
 /**
- * 直传资产的公开投递地址（服务端自己拼，不问客户端要）。
- * ★ 为什么不走 `cloudinary.api.resource()` 拿 secure_url：那是 **Admin API**，免费档全局 500 次/小时，
- *   而取回这一步挂在 inspect（10 次/分钟/人）后面 —— 单个账号就能把全站的 Admin 预算打空，
- *   连带别处读元数据的功能一起挂，且那些功能的失败话术说的都是别的原因。
- *   公开投递地址不花 Admin 配额，取不到就是 404（= 上传没真的完成），语义反而更准。
+ * 直传资产的**签名下载地址**（服务端本地签名，不问客户端要）。
+ *
+ * ★★★ 2026-09-07 线上实测（合并 #60 之后第一次真机跑直传就撞上）：**raw 资产的公开投递一律 401**。
+ *   这个 Cloudinary 账号对 raw 的公开投递是关着的，四条路实测：
+ *     ① 公开投递地址 `res.cloudinary.com/<cloud>/raw/upload/<id>.zip` → **401**
+ *     ② 带签名的投递地址 `.../raw/upload/s--xxx--/v1/<id>.zip`        → **401**
+ *     ③ Admin API 回的 `secure_url`（就是①那条）                      → **401**
+ *     ④ `api.cloudinary.com/v1_1/<cloud>/raw/download?...signature`   → **200 + 822,693 字节**（与原文件逐字节相等）
+ *   所以取回只能走 ④。这一条是**只有真机端到端才抓得到的**：jest 里 axios 是 mock 的，
+ *   契约测试全绿也证明不了投递域名放不放行。
+ * ★ public_id 必须**带扩展名**、format 传空串：raw 的 public_id 本身含扩展名。
+ *   拆成 (去扩展名的 base, "zip") 实测 404 —— `Resource not found - ideahub/live2d-bundles/…-1788812508157`。
+ * ★ `private_download_url` 是**本地算签名**、不发请求，所以原来「别烧 Admin API 那 500 次/小时的全局配额」
+ *   的理由依然成立（那条理由针对的是 `cloudinary.api.resource()`）。
  * @param {"raw"|"video"|"image"} resourceType
- * @param {string} publicIdWithExt raw 资产的 public_id **带扩展名**（Cloudinary 对 raw 会把扩展名并进 id）
+ * @param {string} publicIdWithExt raw 资产的 public_id（带扩展名）
+ * @param {number} [ttlSec] 链接有效期；只在服务端自己取回的这一小段里用，给 5 分钟绰绰有余
  */
-function directDeliveryUrl(resourceType, publicIdWithExt) {
-  const { cloud_name } = cloudinary.config();
-  if (!cloud_name) return "";
-  return `https://res.cloudinary.com/${cloud_name}/${resourceType}/upload/${publicIdWithExt}`;
+function directDownloadUrl(resourceType, publicIdWithExt, ttlSec = 300) {
+  const { cloud_name, api_key, api_secret } = cloudinary.config();
+  if (!cloud_name || !api_key || !api_secret) return "";
+  return cloudinary.utils.private_download_url(publicIdWithExt, "", {
+    resource_type: resourceType,
+    type: "upload",
+    expires_at: Math.round(Date.now() / 1000) + ttlSec,
+  });
 }
 
-module.exports = { DIRECT_UPLOAD_CHUNK_BYTES, cloudinaryReady, signDirectUpload, directDeliveryUrl };
+module.exports = { DIRECT_UPLOAD_CHUNK_BYTES, cloudinaryReady, signDirectUpload, directDownloadUrl };
