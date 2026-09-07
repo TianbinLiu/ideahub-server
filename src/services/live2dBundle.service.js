@@ -21,7 +21,7 @@ const AdmZip = require("adm-zip");
 const AppError = require("../utils/AppError");
 const axios = require("axios");
 const { cloudinary } = require("../config/cloudinary");
-const { directDeliveryUrl } = require("./directUpload.service");
+const { directDownloadUrl } = require("./directUpload.service");
 const CODES = require("../utils/errorCodes");
 const { extractCapabilities } = require("./live2dCapabilities.service");
 
@@ -343,8 +343,9 @@ async function removeBundleDir(relativeDir) {
 /**
  * 取回一份**签名直传**上来的模型包（App 走这条路：25MB 的 zip 过我们自己的服务器必被 Cloudflare 的
  * 125 秒读超时掐断，理由见 services/directUpload.service.js 的 ★★★；官网桌面端仍走 multipart 老路）。
- * ★ 走公开投递地址而不是 `cloudinary.api.resource()`：后者是 Admin API（免费档全局 500 次/小时），
- *   而这一步挂在 inspect（10 次/分钟/人）后面，单个账号就能把全站 Admin 预算打空。理由见 directDeliveryUrl 的 ★。
+ * ★ 走**签名下载地址**：raw 的公开投递在本账号上是 401（2026-09-07 线上实测，四条路的对照见
+ *   directUpload.service.js 的 ★★★）。签名是本地算的，不打 Admin API，所以「别烧 Admin 500 次/小时配额」
+ *   这条理由仍然成立。
  * ★★ 体积闸必须在这里补回来：直传那条路上 **multer 不在链上**，`limits.fileSize` 这道闸自动消失了。
  *   不补的话两条路的验收标准就不一样，而松的那条零症状 —— 一个几百 MB 的 zip 能进来，
  *   直到解压记账时才在磁盘上炸。
@@ -352,7 +353,7 @@ async function removeBundleDir(relativeDir) {
  * @returns {Promise<Buffer>}
  */
 async function downloadDirectBundle(publicIdWithExt) {
-  const url = directDeliveryUrl("raw", publicIdWithExt);
+  const url = directDownloadUrl("raw", publicIdWithExt);
   if (!url) throw new AppError({ code: CODES.SERVER_ERROR, status: 503, message: "服务器还没配好文件存储，暂时不能上传。" });
   let res;
   try {
