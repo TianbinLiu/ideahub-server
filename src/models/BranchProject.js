@@ -30,12 +30,31 @@ const branchProjectSchema = new mongoose.Schema(
     /**
      * 这份画布描述的是作品的**哪一个** revision。
      *
-     * ★★ 它**不是**这份工程自己的版本号：整套回炉的并发支点只有
-     *   `BranchVideo.revision` 一个（两个文档两把锁又没有事务，任一半失败就分叉：
-     *   工程描述的是上一版 → 下次回炉打开旧画布再提交，把线上内容**静默退回**）。
-     *   这里只是个"我对得上哪一版"的标记，冲突判定一律在 updateVideo 里做。
+     * ★★ 它**不是**这份工程自己的版本号，但它是**唯一**说得出"这份画布画的是哪一版"
+     *   的那一格 —— 而这件事和并发是两回事，必须分开看（2026-09-07 评审纠正）：
+     *     · `BranchVideo.revision` 挡的是**并发**（两台设备同时提交，第二发 409）；
+     *     · 这一格挡的是**陈旧**（画布是第 1 版、线上已经是第 2 版）。
+     *   只有前者时，一份陈旧画布配上现读的 baseRevision 会被服务端正常接受，
+     *   把线上内容**静默退回上一版**、全程 200 零报错。
+     *   ⇒ 两条纪律，各在一处：
+     *     ① `putProject` 校验 `videoRevision === BranchVideo.revision`，对不上 400 ——
+     *        这一格**只能靠客户端 PUT 新画布往前走**，没有别的写路径；
+     *     ② 客户端取回时比对 `videoRevision` 与作品当下的 revision，对不上整句拒。
+     *   ⛔ 回炉成功时**绝不**把这一格顶成新版次（旧实现干过，见 controller 的 ⑧）：
+     *      那等于替一份还没换的画布盖章说"我是新版"，把唯一的检出信号亲手抹掉。
      */
     videoRevision: { type: Number, default: 0 },
+    /**
+     * 「这份画布已经不描述作品当下那一版了」。回炉成功那一刻由服务端置真，
+     * 客户端 PUT 新画布时置假（putProject 一处）。
+     *
+     * ★ 它与 `videoRevision` 是**同一件事的两种说法**，留着它是因为客户端要能一眼看出
+     *   "这份工程过期了"而不必先去查作品的 revision（列表接口不回作品正文）。
+     *   判据只有 `videoRevision` 一处（铁律六）—— 这一格是给 UI 用的提示位，
+     *   **不作为拒绝依据**（拒绝在 putProject 与客户端取回两处按 videoRevision 判）。
+     * ★ 判否定：老数据没有这个字段 = 不过期（缺失 = 老数据 = 否定）。
+     */
+    stale: { type: Boolean, default: false },
     title: { type: String, default: "", maxlength: 120 },
     /** 服务端**自己量**的 `JSON.stringify(canvas)` 字节数（不信客户端报的数）。配额按它算。 */
     bytes: { type: Number, default: 0 },

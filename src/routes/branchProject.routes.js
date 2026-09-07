@@ -20,10 +20,20 @@ const {
 // 我留存了哪些工程（只回元信息，绝不回 canvas）
 router.get("/projects", requireAuth, listProjects);
 
-// 取回一份画布（回炉时用）
+// 取回一份画布（回炉时用）。
+// @endpoint GET /api/branch/projects/by-video/:videoId
+//   → { ok, project: { video, title, canvas, videoRevision, stale, lostCount, updatedAt } }
+// ★★ `videoRevision` 是「这份画布描述的是作品第几版」，客户端**必须**拿它与作品当下的
+//   `revision` 比：对不上就不许铺进工坊（那份画布是上一版的，就着它提交会把线上内容
+//   静默退回）。`stale` 是同一件事的 UI 提示位，不作为拒绝依据。
 router.get("/projects/by-video/:videoId", requireAuth, getProject);
 
-// 留存 / 覆盖。★ 必须限流：每次都要序列化并落一份最大 2MB 的文档，
+// 留存 / 覆盖。
+// @endpoint PUT /api/branch/projects/by-video/:videoId
+//   body { title?, canvas, videoRevision, lostCount? }
+//   ★★ `videoRevision` **必须等于作品当下的 revision**，对不上 400 PROJECT_REVISION_MISMATCH
+//     （带 details.currentRevision）——这一格只能靠这条路往前走，回炉那边只标 stale。
+// ★ 必须限流：每次都要序列化并落一份最大 2MB 的文档，
 //   而"发布之后自动留存一次 + 用户手点重试"的正常频率远低于 12/分钟。
 //   按【账号】计：这条在 requireAuth 后面，按 IP 计等于换个出口就重开一桶。
 router.put(

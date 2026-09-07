@@ -77,6 +77,20 @@ const CLEAN_CANVAS = {
 const put = (token, videoId, body) =>
   request(app).put(`/api/branch/projects/by-video/${videoId}`).set("Authorization", `Bearer ${token}`).send(body);
 
+/**
+ * 把作品真的回炉一次（revision 0→1）。
+ * ★ 2026-09-07 起 `putProject` 会校验 `videoRevision === BranchVideo.revision`，
+ *   所以「PUT 一份 videoRevision:1 的画布」这件事必须先让作品真的走到第 2 版 ——
+ *   凭空报一个版次正是那道闸要挡的东西（见 models/BranchProject.js 的 videoRevision ★★）。
+ */
+async function reviseOnce(token, videoId, baseRevision = 0) {
+  await request(app)
+    .patch(`/api/branch/videos/${videoId}`)
+    .set("Authorization", `Bearer ${token}`)
+    .send({ baseRevision, segments: [{ title: "回炉过的段", videoUrl: "https://cdn.example.com/r.mp4" }] })
+    .expect(200);
+}
+
 describe("工坊工程：写入不变量", () => {
   test("正常留存 → 200，bytes 是服务端自己量的（不信客户端报的数）", async () => {
     const author = await registerUser();
@@ -101,6 +115,7 @@ describe("工坊工程：写入不变量", () => {
     const author = await registerUser();
     const videoId = await publish(author.token);
     await put(author.token, videoId, { videoRevision: 0, canvas: CLEAN_CANVAS }).expect(200);
+    await reviseOnce(author.token, videoId);
     await put(author.token, videoId, {
       videoRevision: 1,
       canvas: { ...CLEAN_CANVAS, marker: "第二版" },
@@ -183,6 +198,7 @@ describe("工坊工程：写入不变量", () => {
     await put(author.token, videoId, { videoRevision: 0, canvas: CLEAN_CANVAS }).expect(200);
     // 把这一条撑到接近总量上限，再覆盖一次 —— 排除了本条就该过
     await BranchProject.updateOne({ video: videoId }, { $set: { bytes: 49 * 1024 * 1024 } });
+    await reviseOnce(author.token, videoId);
     await put(author.token, videoId, { videoRevision: 1, canvas: CLEAN_CANVAS }).expect(200);
     expect(await BranchProject.countDocuments({ owner })).toBe(1);
   });

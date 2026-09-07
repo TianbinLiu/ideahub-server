@@ -31,6 +31,12 @@ function isValidId(id) {
  *   他就着那份旧画布再提交一次，线上作品会被静默回滚到第一版。
  * ★ `bytes` 与 `owner` 都是服务端自己算/自己填的，客户端报的数一律不信
  *   （配额是拿它算的，信客户端等于配额不存在）。
+ *
+ * ★★ `videoRevision` 必须**等于作品当下的 revision**，否则 400（2026-09-07 评审补）。
+ *   这是 `BranchProject.videoRevision` 那条 ★★ 的第①条纪律：这一格只能靠这条路往前走。
+ *   放行的表现是库里留下「canvas 是第 1 版正文 / videoRevision 写着 2」这种自相矛盾的行，
+ *   之后谁也看不出它陈旧了 —— 而下一次回炉就着它提交，线上内容被**静默退回**。
+ *   可达路径：A 机回炉成功（rev→1）后 PUT 在途，B 机又回炉成功（rev→2），A 那发 PUT 才落地。
  */
 async function putProject(req, res, next) {
   try {
@@ -38,11 +44,28 @@ async function putProject(req, res, next) {
     if (!isValidId(videoId)) invalidId("Invalid video id");
 
     // 作品必须存在且是你的。★ 先验作品再验配额：作品都不是你的，配额是多少都不该告诉你。
-    const video = await BranchVideo.findById(videoId).select("_id author").lean();
+    const video = await BranchVideo.findById(videoId).select("_id author revision").lean();
     if (!video) notFound("Video not found");
     if (String(video.author) !== String(req.user._id)) forbidden("Forbidden");
 
     const { title, canvas, videoRevision, lostCount } = req.body;
+
+    // ★★ 版次闸（见本函数头的 ★★）。判否定：老作品没有 revision 字段 = 第 0 版。
+    const currentRevision = Number(video.revision || 0);
+    if (Number(videoRevision) !== currentRevision) {
+      console.warn("[project] 版次对不上，拒收", {
+        videoId: String(videoId),
+        code: "PROJECT_REVISION_MISMATCH",
+        got: Number(videoRevision),
+        current: currentRevision,
+      });
+      failWith(
+        400,
+        "PROJECT_REVISION_MISMATCH",
+        `这份工程描述的是第 ${Number(videoRevision) + 1} 版，而这条作品在服务器上已经是第 ${currentRevision + 1} 版了 —— 这一版没有留存。`,
+        { currentRevision }
+      );
+    }
     const bytes = Buffer.byteLength(JSON.stringify(canvas ?? null));
 
     // 配额：**排除这条作品自己已有的那份**（覆盖不该被自己的旧体积挡住）。
@@ -74,7 +97,9 @@ async function putProject(req, res, next) {
     const doc = await BranchProject.findOneAndUpdate(
       { video: video._id },
       {
-        $set: { title: title || "", canvas, bytes, videoRevision, lostCount },
+        // ★ `stale: false`：这一发 PUT 正是"画布换成了当下这一版"的那个动作
+        //   （回炉成功时服务端把它置真，见 branchVideo.controller 的第 ⑧ 步）
+        $set: { title: title || "", canvas, bytes, videoRevision, lostCount, stale: false },
         // ★ owner 只在插入时写：换个人来 PUT 已经被上面那道作者判定挡住了，
         //   而 $set 一个 owner 等于给"作品转移"预留一个我们并不支持的语义
         $setOnInsert: { owner, video: video._id },
@@ -89,6 +114,7 @@ async function putProject(req, res, next) {
         title: doc.title || "",
         bytes: doc.bytes || 0,
         videoRevision: Number(doc.videoRevision || 0),
+        stale: doc.stale === true,
         lostCount: Number(doc.lostCount || 0),
         updatedAt: doc.updatedAt,
       },
@@ -118,7 +144,10 @@ async function getProject(req, res, next) {
         video: doc.video,
         title: doc.title || "",
         canvas: doc.canvas,
+        // ★ 客户端拿这两格与作品当下的 revision 比：对不上就**不许铺进工坊**
+        //   （见 models/BranchProject.js 的 videoRevision ★★ 第②条）
         videoRevision: Number(doc.videoRevision || 0),
+        stale: doc.stale === true,
         lostCount: Number(doc.lostCount || 0),
         updatedAt: doc.updatedAt,
       },
@@ -155,7 +184,7 @@ async function deleteProject(req, res, next) {
 async function listProjects(req, res, next) {
   try {
     const items = await BranchProject.find({ owner: req.user._id })
-      .select("video title bytes videoRevision lostCount updatedAt")
+      .select("video title bytes videoRevision stale lostCount updatedAt")
       .sort({ updatedAt: -1 })
       .limit(PROJECT_LIST_MAX)
       .lean();
@@ -167,6 +196,7 @@ async function listProjects(req, res, next) {
         title: d.title || "",
         bytes: Number(d.bytes || 0),
         videoRevision: Number(d.videoRevision || 0),
+        stale: d.stale === true,
         lostCount: Number(d.lostCount || 0),
         updatedAt: d.updatedAt,
       })),

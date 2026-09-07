@@ -152,7 +152,18 @@ const updateBody = z
     // ★ `.min(1)` 与 publishBody 同一把尺：一条 0 段的作品是**黑屏**，
     //   而它会带着 200 + revision 递增回来 —— 观众端零报错地打不开（本案最怕的形状）。
     segments: z.array(segmentBody).min(1).max(60).optional(),
-    branchTree: branchTreeBody.optional(),
+    // ★★ 回炉时 `null` = **这一版没有分支树**（把互动作品剪成线性），与不带这个键
+    //   （`undefined` = 保留库里那棵旧的）是两件完全不同的事。少了 .nullable() 的后果是
+    //   剪辑页「合并导出」后点「替换原作品」：segments 换了、revision 涨了、弹幕清了、
+    //   收藏者收到通知，而旧 branchTree 原封不动 —— 播放端 `part.branchTree ? 分支 : 线性`，
+    //   观众看到的还是旧互动内容，新合并的成片谁也放不到，全程零报错。
+    //   controller 的 `clearBranchTree` 把 null 翻成 `$unset`。
+    branchTree: branchTreeBody.nullable().optional(),
+    // ★ 卡组的清空语义走**空数组**（`{ name: "", cards: [] }`），不用 null：
+    //   deckBody 的 cards 本来就是可选数组，空数组是它天然的没有卡表达，
+    //   controller 的 `clearDeck` 把它翻成 `$unset`。发布页那颗「随片带上这套卡」
+    //   在回炉时关掉，发的就是这一份（不发这一格的话服务端 $set 碰不到 deck，
+    //   库里那套旧卡组原样留着 —— 一颗看着生效、实际什么都没做的开关）。
     deck: deckBody.optional(),
     /**
      * 客户端手上那份内容基于作品的哪一版。**回炉时必填**（controller 里判，不在这里判：

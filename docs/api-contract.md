@@ -29,7 +29,7 @@
 
 ### BranchProject（工坊工程 / 画布快照）
 ```
-{ owner, video, videoRevision, title, bytes, canvas, lostCount, createdAt, updatedAt }
+{ owner, video, videoRevision, stale, title, bytes, canvas, lostCount, createdAt, updatedAt }
 ```
 按 `video` 唯一的**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 `lean()`，
 挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）。
@@ -296,9 +296,9 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | DELETE | `/api/branch/videos/:id/danmaku/:danmakuId` | required | 删弹幕。**弹幕作者本人 或 作品作者**。→ `{ ok: true }`。限流 30/分钟按账号。★ 无权时回**裸 403**，回包与文案里**绝不能出现作者信息** —— 否则对每条弹幕试删一次，就等于给整面匿名弹幕墙开了一个逐条查作者的接口 |
 | GET | `/api/branch/videos/:id/danmaku` | optional | 弹幕列表（见下「弹幕」）。query `limit`(默认 200，上限 500)。返回 `{ ok, items, truncated }` |
 | POST | `/api/branch/videos/:id/danmaku` | required | 发弹幕 `{ at, text, color? }` → 201 `{ ok, danmaku }`。限流 **30/分钟**（按账号） |
-| GET | `/api/branch/projects` | required | 我留存的工坊工程列表 → `{ ok, items: [{ video, title, bytes, videoRevision, lostCount, updatedAt }] }`，最多 200 条。⛔ **绝不回 `canvas`**（那是"有没有"的问题；回正文等于每次进个人页下载几十 MB） |
-| GET | `/api/branch/projects/by-video/:videoId` | required | 取回画布（**仅作者**）→ `{ ok, project: { video, title, canvas, videoRevision, lostCount, updatedAt } }`。没有 → **404** `{ code: "PROJECT_NOT_FOUND", message: "这条作品没有留存工坊工程。" }`（客户端据此把「回炉重做」画成灰键 + 一句原因，不许摆没有原因的灰） |
-| PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。四种 400：画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`（「画布里还有本机地址…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）、作品不是你的（403）/ 不存在（404） |
+| GET | `/api/branch/projects` | required | 我留存的工坊工程列表 → `{ ok, items: [{ video, title, bytes, videoRevision, stale, lostCount, updatedAt }] }`，最多 200 条。⛔ **绝不回 `canvas`**（那是"有没有"的问题；回正文等于每次进个人页下载几十 MB） |
+| GET | `/api/branch/projects/by-video/:videoId` | required | 取回画布（**仅作者**）→ `{ ok, project: { video, title, canvas, videoRevision, stale, lostCount, updatedAt } }`。没有 → **404** `{ code: "PROJECT_NOT_FOUND", message: "这条作品没有留存工坊工程。" }`（客户端据此把「回炉重做」画成灰键 + 一句原因，不许摆没有原因的灰）。★★ 客户端**必须**拿 `videoRevision` 与作品当下的 `revision` 比，对不上就**不许铺进工坊**（那份画布描述的是上一版，就着它提交会把线上内容静默退回） |
+| PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。**`videoRevision` 必须等于作品当下的 `revision`**，对不上 400 `PROJECT_REVISION_MISMATCH`（带 `details.currentRevision`）—— 这是「这一格只能靠真的 PUT 新画布往前走」那条纪律的唯一实现。五种 400：版次对不上、画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`（「画布里还有本机地址…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）；另有作品不是你的（403）/ 不存在（404） |
 | DELETE | `/api/branch/projects/by-video/:videoId` | required | 放弃留存（**仅作者**）。作品本身不受影响 |
 | GET | `/api/branch/cards` | required | 我的卡片 |
 | POST | `/api/branch/cards` | required | 批量新增 `{ cards: Card[] }`（按 cardId 幂等） |
@@ -955,8 +955,24 @@ UI 把它显示出来 —— 「删了个寂寞」必须有症状。
 
 - **带了 `segments` / `branchTree` / `deck` 任意一个 = 回炉**；一个都没带 = 改壳（行为一字未变）。
 - 回炉必须报 `baseRevision`（客户端手上那份内容基于作品的哪一版）。
+- ★★ **`branchTree: null` = 「这一版没有分支树」**，与「不带 `branchTree` 这个键」（= 保留库里那棵旧的）
+  是两件完全不同的事，服务端把 null 翻成 `$unset`。剪辑页的「合并导出」正是把互动作品改成
+  `{segments:[merged], branchTree: undefined}` —— 少了这一档，作者把互动作品剪成线性再点
+  「替换原作品」，segments 换了、revision 涨了、弹幕清了、通知发了，而**观众看到的还是旧互动内容**
+  （播放端是 `part.branchTree ? 分支 : 线性`），全程零报错。
+  ⇒ 客户端在回炉体里**恒发**这一格（没有分支树时发 `null`）。
+- ★ 同一形状的第二处：**`deck: { name: "", cards: [] }` = 「这一版不带卡组」**（发布页那颗
+  「随片带上这套卡」关掉时发的就是它），服务端翻成 `$unset deck`。不发这一格 = 保留旧卡组。
 - **并发支点只有一个：`BranchVideo.revision`**。条件更新 `{ _id, author, revision: baseRevision }`
   匹配不上就是 409，**一个字都没写进去**（弹幕不清、通知不发、资产不回收）。
+  ★ 条件更新**之前**还有一道同判据的**预检**（读一次 `revision` 就比）：资产转存排在条件更新
+  前面，而 409 是这套设计明确期待会发生的 —— 不预检的话每撞一次就把整批刚转存上去的成片
+  漏成孤儿（既不在任何 `assetUrls` 里，也没落 `PendingAssetPurge` 句柄，清扫器永远收不到）。
+  预检**不能**代替条件更新（两句之间照样能被抢跑）；真在窗口里被抢跑的那一发，409 分支会把
+  本次新转存的地址交给清扫器再抛。
+- ⛔ **并发 ≠ 陈旧**，这两件事各有一道闸：`revision` 挡并发（两台设备同时提交），
+  `BranchProject.videoRevision` 挡陈旧（画布是第 1 版、线上已经是第 2 版）。只有前者时，
+  一份陈旧画布配上现读的 `baseRevision` 会被正常接受，把线上内容**静默退回上一版**。
   ★ 老作品库里没有这个字段：`baseRevision = 0` 时同时认 `{revision: 0}` 与 `{revision: {$exists:false}}`。
 - 成功后 `revision` 自增、`revisedAt` 置为当下，两者都在回包的 `video` 里。
 
@@ -979,12 +995,21 @@ UI 把它显示出来 —— 「删了个寂寞」必须有症状。
    `BranchDanmaku.at` 是**全片累计秒**、没有段落锚点，换内容后每一条都会盖在对不上的画面上且零报错。
    ★ 客户端必须在确认卡上**提前**告诉用户会删掉多少条，不是事后。
 3. **`BRANCH_REVISED` 通知收藏者**（见上「通知」）。
-4. 把 `BranchProject.videoRevision` 对上（画布正文由客户端随后 PUT 覆盖）。
+4. 把这份工程标成 **`stale: true`**。
+   ⛔⛔ **绝不**把 `BranchProject.videoRevision` 顶成新版次：画布正文此刻还是**上一版**的，
+   要等客户端随后 PUT 才换，而那一发 PUT 是即发即忘的（断网/配额/待办缺失任一档都会让它不发生）。
+   盖章之后库里留下「canvas=第 1 版正文、videoRevision=2」这种自相矛盾的行，
+   之后**谁也看不出它陈旧了** —— 客户端拿它和作品 revision 一比正好对上，就着旧画布提交，
+   线上内容被静默退回上一版，全程 200 零报错。
+   ⇒ `videoRevision` 留在旧值（它此刻说的正是实话），只能靠 `PUT /projects/by-video/:id` 往前走。
 
 ### in-use 反查与 `assetUrls`（**上线顺序的硬要求**）
 
 `BranchVideo.assetUrls` = 这条作品占用的全部云端地址（封面 + 各段首尾帧与成片 + 分支树里的每一段），
-在每一次 create 与每一次 revise 时整份重写，带索引。
+在**每一条会写 `cover` / `segments` / `branchTree` 的路径**上整份重写，带索引 —— 一共三处：
+`createVideo`、`reviseVideoContent`、以及**改壳分支里改封面的那一支**（`updateVideo`，2026-09-07 补）。
+漏了第三处会同时错两个方向：旧封面永远留在 `assetUrls` 里挡着回收（零报错的存储泄漏），
+新封面进不了 `assetUrls`（别的作品被删/回炉时查不到本条在用它 → 被 destroy → 观众端黑屏）。
 它存在的唯一理由是反查「这条地址还被别的作品引用着吗」——
 `branchTree.nodes` 在模型里是 **Map**，按 `"branchTree.nodes.x.segment.videoUrl"` 这种点号路径查
 **永远拿到空且零报错**，而互动作品的分支段恰恰只挂在那儿。

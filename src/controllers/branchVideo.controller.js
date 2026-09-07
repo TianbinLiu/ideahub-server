@@ -1163,19 +1163,56 @@ async function broadcastRevised(video) {
 }
 
 /**
+ * 「凭链接可见」的归一规则 —— **唯一实现**（改壳与回炉两条写路径共用，铁律六）。
+ *
+ * ★★ 「凭链接可见」只有在 private 下才成立。改回 public 时**必须把它清掉**，
+ *   否则库里留下 `public + linkOnly:true` 这种自相矛盾的状态 —— 今天没人读它，
+ *   但下一个人写判据时会撞上，而它不报错、只是行为诡异。
+ *   ⚠ 用 $unset 而不是 `linkOnly: false`：这个字段判**有值**（default undefined），
+ *     写个 false 进去等于给每条老作品凭空长出一个字段。
+ * ★★ 判据是「带了 visibility 却**没带** linkOnly」，不是「改成了 public」（2026-08-30 修正）。
+ *   原来只在改回 public 时清 —— 于是老客户端（≤v2.36，它的 PATCH 白名单里根本没有
+ *   linkOnly）无论怎么保存都碰不到那一位：它把这条作品显示成「仅自己可见」、
+ *   提示语写着"别人拿到链接也打不开"，而链接照旧人人打得开。界面收紧了，实际没有 ——
+ *   而这正是隐私功能最不该错的方向。
+ *   ⇒ 「带 visibility 不带 linkOnly」只可能来自老客户端，而它此刻表达的正是
+ *     「仅自己可见」——按它说的办，往严的方向兜底。
+ * ★ 新客户端不受影响：`types.visibilityWire` 两个键一起发（private 显式发
+ *   `linkOnly: false`），唯一不带的是 public，而那一档本来就该清掉这一位。
+ *
+ * @param patch **就地修改**（public 时删掉 linkOnly 键）
+ * @returns 要合进 update 的 `$unset` 片段（可能是空对象）
+ */
+function normalizeLinkOnly(patch) {
+  const $unset = {};
+  if (patch.visibility !== undefined && patch.linkOnly === undefined) $unset.linkOnly = "";
+  if (patch.visibility === "public") delete patch.linkOnly;
+  return $unset;
+}
+
+/**
  * 回炉分支（`updateVideo` 的 ② 档）。顺序是这段代码的核心，不许调换：
  *
  *   ① 读作品（只读判权与并发要用的那几个字段 + 旧正文，供 diff 回收）
  *   ② 四道拒绝（每一句都是要**原样显示给用户**的中文）
+ *   ②b **版次预检**（花钱之前先挡掉绝大多数 409，见下面那条 ★★）
  *   ③ 资产转存（只转 patch 里真的带了的那几个键）
- *   ④ **条件更新**（唯一的并发支点：`revision`），匹配不上 = 409，一个字都没写进去
+ *   ④ **条件更新**（唯一的并发支点：`revision`），匹配不上 = 409，
+ *      而且**把这一发刚转存上去的新资产落成回收句柄**再抛（见 ★★）
  *   ⑤ 差量回收旧资产（带 in-use 反查）
  *   ⑥ 清弹幕
  *   ⑦ 广播（void，不 await，失败不影响成败）
- *   ⑧ 把工程的 videoRevision 对上（画布正文由客户端随后 PUT 覆盖）
+ *   ⑧ 把这份工程标成**已过期**（stale）
  *
  * ★ ④ 之后才动 ⑤⑥⑦⑧：条件更新没匹配上意味着"这一版没提交"，
  *   那就一条弹幕都不该删、一条通知都不该发。
+ *
+ * ★★ ②b 与 ④ 的"落句柄再抛"是同一件事的两半（2026-09-07 评审补）：③ 会把整批成片/首尾帧
+ *   转存进 Cloudinary，而 409 是这套设计**明确期待会发生**的（多设备、取回最新工程重来）。
+ *   转存在前、条件更新在后，撞一次 409 就漏一整套段落 —— 既没写进任何一条作品的
+ *   `assetUrls`，也没落 PendingAssetPurge 句柄，清扫器永远收不到它们（零报错，月底才看得出来）。
+ *   ⇒ ②b 把绝大多数冲突挡在花钱之前；真在 ②b 与 ④ 之间被人抢跑的那一发，
+ *     ④ 负责把新地址交给清扫器。这正是 `purgeVideo` 那条「句柄先落库」的同一条纪律。
  */
 async function reviseVideoContent({ req, res, id, body, baseRevision }) {
   // ① 旧正文要留着做 diff 回收（地址只存在于那份正文里，一 $set 就找不回来了）
@@ -1205,6 +1242,36 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
     failWith(400, "REVISE_NO_BASE", "请求缺少版本号，请更新 App 后再试。");
   }
 
+  // ②b 版次预检 —— **花钱之前**先挡掉绝大多数 409（见本函数头的 ★★）。
+  //   ⛔ 它**不能**代替 ④ 那道条件更新：这两句之间照样能被别的设备抢跑，
+  //     真正的并发支点只有 ④ 一个。这里只是把"必然失败"的那一发挡在转存之前。
+  const beforeRevision = Number(before.revision || 0);
+  if (Number(baseRevision) !== beforeRevision) {
+    console.log("[branch] 回炉冲突（预检）", { videoId: String(id), base: Number(baseRevision), current: beforeRevision });
+    failWith(
+      409,
+      "REVISE_CONFLICT",
+      `这条作品在别的设备上也改过（服务器上已经是第 ${beforeRevision + 1} 版）。你这一版没有提交。`,
+      { currentRevision: beforeRevision }
+    );
+  }
+
+  // ★★ 「这一版没有分支树」与「这一版不带分支树字段」是两件事，必须分得开
+  //   （2026-09-07 评审补的致命项）：回炉走「给了哪几件处理哪几件」，于是不带
+  //   `branchTree` = 保留库里那棵旧的。而剪辑页的**合并导出**正好把互动作品改成
+  //   `{segments:[merged], branchTree: undefined}` —— 作者把互动作品剪成线性、点「替换原作品」，
+  //   服务端换掉 segments、revision 递增、弹幕清空、收藏者收到通知，而旧 branchTree
+  //   原封不动留在库里；播放端是 `part.branchTree ? <BranchPlayer/> : <SegmentPlayer/>`，
+  //   观众看到的仍是旧的互动内容，新合并的成片谁也放不到，全程零报错。
+  //   ⇒ 客户端在回炉体里**恒发**这一格（没有分支树时发 `null`），null 在这里翻成 $unset。
+  const clearBranchTree = body.branchTree === null;
+  if (clearBranchTree) delete body.branchTree;
+  // ★ 同一形状的第二处：`deck: { cards: [] }` = 「这一版不带卡组」（作者在发布页把
+  //   「随片带上这套卡」关掉）。空数组落库会留下一个 `cards: []` 的空卡组对象，
+  //   详情页据 `deck.cards.length` 判，效果一样，但库里那条记录是噪声 —— 直接 $unset。
+  const clearDeck = !!(body.deck && Array.isArray(body.deck.cards) && body.deck.cards.length === 0);
+  if (clearDeck) delete body.deck;
+
   // ③ 只转存 patch 里真的带了的那几个键（cover 由 updateBody 限成 http(s)，
   //    transferImage 对它是 kept，原样返回）
   const transferred = await transferAssetsFor(body, String(req.user._id));
@@ -1215,18 +1282,24 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
   delete shell.branchTree;
   delete shell.deck;
   delete shell.cover;
-  // 「凭链接可见」的清理规则与改壳那条路**同一份判据**（见 updateVideo 里的 ★★）
-  const $unset = {};
-  if (shell.visibility !== undefined && shell.linkOnly === undefined) $unset.linkOnly = "";
-  if (shell.visibility === "public") delete shell.linkOnly;
+  // 「凭链接可见」的清理规则与改壳那条路**同一份判据**（normalizeLinkOnly 一处，铁律六）
+  const $unset = normalizeLinkOnly(shell);
+  if (clearBranchTree) $unset.branchTree = "";
+  if (clearDeck) $unset.deck = "";
 
   // ★★ `assetUrls` 必须按**合并之后**的正文算，不是按 patch 算：
   //   只换 segments 的回炉，branchTree 与 cover 还是旧的，漏了它们等于把还在用的
   //   地址从反查面上摘掉 —— 下一次删除会 destroy 掉这条作品自己的分支画面。
+  //   ★ `clearBranchTree` 那一档算成 undefined（这一版真的没有分支树），
+  //     否则回收面上会留着一棵已经不在正文里的旧树，它那批成片永远收不回来。
   const nextContent = {
     cover: transferred.cover !== undefined ? transferred.cover : before.cover,
     segments: transferred.segments !== undefined ? transferred.segments : before.segments,
-    branchTree: transferred.branchTree !== undefined ? transferred.branchTree : before.branchTree,
+    branchTree: clearBranchTree
+      ? undefined
+      : transferred.branchTree !== undefined
+        ? transferred.branchTree
+        : before.branchTree,
   };
   const nextAssetUrls = assetUrlsOfVideo(nextContent);
 
@@ -1259,6 +1332,18 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
     .lean();
 
   if (!updated) {
+    // ★★ 先把这一发**刚转存上去、却没写进任何一条作品**的新地址交给清扫器，再抛 409
+    //   （见本函数头的 ★★）。判据复用 `recycleGoneAssets` 一处（铁律六）：
+    //   把"新地址集"当 old、"旧正文的地址集"当 keep —— 差集正好就是这一发新产生的孤儿，
+    //   而它自带 `ownedRecyclableAsset` 认领与 in-use 反查两道门（回炉的新旧两版
+    //   逐字共享未改动段落的地址，漏了反查就是"删一条打死另一条"）。
+    try {
+      const orphan = await recycleGoneAssets(nextAssetUrls, assetUrlsOfVideo(before), before.author, id);
+      if (orphan.recycled) console.log(`[branch] 回炉冲突，回收本次新转存的 ${orphan.recycled} 条孤儿资产 video=${id}`);
+    } catch (err) {
+      // 回收失败不该把 409 变成 500：用户要看到的是"你这一版没提交"，不是一句系统错误
+      console.warn("[branch] 回炉冲突后的孤儿资产回收失败:", err?.message || err);
+    }
     // 没匹配上只可能是版本对不上（作者与 id 上面已经验过了）。把**当前**版次一起回去，
     // 客户端才说得出"服务器上已经是第 N 版"（铁律八：失败要响，而且要说得出为什么）。
     const now = await BranchVideo.findById(id).select("revision").lean();
@@ -1295,13 +1380,22 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
   // ⑦ 广播（void：失败不影响回炉成败）
   void broadcastRevised(updated);
 
-  // ⑧ 让工程与作品的版次对上（画布正文由客户端随后 PUT 覆盖）。
-  //   ★ 不 await 也行，但这一步很便宜，await 掉能让"回炉之后立刻再回炉"读到对的版次。
+  // ⑧ 把这份工程标成**已过期**。
+  //
+  // ⛔⛔ 这里**绝不能**把 `videoRevision` 顶成 `updated.revision`（2026-09-07 评审推翻的
+  //   旧实现）：画布正文此刻还是**上一版**的，要等客户端随后 PUT 才换 —— 而那一发 PUT
+  //   是即发即忘的（app 的 `void projects.retainAfterRevise(...)`），断网/配额/待办缺失
+  //   任一档都会让它不发生。盖了章之后库里留下的是「canvas=第 1 版正文、videoRevision=2」
+  //   这种自相矛盾的行，之后**谁也看不出它陈旧了**：客户端拿它和作品的 revision 一比正好对上，
+  //   于是就着一份旧画布提交，线上内容被静默退回上一版，全程 200 零报错。
+  //   ⇒ `videoRevision` 留在旧值不动（它此刻说的正是实话），另置一格 `stale` 给 UI 用。
+  //     这一格只能靠 `putProject`（客户端真的 PUT 了新画布）往前走，没有别的写路径。
   try {
-    await BranchProject.updateOne({ video: id }, { $set: { videoRevision: updated.revision } });
+    await BranchProject.updateOne({ video: id }, { $set: { stale: true } });
   } catch (err) {
-    // 工程对不上版次只会让下一次回炉多走一次"取回最新工程"，不该拖垮这次回炉
-    console.warn("[branch] 工程版次对齐失败:", err?.message || err);
+    // 标不上只会让客户端多走一次"取回最新工程"（videoRevision 那道闸仍然拦得住），
+    // 不该拖垮这次回炉
+    console.warn("[branch] 工程过期标记失败:", err?.message || err);
   }
 
   res.json({ ok: true, video: toVideoPayload(updated, { isOwner: true }) });
@@ -1342,7 +1436,9 @@ async function updateVideo(req, res, next) {
     //   但 `$set: {}` 会静默成功并回一条"改过了"的作品。整句拒（铁律八）。
     if (!Object.keys(body).length) badRequest("no fields to update");
 
-    const doc = await BranchVideo.findById(id).select("_id author").lean();
+    // ★ select 里带上 cover/segments/branchTree：改封面时要按**合并之后**的正文
+    //   重算 assetUrls（见下面那条 ★★）
+    const doc = await BranchVideo.findById(id).select("_id author cover segments branchTree").lean();
     if (!doc) notFound("Video not found");
     if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
 
@@ -1360,27 +1456,25 @@ async function updateVideo(req, res, next) {
     // ★ 用上面那份已经摘掉 baseRevision 的 body（它不是壳字段，$set 进去就是往库里
     //   写一个模型都没有的路径 —— mongoose strict 会静默丢掉，但别指望它兜底）
     const patch = { ...body };
-    // ★★ 「凭链接可见」只有在 private 下才成立。改回 public 时**必须把它清掉**，
-    //   否则库里留下 `public + linkOnly:true` 这种自相矛盾的状态 —— 今天没人读它，
-    //   但下一个人写判据时会撞上，而它不报错、只是行为诡异。
-    //   ⚠ 用 $unset 而不是 `linkOnly: false`：这个字段判**有值**（default undefined），
-    //     写个 false 进去等于给每条老作品凭空长出一个字段。
-    const $unset = {};
-    // ★★ 判据是「带了 visibility 却**没带** linkOnly」，不是「改成了 public」（2026-08-30 修正）。
-    //   原来只在改回 public 时清 —— 于是老客户端（≤v2.36，它的 PATCH 白名单里根本没有
-    //   linkOnly）无论怎么保存都碰不到那一位：它把这条作品显示成「仅自己可见」、
-    //   提示语写着"别人拿到链接也打不开"，而链接照旧人人打得开。
-    //   我在上一条 commit 里写"老客户端读到 private 更严格，失败方向从泄漏翻成过度保守"
-    //   —— 那句话**只对显示成立、对效果不成立**：界面收紧了，实际没有。
-    //   而这正是隐私功能最不该错的方向（本仓的规矩：往放心的方向说错比往吓人的方向说错更糟）。
-    //   ⇒ 「带 visibility 不带 linkOnly」只可能来自老客户端，而它此刻表达的正是
-    //     「仅自己可见」——按它说的办，往严的方向兜底。
-    //   ★ 新客户端不受影响：`types.visibilityWire` 两个键一起发（private 显式发
-    //     `linkOnly: false`），唯一不带的是 public，而那一档本来就该清掉这一位。
-    if (patch.visibility !== undefined && patch.linkOnly === undefined) {
-      $unset.linkOnly = "";
+    // 「凭链接可见」的归一规则：**唯一实现**在 normalizeLinkOnly（回炉那条路调的是同一个，
+    // 铁律六）。原来这里与 reviseVideoContent 各有一份逐字相同的拷贝。
+    const $unset = normalizeLinkOnly(patch);
+
+    // ★★ 改壳也可能动 `cover`，而 `cover` 是 `assetUrls` 的三个来源之一 ——
+    //   `assetUrls` 是 `assetInUseByOthers` 唯一的反查面（见 models/BranchVideo.js），
+    //   而那个反查是「删一条打死另一条」的唯一一道门。漏了这一处会同时错两个方向：
+    //     · 旧封面永远留在 assetUrls 里 ⇒ 它再也回收不掉（零报错的存储泄漏）；
+    //     · 新封面进不了 assetUrls ⇒ 别的作品被删/回炉时查不到本条在用它，
+    //       会被 destroy 掉 —— 观众端黑屏、不可逆、零提示。
+    //   ⇒ 写 `cover/segments/branchTree` 的**每一条**路径都必须重算这一格：
+    //     `createVideo`、`reviseVideoContent`、以及这里，一共三处。
+    if (patch.cover !== undefined) {
+      patch.assetUrls = assetUrlsOfVideo({
+        cover: patch.cover,
+        segments: doc.segments,
+        branchTree: doc.branchTree,
+      });
     }
-    if (patch.visibility === "public") delete patch.linkOnly;
     const update = Object.keys($unset).length ? { $set: patch, $unset } : { $set: patch };
     const updated = await BranchVideo.findByIdAndUpdate(id, update, { returnDocument: "after" })
       .populate("author", AUTHOR_FIELDS)

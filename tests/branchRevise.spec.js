@@ -12,6 +12,13 @@
 //      被别的作品引用着的地址 → 一条都不许 destroy（「删一条打死另一条」）。
 //   R6 revision 必须真的落库并出现在回包里 —— 客户端就靠"回包 revision == base+1"
 //      判断"这台服务端到底支不支持回炉"（老服务端会 strip 内容字段并回 200）。
+//   R7 `branchTree: null` = **这一版没有分支树**：剪辑页「合并导出」把互动作品剪成线性
+//      之后点「替换原作品」，旧的那棵树必须真的从库里消失。留着它的表现是
+//      「segments 换了、revision 涨了、弹幕清了、通知发了，而观众看到的还是旧互动内容」——
+//      播放端是 `part.branchTree ? 分支 : 线性`，全程零报错。
+//   R8 回炉**不许**把工程的 videoRevision 顶成新版次（画布正文还是上一版的）；
+//      只标 `stale`，videoRevision 只能靠客户端 PUT 新画布往前走。
+//   R9 改壳改封面必须重算 `assetUrls`（它是 in-use 反查唯一的面）。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -318,7 +325,11 @@ describe("回炉重做", () => {
     expect(ids).toContain(`ideahub/branch-videos/${author.userId}-200-solo`);
   });
 
-  test("回炉之后工程的 videoRevision 跟着对上（否则第二次回炉会打开旧画布）", async () => {
+  // ⛔ 这一条 2026-09-07 **整个反过来了**。旧版本断言的是「回炉后 proj.videoRevision === 1」，
+  //   而那正是评委挖出来的致命项：画布正文此刻还是第 1 版的（要等客户端随后 PUT 才换），
+  //   盖上"我是第 2 版"的章之后，客户端拿它和作品 revision 一比正好对上 ⇒ 就着旧画布再提交，
+  //   线上内容被静默退回上一版，全程 200 零报错。⇒ videoRevision 必须**留在旧值**。
+  test("R8 回炉不给工程盖章：videoRevision 留在旧值，只标 stale", async () => {
     const author = await registerUser();
     const created = (await publish(author.token)).body.video;
     await request(app)
@@ -333,7 +344,134 @@ describe("回炉重做", () => {
     }).expect(200);
 
     const proj = await BranchProject.findOne({ video: created._id }).lean();
-    expect(proj.videoRevision).toBe(1);
+    expect(proj.videoRevision).toBe(0); // ← 画布正文还是第 1 版的，这一格说的就是实话
+    expect(proj.stale).toBe(true);
+
+    // 客户端取回时看得见这两格（它据此整句拒，不许把陈旧画布铺进工坊）
+    const got = await request(app)
+      .get(`/api/branch/projects/by-video/${created._id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .expect(200);
+    expect(got.body.project.videoRevision).toBe(0);
+    expect(got.body.project.stale).toBe(true);
+
+    // 只有真的 PUT 了新画布，这一格才往前走（且 stale 归位）
+    await request(app)
+      .put(`/api/branch/projects/by-video/${created._id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ title: "工程", videoRevision: 1, canvas: { v: 1, flow: {}, deck: ["新"] } })
+      .expect(200);
+    const proj2 = await BranchProject.findOne({ video: created._id }).lean();
+    expect(proj2.videoRevision).toBe(1);
+    expect(proj2.stale).toBe(false);
+  });
+
+  test("R8b 版次对不上的 PUT 直接 400（陈旧画布不许盖到新版次上）", async () => {
+    const author = await registerUser();
+    const created = (await publish(author.token)).body.video;
+    // 作品已经是第 2 版（revision=1），客户端却报 0 —— 这份画布描述的是上一版
+    await patch(author.token, created._id, {
+      baseRevision: 0,
+      segments: [{ title: "第二版", videoUrl: "https://cdn.example.com/x.mp4" }],
+    }).expect(200);
+
+    const res = await request(app)
+      .put(`/api/branch/projects/by-video/${created._id}`)
+      .set("Authorization", `Bearer ${author.token}`)
+      .send({ title: "工程", videoRevision: 0, canvas: { v: 1, flow: {}, deck: [] } })
+      .expect(400);
+    expect(res.body.code).toBe("PROJECT_REVISION_MISMATCH");
+    expect(res.body.details.currentRevision).toBe(1);
+    expect(await BranchProject.countDocuments({ video: created._id })).toBe(0);
+  });
+
+  test("R7 回炉带 branchTree:null → 库里那棵旧树真的被清掉（合并导出把互动剪成线性）", async () => {
+    const author = await registerUser();
+    const created = (
+      await publish(author.token, {
+        branchTree: {
+          rootId: "b0",
+          nodes: {
+            b0: { id: "b0", segment: { title: "分支段", videoUrl: "https://cdn.example.com/b0.mp4" }, choices: [] },
+          },
+        },
+      })
+    ).body.video;
+    expect(created.branchTree).toBeTruthy();
+
+    const res = await patch(author.token, created._id, {
+      baseRevision: 0,
+      segments: [{ title: "合并成一条", videoUrl: "https://cdn.example.com/merged.webm" }],
+      branchTree: null,
+    }).expect(200);
+
+    // 回包与库里都必须没有那棵树 —— 播放端是 `part.branchTree ? 分支 : 线性`
+    expect(res.body.video.branchTree).toBeUndefined();
+    const doc = await BranchVideo.findById(created._id).lean();
+    expect(doc.branchTree).toBeUndefined();
+    expect(doc.segments).toHaveLength(1);
+    // 回收面也要跟着变：那棵树里的地址不该再留在 assetUrls 上挡着回收
+    expect(doc.assetUrls).not.toContain("https://cdn.example.com/b0.mp4");
+    expect(doc.assetUrls).toContain("https://cdn.example.com/merged.webm");
+  });
+
+  test("R7b 不带 branchTree 的回炉仍然保留旧树（undefined ≠ null，两件事）", async () => {
+    const author = await registerUser();
+    const created = (
+      await publish(author.token, {
+        branchTree: {
+          rootId: "b0",
+          nodes: {
+            b0: { id: "b0", segment: { title: "分支段", videoUrl: "https://cdn.example.com/b0.mp4" }, choices: [] },
+          },
+        },
+      })
+    ).body.video;
+
+    await patch(author.token, created._id, {
+      baseRevision: 0,
+      segments: [{ title: "只换线性段", videoUrl: "https://cdn.example.com/x.mp4" }],
+    }).expect(200);
+
+    const doc = await BranchVideo.findById(created._id).lean();
+    expect(doc.branchTree).toBeTruthy();
+  });
+
+  test("R7c 回炉带空卡组（cards: []）→ 原作品那套旧卡组被撤下", async () => {
+    const author = await registerUser();
+    const created = (
+      await publish(author.token, {
+        deck: { name: "原卡组", cards: [{ id: "c1", name: "原卡", cover: "https://cdn.example.com/c1.jpg" }] },
+      })
+    ).body.video;
+    expect(created.deck.cards).toHaveLength(1);
+
+    const res = await patch(author.token, created._id, {
+      baseRevision: 0,
+      segments: [{ title: "新的一版", videoUrl: "https://cdn.example.com/x.mp4" }],
+      deck: { name: "", cards: [] },
+    }).expect(200);
+
+    expect(res.body.video.deck).toBeUndefined();
+    const doc = await BranchVideo.findById(created._id).lean();
+    expect(doc.deck).toBeUndefined();
+  });
+
+  test("R9 改壳换封面 → assetUrls 跟着重算（in-use 反查唯一的面）", async () => {
+    const author = await registerUser();
+    const created = (await publish(author.token)).body.video;
+    const before = await BranchVideo.findById(created._id).lean();
+    expect(before.assetUrls).toContain("https://cdn.example.com/cover.jpg");
+
+    await patch(author.token, created._id, { cover: "https://cdn.example.com/cover-new.jpg" }).expect(200);
+
+    const doc = await BranchVideo.findById(created._id).lean();
+    // 新封面进得来（否则别的作品被删时查不到本条在用它，会被 destroy → 观众端黑屏）
+    expect(doc.assetUrls).toContain("https://cdn.example.com/cover-new.jpg");
+    // 旧封面出得去（否则它永远回收不掉 —— 零报错的存储泄漏）
+    expect(doc.assetUrls).not.toContain("https://cdn.example.com/cover.jpg");
+    // 段落地址一个都没丢（重算是按**合并之后**的正文算的，不是按 patch 算）
+    expect(doc.assetUrls).toContain("https://cdn.example.com/s1.mp4");
   });
 
   test("BRANCH_REVISED：收藏者收到一条；24h 内再回炉一次不重发", async () => {

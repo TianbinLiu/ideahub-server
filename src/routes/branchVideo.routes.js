@@ -34,6 +34,14 @@ router.post("/videos", requireAuth, validate({ body: publishBody }), createVideo
 router.get("/videos/:id", optionalAuth, getVideo);
 // 作品编辑（改壳：标题/简介/分区/标签/可见性/封面）**与回炉重做**（带 segments /
 // branchTree / deck 任意一个即回炉，需 baseRevision，冲突 409）。判据在 controller 一处。
+// @endpoint PATCH /api/branch/videos/:id
+//   body { title?, category?, description?, tags?, visibility?, linkOnly?, cover?,
+//          segments?, branchTree?, deck?, baseRevision? }
+//   ★★ `branchTree: null` = **这一版没有分支树**（把互动作品剪成线性），服务端翻成 $unset；
+//     「不带 branchTree 这个键」= 保留库里那棵旧的。两件事，客户端在回炉体里**恒发**这一格。
+//   ★ `deck: { name: "", cards: [] }` = **这一版不带卡组**，同样翻成 $unset；不发 = 保留旧卡组。
+//   ★ 回炉成功后 `BranchProject` 只被标 `stale: true`，`videoRevision` **不动**
+//     （见 branchProject.routes.js 的 ★★）。
 // ★ 必须限流：这条端点此前**一条限流都没有**（同文件的 play/like/collect/comment/danmaku
 //   每条都挂了）。加上"带内容字段就跑 Cloudinary 转存"之后，它是这个路由文件里唯一一条
 //   既花钱又不限频的端点 —— 一个脚本就能拿一份 50MB 的 body 把转存额度刷干。

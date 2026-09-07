@@ -1595,7 +1595,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `AiJob.js` - AI评审任务队列
 - `PointsLedger.js` - 虚拟点数账本（只追加的记账分录；`user:null` = 悬赏托管账户）
 - `BranchVideo.js` - 分支视频作品（ideahub-app「卡片工坊」发布的成片）。2026-09-07 加三个字段：`revision`（回炉次数，同时是**乐观并发的唯一支点**）、`revisedAt`、`assetUrls`（这条作品占用的全部云端地址，摊平成带索引的数组，供 in-use 反查 —— `branchTree.nodes` 是 Map，按点号路径查永远拿到空）
-- `BranchProject.js` - 已发布作品的「工坊工程」（画布快照，回炉重做用），按 `video` 唯一。**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 lean，挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）；**不加 TTL**（用户资产不是任务行）；`canvas` 里不许出现 `data:` / `idb:` / 方舟临时地址（PUT 的 zod 与客户端断言两道门）
+- `BranchProject.js` - 已发布作品的「工坊工程」（画布快照，回炉重做用），按 `video` 唯一。**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 lean，挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）；**不加 TTL**（用户资产不是任务行）；`canvas` 里不许出现 `data:` / `idb:` / 方舟临时地址（PUT 的 zod 与客户端断言两道门）。⚠ `videoRevision`（这份画布描述的是哪一版）**只能靠 `putProject` 往前走**，回炉成功时只把 `stale` 置真 —— 替一份还没换的画布盖章说"我是新版"会把「陈旧画布」这一档唯一的检出信号抹掉
 
 ---
 
@@ -1613,7 +1613,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `admin.controller.js` - 管理后台
 - `scraper.controller.js` - 外部内容抓取
 - `workshop.controller.js` - 工坊模板、评论、AI 改版与应用
-- `branchVideo.controller.js` - 分支视频作品：列表/发布/详情/删除/播放/点赞/收藏/评论/弹幕，以及 **PATCH 的两条分支**（改壳 vs 回炉重做）。回炉那条：作者本人 + 乐观并发（`revision`）+ 逐键转存（`transferAssetsFor` 只处理请求里真的带了的键）+ 资产差量回收（带 `assetInUseByOthers` 反查）+ 清空该作品弹幕 + 给收藏者发 `BRANCH_REVISED`
+- `branchVideo.controller.js` - 分支视频作品：列表/发布/详情/删除/播放/点赞/收藏/评论/弹幕，以及 **PATCH 的两条分支**（改壳 vs 回炉重做）。回炉那条：作者本人 + **版次预检**（花钱之前挡掉必然失败的那一发）+ 乐观并发（`revision`）+ 逐键转存（`transferAssetsFor` 只处理请求里真的带了的键，`branchTree: null` / 空 `deck` 翻成 `$unset`）+ 资产差量回收（带 `assetInUseByOthers` 反查；409 时把本次新转存的地址也交给清扫器）+ 清空该作品弹幕 + 给收藏者发 `BRANCH_REVISED` + 把工程标 `stale`。改壳那条：`normalizeLinkOnly`（与回炉共用的唯一实现）+ **改封面时重算 `assetUrls`**
 - `branchProject.controller.js` - 工坊工程读/写/删（`putProject` / `getProject` / `deleteProject` / `listProjects`）。只有作者能碰；`bytes` 服务端自己量；配额 100 条 / 50MB **不自动淘汰**（超了整句拒）
 
 ---
