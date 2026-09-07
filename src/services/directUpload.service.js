@@ -31,6 +31,8 @@
  *   它报的时长、尺寸、体积完全可以伪造，而时长正是 r2v 的计价输入。
  */
 const { cloudinary } = require("../config/cloudinary");
+const AppError = require("../utils/AppError");
+const CODES = require("../utils/errorCodes");
 
 /** 直传的分块大小。★ Cloudinary 的硬约束是「除最后一块外每块 > 5MB」（官方文档原文），
  *  官方 SDK 默认 20,000,000。这里取 6,000,000：够宽（>5MB）也够小 —— 手机慢网上
@@ -55,7 +57,12 @@ function cloudinaryReady() {
  */
 function signDirectUpload({ resourceType, publicId, allowedFormats, maxSizeBytes }) {
   const { cloud_name, api_key, api_secret } = cloudinary.config();
-  if (!cloud_name || !api_key || !api_secret) return null;
+  // ★ 这里**抛**而不是回 null：调用方都是 `res.json({ ok: true, ...signDirectUpload(...) })` 这个形状，
+  //   回 null 展开出来是 `{ ok: true }` —— 一个「成功但没有票」的响应，客户端只会在下一步莫名其妙地失败
+  //   （铁律八：失败要响）。三个调用点前面都还有一道 cloudinaryReady() 把它翻成中文 503，这里是兜底。
+  if (!cloud_name || !api_key || !api_secret) {
+    throw new AppError({ code: CODES.SERVER_ERROR, status: 503, message: "服务器还没配好文件存储，暂时不能上传。" });
+  }
   const timestamp = Math.round(Date.now() / 1000);
   // ★★ 签名与「要发哪些字段」**用同一个对象**：多签一个没发、或发了一个没签，Cloudinary 都只回
   //   一句 Invalid Signature，而那是最难查的一类错。客户端拿到 params 之后原样逐字段转发，
