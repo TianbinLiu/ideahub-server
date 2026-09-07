@@ -10,8 +10,7 @@
 const mongoose = require("mongoose");
 const BranchProject = require("../models/BranchProject");
 const BranchVideo = require("../models/BranchVideo");
-const AppError = require("../utils/AppError");
-const { notFound, forbidden, invalidId } = require("../utils/http");
+const { notFound, forbidden, invalidId, failWith } = require("../utils/http");
 const {
   PROJECT_MAX_COUNT,
   PROJECT_MAX_TOTAL_BYTES,
@@ -22,11 +21,6 @@ const PROJECT_LIST_MAX = 200;
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
-}
-
-/** 带自定义 code 的 4xx（客户端按 code 分档、把 message 原样显示给用户，铁律八） */
-function failWith(status, code, message, details) {
-  throw new AppError({ status, code, message, details });
 }
 
 /**

@@ -30,10 +30,9 @@ const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurg
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
 const { ownedRecyclableAsset, RECYCLABLE_FOLDERS } = require("../utils/templateVideoAsset");
-const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
-// ★ 回炉的四种拒绝要带**自定义 code + 整句中文**（客户端按 code 分档、把 message 原样
-//   显示给用户），utils/http 那几个函数的 code 是固定枚举值，兜不住这四档
-const AppError = require("../utils/AppError");
+// ★ `failWith` 是带**自定义 code + 整句中文**的 4xx（回炉那四档 REVISE_*）：客户端按 code
+//   分档、把 message 原样显示给用户，而同文件里那几个函数的 code 是固定枚举值，兜不住。
+const { badRequest, forbidden, notFound, invalidId, failWith } = require("../utils/http");
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 // 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用；
 // mapWithConcurrency 是仓里唯一一份"有上限的并发 map"，回炉给收藏者扇出通知时复用它
@@ -1025,12 +1024,6 @@ async function getVideo(req, res, next) {
   } catch (err) {
     next(err);
   }
-}
-
-/** 带自定义 code 的 4xx。★ utils/http 里那几个函数的 code 是固定的枚举值，
- *  而回炉的四种拒绝要把 code **和整句中文**一起交给客户端原样显示（铁律八）。 */
-function failWith(status, code, message, details) {
-  throw new AppError({ status, code, message, details });
 }
 
 /**
