@@ -20,6 +20,7 @@ const {
  *  ★ 必须 < Cloudflare 对源站的 125s 读超时，减掉 nginx 收完请求体那段。 */
 const MEDIA_UPLOAD_TIMEOUT_MS = 100_000;
 const { cloudinary } = require("../config/cloudinary");
+const { cloudinaryReady, signDirectUpload } = require("../services/directUpload.service");
 const BranchTemplate = require("../models/BranchTemplate");
 const MaterialRefVideo = require("../models/MaterialRefVideo");
 // 白模 V2 两阶段的取件凭据：**还没取回结果**的那一发也占着原始素材（见下面的第三道 exists）
@@ -100,10 +101,7 @@ async function templateVideoInUse(publicId) {
   return null;
 }
 
-/** 直传的分块大小。★ Cloudinary 的硬约束是「除最后一块外每块 > 5MB」（官方文档原文），
- *  官方 SDK 默认 20,000,000。这里取 6,000,000：够宽（>5MB）也够小 —— 手机慢网上
- *  一块几十秒，中途断了只重传这一块，而不是从头再来 47MB。 */
-const DIRECT_UPLOAD_CHUNK_BYTES = 6_000_000;
+// 直传的票（签名 / 分块大小 / 三条安全纪律）在 services/directUpload.service.js —— 三个上传口共用那一份
 
 router.post("/image", requireAuth, uploadLimit, upload.single("image"), async (req, res, next) => {
   try {
@@ -208,28 +206,20 @@ const mediaConfirmLimit = userRateLimit({ max: 5, windowMs: 60 * 1000, scope: "u
 
 router.post("/media/sign", requireAuth, uploadLimit, async (req, res, next) => {
   try {
-    const { cloud_name, api_key, api_secret } = cloudinary.config();
-    if (!cloud_name || !api_key || !api_secret) {
+    if (!cloudinaryReady()) {
       return res.status(503).json({ ok: false, message: "服务器还没配好视频存储，暂时不能上传。" });
     }
     // public_id 在这里生成，形状必须与 ownWorkshopMediaPublicId 的 `^<userId>-\d+$` 完全吻合
+    // ★ 签名的三条纪律见 services/directUpload.service.js 的文件头（唯一实现）
     const publicId = `${WORKSHOP_MEDIA_FOLDER}/${req.user._id.toString()}-${Date.now()}`;
-    const timestamp = Math.round(Date.now() / 1000);
-    // ★ 与模板那张票同一份签名纪律：overwrite:false（防事后原地换内容）、allowed_formats（防拿 /video 的票往 /raw 传任意文件）
-    const params = {
-      allowed_formats: DIRECT_MEDIA_FORMATS.join(","),
-      overwrite: false,
-      public_id: publicId,
-      timestamp,
-    };
-    const signature = cloudinary.utils.api_sign_request(params, api_secret);
     res.json({
       ok: true,
-      uploadUrl: `https://api.cloudinary.com/v1_1/${cloud_name}/video/upload`,
-      publicId,
-      params: { ...params, api_key, signature },
-      chunkBytes: DIRECT_UPLOAD_CHUNK_BYTES,
-      maxSizeBytes: MAX_DIRECT_MEDIA_BYTES,
+      ...signDirectUpload({
+        resourceType: "video",
+        publicId,
+        allowedFormats: DIRECT_MEDIA_FORMATS,
+        maxSizeBytes: MAX_DIRECT_MEDIA_BYTES,
+      }),
     });
   } catch (err) {
     next(err);
@@ -429,57 +419,25 @@ router.post("/template-video/derive", requireAuth, tplVideoMinuteLimit, tplVideo
 //   删掉等于让所有没更新的人当场失去上传能力（而更新是他们自己决定的）。
 router.post("/template-video/sign", requireAuth, tplVideoMinuteLimit, tplVideoDailyLimit, async (req, res, next) => {
   try {
-    const { cloud_name, api_key, api_secret } = cloudinary.config();
-    if (!cloud_name || !api_key || !api_secret) {
+    if (!cloudinaryReady()) {
       return res.status(503).json({ ok: false, message: "服务器还没配好视频存储，暂时不能上传。" });
     }
-    // ★★ public_id 在**这里**生成，不接受客户端传任何一部分：形状必须与
-    //   ownTemplateVideoPublicId 的 `^<userId>-\d+$` 完全吻合，否则传上去之后
-    //   confirm、登记、回收三处都会判它"不是你的"，而那时文件已经在 Cloudinary 上了。
-    const userId = req.user._id.toString();
-    const publicId = `${TEMPLATE_VIDEO_FOLDER}/${userId}-${Date.now()}`;
-    const timestamp = Math.round(Date.now() / 1000);
-    // ★ 签名覆盖三件事：写到哪个 id、能不能覆盖、允许什么格式。
-    // ★★★ `overwrite: false` 是这条新路**必须**签进去的一项（2026-08-22 实测确认）：
-    //   签名有效期是 1 小时且可复用 ⇒ 不加这一项的话，用户可以先传一段干净素材、
-    //   走完复核与登记、模板过审发布，**再用同一个签名把 Cloudinary 上那份原地换成别的**：
-    //   数据库里一个字段都不动、全程零报错，而所有套用者拿到的已经是新内容。
-    //   实测：不带它时同一签名把 41.2s 的资产换成了 13.7s 的（version 变了、DB 不会知道）；
-    //   带上它时回的是 `existing: true` + 旧资产元数据，新内容写不进去。
-    //   ⚠ 老路没有这个洞不是因为它更安全，而是因为 public_id 由服务端每次新生成、
-    //     客户端从来拿不到"再写一次同一个 id"的机会 —— 直传把这个机会给出去了。
-    //   ⚠ 也实测过它**不影响分块**：中间块照常回 `{done:false}`，末块照常回完整资产。
-    // ★★★ `allowed_formats` 是**必须签**的第二项（2026-08-22 实测出来的真实漏洞）：
-    //   Cloudinary 算签名时**排除 resource_type**（它只在 URL 路径里），所以一张
-    //   `/video/upload` 的票，把 URL 改成 `/raw/upload` 照样有效 —— 实测把一个 HTML
-    //   文件传进了 `res.cloudinary.com/<我们的 cloud>/raw/upload/ideahub/template-videos/…`，
-    //   等于在我们的可信域上开了一个任意文件托管（钓鱼载荷，投诉与封号都记在我们头上）。
-    //   ⚠ `overwrite:false` 拦不住它：三种 resource_type 是**三套独立命名空间**。
-    //   ⚠ 而且这类资产**我们自己永远回收不到**：三处 destroy 全写死 resource_type:"video"
-    //     且不带扩展名，而 raw 资产的 public_id 是带扩展名的（实测 `…-<ts>.html`）。
-    //   加上这一项之后实测回的是 `{"error":{"message":"Raw file format html not allowed"}}`。
-    //   ⚠ 值从 ALLOWED_TEMPLATE_VIDEO_FORMATS 派生（唯一实现）；实测 .mov 传上去
-    //     Cloudinary 报的 format 正是 "mov"，两边对得上，不会误伤。
-    const params = {
-      allowed_formats: ALLOWED_TEMPLATE_VIDEO_FORMATS.join(","),
-      overwrite: false,
-      public_id: publicId,
-      timestamp,
-    };
-    // ★★ 签名与"要发哪些字段"**用同一个对象**：多签一个没发、或发了一个没签，
-    //   Cloudinary 都只回一句 Invalid Signature，而那是最难查的一类错。
-    //   客户端拿到 params 之后**原样逐字段转发**，不许自己拼、也不许增删。
-    const signature = cloudinary.utils.api_sign_request(params, api_secret);
+    // ★★ public_id 在**服务端**生成，不接受客户端传任何一部分：形状必须与 ownTemplateVideoPublicId 的
+    //   `^<userId>-\d+$` 完全吻合，否则传上去之后 confirm、登记、回收三处都会判它"不是你的"，
+    //   而那时文件已经在 Cloudinary 上了。
+    // ★ 签名的三条纪律（public_id 签死 / overwrite:false / allowed_formats）与它们各自挡住的实测漏洞，
+    //   都写在 services/directUpload.service.js 的文件头 —— 那里是这条规则的唯一实现。
+    const publicId = `${TEMPLATE_VIDEO_FOLDER}/${req.user._id.toString()}-${Date.now()}`;
     res.json({
       ok: true,
-      uploadUrl: `https://api.cloudinary.com/v1_1/${cloud_name}/video/upload`,
-      publicId,
-      // 客户端要原样发出去的表单字段（file / Content-Range / X-Unique-Upload-Id 另加）
-      params: { ...params, api_key, signature },
-      // 分块大小由服务端说了算：Cloudinary 要求"除最后一块外每块 > 5MB"，
-      // 这里给 6,000,000（十进制），够宽也够小 —— 慢网上一块几十秒，断了只重传一块。
-      chunkBytes: DIRECT_UPLOAD_CHUNK_BYTES,
-      maxSizeBytes: MAX_TEMPLATE_VIDEO_BYTES,
+      ...signDirectUpload({
+        resourceType: "video",
+        publicId,
+        // ★ 值从 ALLOWED_TEMPLATE_VIDEO_FORMATS 派生（唯一实现）；实测 .mov 传上去 Cloudinary 报的
+        //   format 正是 "mov"，两边对得上，不会误伤。
+        allowedFormats: ALLOWED_TEMPLATE_VIDEO_FORMATS,
+        maxSizeBytes: MAX_TEMPLATE_VIDEO_BYTES,
+      }),
     });
   } catch (err) {
     next(err);

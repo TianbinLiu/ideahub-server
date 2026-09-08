@@ -9,8 +9,9 @@
  * API端点:
  * @endpoint GET    /            - 广场列表（?page&limit&sort=new|hot&q&tag&scope=all|installed|mine）；scope=all 第一页最前面是官方内置条目
  * @endpoint GET    /:id         - 详情（$inc viewCount）；"official-mascot" 回官方内置条目
+ * @endpoint POST   /bundle/sign - 出一张 Cloudinary raw(zip) 直传票（App 上传向导用，绕开 CF 125 秒读超时）；按用户 5 次/分钟 + 20 次/天
  * @endpoint POST   /inspect     - 只看不存（向导第 3 步）：bundle=zip → { entries, entry, capabilities, mapping(自动), completeness, warnings }；按用户 10 次/分钟
- * @endpoint POST   /            - 上传（multipart：bundle=zip ≤25MB + name/description/coverImageUrl/tags/shared/personaId/voice(JSON) + mapping(JSON, companion.json 内容，缺省自动映射) + entry + selfMade）；回包多 warnings / entries
+ * @endpoint POST   /            - 上传（multipart：bundle=zip ≤25MB **或** bundleRef=直传回来的 public_id + name/description/coverImageUrl/tags/shared/personaId/voice(JSON) + mapping(JSON, companion.json 内容，缺省自动映射) + entry + selfMade）；回包多 warnings / entries
  * @endpoint PUT    /:id         - 作者改元数据 / 换绑人格 / 改推荐嗓子 / 改映射 mapping（对象 = 校验后重写 companion.json，null = 恢复自动映射）/ selfMade（JSON）
  * @endpoint DELETE /:id         - 作者删除：连解压目录、收藏、点赞一起删；正在用它的用户回到官方看板娘
  * @endpoint POST   /:id/install / DELETE /:id/install - 收藏下载（downloadCount）
@@ -42,6 +43,15 @@ router.post(
   uploadLive2dBundle.single("bundle"),
   validate({ body: createBody }),
   ctrl.createModel
+);
+// 直传票：App 侧 25MB 的 zip 不可能走 multipart（Cloudflare 125 秒读超时），必须客户端直传 Cloudinary。
+// ★ 两道限流叠着：分钟闸挡脚本，天闸给"出票后不用"的泄漏兜底（那份 raw 资产没人回收）。
+router.post(
+  "/bundle/sign",
+  requireAuth,
+  userRateLimit({ max: 5, windowMs: 60 * 1000, scope: "live2d-bundle-sign" }),
+  userRateLimit({ max: 20, windowMs: 24 * 60 * 60 * 1000, scope: "live2d-bundle-sign-day" }),
+  ctrl.signBundleUpload,
 );
 // 只看不存：向导第 3 步用它拿能力档案 + 自动映射 + 入口候选（解到 uploads/tmp-inspect/ 临时目录，返回前删掉）
 router.post("/inspect", requireAuth, userRateLimit({ max: 10, scope: "live2d-inspect" }), uploadLive2dBundle.single("bundle"), ctrl.inspectModel);
