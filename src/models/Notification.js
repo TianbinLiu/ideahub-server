@@ -25,6 +25,16 @@ const NotificationSchema = new mongoose.Schema(
         // 评论里 @ 到了你。★ 与 ideas 那套的 "MENTION" 刻意分开：同上，deeplink 目标不同
         // （videoId vs ideaId），而且 app 的消息页按类型白名单过滤，混用会让它跳错地方。
         "BRANCH_MENTION",
+        // 你收藏的作品被作者「回炉重做」了（内容换了，链接没变）。收件人 = 收藏者。
+        // ★ deeplink 目标是 **videoId**（与其它 BRANCH_* 同口径），点进去到 /video/:id。
+        // ★ 正文走 **`payload.commentText`**，复用 ADMIN_NOTICE 已经走通的那条通道 ——
+        //   新开一个 `payload.text` 就要同时改 App 的 data/notifications 映射，
+        //   而「服务端发了、App 静默丢掉」正是那张白名单存在要防的事故形态。
+        // ⚠ 老 App（≤v2.45）**收不到**这一类：它的 `BRANCH_NOTIFICATION_TYPES` 是**请求层
+        //   白名单**（列表筛选 / 未读数 / 全部已读三处从它派生），老包压根不会把这个 type
+        //   放进查询。对未升级用户，观众知情为零 —— 这条写进了 docs/api-contract.md，
+        //   不许说成「降级显示」。
+        "BRANCH_REVISED",
         // 平台通知（管理员手动发给某个用户的自由文本）。payload 形状：{ text }。
         // ★ **不带 actorId**（写入点在 branchAdmin.controller 的 notifyUser，传的就是
         //   undefined）：通知以**平台口径**发出，「具体是哪个管理员发的」不透给用户 ——

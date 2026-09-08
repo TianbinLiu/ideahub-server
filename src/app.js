@@ -179,6 +179,10 @@ app.use("/api/branch", require("./routes/branchTemplate.routes"));
 app.use("/api/branch", require("./routes/promptScheme.routes"));
 // 出片技能（画布 agent 指令的封装）与它的广场。同 base，路径全在 /skills 下
 app.use("/api/branch", require("./routes/agentSkill.routes"));
+// 已发布作品的「工坊工程」（画布快照，回炉重做用）。同一个 /api/branch base，
+// 路径全在 /projects 下，与 /videos /cards /decks /templates 不重叠。
+// jsonGate 已经在上面对整个 /api/branch 生效（画布最大 2MB，默认 100kb 会 413）
+app.use("/api/branch", require("./routes/branchProject.routes"));
 // 成片合并（把已转存的 N 段拼成一条）。同一个 /api/branch base，路径全在 /compose 下。
 // 端上原来用 MediaRecorder 实时重录，弱网/低端机上不可靠（2026-08-21 真机复盘）
 app.use("/api/branch", require("./routes/branchCompose.routes"));

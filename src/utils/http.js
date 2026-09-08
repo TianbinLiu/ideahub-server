@@ -26,4 +26,16 @@ function invalidId(message = "Invalid id") {
   throw new AppError({ code: CODES.INVALID_ID, status: 400, message });
 }
 
-module.exports = { badRequest, otpCooldown, commentCooldown, publicLimitExceeded, unauthorized, forbidden, notFound, invalidId };
+/**
+ * 带**自定义 code + 自定义整句人话**的 4xx —— 上面那几个函数的 code 是 `errorCodes` 里
+ * 的固定枚举，而有些业务拒绝（回炉的 REVISE_*、工程留存的 PROJECT_*）要把 code 和
+ * 那句中文一起交给客户端**原样显示给用户**（铁律八），枚举装不下。
+ *
+ * ★ 2026-09-07 合并：branchVideo.controller 与 branchProject.controller 里各有一份
+ *   逐字相同的实现（同一次提交里写出来的），合成这一处（铁律六）。
+ */
+function failWith(status, code, message, details) {
+  throw new AppError({ status, code, message, details });
+}
+
+module.exports = { badRequest, otpCooldown, commentCooldown, publicLimitExceeded, unauthorized, forbidden, notFound, invalidId, failWith };

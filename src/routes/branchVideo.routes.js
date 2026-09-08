@@ -32,8 +32,30 @@ const {
 router.get("/videos", optionalAuth, listVideos);
 router.post("/videos", requireAuth, validate({ body: publishBody }), createVideo);
 router.get("/videos/:id", optionalAuth, getVideo);
-// 作品编辑：只改标题/简介/分区/可见性。片段与卡组不可改（发布即定稿）
-router.patch("/videos/:id", requireAuth, validate({ body: updateBody }), updateVideo);
+// 作品编辑（改壳：标题/简介/分区/标签/可见性/封面）**与回炉重做**（带 segments /
+// branchTree / deck 任意一个即回炉，需 baseRevision，冲突 409）。判据在 controller 一处。
+// @endpoint PATCH /api/branch/videos/:id
+//   body { title?, category?, description?, tags?, visibility?, linkOnly?, cover?,
+//          segments?, branchTree?, deck?, baseRevision? }
+//   ★★ `branchTree: null` = **这一版没有分支树**（把互动作品剪成线性），服务端翻成 $unset；
+//     「不带 branchTree 这个键」= 保留库里那棵旧的。两件事，客户端在回炉体里**恒发**这一格。
+//   ★ `deck: { name: "", cards: [] }` = **这一版不带卡组**，同样翻成 $unset；不发 = 保留旧卡组。
+//   ★ 回炉成功后 `BranchProject` 只被标 `stale: true`，`videoRevision` **不动**
+//     （见 branchProject.routes.js 的 ★★）。
+// ★ 必须限流：这条端点此前**一条限流都没有**（同文件的 play/like/collect/comment/danmaku
+//   每条都挂了）。加上"带内容字段就跑 Cloudinary 转存"之后，它是这个路由文件里唯一一条
+//   既花钱又不限频的端点 —— 一个脚本就能拿一份 50MB 的 body 把转存额度刷干。
+// ★ 6/分钟 与 compose 受理同一把尺（branchCompose.routes.js）：回炉是"改完一版提交一次"
+//   的动作，正常人十秒钟做不完一版；而改壳（改个标题）也走这条路，6 次/分钟仍然够用。
+// ★ 按【账号】计：这条在 requireAuth 后面，按 IP 计等于换个出口就重开一桶
+//   （理由与本文件里发评论那条逐字相同）。
+router.patch(
+  "/videos/:id",
+  requireAuth,
+  userRateLimit({ windowMs: 60 * 1000, max: 6, scope: "branch:revise" }),
+  validate({ body: updateBody }),
+  updateVideo
+);
 // 删作品：作者本人 或 管理员（判据在 controller 的 assertCanDelete 一处）
 router.delete("/videos/:id", requireAuth, removeVideo);
 

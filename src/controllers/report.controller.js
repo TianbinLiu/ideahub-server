@@ -198,7 +198,11 @@ async function resolveTargets(rows) {
   const [videos, comments, danmaku] = await Promise.all([
     idsByType.video.length
       ? BranchVideo.find({ _id: { $in: idsByType.video } })
-          .select("_id title cover visibility takedown author createdAt")
+          // ★ `revision` / `revisedAt`：让复核的人知道「这条作品被回炉重做过 N 次」。
+          //   ⚠ 这**不是**内容快照（Report 刻意不存快照，见 models/Report.js 的 ★）——
+          //   管理员看得到"改过"，看不到"改了什么"。真正的解法是发布/回炉时存一份
+          //   segments 快照供复核，那是又一张表 + 又一条级联路径，本版不做（已知缺口）。
+          .select("_id title cover visibility takedown author createdAt revision revisedAt")
           .populate("author", USER_FIELDS)
           .lean()
       : [],
@@ -232,6 +236,11 @@ async function resolveTargets(rows) {
       //   ⚠ 队列里能看到"已下架但还有待处理举报"是正常的：管理员也可能走
       //     POST /api/admin/branch/videos/:id/takedown 直接下架，那条路不碰举报队列。
       takedown: v.takedown || null,
+      // 「这条作品被回炉重做过几次 / 最近一次是什么时候」。★ 只给次数与时间，
+      //   不给内容差异（Report 不存内容快照，见 .select() 上面那条 ★）。
+      //   0 / 缺失 = 从没回炉过；revisedAt 无值时不发这个键（老作品不该凭空长出日期）。
+      revision: Number(v.revision || 0),
+      ...(v.revisedAt ? { revisedAt: v.revisedAt } : {}),
       author: toUserPayload(v.author),
       createdAt: v.createdAt,
     });

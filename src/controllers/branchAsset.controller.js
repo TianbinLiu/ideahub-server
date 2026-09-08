@@ -1380,4 +1380,7 @@ module.exports = {
   getAssetStats,
   // ★ 给 branchAdmin.controller（级联删用户）复用：计数回写只有这一份实现（铁律六）
   recountAssetStat,
+  // ★ 给 branchVideo.controller（回炉后给收藏者扇出通知）复用：
+  //   "有上限的并发 map" 仓里只有这一份，别在那边再写一个 Promise.all 分片（铁律六）
+  mapWithConcurrency,
 };
