@@ -528,4 +528,87 @@ describe("回炉重做", () => {
     const created = (await publish(author.token)).body.video;
     await patch(author.token, created._id, { baseRevision: 0, segments: [] }).expect(400);
   });
+
+  // ── 2026-09-08 合并前复核挖出的三条「不可逆」──────────────────────────────
+
+  test("R10 转存失败 → 502，且原作品一个字都没动（旧资产不许被当成 gone 删掉）", async () => {
+    const PendingAssetPurge = require("../src/models/PendingAssetPurge");
+    const author = await registerUser();
+    const created = (await publish(author.token)).body.video;
+    await BranchDanmaku.create({ video: created._id, author: author.userId, text: "老弹幕", at: 1 });
+
+    // dataURL 会走真的上传，而测试环境没配 Cloudinary ⇒ 必失败 ⇒ ctx.failed > 0。
+    // 修之前：失败被静默降级（大 dataURL 直接成空串），照样写库 + 把旧的那条永久地址删掉。
+    const res = await patch(author.token, created._id, {
+      baseRevision: 0,
+      segments: [{ title: "换第一段", videoUrl: "data:video/mp4;base64,AAAAIGZ0eXBpc29t" }],
+    });
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe("REVISE_TRANSFER_FAILED");
+    expect(res.body.message).toMatch(/没有.*提交|没能存到云端/);
+
+    // 原作品一个字没动
+    const doc = await BranchVideo.findById(created._id).lean();
+    expect(doc.revision || 0).toBe(0);
+    expect(doc.revisedAt).toBeUndefined();
+    expect(doc.segments).toHaveLength(2);
+    expect(doc.segments[0].videoUrl).toBe("https://cdn.example.com/s1.mp4");
+    // 弹幕没被清、旧资产没落回收句柄
+    expect(await BranchDanmaku.countDocuments({ video: created._id })).toBe(1);
+    expect(await PendingAssetPurge.countDocuments({ source: String(created._id) })).toBe(0);
+  });
+
+  test("R11a keepUrlsOf：keep 集必须含库里**当下**那份 assetUrls（孤儿回收唯一的判据）", () => {
+    // ★★ 这条钉的是复核挖出的那个错法：assetInUseByOthers 用 `_id: { $ne: 本条 }` 把这条作品
+    //   自己排除掉，所以「赢家刚写进本条作品的新地址」在输家眼里是"没人在用" —— 不把库里当下
+    //   那份 assetUrls 并进 keep，就会把赢家刚上线的画面 destroy 掉（观众端 404、不可逆）。
+    //   为什么不走 HTTP：那一拍要求"输家读到的 before 还是旧内容"，在本机 supertest 上复现不稳定
+    //   （我第一版就是这么写的，负向验证照样绿 —— 等于没测）。所以直接钉这个纯函数。
+    const { keepUrlsOf } = branchVideoController;
+    const before = { cover: "https://cdn.example.com/c.jpg", segments: [{ videoUrl: "https://cdn.example.com/old.mp4" }] };
+    const now = { assetUrls: ["https://cdn.example.com/winner-new.mp4"] };
+
+    const keep = keepUrlsOf(before, now);
+    expect(keep).toContain("https://cdn.example.com/old.mp4"); // 旧正文里的
+    expect(keep).toContain("https://cdn.example.com/winner-new.mp4"); // ★ 赢家刚写进去的
+    expect(keep).toContain("https://cdn.example.com/c.jpg");
+
+    // now 缺省时退化成"只看旧正文"（转存失败那条路用的就是这一档：那时库里还没被人改过）
+    expect(keepUrlsOf(before, null)).not.toContain("https://cdn.example.com/winner-new.mp4");
+    // 去重（同一地址在正文与 assetUrls 里各出现一次时只留一份）
+    expect(keepUrlsOf(before, { assetUrls: ["https://cdn.example.com/old.mp4"] }).filter((u) => u.includes("old.mp4"))).toHaveLength(1);
+  });
+
+  test("R11b 同一份 body 并发两发：一发 200 一发 409，作品完好且不留误删句柄", async () => {
+    const PendingAssetPurge = require("../src/models/PendingAssetPurge");
+    const author = await registerUser();
+    // 用 ownedRecyclableAsset 认得出的形状，否则这条用例会因为"外链本来就不回收"而假过
+    const own = (n) => `https://res.cloudinary.com/demo/video/upload/v1/ideahub/branch-videos/${author.userId}-${n}.mp4`;
+    const created = (
+      await publish(author.token, { segments: [{ title: "原段", videoUrl: own(1), durationSec: 5 }] })
+    ).body.video;
+
+    // ★★ 必须**真并发**：两发都要在对方提交之前读到 before（revision=0、还指着 own(1)）。
+    //   写成"先 await 第一发再发第二发"复现不出来 —— 那时第二发读到的 before 已经是新内容，
+    //   assetUrlsOfVideo(before) 里本来就有 own(2)，旧代码也不会把它当孤儿（我第一版就写错成这样，
+    //   把负向验证跑绿了才发现）。
+    const body = { baseRevision: 0, segments: [{ title: "新段", videoUrl: own(2), durationSec: 5 }] };
+    const [r1, r2] = await Promise.all([
+      patch(author.token, created._id, body),
+      patch(author.token, created._id, body),
+    ]);
+    const codes = [r1.status, r2.status].sort();
+    expect(codes).toEqual([200, 409]); // 一发赢、一发撞版次
+
+    // ★ 赢家的新地址此刻正被这条作品用着。修之前：assetInUseByOthers 用 `_id: { $ne: 本条 }`
+    //   把自己排除掉 ⇒ own(2) 被判成"没人在用的孤儿" ⇒ 落句柄 ⇒ destroy ⇒ 观众端 404 黑屏。
+    const handles = await PendingAssetPurge.find({ source: String(created._id) }).lean();
+    const targets = handles.map((h) => String(h.publicId || h.url || ""));
+    expect(targets.some((t) => t.includes(`${author.userId}-2`))).toBe(false);
+
+    // 作品本身完好，仍然指着 own(2)
+    const doc = await BranchVideo.findById(created._id).lean();
+    expect(doc.segments[0].videoUrl).toBe(own(2));
+    expect(doc.assetUrls).toContain(own(2));
+  });
 });

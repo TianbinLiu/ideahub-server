@@ -104,7 +104,7 @@ function fallbackValue(original, label) {
  * 让 segments 与 branchTree 里重复出现的同一帧只上传一次。
  */
 function createTransferContext(userId) {
-  return { userId, cache: new Map(), seq: 0, uploaded: 0, failed: 0, kept: 0 };
+  return { userId, cache: new Map(), seq: 0, uploaded: 0, failed: 0, kept: 0, failedKeys: [] };
 }
 
 function nextKey(ctx, label) {
@@ -131,6 +131,7 @@ async function transferImage(ctx, value, label) {
     ctx.uploaded += 1;
   } catch (err) {
     ctx.failed += 1;
+    ctx.failedKeys.push(String(label));
     console.warn(`[branch] 图片转存失败(${label}):`, err?.message || err);
     out = fallbackValue(raw, label);
   }
@@ -158,6 +159,7 @@ async function transferVideo(ctx, value, label) {
     ctx.uploaded += 1;
   } catch (err) {
     ctx.failed += 1;
+    ctx.failedKeys.push(String(label));
     console.warn(`[branch] 视频转存失败(${label}):`, err?.message || err);
     out = fallbackValue(raw, label); // 降级保留原值（方舟链接约 24h 后失效）
   }
@@ -200,7 +202,7 @@ async function transferSegment(ctx, segment, label) {
  * ★ 顺带修掉一个现存 500：老实现无条件读 `draft.segments.length`，
  *   请求体里没有 segments 时抛 TypeError。
  */
-async function transferAssetsFor(input, userId) {
+async function transferAssetsFor(input, userId, report) {
   const ctx = createTransferContext(userId);
   const draft = input || {};
   const out = {};
@@ -264,6 +266,19 @@ async function transferAssetsFor(input, userId) {
   console.log(
     `[branch] 资源转存完成 user=${userId} uploaded=${ctx.uploaded} kept=${ctx.kept} failed=${ctx.failed}`
   );
+
+  // ★★ 把账目带回给调用方（2026-09-08 补）。此前**只回 out**，于是「有几处没转存成功」
+  //   这件事只存在于上面那行日志里 —— 发布路径无所谓（失败了也不删任何东西，最坏是这一段
+  //   留着方舟临时链接），但**回炉不行**：它紧接着要按新旧地址差集去 destroy 旧资产。
+  //   转存失败 ⇒ 新地址退回原值（方舟链接约 24h 过期）甚至空串（fallbackValue 丢弃超大 dataURL）
+  //   ⇒ 旧的那条永久地址落进 gone 集 ⇒ 被删。接口还回 200、弹幕已清、版次已涨、通知已发。
+  //   出参而不是改返回值形状：createVideo 与既有测试都在直接解构 out 的四个键，不动它们。
+  if (report && typeof report === "object") {
+    report.uploaded = ctx.uploaded;
+    report.kept = ctx.kept;
+    report.failed = ctx.failed;
+    report.failedKeys = ctx.failedKeys.slice();
+  }
 
   return out; // ★ 只含真的处理过的键
 }
@@ -1051,6 +1066,20 @@ async function assetInUseByOthers(url, exceptVideoId) {
 }
 
 /**
+ * 「这一发失败了，把刚传上去的新资产收掉」时的 **keep 集**（唯一实现）。
+ * ★★ 必须同时包含：① 旧正文里的地址（本来就在用的）；② 库里**当下**那份 assetUrls
+ *   —— 因为 assetInUseByOthers 会把本条作品自己排除掉，只靠它的话，另一发请求刚写进去的
+ *   新地址会被判成"没人在用"而删掉（那正是赢家刚上线的画面）。
+ * @param {object} before 这一发开始时读到的正文
+ * @param {object|null} now 库里当下的文档（至少 select 了 assetUrls）；没有就传 null
+ */
+function keepUrlsOf(before, now) {
+  const keep = new Set(assetUrlsOfVideo(before || {}));
+  for (const u of (now && Array.isArray(now.assetUrls) ? now.assetUrls : [])) keep.add(u);
+  return [...keep];
+}
+
+/**
  * 回炉的**差量**资产回收：只回收「旧的有、新的没有、且没有别的作品在用」的那些。
  *
  * ⛔ **不许复用 purgeVideo 的全删**：5 段只改 1 段时另外 4 条 URL 逐字相同，
@@ -1274,7 +1303,8 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
 
   // ③ 只转存 patch 里真的带了的那几个键（cover 由 updateBody 限成 http(s)，
   //    transferImage 对它是 kept，原样返回）
-  const transferred = await transferAssetsFor(body, String(req.user._id));
+  const transfer = { failed: 0, failedKeys: [] };
+  const transferred = await transferAssetsFor(body, String(req.user._id), transfer);
 
   // 壳字段：把内容三件与 cover 摘掉（cover 已经在 transferred 里了，写两遍就会分叉）
   const shell = { ...body };
@@ -1302,6 +1332,26 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
         : before.branchTree,
   };
   const nextAssetUrls = assetUrlsOfVideo(nextContent);
+
+  // ③b **转存失败就不许往下走**（2026-09-08 补）。见 transferAssetsFor 的 ★★：
+  //   失败会把新地址悄悄降级成方舟临时链接或空串，而 ⑤ 的差量回收随后会把**旧的那条永久资产**
+  //   当成"没人用了"删掉 —— 新的 24h 后死链、旧的已经不可逆地没了，而客户端收到的是 200。
+  //   所以在写库之前整句拒，并把这一发已经传上去的新资产按孤儿收掉（与 409 分支同一条路）。
+  if (transfer.failed > 0) {
+    try {
+      const orphan = await recycleGoneAssets(nextAssetUrls, keepUrlsOf(before, null), before.author, id);
+      if (orphan.recycled) console.log(`[branch] 回炉转存失败，回收本次新转存的 ${orphan.recycled} 条孤儿资产 video=${id}`);
+    } catch (err) {
+      console.warn("[branch] 回炉转存失败后的孤儿回收也失败:", err?.message || err);
+    }
+    console.error(`[branch] 回炉转存失败 video=${id} failed=${transfer.failed} keys=${transfer.failedKeys.join(",")}`);
+    failWith(
+      502,
+      "REVISE_TRANSFER_FAILED",
+      `有 ${transfer.failed} 处素材没能存到云端，这一版**没有**提交（原作品一个字没动）。稍后再试一次。`,
+      { failedKeys: transfer.failedKeys }
+    );
+  }
 
   // ④ 条件更新 —— **整套回炉唯一的并发支点**。
   //   ★ 老作品没有 revision 字段：baseRevision=0 时要同时认 `{revision:0}` 与 `{$exists:false}`
@@ -1337,8 +1387,13 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
     //   把"新地址集"当 old、"旧正文的地址集"当 keep —— 差集正好就是这一发新产生的孤儿，
     //   而它自带 `ownedRecyclableAsset` 认领与 in-use 反查两道门（回炉的新旧两版
     //   逐字共享未改动段落的地址，漏了反查就是"删一条打死另一条"）。
+    // ★ 先读**当前**正文再回收：assetInUseByOthers 用 `_id: { $ne: 本条 }` 把这条作品自己排除掉，
+    //   而 409 的成因恰恰是"另一发请求已经把这批新地址写进了同一条作品"。不把 now.assetUrls
+    //   并进 keep 集，就会把**赢家刚刚上线的成片**当成孤儿 destroy 掉（2026-09-08 复核挖出）：
+    //   单机双击就能走到 —— 回炉没有 clientId 幂等键、转存要几十秒，两发 body 又完全一样。
+    const now = await BranchVideo.findById(id).select("revision assetUrls").lean();
     try {
-      const orphan = await recycleGoneAssets(nextAssetUrls, assetUrlsOfVideo(before), before.author, id);
+      const orphan = await recycleGoneAssets(nextAssetUrls, keepUrlsOf(before, now), before.author, id);
       if (orphan.recycled) console.log(`[branch] 回炉冲突，回收本次新转存的 ${orphan.recycled} 条孤儿资产 video=${id}`);
     } catch (err) {
       // 回收失败不该把 409 变成 500：用户要看到的是"你这一版没提交"，不是一句系统错误
@@ -1346,7 +1401,6 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
     }
     // 没匹配上只可能是版本对不上（作者与 id 上面已经验过了）。把**当前**版次一起回去，
     // 客户端才说得出"服务器上已经是第 N 版"（铁律八：失败要响，而且要说得出为什么）。
-    const now = await BranchVideo.findById(id).select("revision").lean();
     const currentRevision = Number((now && now.revision) || 0);
     console.log("[branch] 回炉冲突", { videoId: String(id), base: Number(baseRevision), current: currentRevision });
     failWith(
@@ -2544,6 +2598,10 @@ module.exports = {
   //   要从别人的作品/评论上撤走并把快照重算回来）。那边**只调用，不重写**。
   toVideoPayload,
   TAKEN_DOWN,
+  // ★ 给 tests/branchRevise.spec.js 用：孤儿回收的 keep 集是「删一条打死另一条」那道门的判据，
+  //   而它的错法（漏掉库里当下那份 assetUrls）只在真并发那一拍才显形 —— HTTP 层复现不稳定，
+  //   所以直接钉这个纯函数。
+  keepUrlsOf,
   NOT_TAKEN_DOWN,
   syncLikes,
   syncCommentLikes,
