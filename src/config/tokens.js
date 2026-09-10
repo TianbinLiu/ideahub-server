@@ -361,15 +361,17 @@ function materialRefTokens(inputDurationSec, outputDurationSec, model) {
  *   于是 app 那边的打包报价天然等于服务端逐笔之和，例如炼一张卡 =
  *   1 次 chat(400) + 1 次 image(13.3k) = app 的 forgeCost(1)。
  *
- * ★ 已知不完全一致的两处（写在这里免得以后被当成 bug 反复查）：
- *   1. 「生成本段」时管线可能额外调 Seedream，服务端如实按 model 各收一次出图费：
- *      **补画缺失的设定帧那部分 app 已经报进去了**（2026-08 加的 economy.segmentCost，
- *      简约模式两张都补、走参考生视频则一张都不补），别再往这边加一遍——会变成双算。
- *      仍然没报的只剩**圈选改帧**（segmentGen 第①步，每条标注一次 refineFrame），
- *      也就是**用了圈选时实际比报价高**。
- *   2. 看图说话（chatVision）app 按帧报 VISION_FRAME_TOKENS×N，服务端按一次 chat 收。
- *      也就是**实际可能比报价低**。
- *   两边都是"如实按调用收"，要对齐得改 app 的报价口径，不是改这里。
+ * ★ 与 app 报价的对应关系（两边都"如实按调用收"；对不上时改 app 的报价口径，不是改这里）：
+ *   1. 「生成本段」时管线可能额外调 Seedream，服务端如实按 model 各收一次出图费。
+ *      补画缺失的设定帧（app 的 economy.segmentCost，简约模式两张都补、走参考生视频一张都不补）
+ *      与圈选改帧（economy.annRedrawCost，2026-08-21 补上；哪几条真跑由 segmentGen.redrawnAnns 定）
+ *      app 都已经报进去了，别再往这边加一遍 —— 会变成双算。
+ *   2. 看图说话（chatVision）是**一次 chat**，塞几帧都收 CHAT_TURN_TOKENS。app 2026-09-10 起
+ *      按「chat 调用次数 × CHAT_TURN_TOKENS」报价与记账（economy.mintQuote）；此前按帧报 900×N，
+ *      报价比实收高。钉子在 tests/arkProxy.spec.js「跨仓 chat 定额一致性」。
+ *   （这一段原来的标题是"已知不完全一致的两处"，两处现在都对齐了。）
+ *   ⚠ 第 2 条的前提是 chat **按调用、不按内容量**计价。哪天改成按用量，app 那几个没有帧数参数的
+ *     报价函数（mintQuote / blockoutTemplateCost）必须一起改。
  */
 /**
  * 真人档（MiniMax 海螺 2.3 · 768P）按发一口价（token/发，键 = 时长秒）。
