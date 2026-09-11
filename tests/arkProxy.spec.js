@@ -971,6 +971,44 @@ describe("跨仓 r2v 系数一致性（app 的报价 vs 服务端的结算）", 
   });
 });
 
+describe("跨仓 chat 定额一致性（app 的报价 vs 服务端的结算）", () => {
+  // 抄自 app/src/data/economy.ts（为什么抄不 fs 读：与上面视频/出图两组逐字相同的理由 ——
+  // server 独立部署，会自己跳过的用例是静默失败）。
+  // ★ app 侧有**两个**常量代表"一次 chat 调用"，两个都必须等于这边的 CHAT_TURN_TOKENS：
+  //   CHAT_TURN_TOKENS —— 闲聊、画布 agent、看片提卡（economy.mintQuote 按调用次数乘它）；
+  //   CARD_META_TOKENS —— 素材炼卡每张卡那一次文案 chat（forgeCost 按卡数乘它）。
+  // ★ 2026-09-10 之前这个价**一条钉子都没有**，而 app 的看图报价按"每帧 900"算了很久：
+  //   8 帧的一次看图 app 报 7,200、这边收 400，两仓各自的测试全绿。
+  const APP_CHAT_TOKENS = { CHAT_TURN_TOKENS: 400, CARD_META_TOKENS: 400 };
+
+  test("app 里代表一次 chat 的常量都等于服务端定额", () => {
+    const { CHAT_TURN_TOKENS } = require("../src/config/tokens");
+    for (const [name, tokens] of Object.entries(APP_CHAT_TOKENS)) {
+      expect({ name, tokens }).toEqual({ name, tokens: CHAT_TURN_TOKENS });
+    }
+  });
+
+  test("看图按调用收、不按张数（app 的 mintQuote 只数调用次数，靠的就是这一条）", () => {
+    const { priceOf, CHAT_TURN_TOKENS } = require("../src/config/tokens");
+    const image = { type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } };
+    // 形状 = app arkClient.chatVision 真发的请求体（system + 一条 text + N 张图）
+    const visionBody = (n) => ({
+      model: "doubao-seed-2-1-turbo-260628",
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: [{ type: "text", text: "看图" }, ...Array(n).fill(image)] },
+      ],
+      max_tokens: 1200,
+      thinking: { type: "disabled" },
+    });
+    // ★ 哪天 chat 改成按图数 / 用量计价，这条会红 —— 那时 app 的 economy.mintQuote 与
+    //   blockoutTemplateCost 必须一起改（它们没有帧数参数是有意的），别只把这条断言改绿。
+    for (const n of [0, 1, 8]) {
+      expect({ images: n, cost: priceOf("chat", visionBody(n)) }).toEqual({ images: n, cost: CHAT_TURN_TOKENS });
+    }
+  });
+});
+
 describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 参考视频，2026-08-28）", () => {
   // ★ 与前两条分支的差别：reference 子任务（不是 edit）、输出时长用户选（3~10）、
   //   计价 = (登记输入 + 输出)×720p 锚×2.8（tokens.materialRefTokens）。
