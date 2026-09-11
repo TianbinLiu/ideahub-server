@@ -61,6 +61,7 @@ async function createRechargeOrder(userId, tokens) {
     kind: "recharge",
     packTokens: pack.tokens,
     amountFen: pack.amountFen,
+    amountCheck: "channel",
   });
   return { order };
 }
@@ -76,6 +77,7 @@ async function createPlanOrder(userId, planId) {
     kind: "plan",
     planId: plan.id,
     amountFen: Math.round(plan.price * 100),
+    amountCheck: "channel",
   });
   return { order };
 }
@@ -100,10 +102,15 @@ function isExpired(order) {
  *   expired      订单已超时/已关闭
  *   not_found    订单号不存在
  *   marked_failed 渠道明确告知失败
+ *   wrong_channel 金额不靠回调核的单（amountCheck = product，即 Google Play），不许走回调结算
  */
 async function applyCallback(channel, v) {
   const order = await TokenOrder.findOne({ orderNo: String(v.orderNo || "") });
   if (!order) return { ok: false, code: "not_found" };
+
+  // ★ Google Play 的单（amountCheck = product）amountFen 是 0：走到下面「实付 < 应付」那道校验会恒过，
+  //   等于一张没核过的单也能发币。它只许走 playBilling.service 的兑换（出站查 Google），连"标失败"都不许从这里改
+  if (order.amountCheck === "product") return { ok: false, code: "wrong_channel" };
 
   // 渠道说这笔失败了：记下来，终态，不发币
   if (v.failed) {
@@ -175,7 +182,9 @@ async function applyCallback(channel, v) {
  */
 async function grantForOrder(order) {
   if (order.kind === "recharge") {
-    await wallet.credit(order.user, order.packTokens, "recharge", `订单 ${order.orderNo}`);
+    // Google Play 的单单独记账（iap_recharge；测试购买 iap_test），对账时与国内渠道、与真钱分得开
+    const reason = order.channel === "google_play" ? (order.testPurchase ? "iap_test" : "iap_recharge") : "recharge";
+    await wallet.credit(order.user, order.packTokens, reason, `订单 ${order.orderNo}`);
     return order.packTokens;
   }
   const w = await wallet.buyPlan(order.user, order.planId);
@@ -222,4 +231,5 @@ module.exports = {
   closeOrder,
   isExpired,
   toOrderPayload,
+  grantForOrder,
 };

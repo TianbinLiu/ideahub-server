@@ -309,7 +309,7 @@ async function unbanUser(req, res, next) {
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
  *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
- *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany。
+ *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany；**Google Play 的订单行例外**（去标识化后保留，见下面「不删」）。
  *      token 是对外采购的算力额度，**没有对手方**，删他自己的流水不破坏任何不变量。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
@@ -320,6 +320,10 @@ async function unbanUser(req, res, next) {
  *     删掉他那一侧的分录，对手方的分录就永远配不平，整本账从此说不清 ——
  *     账本是只追加的审计记录，人没了账也得在。
  *   · BranchAssetView —— TTL 索引一天内自清，且 viewer 是不可逆哈希，够不成 PII。
+ *   · TokenOrder 里 Google Play 的那些（channel = google_play）—— **去标识化后保留**：删掉 user / raw / 明文
+ *     purchaseToken，留 purchaseTokenHash、orderId（channelTxnId）、发了多少币、状态。Google 的退款 / 撤销在
+ *     30 天窗口里还会回来，voided 清扫要靠这些行认出「这笔发过多少币」并记 user_gone；删了就只剩一条认不出来的
+ *     撤销记录（D15 阶段 1，规格 §2.6「三条删号入口」那张表）。
  *   · ideas 产品线的内容（Idea/Comment/Like/Group/DM…）—— 本次范围是分支视频这条线
  *     的后台；那边的级联要动 30+ 张表，且有自己的软删除体系（deactivatedAt），
  *     混在这里做一半比不做更糟。作者字段悬空后 populate 出 null，读侧已按
@@ -479,9 +483,18 @@ async function purgeUserCascade(userId) {
     ],
   });
 
-  // ⑨ 钱包流水与订单
+  // ⑨ 钱包流水与订单。★ Google Play 的订单行去标识化后留下（理由见上面「不删」清单），先改它再删其余的
   removed.tokenLedger = (await TokenLedger.deleteMany({ user: uid })).deletedCount;
-  removed.tokenOrders = (await TokenOrder.deleteMany({ user: uid })).deletedCount;
+  removed.tokenOrdersDeidentified = (
+    await TokenOrder.updateMany(
+      { user: uid, channel: "google_play" },
+      {
+        $unset: { user: 1, raw: 1, purchaseToken: 1 },
+        $set: { note: "账号已被管理员永久删除：订单行去标识化保留（对 Google 的退款 / 撤销）" },
+      }
+    )
+  ).modifiedCount;
+  removed.tokenOrders = (await TokenOrder.deleteMany({ user: uid, channel: { $ne: "google_play" } })).deletedCount;
 
   // ⑩ 关注、通知、搜索记录
   removed.follows = (await Follow.deleteMany({ $or: [{ follower: uid }, { following: uid }] })).deletedCount;
