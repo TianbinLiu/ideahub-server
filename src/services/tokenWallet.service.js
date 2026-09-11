@@ -229,16 +229,77 @@ async function buyPlan(userId, planId, now = new Date()) {
   return shape(updated);
 }
 
-/** 今日已经"印"了多少（recharge + plan_buy），用于模拟支付的防滥用上限 */
+/**
+ * Google Play 退款 / 撤销之后的回收（D15 阶段 1）：把发出去的 token 扣回来，**扣到 0 为止、不许负数**。
+ *
+ * ★ 余额扣不够时最终怎么处置（清零记欠账 / 允许负数）是**产品决定 1，还没定**。先按「能扣多少扣多少、
+ *   差额如实回报」做 —— 负数要改 schema 和所有显示，是更大的一步。调用方把差额记在订单上（clawbackState: short）。
+ * ★ 扣的顺序与 debit **相反：先 addon 再 plan**。买来的 token 本来就进的是 addon；先扣 plan 的话，
+ *   「月初买一包 → 退款」会把会作废的 plan 额度换成永不过期的 addon，退一次款白赚一次跨月。
+ * ★ 仍是一次条件原子更新（W1）：每个桶扣 min(桶, 还差的)，并发下不会扣穿。
+ * @returns {Promise<{plan:number, addon:number, planId:string, cycle:string, takenTokens:number, shortTokens:number}|null>}
+ *   用户或钱包不存在 → null
+ */
+async function clawback(userId, amount, memo = "", now = new Date()) {
+  const n = toTokens(amount);
+  if (n === null) return null;
+  const w = await ensureWallet(userId, now);
+  if (!w) return null;
+  if (n === 0) return { ...w, takenTokens: 0, shortTokens: 0 };
+  const before = await User.findOneAndUpdate(
+    { _id: userId, tokenWallet: { $exists: true } },
+    [
+      {
+        $set: {
+          "tokenWallet.addon": { $subtract: ["$tokenWallet.addon", { $min: ["$tokenWallet.addon", n] }] },
+          "tokenWallet.plan": {
+            $subtract: [
+              "$tokenWallet.plan",
+              { $min: ["$tokenWallet.plan", { $max: [0, { $subtract: [n, "$tokenWallet.addon"] }] }] },
+            ],
+          },
+        },
+      },
+    ],
+    // 扣了多少要拿**扣之前**的余额算（管道里两个桶读的都是更新前的值，同 debit 那段说明）
+    { returnDocument: "before", updatePipeline: true },
+  )
+    .select(SELECT)
+    .lean();
+  if (!before) return null;
+  const had = total(before);
+  const taken = Math.min(had, n);
+  const shortTokens = n - taken;
+  const addon = Number(before.tokenWallet.addon) - Math.min(Number(before.tokenWallet.addon), n);
+  const plan = had - taken - addon;
+  await writeEntry(userId, -taken, "iap_clawback", had - taken, shortTokens ? `${memo}（差 ${shortTokens} 没扣到）` : memo);
+  return {
+    plan,
+    addon,
+    planId: before.tokenWallet.planId || DEFAULT_PLAN_ID,
+    cycle: before.tokenWallet.cycle,
+    takenTokens: taken,
+    shortTokens,
+  };
+}
+
+/** 今日已经"印"了多少（recharge + plan_buy，以及 Google Play 发的 iap_recharge / iap_test），对账用 */
 async function mintedToday(userId, now = new Date()) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const rows = await TokenLedger.aggregate([
-    { $match: { user: userId, reason: { $in: ["recharge", "plan_buy"] }, createdAt: { $gte: start } } },
+    {
+      $match: {
+        user: userId,
+        reason: { $in: ["recharge", "plan_buy", "iap_recharge", "iap_test"] },
+        createdAt: { $gte: start },
+      },
+    },
     { $group: { _id: "$reason", sum: { $sum: "$delta" }, n: { $sum: 1 } } },
   ]);
   const byReason = Object.fromEntries(rows.map((r) => [r._id, r]));
   return {
-    rechargeTokens: byReason.recharge?.sum ?? 0,
+    // ★ Google Play 发的币也是「印出来的」，口径并进来（D15 阶段 1）
+    rechargeTokens: (byReason.recharge?.sum ?? 0) + (byReason.iap_recharge?.sum ?? 0) + (byReason.iap_test?.sum ?? 0),
     planBuys: byReason.plan_buy?.n ?? 0,
   };
 }
@@ -262,6 +323,7 @@ module.exports = {
   credit,
   noteAdminFree,
   buyPlan,
+  clawback,
   mintedToday,
   listLedger,
 };

@@ -2225,6 +2225,42 @@ settled。这是**故意**的：宁可"充不了值"，也不要留一个谁调�
 `PAY_ALLOW_MOCK=1` 打开演示用假渠道（**没有验签**）。默认关；生产环境开着会被启动自检
 直接拒绝（`config/preflight.js`）。
 
+### Google Play 结算（D15 阶段 1，服务端）
+
+挂载点：`/api/pay/play`（`routes/playPay.routes.js`，由 `pay.routes.js` 末尾挂上）。**`PLAY_BILLING_ENABLED` 没开时整组 404**。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/pay/play/session` | required | `{ enabled, obfuscatedAccountId, products: [{ productId, kind, tokens }] }`。客户端下单时把 `obfuscatedAccountId` 交给 BillingClient |
+| POST | `/api/pay/play/redeem` | required，按账号限流 | body `{ purchaseToken, productId }`，回包 `{ ok, code, order?, wallet? }` |
+
+**只给 code，句子由客户端出**（D7 a）：
+
+| HTTP | code | 含义 | 发币 | consume |
+|---|---|---|---|---|
+| 200 | `settled` | 这一次发了币 | ✓ | 发币之后做；失败交给清扫器按退避重试 |
+| 200 | `duplicate` | 这个 purchaseToken 早兑过了（同一个账号） | — | 还没 consume 的顺手再试一次 |
+| 202 | `pending` | Google 回报待付款 | ✗ | ✗ |
+| 400 | `bad_request` / `unknown_product` / `quantity_unsupported` | 参数不对 / 商品不在册或与购买记录对不上 / 不止一件 | ✗ | ✗ |
+| 403 | `account_mismatch` | 购买记录里的账号不是你（或这笔已被别的账号兑过） | ✗ | ✗（让 Google 三天后自动退款） |
+| 403 | `account_unbound` | 购买记录里没有账号（常见于 Play 商店促销码），记一条待处理 | ✗ | ✗ |
+| 403 | `test_purchase_blocked` | 测试购买，服务端没放行（`PLAY_ALLOW_TEST_PURCHASES` 或管理员才发） | ✗ | ✗ |
+| 409 | `not_purchased` | CANCELLED / 未知状态 / 这个 token 在本包名下不存在 | ✗ | ✗ |
+| 409 | `already_consumed` | Google 侧已消费、本库没有发过币 | ✗ | ✗ |
+| 502 | `store_unavailable` | 查 Google 失败（网络 / 5xx），稍后重试 —— **不等于没买** | ✗ | ✗ |
+| 503 | `not_configured` | 开了开关但没配盐 | ✗ | ✗ |
+
+- 判据全在 `services/payment/playBilling.service.js` 文件头 P1~P8，回归测试 `server/tests/playBilling.spec.js`。
+- 商品 → token 只在 `config/playProducts.js`（productId 在 Console 建好之前是占位）；价格由 Google 按国家定，
+  服务端不碰金额：这类单 `amountCheck = "product"`、`amountFen = 0`，**不许**走 `/api/pay/callback`（回 `wrong_channel`）。
+- 固定顺序：抢 `settledAt` → 发币进 addon（流水 `iap_recharge`；测试购买 `iap_test`）→ 标 settled → 最后 consume。
+- 退款 / 撤销：惰性清扫一天最多真跑一次（`purchases.voidedpurchases.list`，只查得到 30 天内；租约落库，双实例只有一个在扫），
+  每笔只回收一次：流水 `iap_clawback`，**先扣 addon 再扣 plan、扣到 0 为止**，差额记在订单 `clawbackShortTokens`，
+  `clawbackState: done | short | user_gone`。余额扣不够最终怎么处置是产品决定 1，还没定。
+- `PLAY_ACCOUNT_SALT` **永远不能轮换**（换了之前的购买都认不出主人）。
+- 删号：App 注销（软删）订单行不动、照常回收；管理员硬删（`purgeUserCascade`）Play 订单行去标识化保留，回收记 `user_gone`；
+  官网 `DELETE /api/users/:id` 不级联（既有缺陷，不属于本项），回收同样落到 `user_gone`。
+
 ### 价目表两边必须一致
 
 `server/src/services/payment/order.service.js` 的 `RECHARGE_PACKS` 与
