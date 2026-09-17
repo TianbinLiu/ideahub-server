@@ -1674,10 +1674,13 @@ body `{ roles: [{ label, desc }] }`（**1~9 条**，见上面 `roles` 的铁则 
 - `confirmTemplateRoles()` —— 角色位核对，**成功后把本机 `roles` 一起改写**：出片时点名用的
   是本机那份，只改远端的话作者在这台设备上出的片仍按旧标记点名（改了却没生效，零症状）。
   ⚠ 它**只发 `roles`**，`markSlots` 一个字都不带（那是方案位，见上）。
-- `isOrdinalMark()` / `markSpecOf()` / `markNoun()` / `boxOfLabel()`（`src/data/templates.ts`）——
-  「这个模板是哪种标记方案 + 它那份顺序表 / 界面上怎么称呼它 / 某个位置的框在哪」的
+- `isOrdinalMark()` / `markSpecOf()` / `boxOfLabel()`（`src/data/templates.ts`）——
+  「这个模板是哪种标记方案 + 它那份顺序表 / 某个位置的框在哪」的
   **全 app 唯一实现**。提示词（`studio/blockoutPrompt`）、核对面板、挂卡面板、
   `flowStore.applyCast` 的错误句全部问它们。
+  界面上怎么称呼它（位置 / 编号）**没有名词函数**：原来的 `markNoun()` 在 2026-09-11 做多语言时删了
+  （名词当片段拼进句子，英文拼不成整句），`confirmTemplateRoles`、`flowStore.applyCast`、FlowPage 的挂卡框
+  按 `spec.scheme` 各写一句整话 —— 方案判据仍然只问 `markSpecOf`。
   ★ `markSpecOf` 返回的是**判别联合** `{scheme:"number"} | {scheme:"ordinal", slots}`，
   而不是一个光秃秃的枚举：序数方案下"怎么排序"与"能选哪几个位置"都要那份 slots，
   收成一个值之后，"序数方案但没有顺序表"这种在运行期必然排错序的状态在类型上不可表达。
