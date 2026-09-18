@@ -13,7 +13,6 @@
  * @endpoint GET    /threads?scene=&limit=          - 我的会话列表（按最后活跃倒序），每条带 context 用量
  * @endpoint GET    /threads/:id/messages?before=&limit= - 翻历史（按 seq 倒着分页，返回正序）；含已被提纯的原文与分隔提示
  * @endpoint POST   /threads/:id/compact  {focus?}  - 手动「整理记忆」：只留最后一轮原文，其余提纯；focus 是用户想重点记住的
- * @endpoint POST   /threads/:id/summary/revert     - 摘要回退到上一版
  * @endpoint DELETE /threads/:id                    - 删会话：消息、用量、摘要、从它提炼出的记忆卡，立即硬删
  * @endpoint DELETE /threads?scene=                 - 清空这个场景的全部会话（同上，逐个硬删）
  * @endpoint GET    /memories?scene=                - 「小梦记得的事」
@@ -86,18 +85,13 @@ router.post("/threads/:id/compact", aiRateLimit({ max: 5, scope: "chat-compact" 
     if (!r.ok && r.reason === "busy") {
       return res.status(409).json({ ok: false, message: "正在整理中，请稍候", code: "CHAT_COMPACT_BUSY" });
     }
+    if (!r.ok && r.reason === "gone") {
+      return res.status(404).json({ ok: false, message: "会话不存在或已被删除", code: "CHAT_THREAD_NOT_FOUND" });
+    }
     if (!r.ok) {
       return res.status(502).json({ ok: false, message: "整理失败，请稍后再试", code: "CHAT_COMPACT_FAILED", context: r.context });
     }
     res.json({ ok: true, compacted: r.compacted, context: r.context });
-  } catch (e) {
-    next(e);
-  }
-});
-
-router.post("/threads/:id/summary/revert", async (req, res, next) => {
-  try {
-    res.json({ ok: true, thread: await chatMemory.revertSummary({ userId: req.user._id, threadId: req.params.id }) });
   } catch (e) {
     next(e);
   }

@@ -253,6 +253,12 @@ async function streamCompanionReply({
     closed = true;
     abort.abort();
   });
+  // 'close' 只触发一次：客户端在前面那些查库的 await 期间就断了，这个监听器根本等不到 —— 直接当断开处理，
+  // 不然上游会把整段话生成完、token 照扣，还当成完整回复存进历史
+  if (res.destroyed) {
+    closed = true;
+    abort.abort();
+  }
 
   let index = 0;
   const plainParts = [];
@@ -289,6 +295,11 @@ async function streamCompanionReply({
       failed = true;
       console.error(`[${tag}] stream failed:`, (e && e.message) || e);
     }
+    // 上游半路出错：缓冲里没说完的半句也收进 plainParts（好存下半截回复），但不发 sentence 事件 —— 旧写法的事件序列不变
+    const wasClosed = closed;
+    closed = true;
+    splitter.flush();
+    closed = wasClosed;
   }
 
   // finish：按会话聊天时由路由传入，负责存下这句回复、记用量，返回值并进 done / error（threadId、上下文用量）。

@@ -36,6 +36,17 @@ const COMPACT_RATIO = 0.75;
 /** 连续这么多次提纯失败就不再自动试 */
 const MAX_COMPACT_FAILS = 2;
 /**
+ * 提纯租约的时限：比一次提纯最坏的耗时（aiComplete 60s 超时 × SDK 最多 3 次 + 库操作）长。
+ * 过了这个时间还没放的锁，视为持有者已经死了（进程被重启），别人可以接手。
+ */
+const COMPACT_LEASE_MS = 5 * 60 * 1000;
+/** 组装上下文时最多取最近这么多条原文（提纯没跟上时历史可能攒得很长，不能整段读进内存再裁） */
+const CONTEXT_WINDOW_ROWS = 400;
+/** 连续同角色合并后一条最多这么多字（留末尾） */
+const MERGED_MAX_CHARS = 4000;
+/** 一次提纯最多压这么多字的原文（积压很多时分几次压） */
+const COMPACT_TARGET_MAX_CHARS = 40000;
+/**
  * 自动提纯至少要能压掉这么多条原文（2 轮）才值得调一次模型：否则固定前缀（system + 知识库）偏大时，
  * 每轮都会为了压 1 轮原文去调一次模型。手动「整理记忆」不受这个限制。
  */
@@ -70,7 +81,7 @@ function sceneConfig(scene) {
 
 // ── token 估算 ───────────────────────────────────────────────
 
-const CJK_RE = /[぀-ヿ㐀-鿿가-힯豈-﫿＀-￯]/g;
+const CJK_RE = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
 
 /**
  * 本地估算 token：汉字（及全角、日韩文）按 0.6、其余字符按 0.3 —— DeepSeek 官方给的换算比例
@@ -80,8 +91,9 @@ const CJK_RE = /[぀-ヿ㐀-鿿가-힯豈-﫿＀-￯]/g;
 function estimateTokens(text) {
   const s = String(text || "");
   if (!s) return 0;
-  const cjk = (s.match(CJK_RE) || []).length;
-  return Math.ceil(cjk * 0.6 + (s.length - cjk) * 0.3);
+  const other = s.replace(CJK_RE, "").length; // 比 match 省：不为每个汉字分配一个数组元素
+  const cjk = s.length - other;
+  return Math.ceil(cjk * 0.6 + other * 0.3);
 }
 
 /** 一组消息的估算（每条另加 4 个 token 的消息头开销） */
@@ -92,6 +104,17 @@ function estimateMessages(messages) {
 function clip(text, max) {
   const s = String(text || "");
   return s.length > max ? s.slice(0, max) : s;
+}
+
+/** 留末尾 max 个字 */
+function clipTail(text, max) {
+  const s = String(text || "");
+  return s.length > max ? s.slice(s.length - max) : s;
+}
+
+/** 压成一行（记忆卡、摘要进 system 提示词前）：换行和连续空白都变成一个空格 */
+function oneLine(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
 }
 
 function notFound() {
@@ -117,6 +140,8 @@ async function openThread({ userId, scene, threadId, personaId = null }) {
 /**
  * 往会话里追加一条消息。序号用 $inc 原子取（同一会话两个请求并发也不会撞号）。
  * 会话在这期间被删 → 404。
+ * ★ 取号和写消息是两步：删会话恰好落在两步之间时，写进去的这条会成孤儿（会话没了、原文还在，违背硬删）。
+ *   所以写完再看一眼会话还在不在，不在就把刚写的删掉（删会话一律先删会话本体，见 deleteThread）。
  */
 async function appendMessage(thread, { role, displayText = "", modelText = "", kind = "msg", partial = false }) {
   const now = new Date();
@@ -140,6 +165,10 @@ async function appendMessage(thread, { role, displayText = "", modelText = "", k
     estTokens: kind === "msg" ? estimateTokens(model) : 0,
     partial,
   });
+  if (!(await ChatThread.exists({ _id: updated._id }))) {
+    await ChatMessage.deleteOne({ _id: msg._id });
+    throw notFound();
+  }
   thread.seq = updated.seq;
   thread.title = updated.title;
   thread.messageCount = updated.messageCount;
@@ -167,23 +196,26 @@ async function recentUserTexts(thread, n = 2) {
 
 // ── 上下文组装 ────────────────────────────────────────────────
 
+function memoryScope(thread) {
+  return thread.scene === "support"
+    ? { user: thread.user, scene: "support", sourceThreads: thread._id }
+    : { user: thread.user, scene: "companion" };
+}
+
 async function loadMemories(thread) {
-  const q =
-    thread.scene === "support"
-      ? { user: thread.user, scene: "support", sourceThreads: thread._id }
-      : { user: thread.user, scene: "companion" };
-  return ChatMemory.find(q).sort({ pinned: -1, updatedAt: -1 }).limit(MAX_FACTS).lean();
+  return ChatMemory.find(memoryScope(thread)).sort({ pinned: -1, updatedAt: -1 }).limit(MAX_FACTS).lean();
 }
 
 /**
  * 记忆块（事实卡 + 摘要）的文字。接在 system 提示词的**末尾**（不单独成一条 system 消息：
- * 对话中间插 system 有的兼容端点不认）。客服的这一块因此排在知识库与红线**之后**，并明写不得覆盖规则。
+ * 对话中间插 system 有的兼容端点不认）。客服的这一块因此排在知识库与红线之后，并明写不得覆盖规则。
  * 记忆块只在提纯时变，平时整段前缀不变，模型端的前缀缓存照样命中。
- * 记忆里的文字按**不可信数据**对待（它们来自用户说过的话），明写不许当指令执行。
+ * 记忆里的文字按**不可信数据**对待（它们来自用户说过的话），明写不许当指令执行；每条压成一行，
+ * 不能靠换行把自己伪装成提示词里的另一节。
  */
 function memoryBlock(scene, memories, summaryText) {
-  const facts = (memories || []).map((m) => `- ${m.text}`);
-  const summary = String(summaryText || "").trim();
+  const facts = (memories || []).map((m) => `- ${oneLine(m.text)}`);
+  const summary = oneLine(summaryText);
   if (!facts.length && !summary) return null;
   const head =
     scene === "support"
@@ -198,42 +230,68 @@ function memoryBlock(scene, memories, summaryText) {
 /**
  * 把历史里连续同一角色的消息合成一条（回复失败后用户重发、或半截回复之后又说了一句，都会出现连续的 user）：
  * 有的端点要求 user / assistant 严格交替，否则 400。完全相同的连续用户消息只留一条（那是重发）。
+ * 合出来的一条最多留末尾 MERGED_MAX_CHARS 字：连续失败几百次攒下的用户消息不能合成一条撑爆预算。
  */
 function mergeSameRole(history) {
   const out = [];
   for (const m of history) {
     const last = out[out.length - 1];
     if (last && last.role === m.role) {
-      if (last.content !== m.content) last.content = `${last.content}\n${m.content}`;
+      if (last.content !== m.content) last.content = clipTail(`${last.content}\n${m.content}`, MERGED_MAX_CHARS);
       continue;
     }
-    out.push({ ...m });
+    out.push({ ...m, content: clipTail(m.content, MERGED_MAX_CHARS) });
   }
   return out;
 }
 
 /**
- * 组装发给模型的完整消息：prefix（system + few-shot，由路由按场景给；记忆块接在 system 末尾）→ 最近未提纯的原文。
- * 兜底：估算超预算就从最老的原文开始丢（至少留最后 2 条）—— 正常情况下提纯早就把它压下去了，
- * 这里只防提纯失败或用户贴了超长文本时把一次请求撑爆。
+ * 按预算从最老的开始丢，至少留 minKeep 条（最后一条是用户刚说的话，永远留着）。
+ * 每条只估算一次、用累计值往下减 —— 逐条重算整段是 O(n²)，几千条历史能把事件循环卡住几十秒。
+ */
+function trimToBudget(history, headTokens, k, budget, minKeep) {
+  const sizes = history.map((m) => 4 + estimateTokens(m.content));
+  let total = headTokens + sizes.reduce((a, b) => a + b, 0);
+  let drop = 0;
+  while (history.length - drop > minKeep && total * k > budget) total -= sizes[drop++];
+  return drop ? history.slice(drop) : history;
+}
+
+/**
+ * 组装发给模型的完整消息：prefix（system + few-shot，由路由按场景给；记忆块接在 system 末尾）→ 摘要之后的原文。
+ * ★ 摘要与「原文从哪条开始」必须出自同一份会话文档（summary.coversUntilSeq）：提纯先写摘要、再给消息打
+ *   compacted 标记，如果这里用 compacted 标记挑原文、却用调用方手里的旧摘要，两次写之间来的一轮就会两头落空。
+ *   现在最坏是「旧摘要 + 全部原文」，多花点 token，不会丢上下文。
+ * ★ 原文最多取最近 CONTEXT_WINDOW_ROWS 条；兜底裁剪：估算超预算就从最老的原文开始丢（至少留最后 2 条）——
+ *   正常情况下提纯早就把它压下去了，这里只防提纯失败、没拿到用量或用户贴了超长文本时把一次请求撑爆。
  * @returns {Promise<{messages: object[], estPrompt: number, memoriesCount: number}>}
  */
 async function buildContextMessages({ thread, prefix }) {
-  const memories = await loadMemories(thread);
-  const recent = await ChatMessage.find({ thread: thread._id, kind: "msg", compacted: false }).sort({ seq: 1 }).lean();
-  const block = memoryBlock(thread.scene, memories, thread.summary && thread.summary.text);
+  const fresh = await ChatThread.findById(thread._id).select("summary stats").lean();
+  if (!fresh) throw notFound();
+  const covers = (fresh.summary && fresh.summary.coversUntilSeq) || 0;
+  const [memories, rows] = await Promise.all([
+    loadMemories(thread),
+    ChatMessage.find({ thread: thread._id, kind: "msg", seq: { $gt: covers } })
+      .sort({ seq: -1 })
+      .limit(CONTEXT_WINDOW_ROWS)
+      .lean(),
+  ]);
+  const block = memoryBlock(thread.scene, memories, fresh.summary && fresh.summary.text);
   const head = prefix.map((m) => ({ ...m }));
   if (block) {
     if (head[0] && head[0].role === "system") head[0].content = `${head[0].content}\n\n${block}`;
     else head.unshift({ role: "system", content: block });
   }
-  let history = mergeSameRole(recent.map((m) => ({ role: m.role, content: m.modelText || m.displayText })));
+  let history = mergeSameRole(rows.reverse().map((m) => ({ role: m.role, content: m.modelText || m.displayText })));
   const { budget } = sceneConfig(thread.scene);
-  const k = (thread.stats && thread.stats.calibK) || 1;
+  const k = (fresh.stats && fresh.stats.calibK) || 1;
   const headTokens = estimateMessages(head);
-  while (history.length > 2 && (headTokens + estimateMessages(history)) * k > budget) history.shift();
+  history = trimToBudget(history, headTokens, k, budget, 2);
   // 历史从 assistant 开头时，有的端点会拒；丢到以 user 开头为止
   while (history.length > 1 && history[0].role !== "user") history.shift();
+  // 前缀本身就很大时，两条也放不下 → 只留最后一条（用户刚说的）
+  history = trimToBudget(history, headTokens, k, budget, 1);
   const messages = [...head, ...history];
   return { messages, estPrompt: estimateMessages(messages), memoriesCount: memories.length };
 }
@@ -290,6 +348,20 @@ async function recordUsage({ thread, kind, usage, estPrompt = 0 }) {
   if (set["stats.calibK"]) thread.stats.calibK = set["stats.calibK"];
 }
 
+/**
+ * 接口没给用量（端点不认 stream_options、流在最后一块之前断了）时，用校准过的估算顶上：
+ * 不然用量一直是 0，自动提纯永远不触发，历史只会越攒越长。不写 ChatUsageLog、不动 calibK —— 这不是量出来的。
+ */
+async function recordEstimatedUsage({ thread, estPrompt, completionText }) {
+  if (!(estPrompt > 0)) return;
+  const k = (thread.stats && thread.stats.calibK) || 1;
+  const lastPromptTokens = Math.round(estPrompt * k);
+  const lastCompletionTokens = Math.round(estimateTokens(completionText) * k);
+  await ChatThread.updateOne({ _id: thread._id }, { $set: { "stats.lastPromptTokens": lastPromptTokens, "stats.lastCompletionTokens": lastCompletionTokens } });
+  thread.stats.lastPromptTokens = lastPromptTokens;
+  thread.stats.lastCompletionTokens = lastCompletionTokens;
+}
+
 // ── 一轮对话的收尾 ────────────────────────────────────────────
 
 /**
@@ -302,7 +374,8 @@ async function finishTurn({ thread, displayText, modelText, usage, estPrompt, ab
   if (text) {
     await appendMessage(thread, { role: "assistant", displayText: text, modelText: modelText || text, partial: Boolean(aborted) });
   }
-  await recordUsage({ thread, kind: "reply", usage, estPrompt });
+  if (usage) await recordUsage({ thread, kind: "reply", usage, estPrompt });
+  else await recordEstimatedUsage({ thread, estPrompt, completionText: modelText || text });
   return { threadId: String(thread._id), context: contextState(thread) };
 }
 
@@ -318,8 +391,15 @@ async function maybeCompact(threadId) {
 
 const SENSITIVE_RE = [/1[3-9]\d{9}/, /\d{17}[\dXx]/, /[\w.+-]+@[\w-]+\.[\w.-]+/, /\d{16,19}/];
 
+/**
+ * 记忆卡的敏感信息兜底（提示词已经要求模型别记，这里是第二道）。先 NFKC（全角数字、全角 @ 折成半角），
+ * 再把被空格 / 横线 / 点隔开的数字段接起来（138-1234-5678、6222 0212 3456 7890），然后才套正则。
+ */
 function looksSensitive(text) {
-  return SENSITIVE_RE.some((re) => re.test(String(text || "")));
+  const s = String(text || "")
+    .normalize("NFKC")
+    .replace(/(\d)[\s\-.]+(?=[\dXx])/g, "$1");
+  return SENSITIVE_RE.some((re) => re.test(s));
 }
 
 function buildCompactPrompt({ scene, oldSummary, memories, messages, focus }) {
@@ -333,7 +413,7 @@ function buildCompactPrompt({ scene, oldSummary, memories, messages, focus }) {
     "",
     `【已有摘要】${String(oldSummary || "").trim() || "无"}`,
     "【已有记忆卡】（id：内容）",
-    ...(memories.length ? memories.map((m) => `${m._id}：${m.text}`) : ["无"]),
+    ...(memories.length ? memories.map((m) => `${m._id}：${oneLine(m.text)}`) : ["无"]),
     "",
     "【要整理的对话】",
     ...messages.map((m) => `${m.role === "user" ? "用户" : who}：${clip(m.displayText, 1500)}`),
@@ -366,39 +446,84 @@ function parseCompactJson(text, scene) {
   }
   if (!obj || typeof obj.summary !== "string" || !obj.summary.trim()) return null;
   const cats = MEMORY_CATEGORIES[scene];
+  const factText = (v) => clip(oneLine(v), FACT_MAX_CHARS);
   const add = (Array.isArray(obj.facts_add) ? obj.facts_add : [])
-    .map((f) => ({ text: clip(String((f && f.text) || "").trim(), FACT_MAX_CHARS), category: cats.includes(f && f.category) ? f.category : "other" }))
+    .map((f) => ({ text: factText(f && f.text), category: cats.includes(f && f.category) ? f.category : "other" }))
     .filter((f) => f.text && !looksSensitive(f.text));
   const update = (Array.isArray(obj.facts_update) ? obj.facts_update : [])
-    .map((f) => ({ id: String((f && f.id) || ""), text: clip(String((f && f.text) || "").trim(), FACT_MAX_CHARS) }))
+    .map((f) => ({ id: String((f && f.id) || ""), text: factText(f && f.text) }))
     .filter((f) => mongoose.isValidObjectId(f.id) && f.text && !looksSensitive(f.text));
   const remove = (Array.isArray(obj.facts_remove) ? obj.facts_remove : []).map(String).filter((id) => mongoose.isValidObjectId(id));
-  return { summary: clip(obj.summary.trim(), SUMMARY_MAX_CHARS), add, update, remove };
+  return { summary: clip(oneLine(obj.summary), SUMMARY_MAX_CHARS), add, update, remove };
 }
 
 /**
- * 提纯一次。并发安全：先抢 stats.compacting 锁（抢不到说明另一次正在跑，直接返回 busy）。
+ * 这次要提纯哪几条：保留最近 keep 条原文，其余的压掉。三条约束：
+ *   · 切口落在轮次边界上 —— 保留区不能以助手回复开头（失败 / 半截的一轮会留下没配对的用户消息，
+ *     单纯按条数切会把某个回答和它的问题切到两边：问题进了摘要、回答既不在摘要里也不再发给模型）；
+ *   · 一次最多压 COMPACT_TARGET_MAX_CHARS 字（积压很多时分几次压，提纯请求本身也不能撑爆）；
+ *   · 自动提纯至少要压掉 MIN_AUTO_COMPACT_MESSAGES 条才值得调一次模型。
+ */
+function pickCompactTarget(live, keep, manual) {
+  let cut = Math.max(0, live.length - keep);
+  while (cut > 0 && cut < live.length && live[cut].role === "assistant") cut += 1;
+  let chars = 0;
+  for (let i = 0; i < cut; i++) {
+    chars += String(live[i].displayText || "").length;
+    if (i > 0 && chars > COMPACT_TARGET_MAX_CHARS) {
+      cut = i;
+      while (cut < live.length && live[cut].role === "assistant") cut += 1;
+      break;
+    }
+  }
+  const target = live.slice(0, cut);
+  if (!manual && target.length < MIN_AUTO_COMPACT_MESSAGES) return [];
+  return target;
+}
+
+/**
+ * 删会话撞上正在跑的提纯：删除先删会话本体（deleteThread），提纯每写一步都可能落在它之后。
+ * 收尾时会话已经不在 → 把这次提纯写进去的东西（从它提炼的记忆卡、提纯的用量行）一并清掉，
+ * 不让被删对话里的事实「复活」进以后的每一次聊天。
+ */
+async function cleanupIfThreadGone(thread) {
+  if (await ChatThread.exists({ _id: thread._id })) return false;
+  const ids = (await ChatMemory.find({ user: thread.user, sourceThreads: thread._id }).select("_id").lean()).map((m) => m._id);
+  if (ids.length) await ChatMemory.deleteMany({ _id: { $in: ids } });
+  await ChatMessage.deleteMany({ thread: thread._id });
+  await ChatUsageLog.deleteMany({ thread: thread._id });
+  await logDeletions("chat_memory", ids, thread.user);
+  return true;
+}
+
+/**
+ * 提纯一次。并发安全：先抢提纯租约（stats.compacting + compactingAt），抢不到说明另一次正在跑，返回 busy。
+ * ★ 租约有时限（COMPACT_LEASE_MS）：进程在提纯中途被 pm2 reload / 内存超限重启时 finally 跑不到，
+ *   锁要是永不过期，这个会话从此自动、手动都整理不了。放锁时核对 compactingAt，只放自己那把。
+ * ★ 提交点是会话文档上的摘要（summary.text + coversUntilSeq 一次写入）；compacted 标记只给翻历史的界面用。
  * @param {object} opts
  * @param {string} opts.threadId
  * @param {string} [opts.focus] 用户要求重点记住的内容（手动「整理记忆」时可填）
  * @param {boolean} [opts.manual] 手动触发：只保留最后 1 轮原文；自动触发保留最近 N 轮（sceneConfig.recentMessages）
- * @returns {Promise<{ok: boolean, compacted?: number, reason?: string, context?: object}>}
+ * @returns {Promise<{ok: boolean, compacted?: number, reason?: "busy"|"llm"|"gone", context?: object}>}
  */
 async function compactThread({ threadId, focus = "", manual = false }) {
+  const stamp = new Date();
   const thread = await ChatThread.findOneAndUpdate(
-    { _id: threadId, "stats.compacting": { $ne: true } },
-    { $set: { "stats.compacting": true } },
+    {
+      _id: threadId,
+      $or: [{ "stats.compacting": { $ne: true } }, { "stats.compactingAt": { $not: { $gte: new Date(stamp.getTime() - COMPACT_LEASE_MS) } } }],
+    },
+    { $set: { "stats.compacting": true, "stats.compactingAt": stamp } },
     { returnDocument: "after" },
   );
-  if (!thread) return { ok: false, reason: "busy" };
+  if (!thread) return (await ChatThread.exists({ _id: threadId })) ? { ok: false, reason: "busy" } : { ok: false, reason: "gone" };
   try {
     const cfg = sceneConfig(thread.scene);
-    const live = await ChatMessage.find({ thread: thread._id, kind: "msg", compacted: false }).sort({ seq: 1 }).lean();
-    const keep = manual ? 2 : cfg.recentMessages;
-    const target = live.slice(0, Math.max(0, live.length - keep));
-    if (!target.length || (!manual && target.length < MIN_AUTO_COMPACT_MESSAGES)) {
-      return { ok: true, compacted: 0, context: contextState(thread) };
-    }
+    const covers = thread.summary.coversUntilSeq || 0;
+    const live = await ChatMessage.find({ thread: thread._id, kind: "msg", seq: { $gt: covers } }).sort({ seq: 1 }).lean();
+    const target = pickCompactTarget(live, manual ? 2 : cfg.recentMessages, manual);
+    if (!target.length) return { ok: true, compacted: 0, context: contextState(thread) };
 
     const memories = await loadMemories(thread);
     let parsed = null;
@@ -412,6 +537,8 @@ async function compactThread({ threadId, focus = "", manual = false }) {
     } catch (e) {
       console.warn("[chatMemory] compact LLM failed:", (e && e.message) || e);
     }
+    // 等模型的这几秒里会话被删了 → 什么都不写
+    if (!(await ChatThread.exists({ _id: thread._id }))) return { ok: false, reason: "gone" };
     if (usage) await recordUsage({ thread, kind: "compact", usage });
     if (!parsed) {
       await ChatThread.updateOne({ _id: thread._id }, { $inc: { "stats.compactFailStreak": 1 } });
@@ -420,7 +547,7 @@ async function compactThread({ threadId, focus = "", manual = false }) {
     }
 
     // 记忆卡：只动自己（且同场景、客服只限本会话）的卡
-    const ownQ = thread.scene === "support" ? { user: thread.user, scene: "support", sourceThreads: thread._id } : { user: thread.user, scene: "companion" };
+    const ownQ = memoryScope(thread);
     if (parsed.remove.length) await ChatMemory.deleteMany({ ...ownQ, _id: { $in: parsed.remove } });
     for (const u of parsed.update) {
       const doc = await ChatMemory.findOne({ ...ownQ, _id: u.id });
@@ -439,39 +566,47 @@ async function compactThread({ threadId, focus = "", manual = false }) {
     const all = await ChatMemory.find(ownQ).sort({ pinned: -1, updatedAt: -1 }).select("_id").lean();
     if (all.length > MAX_FACTS) await ChatMemory.deleteMany({ _id: { $in: all.slice(MAX_FACTS).map((m) => m._id) }, pinned: { $ne: true } });
 
+    // 提交：摘要与覆盖到的序号一次写入（只在租约还是自己的时候）。用量显示按差值往下减（同时进行中的一轮
+    // 可能刚写了新的 lastPromptTokens，所以不整体覆盖）。更新管道里的字符串要包 $literal —— 以 "$" 开头会被当成字段路径。
     const lastSeq = target[target.length - 1].seq;
-    await ChatMessage.updateMany({ thread: thread._id, kind: "msg", compacted: false, seq: { $lte: lastSeq } }, { $set: { compacted: true } });
-
-    // 用量显示跟着降下来：减掉被提纯的原文、加上新摘要与新增记忆卡（都乘校准系数）
     const k = thread.stats.calibK || 1;
     const removedTokens = target.reduce((n, m) => n + 4 + (m.estTokens || estimateTokens(m.modelText)), 0);
     const addedTokens = estimateTokens(parsed.summary) - estimateTokens(thread.summary.text) + toAdd.reduce((n, f) => n + 4 + estimateTokens(f.text), 0);
-    const newPrompt = Math.max(0, Math.round((thread.stats.lastPromptTokens || 0) - (removedTokens - addedTokens) * k));
-    const memCount = await ChatMemory.countDocuments(ownQ);
-    await ChatThread.updateOne(
-      { _id: thread._id },
+    const delta = Math.round((removedTokens - addedTokens) * k);
+    const committed = await ChatThread.collection.updateOne({ _id: thread._id, "stats.compactingAt": stamp }, [
       {
         $set: {
-          "summary.prevText": thread.summary.text,
-          "summary.text": parsed.summary,
+          "summary.text": { $literal: parsed.summary },
           "summary.coversUntilSeq": lastSeq,
-          "stats.lastPromptTokens": newPrompt,
+          "summary.version": { $add: [{ $ifNull: ["$summary.version", 0] }, 1] },
+          "stats.lastPromptTokens": { $max: [0, { $subtract: [{ $ifNull: ["$stats.lastPromptTokens", 0] }, delta] }] },
           "stats.compactFailStreak": 0,
           "stats.compactedAt": new Date(),
         },
-        $inc: { "summary.version": 1 },
       },
-    );
-    const turns = Math.ceil(target.length / 2);
-    await appendMessage(thread, {
-      role: "system",
-      kind: "divider",
-      displayText: `已整理前 ${turns} 轮对话（保留摘要${memCount ? `和 ${memCount} 条记忆` : ""}）`,
-    });
+    ]);
+    if (!committed.matchedCount) return { ok: false, reason: (await ChatThread.exists({ _id: thread._id })) ? "busy" : "gone" };
+    await ChatMessage.updateMany({ thread: thread._id, kind: "msg", compacted: false, seq: { $lte: lastSeq } }, { $set: { compacted: true } });
+
+    const memCount = await ChatMemory.countDocuments(ownQ);
+    const turns = target.filter((m) => m.role === "user").length || 1;
+    try {
+      await appendMessage(thread, {
+        role: "system",
+        kind: "divider",
+        displayText: `已整理前 ${turns} 轮对话（保留摘要${memCount ? `和 ${memCount} 条记忆` : ""}）`,
+      });
+    } catch (e) {
+      if (e && e.code === "CHAT_THREAD_NOT_FOUND") return { ok: false, reason: "gone" };
+      throw e;
+    }
     const fresh = await ChatThread.findById(thread._id).lean();
     return { ok: true, compacted: target.length, context: contextState(fresh || thread) };
   } finally {
-    await ChatThread.updateOne({ _id: threadId }, { $set: { "stats.compacting": false } });
+    // 会话被删了 → 清掉这次提纯写进去的东西；还在 → 放掉自己的租约
+    if (!(await cleanupIfThreadGone(thread))) {
+      await ChatThread.updateOne({ _id: thread._id, "stats.compactingAt": stamp }, { $set: { "stats.compacting": false, "stats.compactingAt": null } });
+    }
   }
 }
 
@@ -485,7 +620,8 @@ function serializeThread(t) {
     messageCount: t.messageCount || 0,
     lastActiveAt: t.lastActiveAt,
     createdAt: t.createdAt,
-    summary: { text: (t.summary && t.summary.text) || "", version: (t.summary && t.summary.version) || 0, canRevert: Boolean(t.summary && t.summary.prevText) },
+    summary: { text: (t.summary && t.summary.text) || "", version: (t.summary && t.summary.version) || 0 },
+    compacting: Boolean(t.stats && t.stats.compacting),
     context: contextState(t),
   };
 }
@@ -528,20 +664,18 @@ async function logDeletions(type, ids, userId) {
   await DeletionLog.insertMany(ids.map((id) => ({ targetType: type, targetId: id, user: userId })));
 }
 
-/** 删掉一个会话名下的全部数据（不含记忆卡）。保留期清扫与用户删除共用 */
-async function purgeThreadData(threadId) {
-  await ChatMessage.deleteMany({ thread: threadId });
-  await ChatUsageLog.deleteMany({ thread: threadId });
-  await ChatThread.deleteOne({ _id: threadId });
-}
-
-/** 用户删除一个会话：消息、用量、摘要，以及**从它提炼出的记忆卡**，立即硬删 */
+/**
+ * 用户删除一个会话：消息、用量、摘要，以及**从它提炼出的记忆卡**，立即硬删。
+ * ★ 先删会话本体：它消失的那一刻就是删除点。同时在写的 appendMessage、正在跑的提纯都以「会话还在不在」
+ *   为准收尾（写完发现没了就自己清掉），所以先删本体才不会漏下孤儿消息或复活的记忆卡。
+ */
 async function deleteThread({ userId, threadId }) {
   const t = await getThread({ userId, threadId });
-  const mems = await ChatMemory.find({ user: userId, sourceThreads: t._id }).select("_id").lean();
-  const memIds = mems.map((m) => m._id);
+  await ChatThread.deleteOne({ _id: t._id });
+  const memIds = (await ChatMemory.find({ user: userId, sourceThreads: t._id }).select("_id").lean()).map((m) => m._id);
   if (memIds.length) await ChatMemory.deleteMany({ _id: { $in: memIds } });
-  await purgeThreadData(t._id);
+  await ChatMessage.deleteMany({ thread: t._id });
+  await ChatUsageLog.deleteMany({ thread: t._id });
   await logDeletions("chat_thread", [t._id], userId);
   await logDeletions("chat_memory", memIds, userId);
   return { deletedMemories: memIds.length };
@@ -550,12 +684,18 @@ async function deleteThread({ userId, threadId }) {
 /** 清空一个场景的全部会话（逐个走 deleteThread，连带记忆卡与 DeletionLog） */
 async function deleteAllThreads({ userId, scene }) {
   const threads = await ChatThread.find({ user: userId, scene }).select("_id").lean();
+  let deletedThreads = 0;
   let deletedMemories = 0;
   for (const t of threads) {
-    const r = await deleteThread({ userId, threadId: String(t._id) });
-    deletedMemories += r.deletedMemories;
+    try {
+      const r = await deleteThread({ userId, threadId: String(t._id) });
+      deletedThreads += 1;
+      deletedMemories += r.deletedMemories;
+    } catch (e) {
+      if (!(e && e.code === "CHAT_THREAD_NOT_FOUND")) throw e; // 同时被别处删掉了
+    }
   }
-  return { deletedThreads: threads.length, deletedMemories };
+  return { deletedThreads, deletedMemories };
 }
 
 async function listMemories({ userId, scene }) {
@@ -563,17 +703,21 @@ async function listMemories({ userId, scene }) {
   return rows.map(serializeMemory);
 }
 
+function memoryNotFound() {
+  return new AppError({ code: "CHAT_MEMORY_NOT_FOUND", status: 404, message: "这条记忆不存在或已被删除" });
+}
+
 async function ownMemory(userId, id) {
-  if (!mongoose.isValidObjectId(id)) throw new AppError({ code: "CHAT_MEMORY_NOT_FOUND", status: 404, message: "这条记忆不存在或已被删除" });
+  if (!mongoose.isValidObjectId(id)) throw memoryNotFound();
   const doc = await ChatMemory.findOne({ _id: id, user: userId });
-  if (!doc) throw new AppError({ code: "CHAT_MEMORY_NOT_FOUND", status: 404, message: "这条记忆不存在或已被删除" });
+  if (!doc) throw memoryNotFound();
   return doc;
 }
 
 async function updateMemory({ userId, id, text, pinned }) {
   const doc = await ownMemory(userId, id);
   if (typeof text === "string") {
-    const next = clip(text.trim(), FACT_MAX_CHARS);
+    const next = clip(oneLine(text), FACT_MAX_CHARS);
     if (!next) throw new AppError({ code: "VALIDATION_ERROR", status: 400, message: "记忆内容不能为空" });
     if (next !== doc.text) {
       doc.prevText = doc.text;
@@ -608,22 +752,18 @@ async function clearMemories({ userId, scene }) {
   return { deleted: ids.length };
 }
 
-/** 回退会话摘要到上一版（提纯出了错时用） */
-async function revertSummary({ userId, threadId }) {
-  const t = await getThread({ userId, threadId });
-  if (!t.summary || !t.summary.prevText) throw new AppError({ code: "NOTHING_TO_REVERT", status: 400, message: "摘要没有上一版" });
-  await ChatThread.updateOne({ _id: t._id }, { $set: { "summary.text": t.summary.prevText, "summary.prevText": t.summary.text }, $inc: { "summary.version": 1 } });
-  return serializeThread(await ChatThread.findById(t._id).lean());
-}
-
-/** 删账号时调用：这个人的全部对话数据硬删（账号删除流程接入时用） */
+/**
+ * 删账号时调用：这个人的全部对话数据硬删。会话本体先删（理由同 deleteThread），
+ * 再按 user 删消息 / 用量 / 记忆卡。三条删账号入口都调它（branchAdmin.purgeUserCascade、
+ * users.deleteAccount、admin 删用户），且都在删 User 之前 —— 失败了可以整条重试。
+ */
 async function purgeUserChatData(userId) {
   const threads = (await ChatThread.find({ user: userId }).select("_id").lean()).map((t) => t._id);
+  await ChatThread.deleteMany({ user: userId });
   const mems = (await ChatMemory.find({ user: userId }).select("_id").lean()).map((m) => m._id);
+  await ChatMemory.deleteMany({ user: userId });
   await ChatMessage.deleteMany({ user: userId });
   await ChatUsageLog.deleteMany({ user: userId });
-  await ChatMemory.deleteMany({ user: userId });
-  await ChatThread.deleteMany({ user: userId });
   await logDeletions("chat_thread", threads, userId);
   await logDeletions("chat_memory", mems, userId);
   return { threads: threads.length, memories: mems.length };
@@ -634,10 +774,12 @@ async function purgeUserChatData(userId) {
 let lastSweepAt = 0;
 
 /**
- * 删掉最后活跃超过保留期（陪聊 180 天、客服 30 天）的会话及其消息与用量。记忆卡不随之删除
- * （它们保留到用户删除或账号删除，设计稿 §B1）。
+ * 删掉最后活跃超过保留期（陪聊 180 天、客服 30 天）的会话及其消息与用量。陪聊的记忆卡不随之删除
+ * （跨会话，保留到用户删除或账号删除，设计稿 §B1）；客服的记忆卡只在本会话内有用，跟着会话一起删。
  * ★ 惰性：挂在对话请求上顺手跑，每个进程最多 10 分钟一轮、每轮少量 —— 照 services/assetPurge 的成方
  *   （生产是 pm2 双实例，常驻定时器会两边同时跑）。
+ * ★ 删的时候再核一次 lastActiveAt：列出来之后、删之前，用户可能刚好回到这个会话说了一句。
+ * ★ 到期清扫不记 DeletionLog：备份恢复后清扫按同一条规则再删一次，天然幂等。
  */
 async function sweepExpiredChats(now = Date.now()) {
   if (now - lastSweepAt < SWEEP_INTERVAL_MS) return { skipped: true, removed: 0 };
@@ -647,7 +789,11 @@ async function sweepExpiredChats(now = Date.now()) {
     const cutoff = new Date(now - sceneConfig(scene).retentionDays * 24 * 60 * 60 * 1000);
     const expired = await ChatThread.find({ scene, lastActiveAt: { $lt: cutoff } }).select("_id").limit(SWEEP_BATCH).lean();
     for (const t of expired) {
-      await purgeThreadData(t._id);
+      const r = await ChatThread.deleteOne({ _id: t._id, lastActiveAt: { $lt: cutoff } });
+      if (!r.deletedCount) continue;
+      await ChatMessage.deleteMany({ thread: t._id });
+      await ChatUsageLog.deleteMany({ thread: t._id });
+      if (scene === "support") await ChatMemory.deleteMany({ scene: "support", sourceThreads: t._id });
       removed++;
     }
   }
@@ -666,6 +812,7 @@ module.exports = {
   MAX_FACTS,
   SUMMARY_MAX_CHARS,
   MEMORY_CATEGORIES,
+  COMPACT_LEASE_MS,
   sceneConfig,
   estimateTokens,
   estimateMessages,
@@ -681,7 +828,9 @@ module.exports = {
   finishTurn,
   maybeCompact,
   compactThread,
+  pickCompactTarget,
   parseCompactJson,
+  looksSensitive,
   listThreads,
   getThread,
   getMessages,
@@ -692,7 +841,6 @@ module.exports = {
   revertMemory,
   deleteMemory,
   clearMemories,
-  revertSummary,
   purgeUserChatData,
   sweepExpiredChats,
   kickSweep,

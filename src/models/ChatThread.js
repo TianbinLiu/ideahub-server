@@ -21,9 +21,11 @@
  * @field seq {Number} 最后一条消息的序号；新消息用 $inc 原子取号
  * @field messageCount {Number}
  * @field lastActiveAt {Date} 保留期从这里算
- * @field summary {Object} 滚动摘要：text（≤600 字）/ prevText（上一版，可回退）/ version / coversUntilSeq（摘要覆盖到哪条）
- * @field stats {Object} 上下文计量：lastPromptTokens / lastCompletionTokens（上一轮接口 usage）/ calibK（估算校准系数）/
- *                        compactFailStreak（连续提纯失败次数，≥2 就不再自动试）/ compacting（提纯锁）/ compactedAt
+ * @field summary {Object} 滚动摘要：text（≤600 字）/ version / coversUntilSeq（摘要覆盖到哪条 —— 发给模型的原文从它之后开始，
+ *                        是提纯的提交点；ChatMessage.compacted 只给翻历史的界面用）
+ * @field stats {Object} 上下文计量：lastPromptTokens / lastCompletionTokens（上一轮接口 usage；没给 usage 时是校准过的估算）/
+ *                        calibK（估算校准系数）/ compactFailStreak（连续提纯失败次数，≥2 就不再自动试）/
+ *                        compacting + compactingAt（提纯租约，过 chatMemory.COMPACT_LEASE_MS 视为持有者已死）/ compactedAt
  *
  * @index {user:1, scene:1, lastActiveAt:-1} 会话列表
  * @index {scene:1, lastActiveAt:1} 过期清扫
@@ -44,7 +46,6 @@ const chatThreadSchema = new mongoose.Schema(
     lastActiveAt: { type: Date, default: Date.now },
     summary: {
       text: { type: String, default: "", maxlength: 1200 },
-      prevText: { type: String, default: "", maxlength: 1200 },
       version: { type: Number, default: 0 },
       coversUntilSeq: { type: Number, default: 0 },
     },
@@ -54,6 +55,7 @@ const chatThreadSchema = new mongoose.Schema(
       calibK: { type: Number, default: 1 },
       compactFailStreak: { type: Number, default: 0 },
       compacting: { type: Boolean, default: false },
+      compactingAt: { type: Date, default: null },
       compactedAt: { type: Date, default: null },
     },
   },

@@ -6,6 +6,7 @@ const LeaderboardPost = require("../models/LeaderboardPost");
 const Idea = require("../models/Idea");
 const GroupJoinReferral = require("../models/GroupJoinReferral");
 const AppError = require("../utils/AppError");
+const { purgeUserChatData } = require("../services/chatMemory.service");
 const CODES = require("../utils/errorCodes");
 const { searchRegex } = require("../utils/regex");
 // 大小写不敏感的等值口径：与 models/User.js 上的 ci 索引、@提及查询同一个常量（铁律六）
@@ -523,6 +524,8 @@ async function deleteAccount(req, res, next) {
       throw new AppError('Cannot delete another user account', 403, 'FORBIDDEN');
     }
 
+    // 数字人对话数据先删（记忆卡没有 TTL，账号没了就再没人能删），再删账号本体
+    await purgeUserChatData(id);
     // Delete the user account
     const result = await User.findByIdAndDelete(id);
     if (!result) {

@@ -314,6 +314,11 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     closed = true;
     abort.abort();
   });
+  // 客户端在前面查库的 await 期间就断了 → 'close' 已经错过，直接当断开处理（理由见 companion.service.streamCompanionReply）
+  if (res.destroyed) {
+    closed = true;
+    abort.abort();
+  }
 
   let index = 0;
   const plainParts = [];
@@ -389,6 +394,15 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       failed = true;
       console.error("[support] stream failed:", (e && e.message) || e);
     }
+    // 上游半路出错：把还没判定的开头与缓冲里的半句静默收进 plainParts（存半截回复用），不发事件
+    const wasClosed = closed;
+    closed = true;
+    if (!decided && pending) {
+      decided = true;
+      splitter.push(support.parseHandoff(pending).text);
+    }
+    splitter.flush();
+    closed = wasClosed;
   }
 
   // 按会话：存下这句回复（半截的也存，标 partial）并记用量；失败只记日志，不吞掉已经说完的回复
