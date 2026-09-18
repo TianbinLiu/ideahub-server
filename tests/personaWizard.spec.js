@@ -225,7 +225,9 @@ describe("PUT /api/personas/:id 的 style 是 PATCH 语义", () => {
   it("官网那种只带四个老字段的 style：向导字段一个都不能丢，四个老字段照常更新", async () => {
     const { token } = await createUser();
     const p = await mkFull(token);
-    // 逐字照搬官网 PersonaEditorPage 提交的形状：只有这四个键
+    // 官网 PersonaEditorPage 提交的形状：只有这四个键。⚠ 官网原来清空立场时发的是
+    //   `stanceHint: undefined`（整个键被 JSON 丢掉），在 PATCH 语义下那会变成"清不掉"——
+    //   所以官网同批改成了显式发 ""（client PR「清空立场/倾向时显式发空串」），这里照改后的形状发。
     const res = await request(app)
       .put(`/api/personas/${p._id}`)
       .set(auth(token))
@@ -262,6 +264,18 @@ describe("PUT /api/personas/:id 的 style 是 PATCH 语义", () => {
     // 没发的照旧
     expect(s.tone).toBe("松弛");
     expect(s.summary).toBe("句子短");
+  });
+
+  it("没带的键 = 保持原值（所以客户端想清空一个字段，必须显式发空值，不能靠不发）", async () => {
+    const { token } = await createUser();
+    const p = await mkFull(token);
+    // 模拟官网**修之前**的提交体：清空立场时 stanceHint 这个键根本不在
+    const res = await request(app)
+      .put(`/api/personas/${p._id}`)
+      .set(auth(token))
+      .send({ style: { summary: "句子短", catchphrases: ["冲了"], stats: [] } });
+    expect(res.status).toBe(200);
+    expect(res.body.persona.style.stanceHint).toBe("先做再说");
   });
 
   it("不带 style：style 一个字不动", async () => {
