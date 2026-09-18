@@ -16,18 +16,31 @@ const exampleSchema = z.object({
   user: z.string().trim().min(1).max(300),
   reply: z.string().trim().min(1).max(300),
 });
-// 2026-09-05 起多出向导生成的字段（语气 / 称呼 / 开场白 / 示例对话 / 边界），全部可选，老数据不动
-const styleBody = z.object({
-  summary: z.string().trim().max(2000).optional().default(""),
-  catchphrases: z.array(z.string().trim().max(120)).max(50).optional().default([]),
-  stats: z.array(statSchema).max(30).optional().default([]),
-  stanceHint: z.string().trim().max(500).optional().default(""),
-  tone: z.string().trim().max(300).optional().default(""),
-  addressUser: z.string().trim().max(60).optional().default(""),
-  greeting: z.string().trim().max(300).optional().default(""),
-  examples: z.array(exampleSchema).max(12).optional().default([]),
-  boundaries: z.array(z.string().trim().max(120)).max(12).optional().default([]),
-});
+// style 每个字段的形状、上限与缺省值 —— **唯一一份**，下面「建」和「改」两套 schema 都从这里派生（铁律六）。
+// 2026-09-05 起多出向导生成的字段（语气 / 称呼 / 开场白 / 示例对话 / 边界），全部可选，老数据不动。
+const STYLE_FIELDS = {
+  summary: [z.string().trim().max(2000), ""],
+  catchphrases: [z.array(z.string().trim().max(120)).max(50), []],
+  stats: [z.array(statSchema).max(30), []],
+  stanceHint: [z.string().trim().max(500), ""],
+  tone: [z.string().trim().max(300), ""],
+  addressUser: [z.string().trim().max(60), ""],
+  greeting: [z.string().trim().max(300), ""],
+  examples: [z.array(exampleSchema).max(12), []],
+  boundaries: [z.array(z.string().trim().max(120)).max(12), []],
+};
+const styleShape = (withDefaults) =>
+  Object.fromEntries(
+    Object.entries(STYLE_FIELDS).map(([k, [schema, dflt]]) => [k, withDefaults ? schema.optional().default(dflt) : schema.optional()])
+  );
+// 建人格 / 草稿：没给的键补缺省值（一份完整的 style）
+const styleBody = z.object(styleShape(true));
+// ★★ 改人格：**不补缺省值**，没发的键在解析结果里就不存在，controller 据此只改真的发了的键（PATCH 语义）。
+//   为什么不能复用上面那个（2026-09-18 线上 bug）：官网人格编辑器只认 summary / catchphrases / stats /
+//   stanceHint 四个字段，而 zod 会把没发的 tone / addressUser / greeting / examples / boundaries 补成空值，
+//   controller 再整份替换 doc.style —— App 向导做出来的人格拿到官网上哪怕只改个价格，这五个字段就被清空，
+//   200、零提示。**以后 style 再加字段，老客户端都会踩同一个坑**，所以语义定在服务端，不靠每个客户端记得回传。
+const stylePatchBody = z.object(styleShape(false));
 
 const tagsSchema = z.union([z.array(z.string()), z.string()]);
 
@@ -119,7 +132,8 @@ const updateBody = z.object({
   coverEmoji: z.string().trim().max(8).optional(),
   coverImageUrl: z.string().trim().max(2000).optional(),
   tags: tagsSchema.optional(),
-  style: styleBody.optional(),
+  // 缺省 = style 整块不动；给了 = 只改给了的那几个键（见上面 stylePatchBody 的 ★★）
+  style: stylePatchBody.optional(),
   shared: z.boolean().optional(),
   price: z.number().int().min(0).max(100000).optional(),
   // 对象 = 改成这个，null = 清掉，缺省 = 不动
