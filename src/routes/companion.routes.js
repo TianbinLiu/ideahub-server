@@ -69,7 +69,7 @@ const chatBodySchema = z
       .optional(),
     // 按会话：只发新的一句
     message: z.string().trim().min(1).max(MAX_MESSAGE_CHARS).optional(),
-    threadId: z.string().trim().max(64).optional(),
+    threadId: z.string().trim().max(64).nullable().optional(),
     lang: z.enum(["zh", "en"]).optional(),
   })
   .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
@@ -181,7 +181,7 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
       ttsInstruct: setup.voice.instruct,
       thread: { threadId: String(thread._id), title: thread.title || "" },
       finish: ({ text, rawText, aborted, usage }) =>
-        chatMemory.finishTurn({ thread, displayText: text, modelText: rawText, usage, estPrompt, aborted }),
+        chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted }),
     });
     // 用量到阈值 → 回复发完之后再提纯（不让用户等），失败只记日志
     chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[companion] compact failed:", (e && e.message) || e));

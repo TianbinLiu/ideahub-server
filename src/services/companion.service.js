@@ -149,7 +149,10 @@ function createSentenceSplitter(onSentence, { maxLen = 60 } = {}) {
     }
   }
 
+  // 流在标签写到一半时结束（上游出错 / 客户端断开）：末尾没闭合的 "[..." 只可能是被截断的标签（协议规定标签只在句首），
+  // 不能当正文念出来、存进历史
   function flush() {
+    buf = buf.replace(/\s*\[[^\]]*$/, "");
     emit(buf);
     buf = "";
   }

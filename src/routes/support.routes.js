@@ -73,7 +73,7 @@ const chatBodySchema = z
     messages: z.array(messageSchema).min(1).max(MAX_HISTORY).optional(),
     // 按会话：只发新的一句
     message: z.string().trim().min(1).max(MAX_MESSAGE_CHARS).optional(),
-    threadId: z.string().trim().max(64).optional(),
+    threadId: z.string().trim().max(64).nullable().optional(),
     lang: z.enum(["zh", "en"]).optional(),
   })
   .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
@@ -414,7 +414,10 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
         thread,
         displayText: text,
         // 转人工标记不进历史：模型看到自己上一轮的 [handoff:x] 容易每句都再标一次
-        modelText: rawParts.join("").replace(/\[handoff[^\]]*\]\s*/gi, ""),
+        modelText: rawParts
+          .join("")
+          .replace(/\s*\[[^\]]*$/, "")
+          .replace(/\[handoff[^\]]*\]\s*/gi, ""),
         usage,
         estPrompt,
         aborted: closed || failed,

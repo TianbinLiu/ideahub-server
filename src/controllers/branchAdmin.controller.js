@@ -493,8 +493,10 @@ async function purgeUserCascade(userId) {
   ).deletedCount;
   removed.searchHistory = (await SearchHistory.deleteMany({ user: uid })).deletedCount;
 
-  // ⑩.5 数字人对话：会话 / 消息 / 用量 / 记忆卡
-  removed.chat = await purgeUserChatData(uid);
+  // ⑩.5 数字人对话：会话 / 消息 / 用量 / 记忆卡（回执每项都是数字，App 管理页按数字汇总）
+  const chat = await purgeUserChatData(uid);
+  removed.chatThreads = chat.threads;
+  removed.chatMemories = chat.memories;
 
   // ⑪ 用户本体
   removed.user = (await User.deleteOne({ _id: uid })).deletedCount;

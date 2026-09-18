@@ -88,11 +88,11 @@ beforeEach(async () => {
   chatMemory._resetSweepClock();
 });
 
-async function createUser() {
+async function createUser(role = 'user') {
   const User = require('../src/models/User');
   const { signToken } = require('../src/utils/jwt');
   const random = new mongoose.Types.ObjectId().toString().slice(-6);
-  const user = await User.create({ username: `cm_${random}`, email: `${random}@test.local`, role: 'user', passwordHash: 'hashed' });
+  const user = await User.create({ username: `cm_${random}`, email: `${random}@test.local`, role, passwordHash: 'hashed' });
   return { user, token: signToken(user) };
 }
 
@@ -238,6 +238,13 @@ describe('POST /api/companion/chat 按会话', () => {
     expect(events.some((e) => e.event === 'thread')).toBe(false);
     expect(events.find((e) => e.event === 'done').data.threadId).toBeUndefined();
     expect(await ChatThread.countDocuments()).toBe(0);
+  });
+
+  it('threadId: null 等同于不给（开新会话）', async () => {
+    const { token } = await createUser();
+    const events = parseSse((await chat('/api/companion/chat', token, { message: '你好', threadId: null })).body);
+    expect(events[0].event).toBe('thread');
+    expect(events.find((e) => e.event === 'done').data.threadId).toBe(events[0].data.threadId);
   });
 
   it('message 与 messages[] 同时给 / 都不给 → 400', async () => {
@@ -439,17 +446,38 @@ describe('审查修复的回归', () => {
     expect(t.stats).toMatchObject({ compacting: false, compactingAt: null });
   });
 
+  it('租约被接手：旧持有者不提交摘要、也不放掉新持有者的锁', async () => {
+    const { user } = await createUser();
+    const thread = await seedThread(user._id, 'companion', 4);
+    let release;
+    mockAi.completions = [new Promise((r) => (release = r))];
+    const running = chatMemory.compactThread({ threadId: thread._id, manual: true });
+    await waitFor(() => mockAi.prompts.length === 1);
+    const other = new Date(Date.now() + 1234);
+    await ChatThread.updateOne({ _id: thread._id }, { $set: { 'stats.compacting': true, 'stats.compactingAt': other } });
+    release(GOOD_COMPACT);
+    expect(await running).toMatchObject({ ok: false, reason: 'busy' });
+    const t = await ChatThread.findById(thread._id).lean();
+    expect(t.summary.coversUntilSeq || 0).toBe(0);
+    expect(t.stats.compacting).toBe(true);
+    expect(new Date(t.stats.compactingAt).getTime()).toBe(other.getTime());
+  });
+
   it('等模型时会话被删：什么都不写，被删对话里的事实不会复活', async () => {
     const { user } = await createUser();
     const thread = await seedThread(user._id, 'companion', 10);
     await ChatThread.updateOne({ _id: thread._id }, { $set: { 'stats.lastPromptTokens': 30000 } });
     let release;
     mockAi.completions = [new Promise((r) => (release = r))];
+    const inserts = jest.spyOn(ChatMemory, 'insertMany');
+    const usageWrites = jest.spyOn(ChatUsageLog, 'create');
     const running = chatMemory.maybeCompact(thread._id);
     await waitFor(() => mockAi.prompts.length === 1);
     await chatMemory.deleteThread({ userId: user._id, threadId: String(thread._id) });
     release(JSON.stringify({ summary: '摘要', facts_add: [{ text: '用户最近在看心理医生', category: 'other' }], facts_update: [], facts_remove: [] }));
     expect((await running).reason).toBe('gone');
+    expect(inserts).not.toHaveBeenCalled();
+    expect(usageWrites).not.toHaveBeenCalled();
     expect(await ChatMemory.countDocuments({ user: user._id })).toBe(0);
     expect(await ChatUsageLog.countDocuments({ thread: thread._id })).toBe(0);
     const fresh = await chatMemory.openThread({ userId: user._id, scene: 'companion' });
@@ -506,11 +534,28 @@ describe('审查修复的回归', () => {
   });
 
   it('敏感信息过滤：分隔符、全角数字、全角 @ 都拦得住，普通日期数字不误伤', () => {
-    for (const s of ['用户手机号是138-1234-5678', '用户手机 138 1234 5678', '用户手机号１３８１２３４５６７８', '银行卡 6222 0212 3456 7890', '身份证 110105 19491231 002X', 'abc＠qq.com']) {
-      expect(chatMemory.looksSensitive(s)).toBe(true);
+    for (const s of [
+      '用户手机号是138-1234-5678',
+      '用户手机 138 1234 5678',
+      '用户手机号１３８１２３４５６７８',
+      '用户手机 138—1234—5678',
+      '用户手机 138 – 1234 – 5678',
+      '用户手机 138/1234/5678',
+      '用户手机 138_1234_5678',
+      '用户手机 138，1234，5678',
+      '银行卡 6222 0212 3456 7890',
+      '银行卡 6222 — 0212 — 3456 — 7890',
+      '身份证 110105 19491231 002X',
+      'abc＠qq.com',
+      '邮箱 abc at qq.com',
+      '用户邮箱是 abc(at)qq.com',
+      '用户邮箱 abc#qq.com',
+      '邮箱 abc [at] qq [dot] com',
+    ]) {
+      expect([s, chatMemory.looksSensitive(s)]).toEqual([s, true]);
     }
-    for (const s of ['用户喜欢猫', '用户 2024-12-25 生日', '用户18岁，身高170', '用户生日 1998.03.15']) {
-      expect(chatMemory.looksSensitive(s)).toBe(false);
+    for (const s of ['用户喜欢猫', '用户 2024-12-25 生日', '用户18岁，身高170', '用户生日 1998.03.15', '1998/03/15', '2019/2020/2021', 'C# 和 asp.net', '用户 look at github.com', '用户有3只猫，1只狗']) {
+      expect([s, chatMemory.looksSensitive(s)]).toEqual([s, false]);
     }
   });
 
@@ -569,9 +614,107 @@ describe('审查修复的回归', () => {
     await ChatMemory.create({ user: user._id, scene: 'companion', text: '用户喜欢猫' });
     const { purgeUserCascade } = require('../src/controllers/branchAdmin.controller');
     const removed = await purgeUserCascade(user._id);
-    expect(removed.chat).toEqual({ threads: 1, memories: 1 });
+    expect(removed).toMatchObject({ chatThreads: 1, chatMemories: 1 });
     expect(await ChatMessage.countDocuments({ user: user._id })).toBe(0);
     expect(await ChatMemory.countDocuments({ user: user._id })).toBe(0);
+  });
+});
+
+describe('第二轮审查修复的回归', () => {
+  it('过期清扫不删正持有提纯租约的会话（陪聊记忆卡不被当成用户删除清掉）', async () => {
+    const { user } = await createUser();
+    const thread = await seedThread(user._id, 'companion', 2);
+    await ChatMemory.create({ user: user._id, scene: 'companion', text: '用户叫小明', sourceThreads: [thread._id] });
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000);
+    await ChatThread.updateOne({ _id: thread._id }, { $set: { lastActiveAt: old, 'stats.compacting': true, 'stats.compactingAt': new Date() } });
+    expect((await chatMemory.sweepExpiredChats()).removed).toBe(0);
+    expect(await ChatThread.exists({ _id: thread._id })).not.toBeNull();
+    // 租约过期后照常清扫，记忆卡留下
+    await ChatThread.updateOne({ _id: thread._id }, { $set: { 'stats.compactingAt': new Date(Date.now() - chatMemory.COMPACT_LEASE_MS - 1000) } });
+    chatMemory._resetSweepClock();
+    expect((await chatMemory.sweepExpiredChats()).removed).toBe(1);
+    expect(await ChatMemory.countDocuments({ user: user._id })).toBe(1);
+  });
+
+  it('删会话删到一半出错：再点一次能把残留删完；DeletionLog 先写', async () => {
+    const { user, token } = await createUser();
+    const thread = await seedThread(user._id, 'companion', 3);
+    await ChatMemory.create({ user: user._id, scene: 'companion', text: '用户喜欢猫', sourceThreads: [thread._id] });
+    await ChatUsageLog.create({ thread: thread._id, user: user._id, scene: 'companion', kind: 'reply', promptTokens: 1 });
+    jest.spyOn(ChatMemory, 'deleteMany').mockRejectedValueOnce(new Error('not primary'));
+    const first = await request(app).delete(`/api/chat/threads/${thread._id}`).set('Authorization', `Bearer ${token}`);
+    expect(first.status).toBe(500);
+    expect(await ChatThread.exists({ _id: thread._id })).toBeNull();
+    expect(await DeletionLog.countDocuments({ targetType: 'chat_thread', targetId: thread._id })).toBe(1);
+    const second = await request(app).delete(`/api/chat/threads/${thread._id}`).set('Authorization', `Bearer ${token}`);
+    expect(second.body).toMatchObject({ ok: true, deletedMemories: 1 });
+    expect(await ChatMessage.countDocuments({ thread: thread._id })).toBe(0);
+    expect(await ChatUsageLog.countDocuments({ thread: thread._id })).toBe(0);
+    expect(await ChatMemory.countDocuments({ user: user._id })).toBe(0);
+    // 真的什么都不剩了才 404
+    expect((await request(app).delete(`/api/chat/threads/${thread._id}`).set('Authorization', `Bearer ${token}`)).status).toBe(404);
+  });
+
+  it('上游在标签写到一半时断：截断的标签不进正文、不进历史原文', async () => {
+    const { token } = await createUser();
+    mockAi.chunks = ['[happy][face:happy][action:wave] 你好呀！', ' [neutral][face:nor'];
+    mockAi.failAfterChunks = true;
+    const e1 = parseSse((await chat('/api/companion/chat', token, { message: '你好' })).body);
+    const r1 = await ChatMessage.findOne({ thread: e1[0].data.threadId, role: 'assistant' }).lean();
+    expect(r1.displayText).toBe('你好呀！');
+    expect(r1.modelText).not.toContain('[face:nor');
+
+    mockAi.chunks = ['[happy][action:wa'];
+    const e2 = parseSse((await chat('/api/companion/chat', token, { message: '再来' })).body);
+    expect(await ChatMessage.countDocuments({ thread: e2[0].data.threadId, role: 'assistant' })).toBe(0);
+  });
+
+  it('客服上游半路出错：不补发 sentence / handoff 事件，半截回复存下来', async () => {
+    const { token } = await createUser();
+    mockAi.chunks = ['[sad][face:sad][action:none]抱歉我', '正在查'];
+    mockAi.failAfterChunks = true;
+    const events = parseSse((await chat('/api/support/chat', token, { message: '导出失败' })).body);
+    expect(events.some((e) => e.event === 'sentence' || e.event === 'handoff')).toBe(false);
+    const threadId = events.find((e) => e.event === 'error').data.threadId;
+    const reply = await ChatMessage.findOne({ thread: threadId, role: 'assistant' }).lean();
+    expect(reply).toMatchObject({ partial: true, displayText: '抱歉我正在查' });
+  });
+
+  it('用户自己注销账号：对话数据与记忆卡一起删', async () => {
+    const { user, token } = await createUser();
+    await seedThread(user._id, 'companion', 2);
+    await ChatMemory.create({ user: user._id, scene: 'companion', text: 'x' });
+    const res = await request(app).delete(`/api/users/${user._id}`).set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(await ChatThread.countDocuments({ user: user._id })).toBe(0);
+    expect(await ChatMessage.countDocuments({ user: user._id })).toBe(0);
+    expect(await ChatMemory.countDocuments({ user: user._id })).toBe(0);
+  });
+
+  it('管理员删用户（老后台）：对话数据与记忆卡一起删', async () => {
+    const { user } = await createUser();
+    const admin = await createUser('admin');
+    await seedThread(user._id, 'companion', 2);
+    await ChatMemory.create({ user: user._id, scene: 'companion', text: 'x' });
+    const res = await request(app).delete(`/api/admin/users/${user._id}`).set('Authorization', `Bearer ${admin.token}`);
+    expect(res.status).toBe(200);
+    expect(await ChatThread.countDocuments({ user: user._id })).toBe(0);
+    expect(await ChatMessage.countDocuments({ user: user._id })).toBe(0);
+    expect(await ChatMemory.countDocuments({ user: user._id })).toBe(0);
+  });
+
+  it('上下文最多取最近 400 条原文（预算再大也不整段读）', async () => {
+    process.env.COMPANION_CTX_BUDGET = '10000000';
+    const { user } = await createUser();
+    const thread = await chatMemory.openThread({ userId: user._id, scene: 'companion' });
+    await ChatMessage.insertMany(
+      Array.from({ length: 450 }, (_, i) => ({ thread: thread._id, user: user._id, seq: i + 1, role: i % 2 ? 'assistant' : 'user', displayText: `m${i + 1}`, modelText: `m${i + 1}` })),
+    );
+    const { messages } = await chatMemory.buildContextMessages({ thread, prefix: [{ role: 'system', content: 'S' }] });
+    const history = messages.slice(1);
+    expect(history.length).toBeLessThanOrEqual(400);
+    expect(history[history.length - 1].content).toBe('m450');
+    expect(history.some((m) => m.content === 'm1')).toBe(false);
   });
 });
 

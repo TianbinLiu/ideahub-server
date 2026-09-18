@@ -389,17 +389,25 @@ async function maybeCompact(threadId) {
 
 // ── 提纯 ─────────────────────────────────────────────────────
 
-const SENSITIVE_RE = [/1[3-9]\d{9}/, /\d{17}[\dXx]/, /[\w.+-]+@[\w-]+\.[\w.-]+/, /\d{16,19}/];
+/** 数字段之间允许的分隔：空白、- . , / _、各种破折号（NFKC 之后全角逗号已是半角） */
+const DIGIT_SEP = "[\\s\\-.,/_\\u2010-\\u2015\\u2212]*";
+const SENSITIVE_RE = [
+  new RegExp(`1[3-9]\\d${DIGIT_SEP}\\d{4}${DIGIT_SEP}\\d{4}`), // 手机号（138-1234-5678、138 1234 5678、138—1234—5678）
+  new RegExp(`\\d{6}${DIGIT_SEP}\\d{8}${DIGIT_SEP}\\d{3}[\\dXx]`), // 身份证号
+  new RegExp(`\\d{4}(?:${DIGIT_SEP}\\d{4}){3}`), // 银行卡号（16～19 位，常见 4 位一组）
+  /[\w.+-]+@[\w-]+\.[\w.-]+/, // 邮箱
+];
+/** 变形的邮箱（abc at qq.com、abc(at)qq.com、abc#qq.com、qq 点 com）：只在同一条里提到「邮箱 / mail」时才算，免得误伤「look at github.com」「C#」 */
+const OBFUSCATED_EMAIL_RE = /[a-z0-9._+-]+\s*(?:@|#|[(\[（【]\s*(?:at|艾特)\s*[)\]）】]|\s(?:at|艾特)\s)\s*[a-z0-9-]+\s*(?:\.|[(\[（【]\s*dot\s*[)\]）】]|\sdot\s|点)\s*[a-z]{2,}/i;
+const EMAIL_WORD_RE = /邮箱|邮件|e-?mail|mail/i;
 
 /**
- * 记忆卡的敏感信息兜底（提示词已经要求模型别记，这里是第二道）。先 NFKC（全角数字、全角 @ 折成半角），
- * 再把被空格 / 横线 / 点隔开的数字段接起来（138-1234-5678、6222 0212 3456 7890），然后才套正则。
+ * 记忆卡的敏感信息兜底（提示词已经要求模型别记，这里是第二道）。先 NFKC（全角数字、全角 @、全角逗号折成半角），
+ * 再按模式认：号码允许段与段之间夹常见分隔符（不做「把所有数字接起来」—— 那会把 2019/2020/2021 这类接成假号码）。
  */
 function looksSensitive(text) {
-  const s = String(text || "")
-    .normalize("NFKC")
-    .replace(/(\d)[\s\-.]+(?=[\dXx])/g, "$1");
-  return SENSITIVE_RE.some((re) => re.test(s));
+  const s = String(text || "").normalize("NFKC");
+  return SENSITIVE_RE.some((re) => re.test(s)) || (OBFUSCATED_EMAIL_RE.test(s) && EMAIL_WORD_RE.test(s));
 }
 
 function buildCompactPrompt({ scene, oldSummary, memories, messages, focus }) {
@@ -668,16 +676,23 @@ async function logDeletions(type, ids, userId) {
  * 用户删除一个会话：消息、用量、摘要，以及**从它提炼出的记忆卡**，立即硬删。
  * ★ 先删会话本体：它消失的那一刻就是删除点。同时在写的 appendMessage、正在跑的提纯都以「会话还在不在」
  *   为准收尾（写完发现没了就自己清掉），所以先删本体才不会漏下孤儿消息或复活的记忆卡。
+ * ★ 可以续做：DeletionLog 先写；会话本体已经没了（上一次删到一半出错）也照样按 (会话, 用户) 把残留的
+ *   记忆卡 / 消息 / 用量删完 —— 用户再点一次删除就能收尾。什么都没找到才 404。
  */
 async function deleteThread({ userId, threadId }) {
-  const t = await getThread({ userId, threadId });
-  await ChatThread.deleteOne({ _id: t._id });
-  const memIds = (await ChatMemory.find({ user: userId, sourceThreads: t._id }).select("_id").lean()).map((m) => m._id);
-  if (memIds.length) await ChatMemory.deleteMany({ _id: { $in: memIds } });
-  await ChatMessage.deleteMany({ thread: t._id });
-  await ChatUsageLog.deleteMany({ thread: t._id });
-  await logDeletions("chat_thread", [t._id], userId);
+  if (!mongoose.isValidObjectId(threadId)) throw notFound();
+  const id = new mongoose.Types.ObjectId(String(threadId));
+  const t = await ChatThread.findOne({ _id: id, user: userId }).select("_id").lean();
+  if (t) {
+    await logDeletions("chat_thread", [id], userId);
+    await ChatThread.deleteOne({ _id: id, user: userId });
+  }
+  const memIds = (await ChatMemory.find({ user: userId, sourceThreads: id }).select("_id").lean()).map((m) => m._id);
   await logDeletions("chat_memory", memIds, userId);
+  if (memIds.length) await ChatMemory.deleteMany({ _id: { $in: memIds } });
+  const msgs = await ChatMessage.deleteMany({ thread: id, user: userId });
+  const usage = await ChatUsageLog.deleteMany({ thread: id, user: userId });
+  if (!t && !memIds.length && !msgs.deletedCount && !usage.deletedCount) throw notFound();
   return { deletedMemories: memIds.length };
 }
 
@@ -758,14 +773,15 @@ async function clearMemories({ userId, scene }) {
  * users.deleteAccount、admin 删用户），且都在删 User 之前 —— 失败了可以整条重试。
  */
 async function purgeUserChatData(userId) {
+  // DeletionLog 先写（中途失败重试时照样按 user 删完，不会漏记）
   const threads = (await ChatThread.find({ user: userId }).select("_id").lean()).map((t) => t._id);
-  await ChatThread.deleteMany({ user: userId });
   const mems = (await ChatMemory.find({ user: userId }).select("_id").lean()).map((m) => m._id);
+  await logDeletions("chat_thread", threads, userId);
+  await logDeletions("chat_memory", mems, userId);
+  await ChatThread.deleteMany({ user: userId });
   await ChatMemory.deleteMany({ user: userId });
   await ChatMessage.deleteMany({ user: userId });
   await ChatUsageLog.deleteMany({ user: userId });
-  await logDeletions("chat_thread", threads, userId);
-  await logDeletions("chat_memory", mems, userId);
   return { threads: threads.length, memories: mems.length };
 }
 
@@ -789,7 +805,13 @@ async function sweepExpiredChats(now = Date.now()) {
     const cutoff = new Date(now - sceneConfig(scene).retentionDays * 24 * 60 * 60 * 1000);
     const expired = await ChatThread.find({ scene, lastActiveAt: { $lt: cutoff } }).select("_id").limit(SWEEP_BATCH).lean();
     for (const t of expired) {
-      const r = await ChatThread.deleteOne({ _id: t._id, lastActiveAt: { $lt: cutoff } });
+      // 正在提纯的（租约还没过期）先不删：提纯收尾发现会话没了会把记忆卡当成「用户删除」一起清掉，
+      // 而陪聊的记忆卡按设计要在过期清扫后留下。下一轮再来。
+      const r = await ChatThread.deleteOne({
+        _id: t._id,
+        lastActiveAt: { $lt: cutoff },
+        $or: [{ "stats.compacting": { $ne: true } }, { "stats.compactingAt": { $not: { $gte: new Date(now - COMPACT_LEASE_MS) } } }],
+      });
       if (!r.deletedCount) continue;
       await ChatMessage.deleteMany({ thread: t._id });
       await ChatUsageLog.deleteMany({ thread: t._id });
