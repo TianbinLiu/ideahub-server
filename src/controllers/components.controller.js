@@ -14,14 +14,30 @@ const {
   extractZipToDirectory,
 } = require("../services/live2dBundle.service");
 
-const DEFAULT_REMOTE_MODEL_URL =
+/**
+ * 全站挂件的默认模型 = **官方看板娘小梦**，用**空串**表示（2026-09-18 起）。
+ * 与模型市场 `official-mascot` 同一个约定（见 live2dMarket.service）：服务端不知道官网的域名，所以不存地址，
+ * 官网把空串解析成随站点打包的 /live2d/mascot/mascot.model3.json（client live2d/sampleCredit.activeLive2dModelUrl）。
+ *
+ * ★ 为什么不再是 Hiyori：Hiyori 是 Live2D 官方示例数据，按 Live2D Free Material License Agreement v1.6
+ *   （日文正本），运营方最近一个会计年度的商业活动销售额达到 1,000 万日元时，示例数据只能用于内部或监修目的，
+ *   不能放在公开网站上。
+ */
+const DEFAULT_MODEL_JSON_URL = "";
+/**
+ * 2026-09-18 之前的默认地址。★ 在设置页点过「保存」的人，存进库里的正是它（设置页把默认值原样填进输入框再发回来），
+ * 光改上面那个默认值管不到这些人 —— 读的时候把**逐字等于它**的值当成「没选过」，下一次写入时顺手落成空串。
+ * 只认逐字相等：用户自己填的别的地址（哪怕也是示例）原样保留，那是他的选择，官网照样会给示例挂版权声明。
+ */
+const LEGACY_DEFAULT_MODEL_JSON_URL =
   "https://fastly.jsdelivr.net/gh/Live2D/CubismWebSamples/Samples/Resources/Hiyori/Hiyori.model3.json";
 const LIVE2D_UPLOAD_ROOT = path.join(__dirname, "..", "..", "uploads", "live2d-models");
 function serializeLive2dSettings(raw = {}) {
+  const stored = String(raw.modelJsonUrl || "").trim();
   return {
     enabled: raw.enabled !== false,
     source: raw.source === "uploaded" ? "uploaded" : "remote",
-    modelJsonUrl: String(raw.modelJsonUrl || DEFAULT_REMOTE_MODEL_URL),
+    modelJsonUrl: !stored || stored === LEGACY_DEFAULT_MODEL_JSON_URL ? DEFAULT_MODEL_JSON_URL : stored,
     uploadedModelJsonUrl: String(raw.uploadedModelJsonUrl || ""),
     uploadedBundleName: String(raw.uploadedBundleName || ""),
   };
@@ -72,9 +88,11 @@ function serializeSiteComponents(user) {
   };
 }
 
-function ensureValidModelJsonUrl(url, fieldName) {
+function ensureValidModelJsonUrl(url, fieldName, { allowEmpty = false } = {}) {
   const value = String(url || "").trim();
   if (!value) {
+    // 远程地址留空 = 用官方看板娘（见 DEFAULT_MODEL_JSON_URL）；只有调用方声明允许时才放行
+    if (allowEmpty) return DEFAULT_MODEL_JSON_URL;
     throw new AppError({
       code: CODES.VALIDATION_ERROR,
       status: 400,
@@ -140,7 +158,7 @@ async function updateMyComponents(req, res, next) {
             source: live2dInput.source === "uploaded" ? "uploaded" : "remote",
             modelJsonUrl:
               live2dInput.modelJsonUrl !== undefined
-                ? ensureValidModelJsonUrl(live2dInput.modelJsonUrl, "modelJsonUrl")
+                ? ensureValidModelJsonUrl(live2dInput.modelJsonUrl, "modelJsonUrl", { allowEmpty: true })
                 : currentLive2d.modelJsonUrl,
             uploadedModelJsonUrl: currentLive2d.uploadedModelJsonUrl,
             uploadedBundleName: currentLive2d.uploadedBundleName,
@@ -246,7 +264,7 @@ async function uploadMyLive2dBundle(req, res, next) {
 }
 
 module.exports = {
-  DEFAULT_REMOTE_MODEL_URL,
+  DEFAULT_MODEL_JSON_URL,
   getMyComponents,
   updateMyComponents,
   uploadLive2dBundle,
