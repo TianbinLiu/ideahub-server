@@ -462,7 +462,14 @@ async function updatePersona(req, res, next) {
     if (req.body.coverEmoji !== undefined) doc.coverEmoji = normalizeEmoji(req.body.coverEmoji);
     if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
-    if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
+    if (req.body.style !== undefined) {
+      // ★★ PATCH 语义：只改请求里**真的带了**的键，没带的保持库里的值（2026-09-18 线上 bug，
+      //   理由见 persona.schemas.js 的 stylePatchBody）。显式发 "" / [] 照常算"清空"。
+      //   合并之后仍整份过一遍 normalizeStyle —— 库里的老数据未必合今天的上限，一并归一。
+      const prev = (doc.toObject().style) || {};
+      const sent = Object.fromEntries(Object.entries(req.body.style).filter(([, v]) => v !== undefined));
+      doc.style = normalizeStyle({ ...prev, ...sent });
+    }
     // 被平台下架（举报处置）的人格，作者不能自己再翻成公开；想申诉走工单。原因给作者看，处置人不给（docs/02 6.6）
     if (req.body.shared && doc.takenDown) forbidden(`这个人格已被平台下架（${doc.takenDownReason || "原因见站内通知"}），不能再公开`);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
