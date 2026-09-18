@@ -1,8 +1,9 @@
 /**
  * 全站挂件（SiteLive2D）的组件设置：默认模型从 Live2D 官方示例 Hiyori 换成官方看板娘小梦（2026-09-18）。
  *
- * 约定与模型市场 `official-mascot` 同一个：**modelJsonUrl 空串 = 用官方看板娘**，官网把空串解析成随站点打包的
- * /live2d/mascot/mascot.model3.json（服务端不知道官网的域名，所以不存地址）。
+ * 库里**存空串 = 用官方看板娘**（与模型市场 `official-mascot` 同一约定）；但**回包给的是根相对路径**
+ * /live2d/mascot/mascot.model3.json 本身 —— 还开着的老版本官网页面会把 modelJsonUrl 原样交给挂件，
+ * 回空串它就加载失败，回这个路径它直接就能加载（官网随站点打包了这份文件）。
  * 为什么换：按 Live2D Free Material License，营收达到门槛的运营方不能把示例数据放在公开网站上。
  */
 const mongoose = require("mongoose");
@@ -10,6 +11,7 @@ const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
 
 const LEGACY_HIYORI = "https://fastly.jsdelivr.net/gh/Live2D/CubismWebSamples/Samples/Resources/Hiyori/Hiyori.model3.json";
+const OFFICIAL = "/live2d/mascot/mascot.model3.json";
 
 let mongod;
 let app;
@@ -45,17 +47,17 @@ async function createUser(live2d) {
 const auth = (token) => ({ Authorization: `Bearer ${token}` });
 
 describe("GET /api/me/components：默认模型", () => {
-  it("没存过设置的用户 → modelJsonUrl 空串（= 官方看板娘小梦），不再是 Hiyori", async () => {
+  it("没存过设置的用户 → 官方看板娘小梦的根相对路径，不再是 Hiyori", async () => {
     const { token } = await createUser();
     const res = await request(app).get("/api/me/components").set(auth(token));
     expect(res.status).toBe(200);
-    expect(res.body.components.live2d).toMatchObject({ enabled: true, source: "remote", modelJsonUrl: "" });
+    expect(res.body.components.live2d).toMatchObject({ enabled: true, source: "remote", modelJsonUrl: OFFICIAL });
   });
 
-  it("库里存着**旧的默认地址**（在设置页点过保存的人，存进去的正是 Hiyori）→ 读出来也是空串", async () => {
+  it("库里存着**旧的默认地址**（在设置页点过保存的人，存进去的正是 Hiyori）→ 读出来也是小梦", async () => {
     const { token } = await createUser({ enabled: true, source: "remote", modelJsonUrl: LEGACY_HIYORI });
     const res = await request(app).get("/api/me/components").set(auth(token));
-    expect(res.body.components.live2d.modelJsonUrl).toBe("");
+    expect(res.body.components.live2d.modelJsonUrl).toBe(OFFICIAL);
   });
 
   it("用户**自己**填的别的地址原样保留（只认逐字等于旧默认值的那一个）", async () => {
@@ -67,16 +69,24 @@ describe("GET /api/me/components：默认模型", () => {
 });
 
 describe("PUT /api/me/components：保存", () => {
-  it("modelJsonUrl 留空 → 收下（= 用官方看板娘），落库也是空串", async () => {
-    const { user, token } = await createUser();
-    const res = await request(app)
-      .put("/api/me/components")
-      .set(auth(token))
-      .send({ live2d: { enabled: true, source: "remote", modelJsonUrl: "" } });
-    expect(res.status).toBe(200);
-    expect(res.body.components.live2d.modelJsonUrl).toBe("");
-    const db = await User.findById(user._id).lean();
-    expect(db.siteComponents.live2d.modelJsonUrl).toBe("");
+  it("modelJsonUrl 留空、或原样发回默认路径（设置页会把回包填进输入框再发回来）→ 都收下，落库都是空串", async () => {
+    for (const sent of ["", OFFICIAL, `  ${OFFICIAL}  `]) {
+      const { user, token } = await createUser();
+      const res = await request(app)
+        .put("/api/me/components")
+        .set(auth(token))
+        .send({ live2d: { enabled: true, source: "remote", modelJsonUrl: sent } });
+      expect(res.status).toBe(200);
+      expect(res.body.components.live2d.modelJsonUrl).toBe(OFFICIAL);
+      const db = await User.findById(user._id).lean();
+      expect(db.siteComponents.live2d.modelJsonUrl).toBe("");
+    }
+  });
+
+  it("别的根相对路径不收（只认官方那一个；外部模型照旧要完整 http(s) 地址）", async () => {
+    const { token } = await createUser();
+    const res = await request(app).put("/api/me/components").set(auth(token)).send({ live2d: { enabled: true, source: "remote", modelJsonUrl: "/some/other.model3.json" } });
+    expect(res.status).toBe(400);
   });
 
   it("填了就照旧校验：不是 http(s) 的 json 地址 → 400；合法地址 → 原样收下", async () => {

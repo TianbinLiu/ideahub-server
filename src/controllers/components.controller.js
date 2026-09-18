@@ -15,15 +15,18 @@ const {
 } = require("../services/live2dBundle.service");
 
 /**
- * 全站挂件的默认模型 = **官方看板娘小梦**，用**空串**表示（2026-09-18 起）。
- * 与模型市场 `official-mascot` 同一个约定（见 live2dMarket.service）：服务端不知道官网的域名，所以不存地址，
- * 官网把空串解析成随站点打包的 /live2d/mascot/mascot.model3.json（client live2d/sampleCredit.activeLive2dModelUrl）。
+ * 全站挂件的默认模型 = **官方看板娘小梦**（2026-09-18 起）。
+ * - **库里存空串**表示「用官方的」（与模型市场 `official-mascot` 同一约定，见 live2dMarket.service）；
+ * - **回包给根相对路径本身**：官网随站点打包了这份文件，还开着的**老版本**官网页面会把 modelJsonUrl 原样交给挂件 ——
+ *   回空串它就加载失败，回这个路径它直接就能加载。这样官网与服务端先上哪一边都不会出现坏的组合
+ *   （2026-09-18 提 PR 前评审抓到：回空串时老页面 / 官网单独回滚，登录用户的挂件全部加载失败）。
+ * - 写入时发空串或原样发回这个路径，都存成空串（设置页会把回包填进输入框再发回来）。
  *
  * ★ 为什么不再是 Hiyori：Hiyori 是 Live2D 官方示例数据，按 Live2D Free Material License Agreement v1.6
  *   （日文正本），运营方最近一个会计年度的商业活动销售额达到 1,000 万日元时，示例数据只能用于内部或监修目的，
  *   不能放在公开网站上。
  */
-const DEFAULT_MODEL_JSON_URL = "";
+const OFFICIAL_MODEL_JSON_URL = "/live2d/mascot/mascot.model3.json";
 /**
  * 2026-09-18 之前的默认地址。★ 在设置页点过「保存」的人，存进库里的正是它（设置页把默认值原样填进输入框再发回来），
  * 光改上面那个默认值管不到这些人 —— 读的时候把**逐字等于它**的值当成「没选过」，下一次写入时顺手落成空串。
@@ -32,15 +35,30 @@ const DEFAULT_MODEL_JSON_URL = "";
 const LEGACY_DEFAULT_MODEL_JSON_URL =
   "https://fastly.jsdelivr.net/gh/Live2D/CubismWebSamples/Samples/Resources/Hiyori/Hiyori.model3.json";
 const LIVE2D_UPLOAD_ROOT = path.join(__dirname, "..", "..", "uploads", "live2d-models");
+/** 这个地址是不是「用官方的」（空串、官方路径本身、旧的 Hiyori 默认值 —— 三者都算） */
+function isOfficialModelJsonUrl(url) {
+  const v = String(url || "").trim();
+  return !v || v === OFFICIAL_MODEL_JSON_URL || v === LEGACY_DEFAULT_MODEL_JSON_URL;
+}
+
+/** 回包用的形态（见 OFFICIAL_MODEL_JSON_URL 的说明） */
 function serializeLive2dSettings(raw = {}) {
   const stored = String(raw.modelJsonUrl || "").trim();
   return {
     enabled: raw.enabled !== false,
     source: raw.source === "uploaded" ? "uploaded" : "remote",
-    modelJsonUrl: !stored || stored === LEGACY_DEFAULT_MODEL_JSON_URL ? DEFAULT_MODEL_JSON_URL : stored,
+    modelJsonUrl: isOfficialModelJsonUrl(stored) ? OFFICIAL_MODEL_JSON_URL : stored,
     uploadedModelJsonUrl: String(raw.uploadedModelJsonUrl || ""),
     uploadedBundleName: String(raw.uploadedBundleName || ""),
   };
+}
+
+/**
+ * 落库用的形态：「用官方的」一律存空串 —— 回包形态（官方路径）不许原样落库，否则将来官方路径一改，
+ * 存过的人就停在旧路径上。**唯一实现**：更新组件设置与上传模型包两处写回都走它。
+ */
+function toStoredLive2dSettings(settings) {
+  return { ...settings, modelJsonUrl: isOfficialModelJsonUrl(settings.modelJsonUrl) ? "" : String(settings.modelJsonUrl).trim() };
 }
 
 function serializeSimpleToggleSettings(raw = {}) {
@@ -90,9 +108,11 @@ function serializeSiteComponents(user) {
 
 function ensureValidModelJsonUrl(url, fieldName, { allowEmpty = false } = {}) {
   const value = String(url || "").trim();
+  // 设置页会把回包里的官方路径（根相对，过不了下面的 http(s) 校验）原样发回来 —— 认作「用官方的」
+  if (allowEmpty && value === OFFICIAL_MODEL_JSON_URL) return "";
   if (!value) {
-    // 远程地址留空 = 用官方看板娘（见 DEFAULT_MODEL_JSON_URL）；只有调用方声明允许时才放行
-    if (allowEmpty) return DEFAULT_MODEL_JSON_URL;
+    // 远程地址留空 = 用官方看板娘（见 OFFICIAL_MODEL_JSON_URL）；只有调用方声明允许时才放行
+    if (allowEmpty) return "";
     throw new AppError({
       code: CODES.VALIDATION_ERROR,
       status: 400,
@@ -186,7 +206,7 @@ async function updateMyComponents(req, res, next) {
 
     currentUser.siteComponents = {
       ...(currentUser.siteComponents?.toObject ? currentUser.siteComponents.toObject() : currentUser.siteComponents || {}),
-      live2d: nextLive2d,
+      live2d: toStoredLive2dSettings(nextLive2d),
       tagRank: nextTagRank,
       siteTemplateEditor: nextSiteTemplateEditor,
     };
@@ -238,12 +258,12 @@ async function uploadMyLive2dBundle(req, res, next) {
 
     user.siteComponents = {
       ...(user.siteComponents?.toObject ? user.siteComponents.toObject() : user.siteComponents || {}),
-      live2d: {
+      live2d: toStoredLive2dSettings({
         ...currentLive2d,
         source: "uploaded",
         uploadedModelJsonUrl,
         uploadedBundleName: req.file.originalname,
-      },
+      }),
     };
 
     await user.save();
@@ -264,7 +284,7 @@ async function uploadMyLive2dBundle(req, res, next) {
 }
 
 module.exports = {
-  DEFAULT_MODEL_JSON_URL,
+  OFFICIAL_MODEL_JSON_URL,
   getMyComponents,
   updateMyComponents,
   uploadLive2dBundle,
