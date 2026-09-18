@@ -8,8 +8,10 @@
  *
  * 用户侧:
  * @endpoint GET  /config                 - 客服叫什么、AI/TTS 有没有配、快捷问题（游客可查）
- * @endpoint POST /chat                   - SSE 流式问答。事件与 /api/companion/chat 相同（sentence/token/done/error），
- *                                          多一个 `handoff` {category, reason}：模型判定该转人工时发出（且 done.handoff 为真）
+ * @endpoint POST /chat                   - SSE 流式问答。请求体与事件都与 /api/companion/chat 相同（{message, threadId?} 按会话 /
+ *                                          {messages[]} 旧写法；thread/sentence/token/done/error），
+ *                                          多一个 `handoff` {category, reason}：模型判定该转人工时发出（且 done.handoff 为真）。
+ *                                          客服会话保留 30 天；记忆卡只在本会话内有效（见 chatMemory.service）
  * @endpoint POST /tickets                - 转人工：带上对话记录建工单 → 通知所有管理员 + 邮件；10 分钟内已有未结工单则复用
  * @endpoint GET  /tickets/mine           - 我的工单（含人工回复）
  * @endpoint POST /tickets/:id/messages   - 在自己的工单里追加一条消息（会再通知管理员，10 分钟去重）
@@ -26,6 +28,7 @@
  * @uses {services/support.service.js} - 知识检索 / 提示词 / 转人工标记 / 工单归纳
  * @uses {services/companion.service.js} - 切句与演出标签解析（与首页看板娘同一套协议）
  * @uses {services/aiClient.js} - aiChatStream / hasAiKey
+ * @uses {services/chatMemory.service.js} - 会话持久化 / 上下文组装 / 用量 / 提纯
  * @uses {services/notification.service.js} - createNotification
  * @uses {services/email.service.js} - sendEmail
  * @registered_in src/app.js（adminRouter 必须挂在 /api/admin 之前）
@@ -38,6 +41,7 @@ const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
+const chatMemory = require("../services/chatMemory.service");
 const { loadCompanionSetup, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
 const { resolveVoiceSettings } = require("../utils/voiceSettings");
 const SupportTicket = require("../models/SupportTicket");
@@ -63,10 +67,16 @@ const messageSchema = z.object({
   content: z.string().trim().min(1).max(MAX_MESSAGE_CHARS),
 });
 
-const chatBodySchema = z.object({
-  messages: z.array(messageSchema).min(1).max(MAX_HISTORY),
-  lang: z.enum(["zh", "en"]).optional(),
-});
+const chatBodySchema = z
+  .object({
+    // 旧写法：客户端自带历史（服务端不存；已发布的旧版 App 还在用）
+    messages: z.array(messageSchema).min(1).max(MAX_HISTORY).optional(),
+    // 按会话：只发新的一句
+    message: z.string().trim().min(1).max(MAX_MESSAGE_CHARS).optional(),
+    threadId: z.string().trim().max(64).optional(),
+    lang: z.enum(["zh", "en"]).optional(),
+  })
+  .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
 
 const ticketBodySchema = z.object({
   transcript: z
@@ -231,25 +241,58 @@ publicRouter.get("/config", optionalAuth, async (req, res, next) => {
   }
 });
 
-publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" }), async (req, res) => {
+publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" }), async (req, res, next) => {
   const parsed = chatBodySchema.safeParse(req.body || {});
   if (!parsed.success) return invalid(res, "invalid messages", parsed.error.issues);
   if (!hasAiKey()) return res.status(501).json({ ok: false, message: "AI not configured", code: "AI_NOT_CONFIGURED" });
 
   const history = parsed.data.messages;
-  if (history[history.length - 1].role !== "user") return invalid(res, "last message must be from user");
+  if (history && history[history.length - 1].role !== "user") return invalid(res, "last message must be from user");
+
+  // 装了人格 → 语气跟人设走、每句 TTS 指令带上人设的语调；客服的事实与红线不受影响
+  let setup;
+  let thread = null;
+  let userTurns;
+  try {
+    setup = await loadCompanionSetup({ userId: req.user._id, req });
+    if (history) {
+      userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
+    } else {
+      // 按会话：先存下用户这句（threadId 不是自己的 → 404，此时还没开始 SSE）
+      thread = await chatMemory.beginTurn({
+        userId: req.user._id,
+        scene: "support",
+        threadId: parsed.data.threadId,
+        text: parsed.data.message,
+        personaId: setup.persona && setup.persona._id,
+      });
+      userTurns = await chatMemory.recentUserTexts(thread, 2);
+    }
+  } catch (e) {
+    return next(e);
+  }
 
   // 检索用最近两条用户消息：追问往往只有"那要多久"三个字，单看这一句什么都召回不到
-  const userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
   const knowledge = support.selectKnowledge(userTurns.slice(-2).join("\n"));
-  // 装了人格 → 语气跟人设走、每句 TTS 指令带上人设的语调；客服的事实与红线不受影响
-  const setup = await loadCompanionSetup({ userId: req.user._id, req });
   const system = support.buildSupportSystemPrompt({
     userName: req.user.displayName || req.user.username || "",
     knowledge,
     lang: parsed.data.lang || "zh",
     personaLine: personaPromptLine(setup.persona),
   });
+  // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
+  const prefix = [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona)];
+  let messages;
+  let estPrompt = 0;
+  if (thread) {
+    try {
+      ({ messages, estPrompt } = await chatMemory.buildContextMessages({ thread, prefix }));
+    } catch (e) {
+      return next(e);
+    }
+  } else {
+    messages = [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))];
+  }
 
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -263,6 +306,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     if (closed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+  if (thread) send("thread", { threadId: String(thread._id), title: thread.title || "" });
   const abort = new AbortController();
   // ★ 监听 res 而不是 req 的 close：理由见 companion.routes.js（Node ≥16 里 req 的 close 在请求体读完就触发）
   res.on("close", () => {
@@ -314,15 +358,22 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     pending = "";
   };
 
+  const rawParts = [];
+  let usage = null;
+  let failed = false;
   try {
-    const stream = aiChatStream(
-      // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
-      [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona), ...history.map((m) => ({ role: m.role, content: m.content }))],
-      { maxTokens: MAX_REPLY_TOKENS, temperature: 0.3, signal: abort.signal },
-    );
+    const stream = aiChatStream(messages, {
+      maxTokens: MAX_REPLY_TOKENS,
+      temperature: 0.3,
+      signal: abort.signal,
+      onUsage: (u) => {
+        usage = u;
+      },
+    });
     for await (const delta of stream) {
       if (closed) break;
       feed(delta);
+      rawParts.push(delta);
       send("token", { t: delta });
     }
     if (!decided && pending) {
@@ -331,17 +382,38 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       if (parsedHandoff.handoff) markHandoff(parsedHandoff.category, parsedHandoff.reason);
       splitter.push(parsedHandoff.text);
     }
+    // 客户端断开时也 flush：send 已是空操作，但最后半句要进 plainParts 好存下半截回复
     splitter.flush();
-    send("done", { text: plainParts.join(" "), handoff: Boolean(handoff), category: handoff ? handoff.category : "" });
   } catch (e) {
     if (!closed) {
+      failed = true;
       console.error("[support] stream failed:", (e && e.message) || e);
-      send("error", { message: "support upstream failed" });
     }
-  } finally {
-    closed = true;
-    res.end();
   }
+
+  // 按会话：存下这句回复（半截的也存，标 partial）并记用量；失败只记日志，不吞掉已经说完的回复
+  const text = plainParts.join(" ");
+  let extra = {};
+  if (thread) {
+    try {
+      extra = await chatMemory.finishTurn({
+        thread,
+        displayText: text,
+        // 转人工标记不进历史：模型看到自己上一轮的 [handoff:x] 容易每句都再标一次
+        modelText: rawParts.join("").replace(/\[handoff[^\]]*\]\s*/gi, ""),
+        usage,
+        estPrompt,
+        aborted: closed || failed,
+      });
+    } catch (e) {
+      console.error("[support] finish failed:", (e && e.message) || e);
+    }
+  }
+  if (failed) send("error", { message: "support upstream failed", ...extra });
+  else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
+  closed = true;
+  res.end();
+  if (thread) chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[support] compact failed:", (e && e.message) || e));
 });
 
 publicRouter.post("/tickets", requireAuth, userRateLimit({ max: 5, scope: "support-ticket" }), async (req, res) => {

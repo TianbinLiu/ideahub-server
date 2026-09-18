@@ -215,8 +215,20 @@ function personaExampleMessages(persona, { max = 6 } = {}) {
  * @param {{role: string, content: string}[]} opts.messages 已含 system（与 few-shot）的完整消息列表
  * @param {string} [opts.ttsInstruct] 人设语调，前置到每句的 tts.instruct
  * @param {string} [opts.tag] 日志 / error 事件里的前缀
+ * @param {object|null} [opts.thread] 按会话聊天时给：开头先发一个 `thread` 事件（{threadId, title}）
+ * @param {Function|null} [opts.finish] 按会话聊天时给：async ({text, rawText, aborted, usage}) => extra，
+ *   在 done / error 之前调用（客户端断开时也调，好存下半截回复），返回的字段并进 done / error 事件
  */
-async function streamCompanionReply({ res, messages, ttsInstruct = "", maxTokens = MAX_REPLY_TOKENS, temperature = 0.8, tag = "companion" }) {
+async function streamCompanionReply({
+  res,
+  messages,
+  ttsInstruct = "",
+  maxTokens = MAX_REPLY_TOKENS,
+  temperature = 0.8,
+  tag = "companion",
+  thread = null,
+  finish = null,
+}) {
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -229,6 +241,8 @@ async function streamCompanionReply({ res, messages, ttsInstruct = "", maxTokens
     if (closed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+  // 按会话聊天时第一件事告诉前端 threadId：新会话的 id 要在第一句话之前就拿到，中途断开也不丢
+  if (thread) send("thread", thread);
 
   const abort = new AbortController();
   // ★ 必须监听 res 而不是 req 的 close：Node ≥16 里 IncomingMessage 的 'close' 在请求体读完就触发
@@ -249,25 +263,49 @@ async function streamCompanionReply({ res, messages, ttsInstruct = "", maxTokens
     send("sentence", { index: index++, ...p, tts: ttsParamsFor(p.emotion, ttsInstruct) });
   });
 
+  const rawParts = [];
+  let usage = null;
+  let failed = false;
   try {
-    const stream = aiChatStream(messages, { maxTokens, temperature, signal: abort.signal });
+    const stream = aiChatStream(messages, {
+      maxTokens,
+      temperature,
+      signal: abort.signal,
+      onUsage: (u) => {
+        usage = u;
+      },
+    });
     for await (const delta of stream) {
       if (closed) break;
       splitter.push(delta);
+      rawParts.push(delta);
       send("token", { t: delta });
     }
+    // 客户端断开时也 flush：send 已经是空操作，但最后半句要进 plainParts，好让 finish 存下半截回复
     splitter.flush();
-    send("done", { text: plainParts.join(" ") });
   } catch (e) {
     // 客户端主动断开时 abort 会抛错，这不是故障，静默收场即可；其余照实告诉前端并记日志
     if (!closed) {
+      failed = true;
       console.error(`[${tag}] stream failed:`, (e && e.message) || e);
-      send("error", { message: `${tag} upstream failed` });
     }
-  } finally {
-    closed = true;
-    res.end();
   }
+
+  // finish：按会话聊天时由路由传入，负责存下这句回复、记用量，返回值并进 done / error（threadId、上下文用量）。
+  // 它失败不能吞掉已经说完的回复 —— 记日志，照常发 done。
+  const text = plainParts.join(" ");
+  let extra = {};
+  if (typeof finish === "function") {
+    try {
+      extra = (await finish({ text, rawText: rawParts.join(""), aborted: closed || failed, usage })) || {};
+    } catch (e) {
+      console.error(`[${tag}] finish failed:`, (e && e.message) || e);
+    }
+  }
+  if (failed) send("error", { message: `${tag} upstream failed`, ...extra });
+  else send("done", { text, ...extra });
+  closed = true;
+  res.end();
 }
 
 module.exports = {

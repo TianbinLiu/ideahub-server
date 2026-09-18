@@ -153,6 +153,8 @@ app.use("/api/blocks", require("./routes/blocks.routes"));
 app.use("/api/companion", require("./routes/companion.routes"));
 // App「AI 客服」：GET /config 游客可探测、POST /chat 流式问答、/tickets 转人工工单（用户侧）
 app.use("/api/support", require("./routes/support.routes").publicRouter);
+// 数字人对话的会话与记忆（陪聊 + 客服共用）：翻历史、手动整理、删会话、「记得的事」；全部需登录、只碰自己的
+app.use("/api/chat", require("./routes/chatThreads.routes"));
 // 语音识别代理（客服页按住说话）：收音频二进制，自己 express.raw，不占全局 1MB JSON 阈值
 app.use("/api/asr", require("./routes/asr.routes"));
 // Live2D 模型市场（数字人套装：模型包 + 推荐人格 + 推荐嗓子）；解压落在 uploads/live2d-market/

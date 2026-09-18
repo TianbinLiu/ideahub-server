@@ -30,8 +30,9 @@
  *
  * 导出方法:
  * @exports hasAiKey - 是否已配置 key；供各 service 决定「抛 501」还是「回退启发式」。
- * @exports aiComplete - 发一个 prompt，拿回 { text, model }。
- * @exports aiChatStream - 流式对话（async generator），供 SSE 端点逐句转发。
+ * @exports aiComplete - 发一个 prompt，拿回 { text, model, usage }。
+ * @exports aiChatStream - 流式对话（async generator），供 SSE 端点逐句转发；opts.onUsage 拿本次 token 用量。
+ * @exports normalizeUsage - 把各家 usage 字段收成一个形状（供 chatMemory 计量上下文）。
  * @exports resolveModel - 解析模型名（env 优先，否则用传入的 fallback）。
  *
  * 外部依赖:
@@ -45,6 +46,7 @@
  * @used_in {services/speakingStyleAi.service.js} - 发言风格面板
  * @used_in {services/standpointAi.service.js} - 立场展开自动应答
  * @used_in {routes/companion.routes.js} - 首页看板娘数字人的流式对话
+ * @used_in {services/chatMemory.service.js} - 对话记忆的自动提纯（aiComplete）
  */
 
 const OpenAI = require("openai");
@@ -82,6 +84,30 @@ function hasAiKey() {
   return !!resolveKey();
 }
 
+/**
+ * 把接口返回的 usage 收成一个形状。各家字段名不一样：
+ *   · DeepSeek：prompt_cache_hit_tokens / prompt_cache_miss_tokens（缓存命中按约 1/10 计费）；
+ *   · OpenAI 及多数兼容端点：prompt_tokens_details.cached_tokens、completion_tokens_details.reasoning_tokens。
+ * 没有 usage（有的兼容端点流式不给）→ null，调用方按「没拿到」处理，不当成 0。
+ * @returns {{model: string, promptTokens: number, completionTokens: number, cacheHitTokens: number, cacheMissTokens: number, reasoningTokens: number} | null}
+ */
+function normalizeUsage(usage, model) {
+  if (!usage || typeof usage !== "object") return null;
+  const num = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+  const promptTokens = num(usage.prompt_tokens);
+  const details = usage.prompt_tokens_details || {};
+  const cacheHitTokens = num(usage.prompt_cache_hit_tokens) || num(details.cached_tokens);
+  const cacheMissTokens = num(usage.prompt_cache_miss_tokens) || Math.max(0, promptTokens - cacheHitTokens);
+  return {
+    model: String(model || ""),
+    promptTokens,
+    completionTokens: num(usage.completion_tokens),
+    cacheHitTokens,
+    cacheMissTokens,
+    reasoningTokens: num(usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens),
+  };
+}
+
 function getClient() {
   const baseURL = resolveBaseUrl();
   return new OpenAI({
@@ -101,7 +127,8 @@ function getClient() {
  * @param {string} prompt
  * @param {object} [opts]
  * @param {string} [opts.fallbackModel] - env 未指定 AI_MODEL/OPENAI_MODEL 时使用的模型名
- * @returns {Promise<{ text: string, model: string }>}
+ * @param {number} [opts.maxTokens] - 覆盖 AI_MAX_TOKENS
+ * @returns {Promise<{ text: string, model: string, usage: object|null }>}
  */
 async function aiComplete(prompt, opts = {}) {
   const model = resolveModel(opts.fallbackModel || "gpt-5.2");
@@ -115,7 +142,7 @@ async function aiComplete(prompt, opts = {}) {
     {
       model,
       messages: [{ role: "user", content: String(prompt || "") }],
-      max_tokens: Number(process.env.AI_MAX_TOKENS || 2048),
+      max_tokens: Number(opts.maxTokens || process.env.AI_MAX_TOKENS || 2048),
       ...extraBody(),
     },
     { timeout: Number(process.env.AI_TIMEOUT_MS || 60_000) },
@@ -129,7 +156,7 @@ async function aiComplete(prompt, opts = {}) {
       resp.choices[0].message.content) ||
     "";
 
-  return { text, model };
+  return { text, model, usage: normalizeUsage(resp && resp.usage, (resp && resp.model) || model) };
 }
 
 /**
@@ -140,6 +167,9 @@ async function aiComplete(prompt, opts = {}) {
  *   `max_tokens`（400 "Unsupported parameter"），而国内兼容端点（DeepSeek 等）只认 `max_tokens`。
  *   先按兼容端点的写法发，撞到那条 400 再换名重发一次，两边都能跑，不用按 provider 写分支。
  * ★ signal：调用方（SSE 路由）在客户端断开时 abort，否则上游会把整段话生成完、token 照扣。
+ * ★ usage：流式默认不给用量，要带 stream_options.include_usage —— 最后多来一个 choices 为空、只带 usage 的块
+ *   （OpenAI 与 DeepSeek 都是这个约定）。有的兼容端点不认这个字段、回 400，就去掉它再发一次（和上面换名同一个套路），
+ *   这时拿不到用量，onUsage 不会被调用。中途被 abort 时最后那块也收不到 —— 调用方要能处理「没拿到用量」。
  *
  * @param {Array<{role: string, content: string}>} messages - 含 system 的完整消息列表
  * @param {object} [opts]
@@ -147,6 +177,7 @@ async function aiComplete(prompt, opts = {}) {
  * @param {number} [opts.maxTokens]
  * @param {number} [opts.temperature]
  * @param {AbortSignal} [opts.signal]
+ * @param {(usage: object) => void} [opts.onUsage] - 拿到本次用量时回调一次（形状见 normalizeUsage）
  * @returns {AsyncGenerator<string>}
  */
 async function* aiChatStream(messages, opts = {}) {
@@ -163,22 +194,40 @@ async function* aiChatStream(messages, opts = {}) {
   const reqOpts = { timeout, ...(opts.signal ? { signal: opts.signal } : {}) };
   const client = getClient();
 
+  // 两个可退让的字段：不认 stream_options 的端点去掉它，不认 max_tokens 的端点换成 max_completion_tokens。
+  // 每个字段最多退让一次，最多发三次。
+  let body = { ...base, stream_options: { include_usage: true }, max_tokens: maxTokens };
   let stream;
-  try {
-    stream = await client.chat.completions.create({ ...base, max_tokens: maxTokens }, reqOpts);
-  } catch (e) {
-    const msg = String((e && e.message) || "");
-    if (e && e.status === 400 && /max_completion_tokens/.test(msg)) {
-      stream = await client.chat.completions.create({ ...base, max_completion_tokens: maxTokens }, reqOpts);
-    } else {
-      throw e;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      stream = await client.chat.completions.create(body, reqOpts);
+      break;
+    } catch (e) {
+      const msg = String((e && e.message) || "");
+      if (attempt < 2 && e && e.status === 400 && body.stream_options && /stream_options|include_usage/.test(msg)) {
+        const { stream_options: _drop, ...rest } = body;
+        body = rest;
+      } else if (attempt < 2 && e && e.status === 400 && "max_tokens" in body && /max_completion_tokens/.test(msg)) {
+        const { max_tokens: _drop, ...rest } = body;
+        body = { ...rest, max_completion_tokens: maxTokens };
+      } else {
+        throw e;
+      }
     }
   }
 
+  let usageSent = false;
   for await (const chunk of stream) {
     const delta = chunk && chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
     if (delta) yield delta;
+    if (!usageSent && chunk && chunk.usage && typeof opts.onUsage === "function") {
+      const usage = normalizeUsage(chunk.usage, chunk.model || model);
+      if (usage) {
+        usageSent = true;
+        opts.onUsage(usage);
+      }
+    }
   }
 }
 
-module.exports = { hasAiKey, aiComplete, aiChatStream, resolveModel };
+module.exports = { hasAiKey, aiComplete, aiChatStream, resolveModel, normalizeUsage };
