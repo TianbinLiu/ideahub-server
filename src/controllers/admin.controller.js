@@ -15,6 +15,7 @@ const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
 const Interest = require("../models/Interest");
 const { invalidId, notFound, badRequest } = require("../utils/http");
+const { purgeUserChatData } = require("../services/chatMemory.service");
 
 // 可选模型：有就删，没有就跳过（避免 require 报错）
 let Notification, AiJob;
@@ -142,6 +143,9 @@ async function adminDeleteUser(req, res, next) {
 
     // 删除用户创建的 ideas
     await Idea.deleteMany({ author: user._id });
+
+    // 数字人对话数据（会话 / 消息 / 用量 / 记忆卡）
+    await purgeUserChatData(user._id);
 
     // 删除用户
     await User.deleteOne({ _id: user._id });

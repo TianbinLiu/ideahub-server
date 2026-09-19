@@ -57,6 +57,7 @@ const {
 const { recountAssetStat } = require("./branchAsset.controller");
 // 通知写入一律走 service（全站唯一入口），不在这里 create
 const { createNotification } = require("../services/notification.service");
+const { purgeUserChatData } = require("../services/chatMemory.service");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -313,6 +314,8 @@ async function unbanUser(req, res, next) {
  *      token 是对外采购的算力额度，**没有对手方**，删他自己的流水不破坏任何不变量。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
+ *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
+ *      （硬删 + DeletionLog；记忆卡没有 TTL，账号没了就再没人能删它们，所以必须在这里删）
  *   ⑪ User 本体（最后删：中途挂了还能重来，先删 User 就再也找不到线索了）
  *
  *   不删（刻意的，不是遗漏）：
@@ -489,6 +492,11 @@ async function purgeUserCascade(userId) {
     await Notification.deleteMany({ $or: [{ userId: uid }, { actorId: uid }] })
   ).deletedCount;
   removed.searchHistory = (await SearchHistory.deleteMany({ user: uid })).deletedCount;
+
+  // ⑩.5 数字人对话：会话 / 消息 / 用量 / 记忆卡（回执每项都是数字，App 管理页按数字汇总）
+  const chat = await purgeUserChatData(uid);
+  removed.chatThreads = chat.threads;
+  removed.chatMemories = chat.memories;
 
   // ⑪ 用户本体
   removed.user = (await User.deleteOne({ _id: uid })).deletedCount;
