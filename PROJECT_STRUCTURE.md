@@ -1879,7 +1879,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 **实现备注**:
 - 按 `live2d-widget-master/README.md` 的自托管思路集成，不直接使用写死 CDN 路径的 `autoload.js`
-- 仓库未内置任何模型文件，当前匿名默认模型 JSON 指向外部公开的 Hiyori 模型资源
+- 默认模型 = **官方看板娘小梦**（2026-09-18 起）：组件设置里「用官方的」**库里存空串**（与模型市场 `official-mascot` 同一约定），但**回包给根相对路径** `/live2d/mascot/mascot.model3.json`（官网随站点打包了这份文件）——还开着的老版本官网页面会把 modelJsonUrl 原样交给挂件，回空串它就加载失败；写入时发空串或原样发回这个路径都存成空串（`toStoredLive2dSettings`，更新设置与上传模型包两处共用）。此前指向 Live2D 官方示例 Hiyori——示例数据按 Live2D Free Material License 对营收达到 1,000 万日元的运营方只许内部或监修用途，不能放在公开网站上，所以换掉；库里存着旧 Hiyori 默认地址的，读的时候当成空串（`components.controller` 的 `LEGACY_DEFAULT_MODEL_JSON_URL`）
 
 ---
 
