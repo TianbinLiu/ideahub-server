@@ -63,6 +63,45 @@ const tokenOrderSchema = new mongoose.Schema(
     raw: { type: mongoose.Schema.Types.Mixed, default: undefined },
     /** 失败/关闭的原因，给人看 */
     note: { type: String, default: "", trim: true, maxlength: 500 },
+
+    // ── Google Play（D15 阶段 1，services/payment/playBilling.service.js）──
+    /**
+     * 这张单的金额怎么核：
+     *   channel = 渠道回调报实付金额，与 amountFen 比（order.service 的 O2）；
+     *   product = 渠道不报金额（Google 按国家定价，amountFen 记 0），靠出站查商品购买状态核。
+     * ★★ 新单**必填、没有默认值**：Play 单的 amountFen 是 0，要是被当成 channel 单走了回调结算，
+     *   「实付 < 应付」那道校验对 0 恒过 —— 一张没核过的单也能发币。所以 applyCallback 见 product 一律拒。
+     * ★ 老数据没有这一列，一律按 channel 读（判否定）；只在 isNew 时必填，别让老单 save 时校验失败。
+     */
+    amountCheck: {
+      type: String,
+      enum: ["channel", "product"],
+      required: function () {
+        return this.isNew;
+      },
+    },
+    /** Play 商品 ID（config/playProducts.js 的键） */
+    storeProductId: { type: String, default: undefined, trim: true, maxlength: 128 },
+    /** sha256(purchaseToken)。一个购买只有一张单（唯一索引）；删号去标识化之后还靠它认 voided */
+    purchaseTokenHash: { type: String, default: undefined, trim: true, maxlength: 64 },
+    /** 明文 purchaseToken：只为 consume 重试留着，consume 成功就删；默认不读出来 */
+    purchaseToken: { type: String, default: undefined, select: false, maxlength: 4096 },
+    /** Google 回报这是许可测试账号的购买（发币记 iap_test） */
+    testPurchase: { type: Boolean, default: undefined },
+    /** consume：pending 待办 / done 已完成 / failed 重试次数用完（要人工看） */
+    consumeState: { type: String, enum: ["pending", "done", "failed"], default: undefined },
+    consumeTries: { type: Number, default: undefined, min: 0 },
+    consumeLastError: { type: String, default: undefined, maxlength: 500 },
+    /** 下一次重试不早于这个时刻（指数退避） */
+    consumeNextAt: { type: Date, default: undefined },
+    /** 双实例租约：谁在 consume、拿到什么时候 */
+    consumeLeaseUntil: { type: Date, default: undefined },
+    /** Google 回报退款 / 撤销的时刻。**回收的幂等锚点**：条件更新抢 voidedAt: null → now */
+    voidedAt: { type: Date, default: undefined },
+    /** 回收结局：done 扣回来了 / short 余额不够、扣到 0 为止 / user_gone 人已经不在了 */
+    clawbackState: { type: String, enum: ["done", "short", "user_gone"], default: undefined },
+    /** 没扣到的 token（short / user_gone 时 > 0）。余额扣不够最终怎么处置是产品决定 1，还没定 */
+    clawbackShortTokens: { type: Number, default: undefined, min: 0 },
   },
   { timestamps: true }
 );
@@ -74,6 +113,13 @@ tokenOrderSchema.index(
   { unique: true, partialFilterExpression: { channelTxnId: { $type: "string", $gt: "" } } }
 );
 tokenOrderSchema.index({ user: 1, createdAt: -1 });
+// 一个 Play 购买只有一张单：并发两条兑换同一个 token 时在这里撞死。非 Play 单没有这一列，partial 过滤掉
+tokenOrderSchema.index(
+  { purchaseTokenHash: 1 },
+  { unique: true, partialFilterExpression: { purchaseTokenHash: { $type: "string", $gt: "" } } }
+);
+// consume 清扫只看待办的那几张
+tokenOrderSchema.index({ consumeState: 1, consumeNextAt: 1 }, { partialFilterExpression: { consumeState: "pending" } });
 
 module.exports = mongoose.model("TokenOrder", tokenOrderSchema);
 module.exports.ORDER_KINDS = ORDER_KINDS;
