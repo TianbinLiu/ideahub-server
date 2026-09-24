@@ -25,7 +25,7 @@ function defaultVoiceId() {
 
 /**
  * 读出某个用户的数字人设置并解析成前端可直接用的形状；userId 为空（游客）时只有服务端默认。
- * @returns {{ settings, persona, personaSource, model, voice }}
+ * @returns {{ settings, persona, personaSource, model, voice, consent }}
  */
 async function loadCompanionSetup({ userId, req }) {
   const setting = userId ? await CompanionSetting.findOne({ user: userId }).lean() : null;
@@ -41,6 +41,8 @@ async function loadCompanionSetup({ userId, req }) {
       modelId: setting?.model ? String(setting.model) : null,
       voice: serializeVoiceSettings(setting?.voice),
     },
+    // 首次陪聊的告知同意（加州 SB 243 §22602(a)/§22604）：版本不一致视同没同意，改了告知内容要重新同意
+    consent: { version: setting?.consent?.version || "", at: setting?.consent?.at || null },
     persona: personaSummary(persona),
     personaSource: chosenPersona ? "user" : modelPersona ? "model" : "",
     model: model ? toLive2dModelPayload(model, req, { viewerId: userId, installed: true }) : null,
@@ -97,4 +99,38 @@ function personaPromptLine(persona) {
   return `【人设】用户给你装了人格市场里的人格「${persona.name}」：${persona.styleDescriptor}。说话的语气、用词、口头禅必须贴合这个人设；但你的身份、职责与上面的所有规则不变。`;
 }
 
-module.exports = { OFFICIAL_MODEL_ID, loadCompanionSetup, updateCompanionSetting, personaPromptLine, defaultVoiceId, authorIdOf };
+/** 当前要求的同意版本（与 chatSafety.PROTOCOL_VERSION 同步；官网安全说明页也显示它） */
+function consentVersion() {
+  return require("./chatSafety.service").PROTOCOL_VERSION;
+}
+
+/** 是否需要先同意才能陪聊：前端上线前先留 0，上线后设 COMPANION_REQUIRE_CONSENT=1 */
+function consentRequired() {
+  return String(process.env.COMPANION_REQUIRE_CONSENT || "") === "1";
+}
+
+/** setup.consent 是否为当前版本 */
+function hasConsented(setup) {
+  return Boolean(setup && setup.consent && setup.consent.version === consentVersion());
+}
+
+/** 记下同意（幂等：重复点只更新时间） */
+async function recordConsent({ userId }) {
+  const version = consentVersion();
+  const at = new Date();
+  await CompanionSetting.updateOne({ user: userId }, { $set: { "consent.version": version, "consent.at": at } }, { upsert: true });
+  return { version, at };
+}
+
+module.exports = {
+  OFFICIAL_MODEL_ID,
+  loadCompanionSetup,
+  updateCompanionSetting,
+  personaPromptLine,
+  defaultVoiceId,
+  authorIdOf,
+  consentVersion,
+  consentRequired,
+  hasConsented,
+  recordConsent,
+};

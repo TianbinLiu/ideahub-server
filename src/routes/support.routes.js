@@ -259,13 +259,13 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
     } else {
       // 按会话：先存下用户这句（threadId 不是自己的 → 404，此时还没开始 SSE）
-      thread = await chatMemory.beginTurn({
+      ({ thread } = await chatMemory.beginTurn({
         userId: req.user._id,
         scene: "support",
         threadId: parsed.data.threadId,
         text: parsed.data.message,
         personaId: setup.persona && setup.persona._id,
-      });
+      }));
       userTurns = await chatMemory.recentUserTexts(thread, 2);
     }
   } catch (e) {

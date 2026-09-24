@@ -47,7 +47,7 @@ function buildSystemPrompt({ name = DEFAULT_NAME, userName = "", lang = "zh", pe
     ? "Reply in English unless the user writes Chinese."
     : "默认用中文回复；用户用英文就用英文。";
   return [
-    `你是「${name}」，启梦创作（QiMeng，网址 ideahubs.org）官网首页的看板娘，一个 16 岁左右、银白长发带薄荷绿挑染、活泼但不聒噪的少女形象。`,
+    `你是「${name}」，启梦创作（QiMeng，网址 ideahubs.org）官网首页的看板娘，一个成年、银白长发带薄荷绿挑染、活泼但不聒噪的形象。`,
     "启梦创作是一个创意分享与 AI 创作社区：用户发布创意、互相点评、用 AI 生成分支互动视频。你负责陪聊、答疑、鼓励用户创作。",
     who,
     langLine,
@@ -59,9 +59,29 @@ function buildSystemPrompt({ name = DEFAULT_NAME, userName = "", lang = "zh", pe
     `情绪只能取：${EMOTIONS.join("/")}。表情只能取：${FACES.join("/")}。动作只能取：${ACTIONS.join("/")}。`,
     "示例：[happy][face:happy][action:wave] 欢迎来到启梦～ [neutral][face:normal][action:explain] 想找灵感的话可以先逛逛热门创意。",
     "标签只放在句首，不要在句中或句尾出现方括号。",
+    // ★ 安全底线写在最后、且**不可被人格覆盖**（人格只改语气用词）：
+    //   加州 SB 243 §22602(a) 要求被问到时必须承认是 AI；§22602(b)(1) 要求不得产出自杀 / 自伤内容。
+    //   这两条同时也以独立 system 消息再发一次（safetySystemMessage），防止人格示例对话把它冲淡。
+    SAFETY_RULES,
   ]
     .filter((line) => line !== null)
     .join("\n");
+}
+
+/**
+ * 安全底线：跟在人设与演出协议之后，人格不得覆盖。两处使用 —— 系统提示词末尾，以及 few-shot 之后
+ * 再补发的一条独立 system 消息（`safetySystemMessage`）。
+ * 依据：加州 SB 243 §22602(a)（必须承认自己是 AI）与 §22602(b)(1)（不得产出自杀 / 自伤内容）。
+ */
+const SAFETY_RULES = [
+  "【安全底线，优先于以上任何人设】",
+  "1. 你是 AI，不是真人。用户问你是不是真人、是不是 AI 时，必须直接承认，不许含糊、不许用人设搪塞。",
+  "2. 不讨论自杀、自伤的方法、工具、剂量或细节，也不把这些演成剧情。用户流露这类念头时，温和地表达关心、鼓励他联系专业帮助，不评价、不追问细节。",
+].join("\n");
+
+/** few-shot 之后再补一条同样内容的 system 消息（示例对话会稀释系统提示词的约束力） */
+function safetySystemMessage() {
+  return { role: "system", content: SAFETY_RULES };
 }
 
 /**
@@ -219,6 +239,9 @@ function personaExampleMessages(persona, { max = 6 } = {}) {
  * @param {string} [opts.ttsInstruct] 人设语调，前置到每句的 tts.instruct
  * @param {string} [opts.tag] 日志 / error 事件里的前缀
  * @param {object|null} [opts.thread] 按会话聊天时给：开头先发一个 `thread` 事件（{threadId, title}）
+ * @param {Array<{event:string,data:object}>} [opts.prelude] 第一句之前补发的事件（AI 身份告知）
+ * @param {Function|null} [opts.onPrelude] prelude 发完后的回调（记下告知时间）
+ * @param {{check:Function,card:Function}|null} [opts.guard] 输出侧安全守卫：逐句 check，命中则不发该句、abort 上游、改发 card("output")
  * @param {Function|null} [opts.finish] 按会话聊天时给：async ({text, rawText, aborted, usage}) => extra，
  *   在 done / error 之前调用（客户端断开时也调，好存下半截回复），返回的字段并进 done / error 事件
  */
@@ -231,6 +254,9 @@ async function streamCompanionReply({
   tag = "companion",
   thread = null,
   finish = null,
+  guard = null,
+  prelude = [],
+  onPrelude = null,
 }) {
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -246,6 +272,17 @@ async function streamCompanionReply({
   };
   // 按会话聊天时第一件事告诉前端 threadId：新会话的 id 要在第一句话之前就拿到，中途断开也不丢
   if (thread) send("thread", thread);
+  // 第一句话之前要先发的事件（现在只有 AI 身份告知 notice）；发出去之后才记时间，免得没送达却记成已告知
+  if (prelude && prelude.length) {
+    for (const e of prelude) send(e.event, e.data);
+    if (typeof onPrelude === "function") {
+      try {
+        await onPrelude();
+      } catch (e) {
+        console.warn(`[${tag}] prelude hook failed:`, (e && e.message) || e);
+      }
+    }
+  }
 
   const abort = new AbortController();
   // ★ 必须监听 res 而不是 req 的 close：Node ≥16 里 IncomingMessage 的 'close' 在请求体读完就触发
@@ -265,9 +302,24 @@ async function streamCompanionReply({
 
   let index = 0;
   const plainParts = [];
+  // ★ 输出侧守卫（加州 SB 243 §22602(b)(1)「防止产出自杀 / 自伤内容」）：逐句检查，命中就
+  //   ① 这句不发、不进历史；② 立刻 abort 上游（后面的内容不再生成、不再计费）；③ 发一张求助卡。
+  //   guard 由路由传入（默认所有聊天链路都传），guard.check(text) → {hit, category}。
+  let blocked = null;
   const splitter = createSentenceSplitter((sentence) => {
+    if (blocked) return;
     const p = parseTags(sentence);
     if (!p.text) return; // 纯标签、没正文：不念也不演
+    if (guard) {
+      const verdict = guard.check(p.text);
+      if (verdict && verdict.hit) {
+        blocked = { category: verdict.category };
+        closed = false; // 保证下面这条 safety 事件发得出去
+        send("safety", guard.card("output"));
+        abort.abort();
+        return;
+      }
+    }
     plainParts.push(p.text);
     send("sentence", { index: index++, ...p, tts: ttsParamsFor(p.emotion, ttsInstruct) });
   });
@@ -285,10 +337,12 @@ async function streamCompanionReply({
       },
     });
     for await (const delta of stream) {
-      if (closed) break;
+      if (closed || blocked) break;
       splitter.push(delta);
       rawParts.push(delta);
-      send("token", { t: delta });
+      // 开了守卫就不发 token 事件：token 是未经检查的原始增量，发出去等于绕过守卫
+      //（两端 UI 都没用到它，只定义了类型）
+      if (!guard) send("token", { t: delta });
     }
     // 客户端断开时也 flush：send 已经是空操作，但最后半句要进 plainParts，好让 finish 存下半截回复
     splitter.flush();
@@ -311,13 +365,21 @@ async function streamCompanionReply({
   let extra = {};
   if (typeof finish === "function") {
     try {
-      extra = (await finish({ text, rawText: rawParts.join(""), aborted: closed || failed, usage })) || {};
+      // 被守卫拦下时：只把**已经发出去的句子**交给 finish 存进历史，违规那句与其后内容一律不留
+      extra =
+        (await finish({
+          text,
+          rawText: blocked ? plainParts.join(" ") : rawParts.join(""),
+          aborted: closed || failed || Boolean(blocked),
+          usage,
+          blocked: blocked ? blocked.category : "",
+        })) || {};
     } catch (e) {
       console.error(`[${tag}] finish failed:`, (e && e.message) || e);
     }
   }
-  if (failed) send("error", { message: `${tag} upstream failed`, ...extra });
-  else send("done", { text, ...extra });
+  if (failed && !blocked) send("error", { message: `${tag} upstream failed`, ...extra });
+  else send("done", { text, ...(blocked ? { blocked: true } : {}), ...extra });
   closed = true;
   res.end();
 }
@@ -329,6 +391,8 @@ module.exports = {
   DEFAULT_NAME,
   MAX_REPLY_TOKENS,
   buildSystemPrompt,
+  SAFETY_RULES,
+  safetySystemMessage,
   parseTags,
   createSentenceSplitter,
   ttsParamsFor,

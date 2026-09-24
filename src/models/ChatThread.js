@@ -21,6 +21,7 @@
  * @field seq {Number} 最后一条消息的序号；新消息用 $inc 原子取号
  * @field messageCount {Number}
  * @field lastActiveAt {Date} 保留期从这里算
+ * @field safety {Object} lastDisclosureAt —— 上次告知「你在和 AI 聊天」的时间（纽约 GBL §1702 的 3 小时提醒）
  * @field summary {Object} 滚动摘要：text（≤600 字）/ version / coversUntilSeq（摘要覆盖到哪条 —— 发给模型的原文从它之后开始，
  *                        是提纯的提交点；ChatMessage.compacted 只给翻历史的界面用）
  * @field stats {Object} 上下文计量：lastPromptTokens / lastCompletionTokens（上一轮接口 usage；没给 usage 时是校准过的估算）/
@@ -48,6 +49,10 @@ const chatThreadSchema = new mongoose.Schema(
       text: { type: String, default: "", maxlength: 1200 },
       version: { type: Number, default: 0 },
       coversUntilSeq: { type: Number, default: 0 },
+    },
+    // AI 身份告知（纽约 GBL §1702：交互开始时告知、持续交互每 3 小时再告知一次）
+    safety: {
+      lastDisclosureAt: { type: Date, default: null },
     },
     stats: {
       lastPromptTokens: { type: Number, default: 0 },
