@@ -19,13 +19,18 @@ const ORDER_KINDS = ["recharge", "plan"];
 // settled  已发币，终态
 // closed   已关闭（超时未付/用户取消），终态
 // failed   渠道明确告知支付失败，终态
-const ORDER_STATUSES = ["created", "paid", "settled", "closed", "failed"];
+// refunded 渠道退款/拒付后把已发的 token 收回来了（终态；Play 的 voidedpurchases）
+const ORDER_STATUSES = ["created", "paid", "settled", "closed", "failed", "refunded"];
 
 const tokenOrderSchema = new mongoose.Schema(
   {
     /** 商户订单号，服务端生成，全局唯一。回调认这个号 */
     orderNo: { type: String, required: true, unique: true, trim: true, maxlength: 64 },
-    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    /**
+     * 下单人。★ **允许为空**：Play 的退款通知可能**先于**兑换到达，那一刻我们还不知道
+     * 是谁买的，但必须先把这个 purchaseToken 占位标成已回收，兑换那一步才拒得掉（P1）。
+     */
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     kind: { type: String, enum: ORDER_KINDS, required: true },
 
     // ── 商品快照 ──
@@ -59,6 +64,38 @@ const tokenOrderSchema = new mongoose.Schema(
     /** 实际发放的 token（审计用，正常等于 packTokens 或套餐月额度） */
     grantedTokens: { type: Number, default: 0, min: 0 },
 
+    // ── Google Play（channel="play"）────────────────────────────────
+    /**
+     * Play 的 purchaseToken。**这是这条链路的幂等键**：同一个 token 只能兑一次，
+     * 靠下面那条唯一索引在并发时撞死，而不是靠「先查再写」。
+     * ★ sparse/partial：其它渠道的订单没有这个字段，不能让它们互相撞。
+     */
+    playPurchaseToken: { type: String, default: undefined, trim: true, maxlength: 512 },
+    /** Play 侧的订单号（GPA.xxxx），对账时人眼要看的那个 */
+    playOrderId: { type: String, default: "", trim: true, maxlength: 128 },
+    /** 一次买了几份（Play 允许多买）。**回收按比例时的分母取这里的快照**，不回头查 API */
+    quantity: { type: Number, default: 1, min: 1 },
+    /** 许可测试员的购买。★ 所有营收/成本统计必须排除；退款时差额不转欠额 */
+    isTest: { type: Boolean, default: false },
+    /**
+     * 真正发币完成的时间。**与 settledAt 分开**：settledAt 是「抢到了结算权」，
+     * grantedAt 是「币确实发了」。崩在两者之间时，清扫器靠这个差别知道要补发；
+     * 回收也靠它判断「现在回收会不会把欠额算成 0」（R-5 的推迟）。
+     */
+    grantedAt: { type: Date, default: null },
+    /** consume（对可消耗商品同时完成 acknowledge）成功的时间 */
+    consumedAt: { type: Date, default: null },
+    /** 回收的幂等锚（与 settledAt 同构）：抢到 null → now 的那一次才真的回收 */
+    revokedAt: { type: Date, default: null },
+    /** 实际收回多少 token */
+    clawbackTokens: { type: Number, default: 0, min: 0 },
+    /** 收不回的差额（转成了钱包欠额；isTest 时豁免） */
+    shortfall: { type: Number, default: 0, min: 0 },
+    /** 部分退款时被作废的份数 */
+    voidedQuantity: { type: Number, default: 0, min: 0 },
+    /** Play 的 voidedSource/voidedReason 原值。⚠ 官方没有定义取值含义，只存备查、不据此分支 */
+    refundType: { type: String, default: "", trim: true, maxlength: 64 },
+
     /** 回调原文。出对账纠纷时唯一能自证的东西，不做裁剪 */
     raw: { type: mongoose.Schema.Types.Mixed, default: undefined },
     /** 失败/关闭的原因，给人看 */
@@ -74,6 +111,11 @@ tokenOrderSchema.index(
   { unique: true, partialFilterExpression: { channelTxnId: { $type: "string", $gt: "" } } }
 );
 tokenOrderSchema.index({ user: 1, createdAt: -1 });
+// Play 的幂等键。partial 过滤掉没有这个字段的其它渠道订单（否则它们会在 null 上互撞）
+tokenOrderSchema.index(
+  { playPurchaseToken: 1 },
+  { unique: true, partialFilterExpression: { playPurchaseToken: { $type: "string" } } }
+);
 
 module.exports = mongoose.model("TokenOrder", tokenOrderSchema);
 module.exports.ORDER_KINDS = ORDER_KINDS;

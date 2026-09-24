@@ -18,6 +18,8 @@ const orders = require("../services/payment/order.service");
 const { channelOf, availableChannels } = require("../services/payment/channels");
 const { PAY_ALLOW_MOCK } = require("../config/payment");
 const { PLANS } = require("../config/tokens");
+const play = require("../services/payment/play.service");
+const { playConfigured, PLAY_PRODUCTS, rtdnSecret } = require("../config/play");
 
 const router = express.Router();
 
@@ -32,7 +34,69 @@ router.get("/config", (req, res) => {
     mock: PAY_ALLOW_MOCK,
     packs: orders.RECHARGE_PACKS,
     plans: PLANS,
+    // Google Play 结算。★ Play 版的包里**只能**用这一条：Play 政策要求应用内数字商品
+    //   走 Play Billing，微信/支付宝只在侧载与网页版里用（两者不是"可选其一"）。
+    play: {
+      enabled: playConfigured(),
+      // sku 必须与 Play Console 里创建的商品 id 逐字相同（见 config/play.js 的 ★★）
+      products: Object.entries(PLAY_PRODUCTS).map(([sku, p]) => ({ sku, kind: p.kind, tokens: p.tokens ?? 0, label: p.label })),
+    },
   });
+});
+
+/**
+ * POST /api/pay/play/redeem —— 客户端拿到 purchaseToken 之后来兑。
+ *
+ * ★ **幂等**：同一个 token 重复兑只发一次币（唯一索引兜底），所以客户端可以放心重试 ——
+ *   而且**必须**重试：许可测试员的购买 3 分钟内没被 acknowledge 会被 Google 自动退款，
+ *   而 consume 就发生在这条链路的末尾。
+ * ★ 限流按账号 30 次/分钟：真实购买远到不了这个频率，重试也够用。
+ */
+router.post("/play/redeem", requireAuth, aiRateLimit({ max: 30, scope: "play-redeem" }), async (req, res, next) => {
+  try {
+    if (!playConfigured()) return res.status(501).json({ ok: false, code: "PLAY_NOT_CONFIGURED", message: "本服务尚未接入 Google Play 结算" });
+    const r = await play.redeem({ user: req.user, purchaseToken: String(req.body?.purchaseToken ?? "") });
+    if (!r.ok) {
+      // ★ 状态码分得开：客户端要据此决定"再试一次"还是"别试了"
+      const status = r.code === "VALIDATION_ERROR" ? 400 : r.code === "REVOKED" || r.code === "ACCOUNT_MISMATCH" ? 409 : r.code === "TEST_LIMIT" ? 429 : 502;
+      return res.status(status).json({ ok: false, code: r.code, message: r.message });
+    }
+    res.json({ ok: true, code: r.code, granted: r.granted, wallet: await require("../services/tokenWallet.service").getWallet(req.user._id) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
+ * POST /api/pay/play/rtdn?key=… —— Google Pub/Sub 的推送订阅打到这里（实时开发者通知）。
+ *
+ * ★★ **不能要求登录**（Google 不带我们的 token），所以安全压在 URL 上的共享密钥上，
+ *   而且密钥没配时**一律 404** —— 不向外暴露"这里有个端点"。
+ * ★ 必须**很快回 2xx**：Pub/Sub 认 ack，回慢了会重推。真正的回收在里面做完再回也行
+ *   （单条通知的处理很轻），但任何错误都要回 200 + 记日志，否则 Google 会无限重推同一条。
+ * ★ 通知体是 base64 的 `message.data`，解出来是 `{ version, packageName, eventTimeMillis,
+ *   oneTimeProductNotification | voidedPurchaseNotification | … }`。
+ */
+router.post("/play/rtdn", rateLimit({ windowMs: 60_000, max: 120, scope: "play-rtdn" }), async (req, res) => {
+  const secret = rtdnSecret();
+  if (!secret || String(req.query.key || "") !== secret) return res.status(404).json({ ok: false });
+  try {
+    const raw = String(req.body?.message?.data || "");
+    const payload = raw ? JSON.parse(Buffer.from(raw, "base64").toString("utf8")) : {};
+    const voided = payload.voidedPurchaseNotification;
+    if (voided && voided.purchaseToken) {
+      const r = await play.revokeByToken({
+        purchaseToken: String(voided.purchaseToken),
+        // productType 1=一次性商品；refundType 1=全额 2=部分（官方枚举，含义见文档）
+        refundType: `rtdn/${String(voided.refundType ?? "")}`,
+      });
+      console.warn(`[play] RTDN 退款 token=${String(voided.purchaseToken).slice(0, 12)}… → ${r.code}`);
+    }
+  } catch (e) {
+    // ★ 解析失败也回 200：回非 2xx 只会让 Pub/Sub 无限重推同一条坏消息（铁律八：响而局部）
+    console.error("[play] RTDN 处理失败:", (e && e.message) || e);
+  }
+  res.json({ ok: true });
 });
 
 /**

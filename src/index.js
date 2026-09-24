@@ -144,6 +144,22 @@ async function start() {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === undefined || instanceId === "0") {
       startAiWorker();
+      // Play 的「已作废购买」每小时拉一次。★ 它是 RTDN 的**兜底**，不是替代：
+      //   RTDN 可能丢、也可能我们正好在重启，而漏一条退款 = 用户白拿一整包 token。
+      //   ⚠ 两条路必然重叠 ⇒ 回收本身必须幂等（revokedAt 的条件原子抢占）。
+      // ★ 只在 0 号实例：每个实例各拉一遍只是把同一批通知重复处理 N 次。
+      const play = require("./services/payment/play.service");
+      const { playConfigured } = require("./config/play");
+      if (playConfigured()) {
+        const playTimer = setInterval(
+          () => {
+            // 回看 6 小时：比轮询周期宽出一大截，重启/网络抖动漏掉的那几条下一轮还能捞回来
+            play.pollVoided({ sinceMs: Date.now() - 6 * 3600_000 }).catch((e) => console.error("[play] 轮询失败:", (e && e.message) || e));
+          },
+          60 * 60 * 1000,
+        );
+        playTimer.unref?.();
+      }
     } else {
       console.log(`实例 ${instanceId}：跳过 AI worker（只在 0 号实例运行）`);
     }
