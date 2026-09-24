@@ -11,6 +11,8 @@ const { generatePersonaDraft, analyzeMaterials } = require("../services/personaA
 const { styleDescriptorOf } = require("../services/personaAccess.service");
 const { personaPromptLine } = require("../services/companionSetting.service");
 const companion = require("../services/companion.service");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 const { hasAiKey } = require("../services/aiClient");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
@@ -361,6 +363,10 @@ async function previewChat(req, res, next) {
       lang: req.body.lang || "zh",
       personaLine: personaPromptLine({ name: String(draft.name || "").trim().slice(0, 120), styleDescriptor: styleDescriptorOf(draft.name, style) }),
     });
+    // ★★ 计费（R1.5）：试聊也是一条真的模型调用，此前一分钱不扣，而它的闸门是 20 次/分钟。
+    const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat persona-preview" });
+    if (!pre.ok) return res.status(pre.status).json(pre.body);
+    let produced = false;
     await companion.streamCompanionReply({
       res,
       messages: [
@@ -369,7 +375,13 @@ async function previewChat(req, res, next) {
         ...history.map((m) => ({ role: m.role, content: m.content })),
       ],
       tag: "persona-preview",
+      finish: ({ text }) => {
+        produced = Boolean(text);
+        return {};
+      },
     });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat persona-preview" });
+    else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat persona-preview", snapshot: pre.before });
   } catch (err) {
     next(err);
   }

@@ -243,6 +243,9 @@ describe("/api/ark 的扣费闸门", () => {
     const spy = mockArk(200, {});
     await walletSvc.getWallet(userId);
     await walletSvc.debit(userId, FREE, "掏空");
+    // ★ 掏空这一步写了一行 ark_spend，于是下面那一发会先撞**每日上限**（429）而不是余额不足（402）。
+    //   这条测的是余额闸门，所以把当天流水清掉；日上限自己的用例在 tests/billing.spec.js。
+    await require("../src/models/TokenLedger").deleteMany({ user: userId });
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth(token))

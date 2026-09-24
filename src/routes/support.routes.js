@@ -38,6 +38,8 @@ const mongoose = require("mongoose");
 const { z } = require("zod");
 const { requireAuth, optionalAuth, requireRole } = require("../middleware/auth");
 const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
@@ -294,6 +296,13 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     messages = [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))];
   }
 
+  // ★★ 计费（方案 9.1 的 R1.5）：客服此前也**一分钱不扣**。价钱与陪聊同一个常量
+  //   （`CHAT_TURN_TOKENS`）——方案 §14.6 建议把两者分别提到 4,500 / 2,300，
+  //   那是一次**定价**决定，留给仓库主人拍板；这里只把架构缺口补上。
+  //   注意扣费必须在 SSE 开始之前：一旦响应头发出去，402/403 就只能变成一条 error 事件了。
+  const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat support" });
+  if (!pre.ok) return res.status(pre.status).json(pre.body);
+
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -426,6 +435,9 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       console.error("[support] finish failed:", (e && e.message) || e);
     }
   }
+  // 一个字都没出来 = 上游没受理 ⇒ 退款（受理后才失败的不退：算力已经花掉了）
+  if (!text) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat support" });
+  else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat support", snapshot: pre.before });
   if (failed) send("error", { message: "support upstream failed", ...extra });
   else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
   closed = true;

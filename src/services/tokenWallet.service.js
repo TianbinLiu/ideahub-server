@@ -27,6 +27,7 @@
 // 【W3 月度刷新只发生在跨月的第一次触达】plan 额度每月归位（未用完的作废），
 //    靠 cycle 字段做条件原子更新抢占，抢到的那一次才真正重置。
 //    ★ 不能写成"读出来发现跨月了就 save"——并发下会重置多次，等于反复发额度。
+const mongoose = require("mongoose");
 const User = require("../models/User");
 const TokenLedger = require("../models/TokenLedger");
 const { planOf, DEFAULT_PLAN_ID } = require("../config/tokens");
@@ -392,6 +393,24 @@ async function buyPlan(userId, planId, now = new Date()) {
   return await repayDebt(userId, "购买套餐后自动抵扣");
 }
 
+/**
+ * 今天已经花掉多少 token（UTC 日）。日上限的判据数据（方案 §14.10）。
+ * ★ 只数 `ark_spend`：退款（`ark_refund`）要抵掉，否则一次「扣了又退」的失败调用
+ *   会白白吃掉用户当天的额度。管理员免单那几行 delta=0，天然不计。
+ * ★ 走的是 `{user:1, createdAt:-1}` 那条既有索引；每次付费调用多一次聚合查询，
+ *   这是日上限的代价 —— 换成"读一个计数器字段"就要处理跨日重置与并发自增，
+ *   那条路踩坑的成本远高于这一次查询。
+ */
+async function spentToday(userId, now = new Date()) {
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const rows = await TokenLedger.aggregate([
+    { $match: { user: new mongoose.Types.ObjectId(String(userId)), reason: { $in: ["ark_spend", "ark_refund"] }, createdAt: { $gte: start } } },
+    { $group: { _id: null, sum: { $sum: "$delta" } } },
+  ]);
+  const net = rows.length ? Number(rows[0].sum) : 0;
+  return net < 0 ? -net : 0;
+}
+
 /** 今日已经"印"了多少（recharge + plan_buy），用于模拟支付的防滥用上限 */
 async function mintedToday(userId, now = new Date()) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -423,6 +442,7 @@ module.exports = {
   getWallet,
   debit,
   debtOf,
+  spentToday,
   revokeTokens,
   repayDebt,
   forgiveDebt,

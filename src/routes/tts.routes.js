@@ -35,6 +35,9 @@ const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { VOICE_CATALOG, MIXABLE_VOICES, MAX_MIX_VOICES } = require("../config/voices");
 const { parseMixEntries, normalizeWeights } = require("../utils/voiceSettings");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
+const { setWalletHeaders } = require("../services/arkGateway.service");
 
 const router = express.Router();
 
@@ -143,42 +146,65 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
     },
   };
 
-  let up;
-  try {
-    up = await fetch(TTS_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": apiKey,
-        "X-Api-Resource-Id": is20 ? "seed-tts-2.0" : "seed-tts-1.0",
-        "X-Api-Connect-Id": crypto.randomUUID(),
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-  } catch (e) {
-    return res.status(504).json({ message: `tts upstream ${String(e && e.name) || "error"}` });
+  // ★★ 计费（方案 §14.6 / 9.1 的 R1.5）。**这条链路此前一分钱不扣** ——
+  //   按它自己的闸门（30 次/分钟 × 300 字）算，单账号理论日上限约 ¥2,160/日。
+  //   报价按**截断后的 line**，与真正送去合成的文本同源（报价 ≠ 实扣是另一类事故）。
+  //   上游没出声（没拿到音频帧）＝ 没受理 ⇒ 自动退款，与方舟那条口径逐字相同。
+  const charged = await billing.chargedCall({
+    user: req.user,
+    cost: priceOf("tts", { text: line }),
+    memo: `tts ${speaker}`,
+    refundTag: "ark_refund",
+    forward: () => synthesize(),
+  });
+  if (!charged.ok) {
+    setWalletHeaders(res, charged.wallet);
+    return res.status(charged.status).json(charged.body);
   }
+  setWalletHeaders(res, charged.wallet);
+  const { up, parts, errCode, errMsg, failed } = charged.result;
+  if (failed) return res.status(504).json({ message: failed });
 
-  const sse = await up.text();
-  const parts = [];
-  let errCode = 0;
-  let errMsg = "";
-  for (const raw of sse.split("\n")) {
-    if (!raw.startsWith("data:")) continue;
-    let j;
+  async function synthesize() {
+    let up;
     try {
-      j = JSON.parse(raw.slice(5).trim());
-    } catch {
-      continue;
+      up = await fetch(TTS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": apiKey,
+          "X-Api-Resource-Id": is20 ? "seed-tts-2.0" : "seed-tts-1.0",
+          "X-Api-Connect-Id": crypto.randomUUID(),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+    } catch (e) {
+      return { accepted: false, failed: `tts upstream ${String(e && e.name) || "error"}` };
     }
-    // ★ 20000000 是**结束帧**（message "OK"），不是错误。每次成功合成的最后一帧都是它，
-    //   当成错误记下来的话，一旦真出问题、日志里报的就是这个无辜的码——线上自检时踩过。
-    if (j.code && j.code !== 0 && j.code !== 20000000) {
-      errCode = j.code;
-      errMsg = j.message || "";
+
+    const sse = await up.text();
+    const parts = [];
+    let errCode = 0;
+    let errMsg = "";
+    for (const raw of sse.split("\n")) {
+      if (!raw.startsWith("data:")) continue;
+      let j;
+      try {
+        j = JSON.parse(raw.slice(5).trim());
+      } catch {
+        continue;
+      }
+      // ★ 20000000 是**结束帧**（message "OK"），不是错误。每次成功合成的最后一帧都是它，
+      //   当成错误记下来的话，一旦真出问题、日志里报的就是这个无辜的码——线上自检时踩过。
+      if (j.code && j.code !== 0 && j.code !== 20000000) {
+        errCode = j.code;
+        errMsg = j.message || "";
+      }
+      if (typeof j.data === "string" && j.data) parts.push(Buffer.from(j.data, "base64"));
     }
-    if (typeof j.data === "string" && j.data) parts.push(Buffer.from(j.data, "base64"));
+    // 没拿到任何音频帧 = 上游没受理这次合成（敏感词 / 资源未开通 / 鉴权失败都落在这里）
+    return { accepted: parts.length > 0, up, parts, errCode, errMsg };
   }
 
   if (!parts.length) {

@@ -26,6 +26,9 @@ const express = require("express");
 const crypto = require("crypto");
 const { requireAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
+const billing = require("../services/billing.service");
+const { priceOf, ASR_BYTES_PER_SECOND } = require("../config/tokens");
+const { setWalletHeaders } = require("../services/arkGateway.service");
 
 const ASR_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash";
 const RESOURCE_ID = "volc.bigasr.auc_turbo";
@@ -68,58 +71,99 @@ router.post(
       request: { model_name: "bigmodel", enable_itn: true, enable_punc: true },
     };
 
-    let up;
-    try {
-      up = await fetch(ASR_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Api-Key": apiKey,
-          "X-Api-Resource-Id": RESOURCE_ID,
-          "X-Api-Request-Id": crypto.randomUUID(),
-          "X-Api-Sequence": "-1",
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-      });
-    } catch (e) {
-      console.error("[asr] upstream unreachable:", (e && e.message) || e);
-      return res.status(502).json({ ok: false, message: "asr upstream unreachable", code: "ASR_UPSTREAM" });
+    // ★★ 计费（方案 §14.6 / 9.1 的 R1.5）。**这条链路此前一分钱不扣**。
+    //   时长要等上游识别完才知道，所以先按**字节数上界**预扣（ASR_BYTES_PER_SECOND 取的是
+    //   每秒字节数的下界 ⇒ 秒数偏大 ⇒ 预扣偏多），拿到真实时长后多退少不补。
+    //   反过来（预扣偏少）就是白送，而白送不会有任何报错。
+    const estSeconds = buf.length / (ASR_BYTES_PER_SECOND[format] || 8000);
+    const prepaid = priceOf("asr", { seconds: estSeconds });
+    const charged = await billing.chargedCall({
+      user: req.user,
+      cost: prepaid,
+      memo: `asr ${format}`,
+      refundTag: "ark_refund",
+      forward: () => recognize(),
+    });
+    if (!charged.ok) {
+      setWalletHeaders(res, charged.wallet);
+      return res.status(charged.status).json(charged.body);
     }
-
-    const statusCode = String(up.headers.get("x-api-status-code") || "");
-    const statusMsg = String(up.headers.get("x-api-message") || "");
-    const raw = await up.text().catch(() => "");
-    let j = {};
-    try {
-      j = raw ? JSON.parse(raw) : {};
-    } catch {
-      j = {};
-    }
-    // 20000003 = 上游判定整段是静音（"no valid speech in audio"）：这不是故障，是用户按住了没说话 / 离麦太远，
-    // 按"识别到空文本"回 200，让客户端提示"没听到声音"而不是"服务不可用"（真机实测第一次就撞上）
-    if (up.ok && statusCode === "20000003") {
+    setWalletHeaders(res, charged.wallet);
+    const rec = charged.result;
+    if (rec.unreachable) return res.status(502).json({ ok: false, message: "asr upstream unreachable", code: "ASR_UPSTREAM" });
+    if (rec.silent) {
+      // 静音退全款：上游没识别出任何内容，这次调用没有产物
+      await billing.settleOverCharge({ user: req.user, prepaid, actual: 0, memo: `asr ${format} 静音` });
       res.setHeader("Cache-Control", "no-store");
       return res.json({ ok: true, text: "", durationMs: 0, silent: true });
     }
-    const ok = up.ok && (!statusCode || statusCode === "20000000");
-    if (!ok) {
-      const code = statusCode || String(up.status);
-      // 常见失败翻成人话——只进服务端日志：这些提示会点出账号开通了什么，不该回给客户端
-      const hint =
-        /45000030/.test(code) || /resource/i.test(statusMsg)
-          ? "资源未开通：控制台要单独开通「大模型录音文件识别」（volc.bigasr.auc_turbo）"
-          : /45000001/.test(code) || up.status === 401 || up.status === 403
-            ? "鉴权失败：检查服务端 .env 的 TTS_API_KEY"
-            : statusMsg || raw.slice(0, 200);
-      console.error(`[asr] ${up.status} code=${code} ${hint}`);
-      return res.status(502).json({ ok: false, message: "asr failed", code });
+    if (rec.failedCode) {
+      return res.status(502).json({ ok: false, message: "asr failed", code: rec.failedCode });
     }
-
-    const text = String((j.result && j.result.text) || "").trim();
-    const durationMs = j.audio_info && Number.isFinite(Number(j.audio_info.duration)) ? Math.round(Number(j.audio_info.duration)) : 0;
+    // 按上游给的真实时长结算，多退（少了不补：那会让一次调用扣两次）
+    await billing.settleOverCharge({
+      user: req.user,
+      prepaid,
+      actual: priceOf("asr", { seconds: rec.durationMs / 1000 }),
+      memo: `asr ${format}`,
+    });
     res.setHeader("Cache-Control", "no-store");
-    res.json({ ok: true, text, durationMs });
+    return res.json({ ok: true, text: rec.text, durationMs: rec.durationMs });
+
+    async function recognize() {
+      let up;
+      try {
+        up = await fetch(ASR_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Api-Key": apiKey,
+            "X-Api-Resource-Id": RESOURCE_ID,
+            "X-Api-Request-Id": crypto.randomUUID(),
+            "X-Api-Sequence": "-1",
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+        });
+      } catch (e) {
+        console.error("[asr] upstream unreachable:", (e && e.message) || e);
+        return { accepted: false, unreachable: true };
+      }
+
+      const statusCode = String(up.headers.get("x-api-status-code") || "");
+      const statusMsg = String(up.headers.get("x-api-message") || "");
+      const raw = await up.text().catch(() => "");
+      let j = {};
+      try {
+        j = raw ? JSON.parse(raw) : {};
+      } catch {
+        j = {};
+      }
+      // 20000003 = 上游判定整段是静音（"no valid speech in audio"）：这不是故障，是用户按住了没说话 / 离麦太远，
+      // 按"识别到空文本"回 200，让客户端提示"没听到声音"而不是"服务不可用"（真机实测第一次就撞上）
+      if (up.ok && statusCode === "20000003") {
+        // ★ accepted:true —— 上游**确实受理并跑完了**这段音频，只是里面没有人说话。
+        //   记成未受理会走整笔退款，而算力已经花掉了；真正该做的是按真实时长（0）多退。
+        return { accepted: true, silent: true };
+      }
+      const ok = up.ok && (!statusCode || statusCode === "20000000");
+      if (!ok) {
+        const code = statusCode || String(up.status);
+        // 常见失败翻成人话——只进服务端日志：这些提示会点出账号开通了什么，不该回给客户端
+        const hint =
+          /45000030/.test(code) || /resource/i.test(statusMsg)
+            ? "资源未开通：控制台要单独开通「大模型录音文件识别」（volc.bigasr.auc_turbo）"
+            : /45000001/.test(code) || up.status === 401 || up.status === 403
+              ? "鉴权失败：检查服务端 .env 的 TTS_API_KEY"
+              : statusMsg || raw.slice(0, 200);
+        console.error(`[asr] ${up.status} code=${code} ${hint}`);
+        return { accepted: false, failedCode: code };
+      }
+
+      const text = String((j.result && j.result.text) || "").trim();
+      const durationMs = j.audio_info && Number.isFinite(Number(j.audio_info.duration)) ? Math.round(Number(j.audio_info.duration)) : 0;
+      return { accepted: true, text, durationMs };
+    }
   },
 );
 

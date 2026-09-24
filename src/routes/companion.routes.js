@@ -48,6 +48,8 @@ const companion = require("../services/companion.service");
 const chatMemory = require("../services/chatMemory.service");
 const { loadCompanionSetup, updateCompanionSetting, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
 const { voiceFieldSchema, resolveVoiceSettings } = require("../utils/voiceSettings");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 
 const router = express.Router();
 
@@ -158,11 +160,24 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
 
     // SSE 流式回复的实现在 companion.service.streamCompanionReply（与人格向导的试聊共用）
     if (history) {
+      // ★★ 计费（方案 9.1 的 R1.5）：陪聊此前**一分钱不扣** —— `CHAT_TURN_TOKENS` 早就有价，
+      //   只是从来没有一处调用过扣费。按闸门本身算（20 次/分钟），单账号理论日上限是四位数美元。
+      //   「先扣后转发」的顺序不能让步；此刻 SSE 还没开始，402/403 可以正常回 JSON。
+      const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat companion" });
+      if (!pre.ok) return res.status(pre.status).json(pre.body);
+      let produced = false;
       await companion.streamCompanionReply({
         res,
         messages: [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))],
         ttsInstruct: setup.voice.instruct,
+        finish: ({ text }) => {
+          produced = Boolean(text);
+          return {};
+        },
       });
+      // 一个字都没出来 = 上游没受理（敏感词 / 限流 / 挂了）⇒ 退款，与方舟那条口径逐字相同
+      if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+      else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
       return;
     }
 
@@ -175,14 +190,21 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
       personaId: setup.persona && setup.persona._id,
     });
     const { messages, estPrompt } = await chatMemory.buildContextMessages({ thread, prefix });
+    const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat companion" });
+    if (!pre.ok) return res.status(pre.status).json(pre.body);
+    let produced = false;
     await companion.streamCompanionReply({
       res,
       messages,
       ttsInstruct: setup.voice.instruct,
       thread: { threadId: String(thread._id), title: thread.title || "" },
-      finish: ({ text, rawText, aborted, usage }) =>
-        chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted }),
+      finish: ({ text, rawText, aborted, usage }) => {
+        produced = Boolean(text);
+        return chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted });
+      },
     });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+    else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
     // 用量到阈值 → 回复发完之后再提纯（不让用户等），失败只记日志
     chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[companion] compact failed:", (e && e.message) || e));
   } catch (e) {

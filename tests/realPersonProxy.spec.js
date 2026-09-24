@@ -43,7 +43,11 @@ afterAll(async () => {
   if (mongod) await mongod.stop();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // ★ 先清当天流水：2026-09-24 起有**每日 token 上限**（config/tokens.DAILY_LIMITS），
+  //   而真人档一发 135,000 —— 同一个用户在本文件里连发几次就会从某一条起集体变成 429。
+  //   这里测的是真人档的转发与退款口径，日上限自己的用例在 tests/billing.spec.js。
+  await require("../src/models/TokenLedger").deleteMany({});
   // 出网间谍：任何一次 fetch 都记下来。断言"没出网"靠它，不靠推理。
   fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async () => {
     throw new Error("测试里不应该有任何出网请求");

@@ -780,6 +780,10 @@ describe("r2v 第二条分支：本账号刚传、尚未登记的素材（白模
   test("时长不同 → 扣的钱真的跟着 du_ 走（写死成常量这条会红）", async () => {
     const TokenLedger = require("../src/models/TokenLedger");
     for (const du of [5, 20]) {
+      // ★ 每轮先清掉当天流水：2026-09-24 起有**每日 token 上限**（付费档 3M/日，
+      //   config/tokens.DAILY_LIMITS），而 r2v 一发就是几十万 —— 连发两发会撞上限，
+      //   于是第二发变成 429 而不是 501。这条测的是「单价跟着时长走」，不是日上限。
+      await TokenLedger.deleteMany({ user: paidUserId });
       await request(app)
         .post("/api/ark/contents/generations/tasks")
         .set(asPaid())
