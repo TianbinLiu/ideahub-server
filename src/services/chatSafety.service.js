@@ -99,7 +99,16 @@ function regionOf(country) {
   const c = String(country || "").trim().toUpperCase();
   if (c === "US") return "US";
   if (c === "CN") return "CN";
-  return c ? "OTHER" : "OTHER";
+  return "OTHER";
+}
+
+/**
+ * 这次请求来自哪个国家（**只用来选求助热线**，不做权限判断、不落库）。
+ * 只认 Cloudflare 的国家码：生产的源站只放行 Cloudflare 网段，所以这个头可信；直连本机时为空 → OTHER。
+ * ★ 一处实现（铁律六）：陪聊、试聊都从这里取。
+ */
+function countryOf(req) {
+  return String((req && req.headers && req.headers["cf-ipcountry"]) || "").trim().toUpperCase();
 }
 
 /**
@@ -118,9 +127,11 @@ function crisisResources({ country, lang = "zh" } = {}) {
     { label: zh ? "12356 全国心理援助热线" : "12356 national psychological support line (China)", tel: "12356" },
     { label: zh ? "紧急情况请拨 110 或 120" : "In an emergency, call 110 or 120", tel: "120" },
   ];
+  // ★ 其它地区别直接抄美国那条：988 在美国境外拨不通，标签上必须写清楚「仅限美国境内」，
+  //   否则等于给正处在危机里的人一个打不通的号码。
   const other = [
     { label: zh ? "查找你所在国家/地区的求助热线" : "Find a helpline in your country", url: "https://findahelpline.com/" },
-    ...us.slice(0, 1),
+    { label: zh ? "988 自杀与危机生命线（仅限美国境内）" : "988 Suicide & Crisis Lifeline (United States only)", tel: "988", sms: "988" },
   ];
   return { region, resources: region === "CN" ? cn : region === "US" ? us : other };
 }
@@ -176,6 +187,7 @@ module.exports = {
   detectSelfHarm,
   detectHarmfulOutput,
   regionOf,
+  countryOf,
   crisisResources,
   crisisCard,
   crisisPlainText,

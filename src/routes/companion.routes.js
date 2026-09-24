@@ -97,30 +97,11 @@ const settingsBodySchema = z.object({
   voice: voiceFieldSchema,
 });
 
-/**
- * 这次请求来自哪个国家。只取 Cloudflare 给的国家码（生产的源站只放行 Cloudflare 网段，所以这个头可信；
- * 直连本机时为空 → OTHER）。**只用来选求助热线**，不做权限判断，也不落库。
- */
-function countryOf(req) {
-  return String(req.headers["cf-ipcountry"] || "").trim().toUpperCase();
-}
-
-/** 不经过模型也要回一条 SSE 时用（输入命中危机、需要先同意等） */
-function openSse(res) {
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  if (typeof res.flushHeaders === "function") res.flushHeaders();
-  return (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
 /** AI 身份告知的一句话（纽约 GBL §1702：交互开始与每 3 小时） */
 function aiNoticeText(name, lang) {
   return lang === "en"
     ? `You're chatting with an AI. ${name} is not a real person and can be wrong. Remember to take a break.`
-    : `你正在和 AI 聊天，${name} 不是真人，回答可能出错。聊久了记得休息一下。`;
+    : `你正在和 AI 聊天，${name}不是真人，回答可能出错。聊久了记得休息一下。`;
 }
 
 function companionName() {
@@ -151,7 +132,7 @@ router.get("/config", optionalAuth, async (req, res, next) => {
         consentVersion: consentVersion(),
         consentRequired: consentRequired(),
         consented: setup ? hasConsented(setup) : false,
-        ...chatSafety.crisisResources({ country: countryOf(req), lang: String(req.query.lang || "zh") }),
+        ...chatSafety.crisisResources({ country: chatSafety.countryOf(req), lang: String(req.query.lang || "zh") }),
       },
     });
   } catch (e) {
@@ -210,7 +191,7 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
   }
 
   const lang = parsed.data.lang || "zh";
-  const country = countryOf(req);
+  const country = chatSafety.countryOf(req);
   const caps = parsed.data.caps || [];
 
   try {
@@ -237,10 +218,26 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
 
     // SSE 流式回复的实现在 companion.service.streamCompanionReply（与人格向导的试聊共用）
     if (history) {
+      // ★ 旧写法同样要查输入侧：条文管的是「我们这套服务」，不是「客户端用了哪种请求体」。
+      //   这条链路服务端不存历史，所以只发卡片、记匿名计数，不写库。
+      const legacyVerdict = chatSafety.detectSelfHarm(history[history.length - 1].content);
+      if (legacyVerdict.hit) {
+        const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+        await chatSafety.recordReferral({ scene: "companion", trigger: "input", country });
+        const send = companion.openSse(res);
+        for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct })) send(e.event, e.data);
+        send("done", { text: "", safety: true });
+        res.end();
+        return;
+      }
       await companion.streamCompanionReply({
         res,
         messages: [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))],
         ttsInstruct: setup.voice.instruct,
+        country,
+        lang,
+        caps,
+        scene: "companion",
       });
       return;
     }
@@ -260,17 +257,19 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
     const verdict = chatSafety.detectSelfHarm(parsed.data.message);
     if (verdict.hit) {
       const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+      // 标题取自第一句用户消息 —— 但危机那句不该成为会话列表上的标题（用户自己回头看也刺眼）
+      await chatMemory.clearTitleIfEquals(thread, parsed.data.message);
+      threadEvent.title = thread.title || ""; // 标题在上面几行刚被清掉，别把旧值发给前端
       await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) });
       await chatSafety.recordReferral({ scene: "companion", trigger: "input", country });
-      const send = openSse(res);
+      const send = companion.openSse(res);
       send("thread", threadEvent);
       if (disclosureDue) {
         send("notice", { kind: "ai_disclosure", text: aiNoticeText(companionName(), lang) });
         await chatMemory.markDisclosed(thread);
       }
-      // 老客户端不认 safety 事件，就把求助文字当成一句台词发过去，至少看得到热线
-      if (caps.includes("safety")) send("safety", card);
-      else send("sentence", { index: 0, text: chatSafety.crisisPlainText(card), emotion: "sad", face: "sad", action: "none", tts: null });
+      // 老客户端不认 safety 事件，就把求助文字当成一句台词发过去（companion.crisisCardEvents 一处实现）
+      for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct })) send(e.event, e.data);
       send("done", { text: "", threadId: threadEvent.threadId, context: chatMemory.contextState(thread), safety: true });
       res.end();
       return;
@@ -286,16 +285,16 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
         ? [{ event: "notice", data: { kind: "ai_disclosure", text: aiNoticeText(companionName(), lang) } }]
         : [],
       onPrelude: () => chatMemory.markDisclosed(thread),
-      // ★ 输出侧守卫：逐句检查模型说的话，命中就不发这句、abort 上游、改发求助卡（§22602(b)(1)「防止产出」）
-      guard: {
-        check: (text) => chatSafety.detectHarmfulOutput(text),
-        card: (trigger) => chatSafety.crisisCard({ trigger, country, lang }),
-      },
+      // 输出侧守卫默认就是开的（companion.service：检测、发卡、abort、匿名计数都在那里）；
+      // 这里只补一件它做不了的事 —— 把求助卡也写进这个会话的历史，用户翻回来还看得到。
+      country,
+      lang,
+      caps,
+      scene: "companion",
       finish: async ({ text, rawText, aborted, usage, blocked }) => {
         if (blocked) {
           const card = chatSafety.crisisCard({ trigger: "output", country, lang });
           await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) });
-          await chatSafety.recordReferral({ scene: "companion", trigger: "output", country });
         }
         return chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted });
       },

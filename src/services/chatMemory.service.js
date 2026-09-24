@@ -216,6 +216,14 @@ async function markDisclosed(thread, now = new Date()) {
   if (thread.safety) thread.safety.lastDisclosureAt = now;
 }
 
+/** 标题等于这句话时清掉（危机消息不该留在会话标题里；下一句正常消息会重新命名） */
+async function clearTitleIfEquals(thread, text) {
+  const title = clip(String(text || "").trim(), 40);
+  if (!title || thread.title !== title) return;
+  await ChatThread.updateOne({ _id: thread._id }, { $set: { title: "" } });
+  thread.title = "";
+}
+
 /** 本会话最近几句用户原话（客服按它检索知识库：追问往往只有"那要多久"三个字，单看这一句什么都召回不到） */
 async function recentUserTexts(thread, n = 2) {
   const rows = await ChatMessage.find({ thread: thread._id, role: "user", kind: "msg" }).sort({ seq: -1 }).limit(n).lean();
@@ -884,6 +892,7 @@ module.exports = {
   openThread,
   appendMessage,
   beginTurn,
+  clearTitleIfEquals,
   isDisclosureDue,
   markDisclosed,
   DISCLOSURE_EVERY_MS,

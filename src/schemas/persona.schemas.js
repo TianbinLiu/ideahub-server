@@ -111,6 +111,8 @@ const previewChatBody = z.object({
     .min(1)
     .max(20),
   lang: z.enum(["zh", "en"]).optional().default("zh"),
+  // 客户端声明自己认识哪些新事件（同 /api/companion/chat）；不声明就把求助卡退化成一句台词
+  caps: z.array(z.enum(["safety", "notice"])).max(4).optional(),
 });
 
 const updateBody = z.object({

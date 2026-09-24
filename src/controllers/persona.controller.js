@@ -11,6 +11,7 @@ const { generatePersonaDraft, analyzeMaterials } = require("../services/personaA
 const { styleDescriptorOf } = require("../services/personaAccess.service");
 const { personaPromptLine } = require("../services/companionSetting.service");
 const companion = require("../services/companion.service");
+const chatSafety = require("../services/chatSafety.service");
 const { hasAiKey } = require("../services/aiClient");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
@@ -355,6 +356,21 @@ async function previewChat(req, res, next) {
     const history = req.body.messages;
     if (history[history.length - 1].role !== "user") badRequest("last message must be from user");
     const draft = req.body.draft;
+    const lang = req.body.lang || "zh";
+    const caps = Array.isArray(req.body.caps) ? req.body.caps : [];
+    const country = chatSafety.countryOf(req);
+    // ★ 试聊也是一条真的聊天链路（用户对着草稿人格说话），输入侧一样要查：
+    //   命中就不调模型、直接给求助卡。输出侧由 streamCompanionReply 默认守卫兜着。
+    const previewVerdict = chatSafety.detectSelfHarm(history[history.length - 1].content);
+    if (previewVerdict.hit) {
+      const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+      await chatSafety.recordReferral({ scene: "persona_preview", trigger: "input", country });
+      const send = companion.openSse(res);
+      for (const e of companion.crisisCardEvents({ card, caps })) send(e.event, e.data);
+      send("done", { text: "", safety: true });
+      res.end();
+      return;
+    }
     const style = normalizeStyle(draft.style);
     const system = companion.buildSystemPrompt({
       userName: req.user.displayName || req.user.username || "",
@@ -366,9 +382,15 @@ async function previewChat(req, res, next) {
       messages: [
         { role: "system", content: system },
         ...companion.personaExampleMessages({ examples: style.examples }),
+        // 安全底线在 few-shot 之后再发一次（草稿人格的示例对话同样会稀释它）
+        companion.safetySystemMessage(),
         ...history.map((m) => ({ role: m.role, content: m.content })),
       ],
       tag: "persona-preview",
+      country,
+      lang,
+      caps,
+      scene: "persona_preview",
     });
   } catch (err) {
     next(err);

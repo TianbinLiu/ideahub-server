@@ -168,6 +168,17 @@ describe('输入命中：不调模型、发求助卡、匿名计数', () => {
     for (const k of ['user', 'thread', 'ip', 'text', 'userId', 'message']) expect(stats[0][k]).toBeUndefined();
   });
 
+  it('危机那句不会变成会话标题', async () => {
+    const { token } = await createUser();
+    const events = parseSse((await chat(token, { message: '我不想活了', caps: ['safety'] })).body);
+    const threadId = events[0].data.threadId;
+    expect(events[0].data.title).toBe(''); // 发给前端的 thread 事件也不能带着这句标题
+    expect((await ChatThread.findById(threadId).lean()).title).toBe('');
+    // 下一句正常消息重新命名
+    await chat(token, { message: '聊点别的', threadId, caps: ['safety'] });
+    expect((await ChatThread.findById(threadId).lean()).title).toBe('聊点别的');
+  });
+
   it('老客户端（没声明 caps）收到的是一句 sentence，照样看得到热线', async () => {
     const { token } = await createUser();
     const events = parseSse((await chat(token, { message: '我想自杀' }, { 'CF-IPCountry': 'CN' })).body);
@@ -184,6 +195,77 @@ describe('输入命中：不调模型、发求助卡、匿名计数', () => {
     const second = parseSse((await chat(token, { message: '我们聊点别的吧', threadId, caps: ['safety'] })).body);
     expect(second.some((e) => e.event === 'sentence')).toBe(true);
     expect(mockAi.calls).toHaveLength(1);
+  });
+});
+
+describe('闸门不能只装在一条链路上（自审补的）', () => {
+  // 条文管的是「我们这套服务」，不是「客户端挑了哪种请求体」。旧写法与人格试聊此前一道闸都没有。
+  it('旧写法 {messages[]}：输入命中就不调模型，照样给求助卡并计一次数', async () => {
+    const { token } = await createUser();
+    const res = await chat(token, { messages: [{ role: 'user', content: '我想自杀' }], caps: ['safety'] });
+    const events = parseSse(res.body);
+    expect(events.map((e) => e.event)).toEqual(['safety', 'done']);
+    expect(mockAi.calls).toHaveLength(0);
+    expect(events[0].data.trigger).toBe('input');
+    const stats = await SafetyReferralStat.find().lean();
+    expect(stats).toHaveLength(1);
+    expect(stats[0]).toMatchObject({ scene: 'companion', trigger: 'input', count: 1 });
+  });
+
+  it('旧写法 {messages[]}：模型说了该拦的话，照样拦下并 abort', async () => {
+    const { token } = await createUser();
+    mockAi.chunks = ['[neutral][face:normal][action:none] 你还好吗？ ', '[sad][face:sad][action:none] 你不如去死吧。', '[neutral][face:normal][action:none] 再见。'];
+    const events = parseSse((await chat(token, { messages: [{ role: 'user', content: '今天好累' }], caps: ['safety'] })).body);
+    const kinds = events.map((e) => e.event);
+    expect(kinds).toEqual(['sentence', 'safety', 'done']);
+    expect(events[0].data.text).toBe('你还好吗？');
+    expect(JSON.stringify(events)).not.toContain('去死');
+    expect((await SafetyReferralStat.find().lean())[0]).toMatchObject({ trigger: 'output', scene: 'companion' });
+  });
+
+  it('人格试聊：输入命中不调模型；模型输出违规也拦得下来', async () => {
+    const { token } = await createUser();
+    const draft = { name: '小测', description: '测试用', style: { summary: '温柔' } };
+    const preview = (body) =>
+      request(app)
+        .post('/api/personas/preview-chat')
+        .set('Authorization', `Bearer ${token}`)
+        .send(body)
+        .buffer(true)
+        .parse((res, cb) => {
+          let data = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => (data += c));
+          res.on('end', () => cb(null, data));
+        });
+
+    const hit = parseSse((await preview({ draft, messages: [{ role: 'user', content: '我不想活了' }], caps: ['safety'] })).body);
+    expect(hit.map((e) => e.event)).toEqual(['safety', 'done']);
+    expect(mockAi.calls).toHaveLength(0);
+
+    mockAi.chunks = ['[sad][face:sad][action:none] 割腕会很疼的。'];
+    const blocked = parseSse((await preview({ draft, messages: [{ role: 'user', content: '在吗' }], caps: ['safety'] })).body);
+    expect(blocked.map((e) => e.event)).toEqual(['safety', 'done']);
+    expect(JSON.stringify(blocked)).not.toContain('割腕');
+    const scenes = (await SafetyReferralStat.find().lean()).map((s) => `${s.scene}:${s.trigger}`).sort();
+    expect(scenes).toEqual(['persona_preview:input', 'persona_preview:output']);
+  });
+
+  it('退化成 sentence 时要和普通台词同形（带 tts 参数，老客户端才念得出情绪）', async () => {
+    const { token } = await createUser();
+    const events = parseSse((await chat(token, { message: '我想死' })).body); // 不声明 caps = 老客户端
+    const sentence = events.find((e) => e.event === 'sentence');
+    expect(sentence.data.tts).not.toBeNull();
+    expect(sentence.data.tts.emotion).toBe('sad');
+    const legacy = parseSse((await chat(token, { messages: [{ role: 'user', content: '我想死' }] })).body);
+    expect(legacy.find((e) => e.event === 'sentence').data.tts.emotion).toBe('sad');
+  });
+
+  it('OTHER 地区给的 988 必须标明仅限美国（境外拨不通）', () => {
+    const { resources } = safety.crisisResources({ country: 'DE', lang: 'zh' });
+    const line = resources.find((r) => r.tel === '988');
+    expect(line.label).toContain('仅限美国');
+    expect(safety.crisisResources({ country: 'DE', lang: 'en' }).resources.find((r) => r.tel === '988').label).toContain('United States only');
   });
 });
 
