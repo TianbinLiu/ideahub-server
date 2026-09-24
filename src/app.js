@@ -137,6 +137,11 @@ app.use("/api/notifications", notificationsRoutes);
 const reportRoutes = require("./routes/report.routes");
 app.use("/api/admin/branch/reports", reportRoutes.adminRouter);
 app.use("/api/branch/reports", reportRoutes.publicRouter);
+
+// NCII 移除请求（TAKE IT DOWN Act §3）。★ 公开那条**免登录**：受害者通常不是我们的用户。
+//   管理端这条同样要排在 `app.use("/api/admin", adminRoutes)` 之前，理由与上面逐字相同。
+app.use("/api/admin/takedown", require("./routes/takedown.routes").adminRouter);
+app.use("/api/takedown", require("./routes/takedown.routes").publicRouter);
 // 分支视频的其余管理端：下架 / 撤销下架 / 下架列表 / 平台统计。
 // ★ 与上面那条同一个 base（`/api/admin/branch`），后台控制台只用记一个前缀；
 //   同样必须排在 `app.use("/api/admin", adminRoutes)` **之前**，理由与上面逐字相同。
