@@ -22,6 +22,13 @@ const mongoose = require("mongoose");
 // admin_free  管理员免单的方舟调用：**余额不动（delta=0），但这笔钱真花出去了**，
 //             实际金额记在 costTokens 里。见下面 costTokens 的说明与
 //             services/tokenWallet.service.js 的 noteAdminFree。
+// play_refund    渠道退款把已发的 token 收回来（负）
+// debt_incurred  收回时余额不够，差额转成欠额：**余额不动（delta=0）**，差额记在 costTokens
+// debt_repaid    下次充值抵扣欠额（负）
+// debt_forgiven  管理员免除欠额（delta=0，金额记 costTokens）
+// provider_failed 上游受理后才失败、按政策退回的那一类（与 ark_refund 分开，便于对账）
+// ★★ 这是 **mongoose enum**：没注册的 reason 会写入失败，而 writeEntry 把异常吞进
+//    console.error —— 表现是「回收做了、账本静默缺条」。加新 reason 必须先加这里。
 const TOKEN_REASONS = [
   "grant",
   "recharge",
@@ -30,6 +37,11 @@ const TOKEN_REASONS = [
   "ark_spend",
   "ark_refund",
   "admin_free",
+  "play_refund",
+  "debt_incurred",
+  "debt_repaid",
+  "debt_forgiven",
+  "provider_failed",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(
@@ -56,6 +68,11 @@ const tokenLedgerSchema = new mongoose.Schema(
      * ★ 老数据没有这一列（undefined）。读的时候按"没有"处理，别把它当 0 参与求和之外的判断。
      */
     costTokens: { type: Number, default: undefined },
+    /**
+     * 这一笔来自**测试购买**（Play 许可测试员）。所有营收 / 成本统计必须排除它，
+     * 否则测试员刷几次就把月报打成一条不存在的曲线。老数据没有这一列（undefined = 不是测试）。
+     */
+    isTest: { type: Boolean, default: undefined },
   },
   { timestamps: true }
 );

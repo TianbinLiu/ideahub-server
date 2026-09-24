@@ -86,6 +86,10 @@ function setWalletHeaders(res, w) {
   if (!w) return;
   res.setHeader("X-Wallet-Plan", String(w.plan));
   res.setHeader("X-Wallet-Addon", String(w.addon));
+  // ★ 欠额也要进镜像：App 的 canAfford 在镜像为空时一律放行，冻结状态不下发的话
+  //   被冻结的用户会看到正常报价、点下去才吃 403（§15.4.4 的实现坑之一）。
+  //   老客户端不认这个头，只是照旧显示余额 —— 不会坏。
+  if (w.debt) res.setHeader("X-Wallet-Debt", String(w.debt));
 }
 
 async function chargedArkCall({
@@ -140,6 +144,27 @@ async function chargedArkCall({
   let w = before;
 
   if (!free) {
+    // ★ 退款欠额冻结（§15.4 R-7/R-8）。和套餐门禁同一格、在 debit 之前 —— 只有这一处实现。
+    //   403 而不是 402：402 的含义是「充值就能继续」，而欠额下用户要先知道欠了多少、
+    //   充多少才够；合并成 402 会让他一直充一直被拒。
+    const debt = wallet.debtOf(before);
+    if (debt > 0) {
+      return {
+        ok: false,
+        reason: "debt",
+        status: 403,
+        body: {
+          ok: false,
+          code: "WALLET_FROZEN",
+          message: `账户有 ${debt} token 欠额，充值抵扣后即可继续生成`,
+          debt,
+          need: cost,
+          balance: before ? before.plan + before.addon : 0,
+        },
+        wallet: before,
+      };
+    }
+
     // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端置灰是提示，不是边界）
     const denied = paidOnlyDenial(before?.planId, model);
     if (denied) {
