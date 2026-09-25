@@ -57,6 +57,14 @@ const userSchema = new mongoose.Schema(
     },
 
     avatarUrl: { type: String, default: "" },
+    /**
+     * 这个账号在 Play 那边的混淆 id（HMAC(userId) 前 32 位十六进制）。
+     * ★ 用它而不是 userId：官方要求 obfuscated，而且这个值会出现在 Play 的日志与回包里。
+     * 退款通知只带 purchaseToken 时，靠订单找人；这个字段是人工排查时的另一条线索。
+     */
+    playAccountId: { type: String, default: "", trim: true, maxlength: 64, index: true, sparse: true },
+    /** 退款次数（屡次退款的判定材料；阈值与处置方式待定，先只计数不处置） */
+    playRefundCount: { type: Number, default: 0, min: 0 },
 
     // ✅ 公开数字 UID（个人页展示的那个）。9 位随机数，出处只有 utils/uid.js。
     // ★ sparse+unique 且**绝不给 default**——与 phone 同一条理由：给 default 会让
