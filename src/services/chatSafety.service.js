@@ -33,8 +33,17 @@ const PROTOCOL_VERSION = "2026-09-24.1";
 function normalize(text) {
   return String(text || "")
     .normalize("NFKC")
-    .replace(/[​-‏‪-‮﻿]/g, "")
-    .replace(/([一-鿿])[\s._*·・\-—~]+(?=[一-鿿])/g, "$1")
+    .replace(/[​-‏‪-‮﻿­⁠]/gu, "")
+    // ★★ 汉字之间的插字改成**白名单**（2026-09-25 评审）：原来是黑名单
+    //   `[\s._*·・\-—~]`，于是 `我想自💀杀`、软连字符、变体选择符、数字、字母
+    //   全都能绕过（反而刻意插空格会命中）。现在的规则是：两个汉字之间**只要不是汉字**
+    //   的东西，一律删。英文那侧不能这么删（会把 "I want to die" 删成一个词），所以只管汉字间。
+    .replace(/([一-鿿])[^一-鿿]{1,3}(?=[一-鿿])/gu, (m, c, offset, s) => {
+      const between = m.slice(1);
+      // 中文标点与空白本来就该删；字母数字也删（插字混淆）；但别把「他说 die 了」这种
+      // 夹着有意义英文单词的句子粘死 —— 超过 3 个字符的就不当插字（上面的量词已限 1~3）
+      return /^[\s\p{P}\p{S}0-9a-z]+$/iu.test(between) ? c : m;
+    })
     .toLowerCase();
 }
 
@@ -45,7 +54,19 @@ function normalize(text) {
 /** 「想死」类：必须排除「想死你/他/她/我们了」这种想念 */
 const ZH_WISH_DEAD = /想死(?!(你|您|他|她|它|我们|你们|他们))|不想活|活不下去|活着(好累|没意思|没意义)|不如死了|想去死|一觉不(醒|起来)|睡过去别醒/;
 const ZH_SUICIDE = /自杀|自殺|轻生|輕生|自尽|自盡|结束(我的|自己的)?生命|結束(我的|自己的)?生命|了结自己|了結自己|遗书|遺書/;
-const ZH_METHOD = /割腕|割脉|割脈|跳楼|跳樓|跳河|跳江|上吊|烧炭|燒炭|吞药|吞藥|安眠药|安眠藥|农药|農藥|煤气自|一氧化碳|攒药|攢藥/;
+/**
+ * 方法类。★★ **必须带意图/动作约束**（2026-09-25 评审）：原来全是裸词，于是
+ *   「晚上一起打农药吗」（王者荣耀）、「医生给我开了安眠药」、「想去玩跳楼机」、
+ *   「周末去烧炭烤肉」、「跳楼价」、「一氧化碳中毒的原理是什么」全部命中。
+ *   代价不是「多一张卡」：输入侧命中就**完全不调模型**，这一轮一个字都不回，重发还是一样；
+ *   `recordReferral` 还会把要报给加州自杀预防办公室的数字灌污；更糟的是
+ *   `chatMemory` 会把这句话在**此后每一轮**替换成「[用户表达了自伤念头…]」的伪声明。
+ *   文件头立的标准本来就是「必须排除常见说法」—— `ZH_WISH_DEAD` 做了，这里一个都没做。
+ * ★ 同一套词表也用在输出侧，所以「冬天烧炭取暖要防一氧化碳中毒」这种正常回答
+ *   原来也会被丢句 + abort + 发卡 + 计数。
+ */
+const ZH_METHOD =
+  /割腕|割脉|割脈|上吊|自缢|自縊|(从|從)[^，。！？]{0,12}(跳楼|跳樓|跳下去)|跳(楼|樓)自杀|跳(楼|樓)自殺|跳(河|江)自(杀|殺)|(烧炭|燒炭)自(杀|殺)|(吞|服|喝|吃)[^，。！？]{0,4}(一整|整|一|半|几|好几)?(瓶|盒|把|包)[^，。！？]{0,4}(安眠药|安眠藥|农药|農藥|百草枯|老鼠药|老鼠藥)|(攒|攢)(够)?(药|藥)|吞药自|吞藥自|(用|开)?煤气自(杀|殺)|一氧化碳自(杀|殺)|(自杀|自殺)(的)?(方法|方式|步骤|步驟|教程)/;
 const ZH_SELF_HARM = /自残|自殘|伤害自己|傷害自己|弄伤自己|弄傷自己|划自己|劃自己|烫自己|燙自己/;
 
 const EN_WISH_DEAD = /\b(want|wanna|wish|going)\s+to\s+die\b|\bwish\s+i\s+(was|were)\s+dead\b|\bbetter\s+off\s+dead\b|\b(don['’]?t|do\s+not)\s+(want\s+to|wanna)\s+(live|be\s+alive)\b|\b(no|any)\s+reason\s+to\s+live\b|\bnot\s+worth\s+living\b|\btired\s+of\s+living\b/i;
@@ -54,7 +75,9 @@ const EN_METHOD = /\boverdos\w*|\blethal\s+dose\b|\bhang\s+my\s?self\b|\bjump\s+
 const EN_SELF_HARM = /\bself[-\s]?harm\w*|\b(hurt|hurting|harm|harming|cut|cutting|burn|burning)\s+my\s?self\b/i;
 
 /** 输出侧额外拦：鼓动、教方法、辱骂式「去死」 */
-const ZH_ENCOURAGE = /你(应该|就)?去死|去死吧|不如(去)?自杀|建议你自杀|吃(一整)?(瓶|盒)安眠药|怎么(自杀|上吊|割腕)|自杀(的)?(方法|步骤|教程)/;
+// ★ 裸「去死」原来漏在外面（`你(应该|就)?去死` 要紧邻、`去死吧` 要带「吧」）——
+//   「去死！」单句零前提就能过。输出侧不管它是不是在演，陪伴机器人都不能这么说话。
+const ZH_ENCOURAGE = /去死|不如(去)?自杀|建议你自杀|吃(一整)?(瓶|盒)安眠药|怎么(自杀|上吊|割腕)|自杀(的)?(方法|步骤|教程)/;
 const EN_ENCOURAGE = /\bkys\b|\byou\s+should\s+(just\s+)?(die|kill\s+your\s?self)\b|\bhow\s+to\s+(kill\s+your\s?self|commit\s+suicide|hang\s+your\s?self)\b|\blethal\s+dose\s+of\b|\bways?\s+to\s+(die|kill\s+your\s?self)\b/i;
 
 const CATEGORIES = [
@@ -177,8 +200,24 @@ function crisisPlainText(card) {
   return lines.join("\n");
 }
 
-/** 命中自伤的用户原话进不了模型上下文，用这句固定占位（固定文本，不影响前缀缓存） */
-const SELF_HARM_PLACEHOLDER = "[用户表达了自伤念头，系统已提供求助热线]";
+/**
+ * 命中自伤的用户原话进不了模型上下文，用这句固定占位（固定文本，不影响前缀缓存）。
+ * ★ 不要在这句里断言「已提供求助热线」（2026-09-25 评审）：它会被渲染进提纯的输入，
+ *   而提纯的提示词要求「保留情绪变化」—— 我们自己写的一句断言就这样变成了模型眼里的事实。
+ */
+const SELF_HARM_PLACEHOLDER = "[此处原有一段涉及自伤的内容，已按安全协议移除]";
+
+/**
+ * 把一串消息里命中自伤的**用户原话**换成占位句。
+ * ★ 旧写法 `{messages[]}` 的历史是**客户端自带**的，服务端不存 —— 也就没有
+ *   `buildContextMessages` 那道替换。不在这里换的话，用户说过的那句危机原话会在
+ *   **此后每一轮**被原样回灌给模型（2026-09-25 评审）。
+ */
+function sanitizeHistory(messages) {
+  return (messages || []).map((m) =>
+    m && m.role === "user" && detectSelfHarm(m.content).hit ? { ...m, content: SELF_HARM_PLACEHOLDER } : m,
+  );
+}
 
 module.exports = {
   PROTOCOL_VERSION,
@@ -191,5 +230,6 @@ module.exports = {
   crisisResources,
   crisisCard,
   crisisPlainText,
+  sanitizeHistory,
   recordReferral,
 };

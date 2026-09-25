@@ -318,8 +318,13 @@ async function streamCompanionReply({
   };
   // 按会话聊天时第一件事告诉前端 threadId：新会话的 id 要在第一句话之前就拿到，中途断开也不丢
   if (thread) send("thread", thread);
-  // 第一句话之前要先发的事件（现在只有 AI 身份告知 notice）；发出去之后才记时间，免得没送达却记成已告知
-  if (prelude && prelude.length) {
+  // ★ 客户端在前面那些查库的 await 期间就断开时，'close' 事件早已错过、`closed` 还是 false
+  //   —— 这个兜底检查原来排在 prelude **之后**，于是告知「发」给了一个已经没人的连接，
+  //   却照样 markDisclosed（2026-09-25 评审）。提到 prelude 之前。
+  if (res.destroyed || res.writableEnded) closed = true;
+
+  // 第一句话之前要先发的事件（现在只有 AI 身份告知 notice）；**确认发得出去**才记时间
+  if (prelude && prelude.length && !closed) {
     for (const e of prelude) send(e.event, e.data);
     if (typeof onPrelude === "function") {
       try {
@@ -419,7 +424,24 @@ async function streamCompanionReply({
 
   // finish：按会话聊天时由路由传入，负责存下这句回复、记用量，返回值并进 done / error（threadId、上下文用量）。
   // 它失败不能吞掉已经说完的回复 —— 记日志，照常发 done。
-  const text = plainParts.join(" ");
+  let text = plainParts.join(" ");
+  // ★★ 逐句查之后**再对整段查一次**（2026-09-25 评审）：切句的 ENDERS 含换行与省略号，
+  //   于是一句话被切成两半、每半都不命中，两句照发（「你可以割 / 腕。」就是这个形状）。
+  //   反讽的是 normalize 会删汉字间的插字，所以对整段查反而命中 —— 是「先切后查」的顺序
+  //   把反混淆设计自己废掉了。整段命中时：不进历史、不进上下文，改发求助卡。
+  if (guard !== false && !blocked && text) {
+    const whole = chatSafety.detectHarmfulOutput(text);
+    if (whole && whole.hit) {
+      blocked = { category: whole.category };
+      const card = chatSafety.crisisCard({ trigger: "output", country, lang });
+      for (const e of crisisCardEvents({ card, caps, ttsInstruct, index: index++ })) send(e.event, e.data);
+      referral = chatSafety.recordReferral({ scene: scene || tag, trigger: "output", country });
+      // 已经发出去的句子收不回来，但不让它进历史、进上下文、进下一轮的提示词
+      plainParts.length = 0;
+      text = "";
+      console.warn(`[${tag}] 整段复查命中（逐句都没命中）：${whole.category}`);
+    }
+  }
   if (referral) await referral; // recordReferral 自己吞错误，这里只等它落库
   let extra = {};
   if (typeof finish === "function") {

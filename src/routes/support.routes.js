@@ -41,6 +41,7 @@ const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
+const chatSafety = require("../services/chatSafety.service");
 const chatMemory = require("../services/chatMemory.service");
 const { loadCompanionSetup, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
 const { resolveVoiceSettings } = require("../utils/voiceSettings");
@@ -75,6 +76,8 @@ const chatBodySchema = z
     message: z.string().trim().min(1).max(MAX_MESSAGE_CHARS).optional(),
     threadId: z.string().trim().max(64).nullable().optional(),
     lang: z.enum(["zh", "en"]).optional(),
+  // 客户端声明自己认识哪些新事件；不声明的老客户端会收到退化形式（求助卡走 sentence）
+  caps: z.array(z.enum(["safety", "notice"])).max(4).optional(),
   })
   .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
 
@@ -294,6 +297,29 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     messages = [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))];
   }
 
+  // ★★ 客服也要有闸（2026-09-25 评审）。原来只有官网陪聊接了协议，而**客服是 Google Play
+  //   上唯一的通用对话入口**：同一位看板娘、同一套人格、同一个模型。SB 243 的「companion
+  //   chatbot」豁免能不能罩住纯客服还没拍板，而在拍板之前，这条链路一道闸都没有。
+  //   口径与陪聊逐字相同：用户这句命中 → **不调模型**（0 token）、直接回求助卡。
+  const country = chatSafety.countryOf(req);
+  const lang = parsed.data.lang || "zh";
+  const caps = Array.isArray(parsed.data.caps) ? parsed.data.caps : [];
+  const lastUserText = thread ? parsed.data.message : history[history.length - 1].content;
+  const verdict = chatSafety.detectSelfHarm(lastUserText);
+  if (verdict.hit) {
+    const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+    if (thread) {
+      await chatMemory.clearTitleIfEquals(thread, lastUserText);
+      await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) });
+    }
+    await chatSafety.recordReferral({ scene: "support", trigger: "input", country });
+    const sendCrisis = companion.openSse(res);
+    if (thread) sendCrisis("thread", { threadId: String(thread._id), title: thread.title || "" });
+    for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct })) sendCrisis(e.event, e.data);
+    sendCrisis("done", { text: "", handoff: false, category: "", ...(thread ? { threadId: String(thread._id) } : {}), safety: true });
+    return res.end();
+  }
+
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -328,7 +354,11 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     handoff = { category, reason };
     send("handoff", handoff);
   };
+  // 输出侧守卫：与陪聊同一套判据（chatSafety.detectHarmfulOutput），命中即不发这句、
+  // abort 上游、改发求助卡。★ 客服比陪聊更需要它：它的回答会被当成「平台的说法」。
+  let blocked = null;
   const splitter = companion.createSentenceSplitter((sentence) => {
+    if (blocked) return;
     const p = companion.parseTags(sentence);
     // 模型有时把 [handoff:x] 写在某一句的句首而不是整段开头（实测 doubao-seed-2.0-mini 三成概率）：
     // 剥掉已知演出标签后再查一次，标记不能念出来也不能进字幕
@@ -336,9 +366,23 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     if (h.handoff) markHandoff(h.category, h.reason);
     const text = h.text.replace(/\[handoff[^\]]*\]\s*/gi, "").trim();
     if (!text) return;
+    const out = chatSafety.detectHarmfulOutput(text);
+    if (out && out.hit) {
+      blocked = { category: out.category };
+      const card = chatSafety.crisisCard({ trigger: "output", country, lang });
+      const wasClosed = closed;
+      closed = false;
+      for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct, index: index++ })) send(e.event, e.data);
+      closed = wasClosed;
+      abort.abort();
+      referral = chatSafety.recordReferral({ scene: "support", trigger: "output", country });
+      return;
+    }
     plainParts.push(text);
     send("sentence", { index: index++, ...p, text, tts: companion.ttsParamsFor(p.emotion, setup.voice.instruct) });
   });
+  // 计数的写库在 done 之前 await 掉（切句回调是同步的，这里只能先接住 promise）
+  let referral = null;
 
   // 回复开头可能是 [handoff:xxx]：攒到能判定为止（有 "]" 或已经不像这个前缀），再决定是标记还是正文
   let pending = "";
@@ -376,10 +420,12 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       },
     });
     for await (const delta of stream) {
-      if (closed) break;
+      if (closed || blocked) break;
       feed(delta);
       rawParts.push(delta);
-      send("token", { t: delta });
+      // ★★ 接了输出守卫之后就**不能再发 token**（2026-09-25 评审在客服这条链路上逮到）：
+      //   token 是**未经检查的原始增量**，发出去等于把守卫刚刚拦下的那句话原样送到客户端。
+      //   两端 UI 都没用它（只定义了类型），所以直接不发。
     }
     if (!decided && pending) {
       decided = true;
@@ -407,6 +453,12 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
 
   // 按会话：存下这句回复（半截的也存，标 partial）并记用量；失败只记日志，不吞掉已经说完的回复
   const text = plainParts.join(" ");
+  if (referral) await referral;
+  if (blocked && thread) {
+    // 被拦下时求助卡也要进历史，用户翻回来还看得到（与陪聊同口径）
+    const card = chatSafety.crisisCard({ trigger: "output", country, lang });
+    await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) }).catch(() => {});
+  }
   let extra = {};
   if (thread) {
     try {
@@ -426,7 +478,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       console.error("[support] finish failed:", (e && e.message) || e);
     }
   }
-  if (failed) send("error", { message: "support upstream failed", ...extra });
+  if (failed && !blocked) send("error", { message: "support upstream failed", ...extra });
   else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
   closed = true;
   res.end();

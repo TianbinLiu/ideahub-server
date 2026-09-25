@@ -509,7 +509,16 @@ function parseCompactJson(text, scene) {
     .map((f) => ({ id: String((f && f.id) || ""), text: factText(f && f.text) }))
     .filter((f) => mongoose.isValidObjectId(f.id) && f.text && !looksSensitive(f.text));
   const remove = (Array.isArray(obj.facts_remove) ? obj.facts_remove : []).map(String).filter((id) => mongoose.isValidObjectId(id));
-  return { summary: clip(oneLine(obj.summary), SUMMARY_MAX_CHARS), add, update, remove };
+  // ★★ 摘要也要过这道闸（2026-09-25 评审）：`facts_add` / `facts_update` 都过了，唯独摘要
+  //   直接落库 —— 而摘要会被拼进**每一轮**上下文的开头，下一次提纯又把它当 oldSummary 读回去
+  //   自我延续。占位替换只重写原文行、不复查摘要，所以唯一的防线是提示词里那句「规则 1.1」。
+  //   命中就整段丢弃：宁可这一轮没摘要（下一轮会重做），也不能把危机内容永久钉在上下文头部。
+  const summary = clip(oneLine(obj.summary), SUMMARY_MAX_CHARS);
+  if (looksSensitive(summary)) {
+    console.warn("[chatMemory] 提纯出来的摘要命中敏感判据，整段丢弃");
+    return { summary: "", add, update, remove };
+  }
+  return { summary, add, update, remove };
 }
 
 /**
@@ -635,7 +644,10 @@ async function compactThread({ threadId, focus = "", manual = false }) {
     const committed = await ChatThread.collection.updateOne({ _id: thread._id, "stats.compactingAt": stamp }, [
       {
         $set: {
-          "summary.text": { $literal: parsed.summary },
+          // ★ 摘要被敏感判据丢掉时（parsed.summary 为空）**保留旧摘要**，而不是写成空串：
+          //   写空会把之前那段正常摘要也一起抹掉。覆盖点照常前移 —— 那段内容按安全协议
+          //   本来就不该进长期记忆，代价是这一窗口里的普通细节也跟着不留，这是有意的取舍。
+          "summary.text": { $literal: parsed.summary || thread.summary.text || "" },
           "summary.coversUntilSeq": lastSeq,
           "summary.version": { $add: [{ $ifNull: ["$summary.version", 0] }, 1] },
           "stats.lastPromptTokens": { $max: [0, { $subtract: [{ $ifNull: ["$stats.lastPromptTokens", 0] }, delta] }] },

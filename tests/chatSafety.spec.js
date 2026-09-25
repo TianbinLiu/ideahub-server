@@ -217,8 +217,9 @@ describe('闸门不能只装在一条链路上（自审补的）', () => {
     mockAi.chunks = ['[neutral][face:normal][action:none] 你还好吗？ ', '[sad][face:sad][action:none] 你不如去死吧。', '[neutral][face:normal][action:none] 再见。'];
     const events = parseSse((await chat(token, { messages: [{ role: 'user', content: '今天好累' }], caps: ['safety'] })).body);
     const kinds = events.map((e) => e.event);
-    expect(kinds).toEqual(['sentence', 'safety', 'done']);
-    expect(events[0].data.text).toBe('你还好吗？');
+    // 旧写法这条链路服务端不存历史、没有 lastDisclosureAt 可依据 ⇒ 每轮都先告知一次
+    expect(kinds).toEqual(['notice', 'sentence', 'safety', 'done']);
+    expect(events.find((e) => e.event === 'sentence').data.text).toBe('你还好吗？');
     expect(JSON.stringify(events)).not.toContain('去死');
     expect((await SafetyReferralStat.find().lean())[0]).toMatchObject({ trigger: 'output', scene: 'companion' });
   });
@@ -245,7 +246,7 @@ describe('闸门不能只装在一条链路上（自审补的）', () => {
 
     mockAi.chunks = ['[sad][face:sad][action:none] 割腕会很疼的。'];
     const blocked = parseSse((await preview({ draft, messages: [{ role: 'user', content: '在吗' }], caps: ['safety'] })).body);
-    expect(blocked.map((e) => e.event)).toEqual(['safety', 'done']);
+    expect(blocked.map((e) => e.event)).toEqual(['notice', 'safety', 'done']);
     expect(JSON.stringify(blocked)).not.toContain('割腕');
     const scenes = (await SafetyReferralStat.find().lean()).map((s) => `${s.scene}:${s.trigger}`).sort();
     expect(scenes).toEqual(['persona_preview:input', 'persona_preview:output']);
@@ -266,6 +267,97 @@ describe('闸门不能只装在一条链路上（自审补的）', () => {
     const line = resources.find((r) => r.tel === '988');
     expect(line.label).toContain('仅限美国');
     expect(safety.crisisResources({ country: 'DE', lang: 'en' }).resources.find((r) => r.tel === '988').label).toContain('United States only');
+  });
+});
+
+describe('评审补的几条（2026-09-25）', () => {
+  function support(token, body) {
+    return request(app)
+      .post('/api/support/chat')
+      .set('Authorization', `Bearer ${token}`)
+      .send(body)
+      .buffer(true)
+      .parse((res, cb) => {
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (data += c));
+        res.on('end', () => cb(null, data));
+      });
+  }
+
+  it('★ 客服链路也有闸：输入命中不调模型、直接回求助卡', async () => {
+    const { token } = await createUser();
+    const events = parseSse((await support(token, { message: '我不想活了', caps: ['safety'] })).body);
+    expect(events.map((e) => e.event)).toEqual(['thread', 'safety', 'done']);
+    expect(mockAi.calls).toHaveLength(0);
+    expect((await SafetyReferralStat.find().lean())[0]).toMatchObject({ scene: 'support', trigger: 'input' });
+  });
+
+  it('★ 客服的输出也拦：模型说了该拦的话，那句不发、改发求助卡', async () => {
+    const { token } = await createUser();
+    mockAi.chunks = ['[neutral][face:normal][action:none] 你好呀。 ', '[sad][face:sad][action:none] 你不如去死吧。'];
+    const events = parseSse((await support(token, { message: '你好', caps: ['safety'] })).body);
+    expect(events.map((e) => e.event)).toEqual(['thread', 'sentence', 'safety', 'done']);
+    expect(JSON.stringify(events)).not.toContain('去死');
+    expect((await SafetyReferralStat.find({ trigger: 'output' }).lean())[0]).toMatchObject({ scene: 'support' });
+  });
+
+  it('★ 切句把一句话劈成两半时，整段复查要接住（先切后查会漏）', async () => {
+    const { token } = await createUser();
+    // ENDERS 含换行：逐句查时两半都不命中，拼起来才命中
+    mockAi.chunks = ['[neutral][face:normal][action:none] 你可以割\n', '腕。'];
+    const events = parseSse((await chat(token, { message: '难受', caps: ['safety'] })).body);
+    expect(events.some((e) => e.event === 'safety')).toBe(true);
+    expect(events[events.length - 1].data.text).toBe(''); // 被拦下的整段不进历史
+    const rows = await ChatMessage.find({ role: 'assistant' }).lean();
+    for (const r of rows) expect(r.displayText).not.toMatch(/割/);
+  });
+
+  it('★ 日常说法不该被方法词表误伤（误判的代价是这一轮一个字都不回）', async () => {
+    for (const t of ['晚上一起打农药吗', '医生给我开了安眠药', '我最近一直吃安眠药也睡不好', '想去玩跳楼机', '周末去烧炭烤肉', '跳楼价', '一氧化碳中毒的原理是什么']) {
+      expect({ t, hit: safety.detectSelfHarm(t).hit }).toEqual({ t, hit: false });
+    }
+    for (const t of ['吞了一整瓶安眠药', '从楼上跳楼', '烧炭自杀', '自杀的方法', '割腕']) {
+      expect({ t, hit: safety.detectSelfHarm(t).hit }).toEqual({ t, hit: true });
+    }
+  });
+
+  it('★ 插字归一化要按白名单：emoji / 软连字符 / 字母数字都不能当掩护', () => {
+    for (const t of ['我想自💀杀', '我想自­杀', '我想自2杀', '我 想 自 杀']) {
+      expect({ t, hit: safety.detectSelfHarm(t).hit }).toEqual({ t, hit: true });
+    }
+  });
+
+  it('★ 旧写法的历史里那句危机原话不会被回灌给模型', async () => {
+    const { token } = await createUser();
+    await chat(token, {
+      messages: [
+        { role: 'user', content: '我想自杀' },
+        { role: 'assistant', content: '（求助卡）' },
+        { role: 'user', content: '聊点别的吧' },
+      ],
+      caps: ['safety'],
+    });
+    expect(mockAi.calls).toHaveLength(1);
+    const sent = JSON.stringify(mockAi.calls[0]);
+    expect(sent).not.toContain('我想自杀');
+    expect(sent).toContain('已按安全协议移除');
+  });
+
+  it('★ 提纯出来的摘要命中敏感判据时整段丢弃，且不抹掉原来那段摘要', async () => {
+    const { user } = await createUser();
+    const thread = await chatMemory.openThread({ userId: user._id, scene: 'companion' });
+    await ChatThread.updateOne({ _id: thread._id }, { $set: { 'summary.text': '之前的正常摘要' } });
+    for (let i = 0; i < 8; i += 1) {
+      await chatMemory.appendMessage(thread, { role: 'user', kind: 'msg', displayText: `第 ${i} 句`, modelText: `第 ${i} 句` });
+      await chatMemory.appendMessage(thread, { role: 'assistant', kind: 'msg', displayText: '好', modelText: '好' });
+    }
+    mockAi.completions = [JSON.stringify({ summary: '用户说他想自杀，情绪低落', facts_add: [], facts_update: [], facts_remove: [] })];
+    const r = await chatMemory.compactThread({ threadId: thread._id, manual: true });
+    expect(r.ok).toBe(true); // 真的跑了提纯（不然下面那条断言是空跑）
+    const after = await ChatThread.findById(thread._id).lean();
+    expect(after.summary.text).toBe('之前的正常摘要'); // 没被危机摘要覆盖，也没被写空
+    expect(after.summary.coversUntilSeq).toBeGreaterThan(0); // 覆盖点照常前移
   });
 });
 

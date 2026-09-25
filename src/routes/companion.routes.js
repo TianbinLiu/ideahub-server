@@ -232,12 +232,16 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
       }
       await companion.streamCompanionReply({
         res,
-        messages: [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))],
+        // ★ 客户端自带的历史也要过一遍占位替换：不然那句危机原话会在此后每一轮回灌给模型
+        messages: [...prefix, ...chatSafety.sanitizeHistory(history.map((m) => ({ role: m.role, content: m.content })))],
         ttsInstruct: setup.voice.instruct,
         country,
         lang,
         caps,
         scene: "companion",
+        // ★ 旧写法原来**一次告知都不发**：这条链路服务端不存历史、没有 lastDisclosureAt 可依据，
+        //   那就每一轮都告知 —— 宁可多说一次，也不能让「交互开始时告知」在这条链路上不存在。
+        prelude: [{ event: "notice", data: { kind: "ai_disclosure", text: aiNoticeText(companionName(), lang) } }],
       });
       return;
     }

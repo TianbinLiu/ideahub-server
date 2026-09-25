@@ -391,6 +391,16 @@ async function previewChat(req, res, next) {
       lang,
       caps,
       scene: "persona_preview",
+      // 试聊也是真的在和 AI 说话，同样要告知（这条链路服务端不存历史，所以每轮都发）
+      prelude: [
+        {
+          event: "notice",
+          data: {
+            kind: "ai_disclosure",
+            text: lang === "en" ? "You're previewing an AI persona. It is not a real person and can be wrong." : "你正在试聊一个 AI 人格，不是真人，回答可能出错。",
+          },
+        },
+      ],
     });
   } catch (err) {
     next(err);
