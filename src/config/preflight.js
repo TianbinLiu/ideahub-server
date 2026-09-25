@@ -57,6 +57,13 @@ function collectConfigProblems(env = process.env) {
     if (!env.CORS_ORIGINS && !env.CLIENT_BASE_URL) {
       problems.push("CORS_ORIGINS / CLIENT_BASE_URL 均未设置，CORS 将对所有来源开放");
     }
+    // ★★ 首次告知同意的开关（加州 SB 243 §22602(a)/§22604）。它是**合并之后的一个手工步骤**，
+    //   而「忘了打开」与「功能没上线」在系统里长得一模一样：服务照常跑、用户照常聊，
+    //   只是那道法定告知从来没出现过。所以在生产环境把「没打开」报出来 ——
+    //   真要暂时不开，显式写 COMPANION_REQUIRE_CONSENT=0，让它成为一个有人做过的决定。
+    if (!env.COMPANION_REQUIRE_CONSENT) {
+      problems.push("COMPANION_REQUIRE_CONSENT 未设置：陪聊的首次告知同意（SB 243）不会生效。确实不开就显式写 0");
+    }
     // Runway 至今是**纯代理**：runway.routes.js 里两处 fetch 直连上游，一次扣费调用都没有
     // （对照方舟那条走的是 billedForward）。生产配上这把钥匙 = 任何拿得到我们 token 的人
     // 都能无计量地烧钱，而账上一分不记 —— 这类"配了就能跑、错了没人知道"正是本文件存在的理由。
