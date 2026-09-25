@@ -126,17 +126,21 @@ adminRouter.post("/:id/scan", requireAuth, requireRole(ADMIN_ROLE), async (req, 
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: "not found", code: "NOT_FOUND" });
     const doc = await TakedownRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ message: "not found", code: "NOT_FOUND" });
-    const { urls, refs } = await ncii.findReferences(doc.urls);
-    doc.copySearch = { ranAt: new Date(), foundCount: refs.length };
+    const { urls, refs, truncated } = await ncii.findReferences(doc.urls);
+    doc.copySearch = { ranAt: new Date(), foundCount: refs.length, truncated: truncated || [] };
     await doc.save();
-    res.json({ ok: true, urls, refs });
+    // truncated 不为空 = 这次检索**不完整**，调用方必须看得见（foundCount 是履行证据）
+    res.json({ ok: true, urls, refs, truncated: truncated || [] });
   } catch (e) {
     next(e);
   }
 });
 
 const resolveBody = z.object({
-  status: z.enum(["removed", "rejected", "need_info"]),
+  // ★ `pending` 也要能选（2026-09-25 评审）：置成 need_info 之后原来**没有任何接口**
+  //   能把它放回队列，而请求人补了材料之后必须回得去 —— 否则那条请求永久停摆，
+  //   `handledAt` 上还挂着一个看起来像「处理过」的时间戳。
+  status: z.enum(["removed", "rejected", "need_info", "pending"]),
   handleNote: z.string().trim().max(1000).optional().default(""),
   removed: z
     .array(
@@ -163,13 +167,18 @@ adminRouter.patch("/:id", requireAuth, requireRole(ADMIN_ROLE), validate({ body:
           status: req.body.status,
           handleNote: req.body.handleNote,
           handler: req.user._id,
-          handledAt: new Date(),
+          // 放回队列时清掉处理时间戳：留着的话队列里那条看起来像「已经处理过」
+          handledAt: req.body.status === "pending" ? null : new Date(),
           removed: req.body.removed,
+          // 重新进入时限视野时，提醒档位也要重置，否则它再也不会响
+          ...(req.body.status === "pending" ? { reminderStage: "" } : {}),
         },
       },
       { new: true }
     ).lean();
     if (!doc) return res.status(404).json({ message: "not found", code: "NOT_FOUND" });
+    // 官网上承诺了「用邮件回复你结果」—— 这一步在这之前一个字都没发过
+    if (req.body.status !== "pending") ncii.notifyRequester(doc).catch((e) => console.error("[takedown] 回复失败:", (e && e.message) || e));
     res.json({ ok: true, item: { ...doc, _id: String(doc._id) } });
   } catch (e) {
     next(e);

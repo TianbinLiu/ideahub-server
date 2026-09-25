@@ -95,6 +95,8 @@ const takedownRequestSchema = new mongoose.Schema(
     copySearch: {
       ranAt: { type: Date, default: null },
       foundCount: { type: Number, default: 0 },
+      /** 哪些表的命中数撞到了单表上限 —— 非空 = 这次检索**不完整**，foundCount 不能当完整证据 */
+      truncated: { type: [String], default: [] },
     },
     /** 到期提醒发到哪一档了（"soon" / "overdue"），避免每轮清扫都重发 */
     reminderStage: { type: String, default: "" },
@@ -110,7 +112,11 @@ takedownRequestSchema.index({ status: 1, dueAt: 1 });
 // dueAt 由 receivedAt 推导，不接受调用方传值 —— 能传的话「48 小时」就成了一个可以自己往后挪的数字。
 takedownRequestSchema.pre("validate", function setDue() {
   if (!this.receivedAt) this.receivedAt = new Date();
-  this.dueAt = new Date(this.receivedAt.getTime() + SLA_MS);
+  // ★ 判据是 **isNew**，两头都要守住（2026-09-25 评审）：
+  //   · 新文档：**无条件覆盖**调用方传进来的 dueAt —— 48 小时不是一个能自己往后挪的数字；
+  //   · 已有文档：**一个字都不动** —— 原来每次 save 都重算，而 `/scan` 与到期清扫都会 save，
+  //     于是针对「同一档不重发」的那条测试变成空跑（save 一次就把 dueAt 推回 +48h）。
+  if (this.isNew) this.dueAt = new Date(this.receivedAt.getTime() + SLA_MS);
 });
 
 module.exports = mongoose.model("TakedownRequest", takedownRequestSchema);

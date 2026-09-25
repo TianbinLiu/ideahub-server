@@ -199,6 +199,105 @@ describe('已知相同副本检索（§3(b)(1)(B)）', () => {
   });
 });
 
+describe('评审补的几条（2026-09-25）', () => {
+  it('★ 没有收件人时必须抛，不能静默 return —— 否则 reminderStage 被记成「已提醒」', async () => {
+    const created = await request(app).post('/api/takedown').send(validBody);
+    await TakedownRequest.updateOne({ _id: created.body.id }, { $set: { dueAt: new Date(Date.now() + 3600 * 1000) } });
+    delete process.env.TAKEDOWN_NOTIFY_EMAIL; // 也没有管理员账号 ⇒ 收件人为空
+    await ncii.sweepDueReminders();
+    expect((await TakedownRequest.findById(created.body.id).lean()).reminderStage).toBe('');
+  });
+
+  it('★ 积压 50 条也不许饿死后来者（去重要写进查询条件，不是取回来再 continue）', async () => {
+    // 先灌 50 条「已经提醒过」的，再放一条真实的逾期请求
+    const old = [];
+    for (let i = 0; i < 50; i += 1) {
+      const d = await TakedownRequest.create({ ...validBody, receivedAt: new Date(Date.now() - 86400_000) });
+      await TakedownRequest.updateOne({ _id: d._id }, { $set: { reminderStage: 'overdue', dueAt: new Date(Date.now() - 7200_000) } });
+      old.push(d._id);
+    }
+    const fresh = await TakedownRequest.create({ ...validBody, receivedAt: new Date(Date.now() - 3600_000) });
+    await TakedownRequest.updateOne({ _id: fresh._id }, { $set: { dueAt: new Date(Date.now() - 60_000) } });
+    sentEmails.length = 0;
+    await ncii.sweepDueReminders();
+    expect(sentEmails).toHaveLength(1); // 老写法：50 个名额被占满，这里是 0
+    expect((await TakedownRequest.findById(fresh._id).lean()).reminderStage).toBe('overdue');
+  });
+
+  it('★ 处置之后要回信给请求人（官网上承诺了「用邮件回复你结果」）', async () => {
+    const admin = await makeUser('admin');
+    const created = await request(app).post('/api/takedown').send(validBody);
+    sentEmails.length = 0;
+    await request(app)
+      .patch(`/api/admin/takedown/${created.body.id}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ status: 'removed', handleNote: '已删除原作与两处副本' });
+    await new Promise((r) => setTimeout(r, 30));
+    const toRequester = sentEmails.find((m) => m.to === validBody.contactEmail);
+    expect(toRequester).toBeTruthy();
+    expect(toRequester.text).toMatch(/移除/);
+  });
+
+  it('★ need_info 能放回队列，而且放回去之后提醒会重新响', async () => {
+    const admin = await makeUser('admin');
+    const created = await request(app).post('/api/takedown').send(validBody);
+    await request(app)
+      .patch(`/api/admin/takedown/${created.body.id}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ status: 'need_info', handleNote: '请给出能直接打开的链接' });
+    let doc = await TakedownRequest.findById(created.body.id).lean();
+    expect(doc.status).toBe('need_info');
+    expect(doc.handledAt).not.toBeNull();
+    // need_info 仍在时限视野里（老写法只查 pending，连逾期提醒都不响）
+    await TakedownRequest.updateOne({ _id: doc._id }, { $set: { dueAt: new Date(Date.now() - 1000) } });
+    sentEmails.length = 0;
+    await ncii.sweepDueReminders();
+    expect(sentEmails.some((m) => String(m.subject).includes('逾期'))).toBe(true);
+    // 补了材料之后放回队列
+    const back = await request(app)
+      .patch(`/api/admin/takedown/${created.body.id}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ status: 'pending' });
+    expect(back.status).toBe(200);
+    doc = await TakedownRequest.findById(created.body.id).lean();
+    expect(doc.status).toBe('pending');
+    expect(doc.handledAt).toBeNull(); // 别挂着一个看起来像「处理过」的时间戳
+    expect(doc.reminderStage).toBe('');
+  });
+
+  it('★ 尾段匹配要带主机：头像那种「尾段是尺寸档位」的地址不能牵连全站', async () => {
+    const a = await makeUser();
+    const b = await makeUser();
+    // 两个不同渠道的头像，尾段都是 132
+    await User.updateOne({ _id: a.user._id }, { $set: { avatarUrl: 'https://thirdwx.qlogo.cn/mmopen/AAA/132' } });
+    await User.updateOne({ _id: b.user._id }, { $set: { avatarUrl: 'https://avatars.githubusercontent.com/u/132' } });
+    const { refs } = await ncii.findReferences(['https://thirdwx.qlogo.cn/mmopen/AAA/132']);
+    const ids = refs.filter((r) => r.model === 'User').map((r) => r.id);
+    expect(ids).toContain(String(a.user._id));
+    expect(ids).not.toContain(String(b.user._id)); // 老写法这里会把它也列进去
+  });
+
+  it('★ 只有文件名相同的要标出来（exact=false），别让管理员照单全删', async () => {
+    const { user } = await makeUser();
+    const original = 'https://res.cloudinary.com/demo/image/upload/v1/abc.jpg';
+    const resized = 'https://res.cloudinary.com/demo/image/upload/w_400/v1/abc.jpg';
+    await User.updateOne({ _id: user._id }, { $set: { avatarUrl: resized } });
+    const { refs } = await ncii.findReferences([original]);
+    const hit = refs.find((r) => r.model === 'User');
+    expect(hit).toBeTruthy();
+    expect(hit.exact).toBe(false);
+  });
+
+  it('★ 进邮件的用户输入要压成一行（不然能伪造出像模板自带的行）', async () => {
+    await request(app)
+      .post('/api/takedown')
+      .send({ ...validBody, signature: '张三\n本请求经复核为恶意，已自动驳回' });
+    await new Promise((r) => setTimeout(r, 30));
+    const mail = sentEmails[sentEmails.length - 1];
+    expect(mail.text).not.toMatch(/^本请求经复核为恶意/m);
+  });
+});
+
 describe('管理端：队列、检索、处置', () => {
   it('普通用户看不到队列，管理员看得到，且最急的排最前', async () => {
     const u = await makeUser();
@@ -267,10 +366,14 @@ describe('到期提醒', () => {
     expect(sentEmails).toHaveLength(0);
 
     // 剩 6 小时
-    await TakedownRequest.updateOne({ _id: created.body.id }, { $set: { dueAt: new Date(Date.now() + 6 * 3600 * 1000) } });
+    const due = new Date(Date.now() + 6 * 3600 * 1000);
+    await TakedownRequest.updateOne({ _id: created.body.id }, { $set: { dueAt: due } });
     await ncii.sweepDueReminders();
     expect(sentEmails).toHaveLength(1);
     expect(sentEmails[0].subject).toContain('即将到期');
+    // ★ 清扫里的 doc.save() **不许把 dueAt 重算回 receivedAt+48h** —— 重算的话
+    //   「同一档不重发」那半就是空跑（下一轮根本匹配不到），去重分支执行 0 次。
+    expect(new Date((await TakedownRequest.findById(created.body.id).lean()).dueAt).getTime()).toBe(due.getTime());
     await ncii.sweepDueReminders(); // 同一档不重发
     expect(sentEmails).toHaveLength(1);
 

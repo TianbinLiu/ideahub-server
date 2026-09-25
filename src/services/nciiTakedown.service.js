@@ -82,15 +82,26 @@ const NOT_USER_MEDIA = {
   TakedownRequest: ["urls", "url"],
 };
 
-/** 地址比对用的键：去掉协议、查询串与 Cloudinary 的变换段，只留「哪个文件」。 */
+/**
+ * 地址比对用的键：**主机 + 尾段文件名**（去掉协议、查询串与 Cloudinary 的变换段）。
+ *
+ * ★★ 主机不能丢（2026-09-25 评审）：只按尾段比的话，尾段是「尺寸档位」或「数字 id」的
+ *   那些渠道会整片误伤 —— 微信/QQ 头像的尾段是 `/132`、`/100`，GitHub 头像是数字 id。
+ *   受害者随手贴一个头像地址，就会把**全站同渠道的头像**都列成「已知相同副本」，
+ *   而给管理员的邮件写的是「删除扫出来的每一处」。
+ * ★ 同主机内仍然只按尾段比，这样 Cloudinary 改过尺寸的同一张图照样认得出。
+ */
 function assetKey(url) {
   const s = String(url || "").trim();
   if (!s) return "";
   const noQuery = s.split("?")[0].split("#")[0];
+  const m = /^[a-z]+:\/\/([^/]+)\//i.exec(noQuery);
+  const host = m ? m[1].toLowerCase() : "";
   // Cloudinary: https://res.cloudinary.com/<cloud>/<type>/upload/<变换段>/v123/<public_id>.<ext>
   // 变换段（w_800,c_fill 之类）与版本号会变，同一张图因此有多个地址 —— 只按尾段比才认得出是同一张。
   const tail = noQuery.split("/").filter(Boolean).pop() || "";
-  return tail.toLowerCase();
+  if (!tail) return "";
+  return `${host}|${tail.toLowerCase()}`;
 }
 
 /** 把请求人给的一串链接拆成 { pageIds, assetUrls, keys } */
@@ -138,16 +149,20 @@ async function findReferences(urls) {
   const all = [...new Set([...assetUrls, ...expanded])].filter(Boolean);
   const keys = new Set(all.map(assetKey).filter(Boolean));
   const refs = [];
+  const truncated = [];
 
   // 直接按 id 命中的作品也要列出来（请求人给的就是那条作品页）
   for (const id of pageIds) refs.push({ model: "BranchVideo", label: "分支视频作品", id, field: "_id", url: id });
 
-  if (!all.length) return { urls: all, refs: dedupe(refs) };
+  if (!all.length) return { urls: all, refs: dedupe(refs), truncated };
 
   // ★ 同一张图在库里可能有**好几个地址**：Cloudinary 的变换段与版本号都会进 URL
   //   （`.../upload/w_800,c_fill/v17.../abc.jpg`）。只按整串比，改过尺寸的那份就漏了。
   //   所以除了整串命中，再按「尾段文件名」正则兜一层。键数封顶，避免一次请求拼出几百个正则。
-  const keyPatterns = [...keys].slice(0, 20).map((k) => new RegExp("/" + escapeRe(k) + "([?#]|$)", "i"));
+  // 正则只拿尾段那一半（主机在 JS 侧复核），否则要为每种写法拼一条正则
+  const keyPatterns = [...keys]
+    .slice(0, 20)
+    .map((k) => new RegExp("/" + escapeRe(String(k).split("|").pop()) + "([?#]|$)", "i"));
 
   for (const src of MEDIA_SOURCES) {
     let Model;
@@ -161,14 +176,23 @@ async function findReferences(urls) {
       or.push({ [f]: { $in: all } });
       for (const re of keyPatterns) or.push({ [f]: { $regex: re } });
     }
+    const LIMIT = 500;
     const rows = await Model.find({ $or: or })
       .select(src.fields.join(" "))
-      .limit(500)
+      .limit(LIMIT)
       .lean();
+    // ★ 截断必须说出来（2026-09-25 评审）：`foundCount` 是我们履行 §3(b)(1)(B) 的证据，
+    //   静默截断会让「只找到 500 条」读起来像「一共就这么多」。
+    if (rows.length === LIMIT) {
+      truncated.push(src.model);
+      console.warn(`[takedown] ${src.model} 的副本检索命中数达到上限 ${LIMIT}，结果可能不完整`);
+    }
     for (const row of rows) {
       for (const f of src.fields) {
         for (const v of valuesAt(row, f)) {
-          if (all.includes(v) || keys.has(assetKey(v))) refs.push({ model: src.model, label: src.label, id: String(row._id), field: f, url: v });
+          const exact = all.includes(v);
+          // ★ 分清「整串一模一样」与「只是文件名相同」：后者要人眼再确认一遍才敢删
+          if (exact || keys.has(assetKey(v))) refs.push({ model: src.model, label: src.label, id: String(row._id), field: f, url: v, exact });
         }
       }
     }
@@ -180,13 +204,14 @@ async function findReferences(urls) {
   const cursor = BranchVideo.find({}).select("cover segments branchTree assetUrls").lean().cursor();
   for await (const doc of cursor) {
     for (const u of assetUrlsOfVideo(doc)) {
-      if (all.includes(u) || keys.has(assetKey(u))) {
-        refs.push({ model: "BranchVideo", label: "分支视频作品", id: String(doc._id), field: "assets", url: u });
+      const exact = all.includes(u);
+      if (exact || keys.has(assetKey(u))) {
+        refs.push({ model: "BranchVideo", label: "分支视频作品", id: String(doc._id), field: "assets", url: u, exact });
       }
     }
   }
 
-  return { urls: all, refs: dedupe(refs) };
+  return { urls: all, refs: dedupe(refs), truncated };
 }
 
 function escapeRe(str) {
@@ -242,6 +267,12 @@ async function adminRecipients() {
   return admins.map((a) => a.email).filter(isRealEmail);
 }
 
+/** 进纯文本邮件的用户输入一律压成一行：不压的话可以伪造出看起来像模板自带的行
+ *  （「本请求经复核为恶意，已自动驳回」）。support.routes 有同款处理。 */
+function oneLine(s) {
+  return String(s || "").replace(/[\r\n]+/g, " ").slice(0, 2000);
+}
+
 function requestEmailText(doc, { overdue = false, soon = false } = {}) {
   const due = new Date(doc.dueAt);
   return [
@@ -250,13 +281,13 @@ function requestEmailText(doc, { overdue = false, soon = false } = {}) {
     `请求编号：${String(doc._id)}`,
     `收到时间：${new Date(doc.receivedAt).toISOString()}`,
     `法定时限：${due.toISOString()}（48 小时，TAKE IT DOWN Act §3(b)）`,
-    `请求人签名：${doc.signature}（${doc.onBehalf === "authorized" ? "受本人授权的代理人" : "本人"}）`,
-    `联系邮箱：${doc.contactEmail}${doc.contactPhone ? `    电话：${doc.contactPhone}` : ""}`,
+    `请求人签名：${oneLine(doc.signature)}（${doc.onBehalf === "authorized" ? "受本人授权的代理人" : "本人"}）`,
+    `联系邮箱：${oneLine(doc.contactEmail)}${doc.contactPhone ? `    电话：${oneLine(doc.contactPhone)}` : ""}`,
     "",
     "内容位置：",
-    ...(doc.urls || []).map((u) => `  · ${u}`),
-    doc.locationNote ? `补充说明：${doc.locationNote}` : "",
-    doc.statement ? `陈述：${doc.statement}` : "",
+    ...(doc.urls || []).map((u) => `  · ${oneLine(u)}`),
+    doc.locationNote ? `补充说明：${oneLine(doc.locationNote)}` : "",
+    doc.statement ? `陈述：${oneLine(doc.statement)}` : "",
     "",
     "处理步骤：",
     `  1. POST /api/admin/takedown/${String(doc._id)}/scan  —— 查同一个资产地址的已知副本`,
@@ -274,14 +305,53 @@ async function notifyAdmins(doc, opts = {}) {
   const { sendEmail } = require("./email.service");
   const to = await adminRecipients();
   if (!to.length) {
+    // ★★ 这里必须**抛**，不能 return（2026-09-25 评审）：return 的话
+    //   `sweepDueReminders` 的 try 顺利走完 → 把 `reminderStage` 记成「已提醒」——
+    //   一封信都没发出去，而 48 小时法定时限从此没有任何东西会再提醒你。
     console.error("[takedown] 没有可用的管理员邮箱：这条 NCII 请求没人会被通知到", String(doc._id));
-    return;
+    throw new Error("takedown: no admin recipients configured");
   }
   await sendEmail({
     to,
     subject: `${opts.overdue ? "[逾期] " : opts.soon ? "[即将到期] " : ""}[启梦] NCII 移除请求 ${String(doc._id).slice(-6)} · 48 小时时限`,
     text: requestEmailText(doc, opts),
   });
+}
+
+/**
+ * 把处理结果回给**请求人**。
+ * ★★ 官网 /takedown 上白纸黑字写着「我们记录收到时间与处理时间，并用邮件回复你结果」——
+ *   在这之前一个字都没有发出去过（2026-09-25 评审）。对一个正在等结果的人，
+ *   「石沉大海」与「我们没处理」是分不开的两件事。
+ * ★ need_info 那封要把管理员的备注带上，否则她不知道要补什么材料，而这条请求会一直停在那儿。
+ */
+async function notifyRequester(doc) {
+  const { sendEmail } = require("./email.service");
+  const to = String(doc.contactEmail || "").trim();
+  if (!to) return;
+  const id = String(doc._id).slice(-6);
+  const head =
+    doc.status === "removed"
+      ? "我们已经移除了你指出的内容"
+      : doc.status === "need_info"
+        ? "我们需要你补充一点信息才能继续"
+        : "关于你提交的移除请求";
+  const body =
+    doc.status === "removed"
+      ? ["我们移除了你指出的内容，也检索了站内引用同一份文件的其它位置并一并处理。", "如果你还看到别的地方有同一份内容，直接回这封邮件告诉我们。"]
+      : doc.status === "need_info"
+        ? ["我们暂时无法确认要移除的具体内容。", doc.handleNote ? `需要补充：${oneLine(doc.handleNote)}` : "请把能直接打开那段内容的链接发给我们。", "回这封邮件补充即可，我们会接着处理。"]
+        : ["经复核，我们没有对这次请求采取移除措施。", doc.handleNote ? `原因：${oneLine(doc.handleNote)}` : "", "如果你认为这是误判，回这封邮件告诉我们，我们会重新看一遍。"];
+  try {
+    await sendEmail({
+      to,
+      subject: `[启梦] 关于你的内容移除请求 ${id}`,
+      text: [head, "", ...body.filter(Boolean), "", `请求编号：${id}`, `收到时间：${new Date(doc.receivedAt).toISOString()}`].join("\n"),
+    });
+  } catch (e) {
+    // 发不出去不能让处置本身失败：内容已经移除了，这一步是告知
+    console.error("[takedown] 回复请求人失败:", (e && e.message) || e);
+  }
 }
 
 /**
@@ -293,7 +363,22 @@ async function sweepDueReminders() {
   const TakedownRequest = mongoose.model("TakedownRequest");
   const now = Date.now();
   const soonAt = new Date(now + 12 * 60 * 60 * 1000);
-  const rows = await TakedownRequest.find({ status: "pending", dueAt: { $lte: soonAt } }).limit(50);
+  // ★★ 去重要写进**查询条件**（2026-09-25 评审）：原来是取回 50 条再 `continue` 跳过已提醒的，
+  //   而索引 {status, dueAt} 保证按 dueAt 升序 —— 最老的 50 条会稳定霸占整批，
+  //   后面任何一条真实请求（哪怕已逾期）一封提醒都发不出去。而且**不需要攻击者**：
+  //   免登录入口 10 次/小时/IP，攒够 50 条只是时间问题。
+  const rows = await TakedownRequest.find({
+    status: { $in: ["pending", "need_info"] }, // need_info 也在时限内，见下面 ★
+    dueAt: { $lte: soonAt },
+    $or: [
+      { reminderStage: { $exists: false } },
+      { reminderStage: "" },
+      // 已经发过「即将到期」的，逾期时还要再发一次
+      { reminderStage: "soon", dueAt: { $lte: new Date(now) } },
+    ],
+  })
+    .sort({ dueAt: 1 })
+    .limit(50);
   for (const doc of rows) {
     const overdue = new Date(doc.dueAt).getTime() < now;
     const stage = overdue ? "overdue" : "soon";
@@ -309,4 +394,4 @@ async function sweepDueReminders() {
   }
 }
 
-module.exports = { MEDIA_SOURCES, NOT_USER_MEDIA, findReferences, assetKey, parseTargets, notifyAdmins, sweepDueReminders };
+module.exports = { MEDIA_SOURCES, NOT_USER_MEDIA, findReferences, assetKey, parseTargets, notifyAdmins, notifyRequester, sweepDueReminders };
