@@ -11,6 +11,9 @@
  *   （与 companion.service.personaExampleMessages 给 few-shot 补标签是同一个道理）。
  * ★ compacted=true 的消息**原文照样保留**给用户翻历史，只是不再发给模型（它们已经被提纯进了摘要与记忆卡）。
  * ★ kind=divider 是提纯时插进对话流的一条分隔提示（「已整理前 N 轮…」），role=system，永远不发给模型。
+ * ★ kind=safety 是危机求助卡、kind=notice 是「你在和 AI 聊天」的告知（都 role=system）。它们和 divider 一样
+ *   **不进模型上下文**（buildContextMessages 只取 kind="msg"），但要留在历史里给用户翻看，也是我们履行
+ *   加州 SB 243 §22602 的证据。
  *
  * @field thread {ObjectId}
  * @field user {ObjectId} 冗余一份，删账号时能按人批量删
@@ -35,7 +38,7 @@ const chatMessageSchema = new mongoose.Schema(
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     seq: { type: Number, required: true },
     role: { type: String, enum: ["user", "assistant", "system"], required: true },
-    kind: { type: String, enum: ["msg", "divider"], default: "msg" },
+    kind: { type: String, enum: ["msg", "divider", "safety", "notice"], default: "msg" },
     displayText: { type: String, default: "", maxlength: 8000 },
     modelText: { type: String, default: "", maxlength: 12000 },
     estTokens: { type: Number, default: 0 },

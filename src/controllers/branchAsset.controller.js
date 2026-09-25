@@ -462,6 +462,9 @@ async function updateCard(req, res, next) {
     if (typeof req.body.name === "string") $set.name = req.body.name;
     if (typeof req.body.summary === "string") $set.summary = req.body.summary;
     if (Array.isArray(req.body.tags)) $set.tags = req.body.tags;
+    // ★★ 出片句：给空串是**明确地不要**（回到"只报卡名"），所以判类型不判真假值 —— 写成
+    //   `if (req.body.idLine)` 的话"清掉出片句"这件事永远做不到，而屏幕上会显示已保存。
+    if (typeof req.body.idLine === "string") $set.idLine = req.body.idLine;
     // 真人声明只在这次真给了布尔时才动：PATCH 是定向 $set，不带 = 保留库里原值。
     // （当前客户端不发它；schema 里声明是留门，见 schemas 里 updateCardBody 的注释）
     if (typeof req.body.realPerson === "boolean") $set.realPerson = req.body.realPerson;

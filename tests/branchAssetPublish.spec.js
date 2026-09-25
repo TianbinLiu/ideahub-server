@@ -930,6 +930,37 @@ describe("卡片/卡组发布到创意工坊", () => {
     expect(both.body.card.views).toHaveLength(2);
   });
 
+  // ★★ 为什么单独一组（2026-09-24）：**出片时真正读的是 idLine**，而简介 2026-09-18 起不进提示词。
+  //   这条 PATCH 不收 idLine 的那段时间里，老卡（idLine 为空）在产品内没有任何把手能补 ——
+  //   而客户端发了也不会报错（z.object 静默 strip），所以这里要**回读**着验，不能只看回包。
+  test("A15c 能改出片句（idLine），空串 = 明确地不要，别的字段一个不动", async () => {
+    const author = await registerUser();
+    const card = cardOf({ name: "没写出片句的老卡", summary: "简介只给人看" });
+    await addCards(author.token, [card]).expect(201);
+    const patch = (body) =>
+      request(app).patch(`/api/branch/cards/${card.cardId}`).set("Authorization", `Bearer ${author.token}`).send(body);
+
+    const set = await patch({ idLine: "银发红瞳，左眼戴全息镜片，黑色长风衣" }).expect(200);
+    expect(set.body.card.idLine).toBe("银发红瞳，左眼戴全息镜片，黑色长风衣");
+    expect(set.body.card.summary).toBe("简介只给人看"); // 没给的字段不动
+
+    // ★ 回读才算数：回包可能只是内存里的对象，而"发了、被 strip、读回来是空的"正是这条要防的
+    const listed = await request(app).get("/api/branch/cards").set("Authorization", `Bearer ${author.token}`).expect(200);
+    expect(listed.body.cards.find((c) => c.cardId === card.cardId).idLine).toBe("银发红瞳，左眼戴全息镜片，黑色长风衣");
+
+    // 只改名字不许把它带走（定向 $set，同 A15 的 views）
+    const renamed = await patch({ name: "改了名字" }).expect(200);
+    expect(renamed.body.card.idLine).toBe("银发红瞳，左眼戴全息镜片，黑色长风衣");
+
+    // 空串 = 明确地不要（判类型不判真假值），回读也要是空的
+    await patch({ idLine: "" }).expect(200);
+    const cleared = await request(app).get("/api/branch/cards").set("Authorization", `Bearer ${author.token}`).expect(200);
+    expect(cleared.body.cards.find((c) => c.cardId === card.cardId).idLine).toBe("");
+
+    // 超上限整发 400（与建卡同一个数），库里那份不动
+    await patch({ idLine: "长".repeat(201) }).expect(400);
+  });
+
   test("A16 肖像授权绑定随账号走：PATCH 存得下、我的列表读得回、广场与安装都不带、null 解绑", async () => {
     const author = await registerUser();
     const taker = await registerUser();
