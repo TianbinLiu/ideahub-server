@@ -446,7 +446,14 @@ async function updatePersona(req, res, next) {
     if (req.body.coverEmoji !== undefined) doc.coverEmoji = normalizeEmoji(req.body.coverEmoji);
     if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
-    if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
+    if (req.body.style !== undefined) {
+      // ★★ PATCH 语义：只改请求里**真的带了**的键，没带的保持库里的值（2026-09-18 线上 bug，
+      //   理由见 persona.schemas.js 的 stylePatchBody）。显式发 "" / [] 照常算"清空"。
+      //   合并之后仍整份过一遍 normalizeStyle —— 库里的老数据未必合今天的上限，一并归一。
+      const prev = (doc.toObject().style) || {};
+      const sent = Object.fromEntries(Object.entries(req.body.style).filter(([, v]) => v !== undefined));
+      doc.style = normalizeStyle({ ...prev, ...sent });
+    }
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.voice !== undefined) doc.voice = await expandVoiceInput(req.body.voice, req.user._id);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）
