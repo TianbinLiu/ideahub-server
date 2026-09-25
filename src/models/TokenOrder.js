@@ -83,8 +83,18 @@ const tokenOrderSchema = new mongoose.Schema(
      * 回收也靠它判断「现在回收会不会把欠额算成 0」（R-5 的推迟）。
      */
     grantedAt: { type: Date, default: null },
+    /** 落单时存下的商品 id。清扫器重试 consume 要用它（raw 里那份藏在数组第二层） */
+    playProductId: { type: String, default: "", trim: true, maxlength: 128 },
     /** consume（对可消耗商品同时完成 acknowledge）成功的时间 */
     consumedAt: { type: Date, default: null },
+    /**
+     * consume 试了几次、最后一次什么时候。
+     * ★★ 不是装饰：Play 对可消耗商品「3 天未 acknowledge 自动退款」，而 consume 蕴含
+     *   acknowledge。没有这两个字段，「试了多少次、还要不要继续试、是不是该告警」在事后
+     *   完全看不出来 —— 而这条链路失败时是**静默**的（consume 只 console.error）。
+     */
+    consumeAttempts: { type: Number, default: 0, min: 0 },
+    consumeLastAt: { type: Date, default: null },
     /** 回收的幂等锚（与 settledAt 同构）：抢到 null → now 的那一次才真的回收 */
     revokedAt: { type: Date, default: null },
     /** 实际收回多少 token */

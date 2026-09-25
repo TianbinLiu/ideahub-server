@@ -159,6 +159,13 @@ async function start() {
           60 * 60 * 1000,
         );
         playTimer.unref?.();
+        // ★★ 没跑完的订单每分钟接着跑（consume 重试 + 崩在发币中间的补发）。
+        //   一分钟这个频率是被 Play 逼出来的：许可测试员的购买 **3 分钟**不 acknowledge
+        //   就会被自动退款，而 consume 蕴含 acknowledge。
+        const playSweep = setInterval(() => {
+          play.sweepUnconsumed().catch((e) => console.error("[play] 清扫失败:", (e && e.message) || e));
+        }, 60 * 1000);
+        playSweep.unref?.();
       }
     } else {
       console.log(`实例 ${instanceId}：跳过 AI worker（只在 0 号实例运行）`);

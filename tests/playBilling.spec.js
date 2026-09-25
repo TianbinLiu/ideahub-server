@@ -195,6 +195,83 @@ describe('兑换', () => {
   });
 });
 
+describe('consume 失败之后（2026-09-25 评审逮到的 critical）', () => {
+  it('★ consume 撞上游错误 → 重试 redeem 会**补跑** consume（老写法永远补不上）', async () => {
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct });
+    upstream.consumeOk = false; // 第一次 consume 失败
+    await redeem(token, 'ptok-consume-fail');
+    let order = await TokenOrder.findOne({ playPurchaseToken: 'ptok-consume-fail' }).lean();
+    expect(order.consumedAt).toBeNull();
+    expect(order.consumeAttempts).toBe(1); // 失败要留痕，否则事后看不出试过几次
+
+    upstream.consumeOk = true; // 上游恢复
+    const again = await redeem(token, 'ptok-consume-fail');
+    expect(again.body.code).toBe('duplicate');
+    order = await TokenOrder.findOne({ playPurchaseToken: 'ptok-consume-fail' }).lean();
+    expect(order.consumedAt).not.toBeNull(); // ← 老写法这里仍是 null：3 天后被 Google 自动退款
+    expect(order.grantedTokens).toBe(150_000); // 没有重复发币
+    expect(await TokenLedger.countDocuments({ user: user._id, reason: 'recharge' })).toBe(1);
+  });
+
+  it('★ 清扫器把没 consume 的订单接着跑完（测试购买走 60 秒快车道）', async () => {
+    const { token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
+    upstream.consumeOk = false;
+    await redeem(token, 'ptok-sweep');
+    // 退避窗口内不重试
+    let r = await play.sweepUnconsumed({ now: new Date(Date.now() + 10_000) });
+    expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-sweep' }).lean()).consumedAt).toBeNull();
+    // 过了 60 秒就重试
+    upstream.consumeOk = true;
+    r = await play.sweepUnconsumed({ now: new Date(Date.now() + 61_000) });
+    expect(r.handled).toBeGreaterThan(0);
+    expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-sweep' }).lean()).consumedAt).not.toBeNull();
+  });
+
+  it('★ 崩在「抢到发币权」与「币真的进账」之间 → 清扫器按账本判断并补发', async () => {
+    const { user } = await makeUser();
+    await wallet.ensureWallet(user._id);
+    const before = (await wallet.getWallet(user._id)).plan;
+    // 造出那个中间态：grantedAt 有值、status 还是 paid、账本里没有这笔
+    await TokenOrder.create({
+      orderNo: 'PLAYMID1',
+      user: user._id,
+      kind: 'recharge',
+      amountFen: 0,
+      channel: 'play',
+      playPurchaseToken: 'ptok-mid',
+      playProductId: 'tokens_150k',
+      packTokens: 150_000,
+      status: 'paid',
+      settledAt: new Date(),
+      grantedAt: new Date(),
+      consumedAt: new Date(), // consume 那半已经做完，只测补发
+    });
+    const r = await play.sweepUnconsumed();
+    expect(r.granted).toBe(150_000);
+    const after = await User.findById(user._id).select('tokenWallet').lean();
+    expect(after.tokenWallet.plan + after.tokenWallet.addon).toBe(before + 150_000);
+    expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-mid' }).lean()).status).toBe('settled');
+    // 再跑一轮不许重复补发
+    await play.sweepUnconsumed();
+    const after2 = await User.findById(user._id).select('tokenWallet').lean();
+    expect(after2.tokenWallet.plan + after2.tokenWallet.addon).toBe(before + 150_000);
+  });
+
+  it('★ 已经发过币的（账本里有那条 recharge）不许再补发一次', async () => {
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct });
+    await redeem(token, 'ptok-done');
+    const bal = await balance(user._id);
+    // 人为把 status 打回 paid，模拟「状态没写成功但币已经发了」
+    await TokenOrder.updateOne({ playPurchaseToken: 'ptok-done' }, { $set: { status: 'paid' } });
+    const r = await play.sweepUnconsumed();
+    expect(r.granted).toBe(0);
+    expect(await balance(user._id)).toBe(bal);
+  });
+});
+
 describe('测试购买（许可测试员）', () => {
   it('照常发币，但订单与流水都标 isTest', async () => {
     const { user, token, acct } = await makeUser();
@@ -322,6 +399,60 @@ describe('退款回收', () => {
     const r = await play.pollVoided({ sinceMs: Date.now() - 3600_000 });
     expect(r.handled).toBe(1);
     expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-poll' }).lean()).status).toBe('refunded');
+  });
+});
+
+describe('归属与部分退款（2026-09-25 评审补）', () => {
+  it('★ 重复兑换的快路径也要校验归属：别人的 token 问不出「发了多少」', async () => {
+    const a = await makeUser();
+    const b = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: a.acct });
+    await redeem(a.token, 'ptok-owned');
+    const res = await redeem(b.token, 'ptok-owned');
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('ACCOUNT_MISMATCH');
+    expect(res.body.granted).toBeUndefined();
+  });
+
+  it('★ 已退款的购买再兑 → REVOKED，而不是「已到账」', async () => {
+    const { token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct });
+    await redeem(token, 'ptok-revoked-then-redeem');
+    await play.revokeByToken({ purchaseToken: 'ptok-revoked-then-redeem' });
+    const res = await redeem(token, 'ptok-revoked-then-redeem');
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('REVOKED');
+  });
+
+  it('★ RTDN 的部分退款不按全额收，交给带份数的轮询', async () => {
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct, quantity: 3 });
+    await redeem(token, 'ptok-rtdn-partial');
+    const before = await balance(user._id);
+    const res = await request(app)
+      .post('/api/pay/play/rtdn?key=rtdn-secret')
+      .send({ message: { data: Buffer.from(JSON.stringify({ voidedPurchaseNotification: { purchaseToken: 'ptok-rtdn-partial', refundType: 2 } })).toString('base64') } });
+    expect(res.status).toBe(200);
+    // 没有按全额收，也没有抢掉 revokedAt（否则轮询永远纠正不回来）
+    expect(await balance(user._id)).toBe(before);
+    expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-rtdn-partial' }).lean()).revokedAt).toBeNull();
+    // 轮询带着份数来，按 1/3 收
+    upstream.voided = [{ purchaseToken: 'ptok-rtdn-partial', voidedQuantity: 1 }];
+    await play.pollVoided({ sinceMs: Date.now() - 3600_000 });
+    expect(await balance(user._id)).toBe(before - 150_000);
+  });
+
+  it('★ 拉作废清单必须带 includeQuantityBasedPartialRefund（默认 false = 看不见部分退款）', async () => {
+    await play.pollVoided({ sinceMs: 1 });
+    const call = fetchSpy.mock.calls.map((c) => String(c[0])).find((u) => u.includes('voidedpurchases'));
+    expect(call).toContain('includeQuantityBasedPartialRefund=true');
+  });
+
+  it('混淆账号 id 拿得到（拿不到的话账号绑定那道闸永远是空的）', async () => {
+    const { user, token } = await makeUser();
+    const res = await request(app).get('/api/pay/play/account').set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.obfuscatedAccountId).toBe(play.obfuscatedAccountId(user._id));
   });
 });
 

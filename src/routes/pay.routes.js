@@ -68,6 +68,20 @@ router.post("/play/redeem", requireAuth, aiRateLimit({ max: 30, scope: "play-red
 });
 
 /**
+ * GET /api/pay/play/account —— 把这个账号的**混淆 id** 交给客户端。
+ *
+ * ★★ 没有这条，账号绑定那道闸就是空的（2026-09-25 评审）：`obfuscatedAccountId` 是
+ *   HMAC(服务端密钥, userId)，客户端算不出来；拿不到就只能不带，而服务端对「没带」
+ *   只打一行 warn 就放行 —— 于是「别人的购买兑不到我账上」这句话没有任何东西在兑现。
+ * ★ App 在发起 Play 购买时把它设进 `obfuscatedAccountId`（Billing 的
+ *   `setObfuscatedAccountId`），购买回包里就会带着它回来。
+ */
+router.get("/play/account", requireAuth, (req, res) => {
+  if (!playConfigured()) return res.status(501).json({ ok: false, code: "PLAY_NOT_CONFIGURED" });
+  res.json({ ok: true, obfuscatedAccountId: play.obfuscatedAccountId(req.user._id) });
+});
+
+/**
  * POST /api/pay/play/rtdn?key=… —— Google Pub/Sub 的推送订阅打到这里（实时开发者通知）。
  *
  * ★★ **不能要求登录**（Google 不带我们的 token），所以安全压在 URL 上的共享密钥上，
@@ -85,12 +99,22 @@ router.post("/play/rtdn", rateLimit({ windowMs: 60_000, max: 120, scope: "play-r
     const payload = raw ? JSON.parse(Buffer.from(raw, "base64").toString("utf8")) : {};
     const voided = payload.voidedPurchaseNotification;
     if (voided && voided.purchaseToken) {
-      const r = await play.revokeByToken({
-        purchaseToken: String(voided.purchaseToken),
-        // productType 1=一次性商品；refundType 1=全额 2=部分（官方枚举，含义见文档）
-        refundType: `rtdn/${String(voided.refundType ?? "")}`,
-      });
-      console.warn(`[play] RTDN 退款 token=${String(voided.purchaseToken).slice(0, 12)}… → ${r.code}`);
+      // ★★ 部分退款（refundType=2）**不在这里收**（2026-09-25 评审）：
+      //   Google 的 voidedPurchaseNotification **本来就不带份数**，在这里收就只能按全额收 ——
+      //   买 3 份退 1 份会被收走全部，差额转欠额 + 冻结；而一小时后带着正确份数的轮询
+      //   撞上 `revokedAt` 的幂等抢占，在算 clawback 之前就 return duplicate，**永不纠正**。
+      //   所以这一类只当「去看一眼」的信号，交给 pollVoided（它带 includeQuantityBasedPartialRefund）。
+      const partial = String(voided.refundType ?? "") === "2";
+      if (partial) {
+        console.warn(`[play] RTDN 部分退款，交给轮询按份数处理 token=${String(voided.purchaseToken).slice(0, 12)}…`);
+      } else {
+        const r = await play.revokeByToken({
+          purchaseToken: String(voided.purchaseToken),
+          // productType 1=一次性商品；refundType 1=全额 2=部分（官方枚举，含义见文档）
+          refundType: `rtdn/${String(voided.refundType ?? "")}`,
+        });
+        console.warn(`[play] RTDN 退款 token=${String(voided.purchaseToken).slice(0, 12)}… → ${r.code}`);
+      }
     }
   } catch (e) {
     // ★ 解析失败也回 200：回非 2xx 只会让 Pub/Sub 无限重推同一条坏消息（铁律八：响而局部）

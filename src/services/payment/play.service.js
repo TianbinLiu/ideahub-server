@@ -131,6 +131,26 @@ async function consume(productId, purchaseToken) {
 }
 
 /**
+ * consume 一笔订单并记账。**只有这一处**会写 `consumedAt`（铁律六）。
+ * 失败不抛：发币已经完成，这里失败要能被重试 —— 但必须把尝试次数记下来，
+ * 否则「试了多少次、还要不要继续试」在事后完全看不出来。
+ */
+async function consumeAndMark(order) {
+  const ok = await consume(productIdOf(order), order.playPurchaseToken);
+  if (ok) {
+    await TokenOrder.updateOne({ _id: order._id }, { $set: { consumedAt: new Date() } });
+    return true;
+  }
+  await TokenOrder.updateOne({ _id: order._id }, { $inc: { consumeAttempts: 1 }, $set: { consumeLastAt: new Date() } });
+  return false;
+}
+
+/** 订单上的商品 id：优先用落单时存下来的快照，回退到 raw 里的那份 */
+function productIdOf(order) {
+  return String(order.playProductId || order.raw?.productLineItem?.[0]?.productId || "");
+}
+
+/**
  * 把「用户账号」编进购买里的那个 id。★ 不能直接用 userId：
  * 官方要求 obfuscated（不可反推），而且它会出现在 Play 的日志与回包里。
  * 用 HMAC(userId) 的前 32 位十六进制，服务端按同一把盐反查（`User.playAccountId`）。
@@ -158,14 +178,26 @@ async function redeem({ user, purchaseToken, now = new Date() }) {
   const token = String(purchaseToken || "").trim();
   if (!token || token.length > 512) return { ok: false, code: "VALIDATION_ERROR", message: "purchaseToken 不合法" };
 
-  // 已经兑过 → 直接回既有结果（P4：唯一索引是并发时真正兜住的那道，这里只是快路径）
   const existing = await TokenOrder.findOne({ playPurchaseToken: token });
-  if (existing && existing.grantedAt) {
-    return { ok: true, code: "duplicate", granted: existing.grantedTokens, order: existing };
-  }
+  // ★ 顺序：**先判回收、再判重复**（2026-09-25 评审）。反过来的话，一笔已经退款回收过的购买
+  //   再兑一次仍会返回 `ok:true / duplicate / granted:4500000`，把「已退款」说成「已到账」。
   if (existing && existing.revokedAt) {
     // P1：已经被回收的购买永远不再发币，也不再 consume（R-11）
     return { ok: false, code: "REVOKED", message: "这笔购买已被退款" };
+  }
+  if (existing && existing.grantedAt) {
+    // ★ 快路径也要校验归属：不校验的话，拿到别人 purchaseToken 的人能从这里问出
+    //   「这笔发了多少」，而且账号绑定那道检查排在它后面、被整条绕过。
+    if (existing.user && String(existing.user) !== String(user._id)) {
+      console.warn(`[play] 快路径上的账号不匹配 user=${user._id} order=${existing.orderNo}`);
+      return { ok: false, code: "ACCOUNT_MISMATCH", message: "这笔购买不属于当前账号" };
+    }
+    // ★★ **这里必须补跑 consume**（2026-09-25 评审逮到的 critical）：
+    //   consume 撞一次 Google 5xx/超时之后，客户端按文档重试 —— 而重试正好走这条快路径，
+    //   于是 consume 永不重发、3 天后 Google 自动退款并撤销权益 ⇒ 已经花掉的部分转成欠额、
+    //   一个正常付费用户被冻结，全程零报警。清扫器是兜底，这里是第一道。
+    if (!existing.consumedAt) await consumeAndMark(existing);
+    return { ok: true, code: "duplicate", granted: existing.grantedTokens, order: existing };
   }
 
   const p = await getPurchase(token);
@@ -215,6 +247,7 @@ async function redeem({ user, purchaseToken, now = new Date() }) {
       channelTxnId: p.orderId,
       playPurchaseToken: token,
       playOrderId: p.orderId,
+      playProductId: p.productId,
       quantity: p.quantity,
       isTest: p.isTest,
       status: "paid",
@@ -236,15 +269,17 @@ async function redeem({ user, purchaseToken, now = new Date() }) {
     return { ok: false, code: "REVOKED", message: "这笔购买已被退款", order: fresh };
   }
 
-  await wallet.credit(user._id, amount, "recharge", `Play ${p.productId}${p.isTest ? "（测试购买）" : ""}`, now);
+  // ★ memo 带上 orderNo：它是「这笔币到底发没发」的**唯一可查证据**，清扫器靠它判断
+  //   崩在 credit 前后（见 sweepUnconsumed 的 ★★）。也方便人工对账。
+  await wallet.credit(user._id, amount, "recharge", `Play ${p.productId} 订单 ${order.orderNo}${p.isTest ? "（测试购买）" : ""}`, now);
   await TokenOrder.updateOne({ _id: order._id }, { $set: { status: "settled", grantedTokens: amount } });
   // 记下这个账号的 Play 身份，退款通知只带 token 时靠它找人
   await User.updateOne({ _id: user._id, playAccountId: { $ne: expect } }, { $set: { playAccountId: expect } });
 
-  // P2：发完币再 consume。失败不影响本次结果（清扫器会重试）——
-  // ⚠ 但对**测试购买**要当回事：3 分钟不 acknowledge 就会被 Google 自动退款。
-  const consumed = await consume(p.productId, token);
-  if (consumed) await TokenOrder.updateOne({ _id: order._id }, { $set: { consumedAt: new Date() } });
+  // P2：发完币再 consume。失败不影响本次结果 —— 由 `sweepUnconsumed`（index.js 每分钟一轮）
+  // 与下一次 redeem 的快路径各兜一道。⚠ 对**测试购买**尤其要紧：3 分钟不 acknowledge
+  // 就会被 Google 自动退款，所以清扫器对 isTest 走 60 秒快车道。
+  await consumeAndMark(await TokenOrder.findById(order._id));
 
   return { ok: true, code: "settled", granted: amount, order: await TokenOrder.findById(order._id) };
 }
@@ -263,7 +298,9 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
       { playPurchaseToken: token },
       {
         $setOnInsert: {
-          orderNo: `PLAYVOID${Date.now().toString(36).toUpperCase()}`,
+          // ★ 带随机后缀：只用毫秒时间戳的话，同一毫秒到达的两条 RTDN 会撞 orderNo 唯一索引，
+          //   而下面那个 .catch 会把失败吞掉、函数照样回 ok:true —— 占位没落、P1 那道防线不存在。
+          orderNo: `PLAYVOID${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(4).toString("hex").toUpperCase()}`,
           user: null,
           kind: "recharge",
           amountFen: 0,
@@ -275,7 +312,13 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
         },
       },
       { upsert: true },
-    ).catch((e) => console.error("[play] 退款占位失败:", (e && e.message) || e));
+    ).catch((e) => {
+      console.error("[play] 退款占位失败:", (e && e.message) || e);
+      return null;
+    });
+    // 占位没落就别谎报成功：调用方（RTDN / 轮询）据此决定要不要再来一次
+    const placed = await TokenOrder.exists({ playPurchaseToken: token });
+    if (!placed) return { ok: false, code: "PLACEHOLDER_FAILED" };
     return { ok: true, code: "voided_before_redeem" };
   }
 
@@ -315,14 +358,85 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
     {
       $set: {
         status: "refunded",
-        clawbackTokens: clawback,
+        // ★ 记**实际收回**的量（字段注释也是这么写的），不是「打算收多少」：
+        //   用户已注销时 revokeTokens 返回 null，记成全额就等于「一分没收回记成全额收回」。
+        clawbackTokens: r ? r.clawed : 0,
         shortfall: r ? r.shortfall : 0,
         voidedQuantity: voided,
       },
     },
   );
   await User.updateOne({ _id: order.user }, { $inc: { playRefundCount: 1 } });
-  return { ok: true, code: "revoked", clawed: r ? r.clawed : 0, shortfall: r ? r.shortfall : 0 };
+  if (!r) {
+    // 钱包不存在（账号已注销）——一分没收回。要响，别当成功：轮询会把它计进 handled。
+    console.error(`[play] 回收时找不到钱包（账号已注销？）订单 ${order.orderNo}`);
+    return { ok: false, code: "WALLET_GONE" };
+  }
+  return { ok: true, code: "revoked", clawed: r.clawed, shortfall: r.shortfall };
+}
+
+/**
+ * **清扫器**：把没跑完的 Play 订单接着跑完。由 index.js 每分钟调一次（只在 0 号实例）。
+ *
+ * ★★ 这个函数是 2026-09-25 评审逮到的那条 critical 的正解。在它之前，代码里三处注释
+ *   （「清扫器会重试」「清扫器靠这个差别知道要补发」）指望的东西**根本不存在**，而
+ *   redeem 的重复快路径又排在 consume 之前 —— 于是 consume 撞一次上游 5xx 就永远补不上，
+ *   3 天后 Google 自动退款并撤销权益，已花掉的部分转成欠额、把一个正常付费用户冻住。
+ *
+ * 处理两类残局：
+ *   A. `grantedAt` 有、`consumedAt` 没有 ⇒ 币发了但没 consume，**重试 consume**。
+ *      测试购买走 60 秒快车道（3 分钟就会被自动退款），真实购买按退避重试。
+ *   B. `grantedAt` 有、`status !== "settled"` ⇒ 崩在「抢到发币权」与「币真的进账」之间。
+ *      ★★ 用**账本**判断到底发没发：`credit` 会写一条 memo 带订单号的 recharge 流水。
+ *      有 ⇒ 只补 status/grantedTokens；没有 ⇒ 补发一次。
+ *      ⚠ 残留窗口：`credit` 内部是「先 $inc 余额、再写流水」，崩在这两步之间时这里会
+ *      重发一次。这个窗口本来就存在于 `credit` 自身（写流水失败只记日志），单机 Mongo
+ *      没有事务可用；量级是毫秒级，而另一边的代价是「钱付了一个 token 没发」。
+ */
+async function sweepUnconsumed({ now = new Date(), limit = 50 } = {}) {
+  if (!playConfigured()) return { handled: 0, granted: 0 };
+  const TokenLedger = require("../../models/TokenLedger");
+  const rows = await TokenOrder.find({
+    channel: "play",
+    revokedAt: null,
+    grantedAt: { $ne: null },
+    $or: [{ consumedAt: null }, { status: { $ne: "settled" } }],
+  })
+    .sort({ createdAt: 1 })
+    .limit(limit);
+
+  let handled = 0;
+  let granted = 0;
+  for (const order of rows) {
+    // B：补发（先判，再 consume —— 顺序与 redeem 一致：P2 要求 consume 在发币之后）
+    if (order.status !== "settled" && order.user) {
+      const already = await TokenLedger.exists({ user: order.user, reason: "recharge", memo: new RegExp(`订单 ${order.orderNo}(（|$)`) });
+      if (!already) {
+        const amount = Number(order.packTokens) || 0;
+        if (amount > 0) {
+          await wallet.credit(order.user, amount, "recharge", `Play 补发 订单 ${order.orderNo}`, now);
+          granted += amount;
+          console.warn(`[play] 补发 ${amount} token（崩在发币中间）订单 ${order.orderNo}`);
+        }
+      }
+      await TokenOrder.updateOne({ _id: order._id }, { $set: { status: "settled", grantedTokens: Number(order.packTokens) || 0 } });
+      handled += 1;
+    }
+
+    // A：重试 consume。退避：测试购买 60 秒（3 分钟就会被自动退款），真实购买 10 分钟。
+    if (!order.consumedAt) {
+      const waitMs = order.isTest ? 60_000 : 10 * 60_000;
+      const last = order.consumeLastAt ? new Date(order.consumeLastAt).getTime() : 0;
+      if (now - last < waitMs) continue;
+      const ok = await consumeAndMark(order);
+      handled += ok ? 1 : 0;
+      // 试了很多次还不成，说明不是抖动 —— 要响，不能继续静默重试到被自动退款
+      if (!ok && (Number(order.consumeAttempts) || 0) + 1 >= 5) {
+        console.error(`[play] consume 连续失败 ${order.consumeAttempts + 1} 次，订单 ${order.orderNo} 有被 Google 自动退款的风险`);
+      }
+    }
+  }
+  return { handled, granted, scanned: rows.length };
 }
 
 /**
@@ -333,8 +447,12 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
  */
 async function pollVoided({ sinceMs = Date.now() - 24 * 3600_000 } = {}) {
   if (!playConfigured()) return { ok: false, code: "PLAY_NOT_CONFIGURED", handled: 0 };
+  // ★ `includeQuantityBasedPartialRefund=true` 不能省（2026-09-25 评审）：官方默认 false，
+  //   不带的话**部分退款根本不会出现在这份清单里** —— 而 RTDN 那条又不带份数，
+  //   两边都看不见就等于部分退款永远收不回。
   const r = await callPlay(
-    `/applications/${encodeURIComponent(packageName())}/purchases/voidedpurchases?startTime=${Math.floor(sinceMs)}&type=1`,
+    `/applications/${encodeURIComponent(packageName())}/purchases/voidedpurchases` +
+      `?startTime=${Math.floor(sinceMs)}&type=1&includeQuantityBasedPartialRefund=true`,
   );
   if (!r.ok) {
     console.error(`[play] voidedpurchases ${r.status} ${String(r.json?.error?.message || "").slice(0, 160)}`);
@@ -356,4 +474,4 @@ async function pollVoided({ sinceMs = Date.now() - 24 * 3600_000 } = {}) {
   return { ok: true, code: "polled", handled, total: rows.length };
 }
 
-module.exports = { accessToken, getPurchase, consume, redeem, revokeByToken, pollVoided, obfuscatedAccountId };
+module.exports = { accessToken, getPurchase, consume, redeem, revokeByToken, pollVoided, sweepUnconsumed, obfuscatedAccountId };
