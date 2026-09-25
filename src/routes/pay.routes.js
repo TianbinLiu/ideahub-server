@@ -165,4 +165,7 @@ if (PAY_ALLOW_MOCK) {
   });
 }
 
+/** Google Play 结算（D15 阶段 1）。PLAY_BILLING_ENABLED 没开时这一组 404，见 playPay.routes.js */
+router.use("/play", require("./playPay.routes"));
+
 module.exports = router;

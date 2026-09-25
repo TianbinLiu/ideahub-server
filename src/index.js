@@ -103,6 +103,7 @@ async function start() {
     assertProductionConfig();
     // 假支付开着这件事不该只写在 .env 里没人看见
     require("./config/payment").warnPaymentMode();
+    require("./config/playBilling").warnPlayBillingMode();
     await syncProjectDocs();
 
     // 验证 Cloudinary 配置

@@ -22,6 +22,9 @@ const mongoose = require("mongoose");
 // admin_free  管理员免单的方舟调用：**余额不动（delta=0），但这笔钱真花出去了**，
 //             实际金额记在 costTokens 里。见下面 costTokens 的说明与
 //             services/tokenWallet.service.js 的 noteAdminFree。
+// iap_recharge Google Play 购买发放（进 addon，D15 阶段 1）
+// iap_test     Google Play **测试购买**发放（只有 PLAY_ALLOW_TEST_PURCHASES 或管理员才发），与真钱分开记
+// iap_clawback Google Play 退款 / 撤销之后回收（负；扣到 0 为止，没扣到的差额记在订单 clawbackShortTokens 上）
 const TOKEN_REASONS = [
   "grant",
   "recharge",
@@ -30,6 +33,9 @@ const TOKEN_REASONS = [
   "ark_spend",
   "ark_refund",
   "admin_free",
+  "iap_recharge",
+  "iap_test",
+  "iap_clawback",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(

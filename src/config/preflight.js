@@ -18,6 +18,8 @@ function collectConfigProblems(env = process.env) {
 
   // 支付：假渠道没有验签，生产环境开着等于任何人都能给自己发 token
   problems.push(...require("./payment").collectPaymentProblems(env));
+  // Google Play 结算：只查「配了一半」，不出网。开关开着却缺服务账号 / 盐，兑换一定失败而客户端的购买入口照常亮着
+  problems.push(...require("./playBilling").collectPlayBillingProblems(env));
 
   const secret = env.JWT_SECRET || "";
   if (!secret) problems.push("JWT_SECRET 未设置");
