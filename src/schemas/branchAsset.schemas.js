@@ -150,6 +150,13 @@ const updateCardBody = z
     name: z.string().trim().max(120).optional(),
     summary: z.string().trim().max(2000).optional(),
     tags: z.array(z.string().trim().max(40)).max(12).optional(),
+    // ★★ 出片句（2026-09-24 补）：**出片时真正读的就是它**（app 的 types.idLineOf），
+    //   而简介 2026-09-18 起一个字都不进提示词。于是这条 PATCH 不收它的后果是：
+    //   那天之前铸的卡（idLine 为空）在产品内**再没有任何把手**能补上 —— 出片时那个角色只剩一个名字，
+    //   形象由模型自己编，钱照花。客户端发过、被 z.object 静默 strip、回包一切正常（零报错）。
+    //   ⚠ 上限 200 与建卡（cardItem 的 idLine）、模型（BranchCard.idLine maxlength）逐字相同：
+    //     三处不等的话，用户能建出来的卡改不动、或者改完吃一个 400。
+    idLine: z.string().trim().max(200).optional(),
     // 真人声明可以跟着一起改（可选；不带就保留库里原值——controller 只在拿到布尔时 $set）。
     // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
     //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。

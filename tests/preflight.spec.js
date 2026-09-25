@@ -37,6 +37,28 @@ describe("生产配置自检 · Runway 接上计费之后，那道硬闸按约�
   });
 });
 
+describe("生产配置自检 · SB 243 的同意开关是合并后的手工步骤", () => {
+  // ★ 「忘了打开」与「功能没上线」在系统里长得一模一样：服务照常跑、用户照常聊，
+  //   只是那道法定告知从来没出现过。所以要么打开、要么显式写 0（让它成为有人做过的决定）。
+  const consentProblems = (env) => collectConfigProblems(env).problems.filter((p) => p.includes("CONSENT"));
+
+  test("生产没设这个变量：报出来", () => {
+    expect(consentProblems(prodBase())).toHaveLength(1);
+  });
+
+  test("显式写 0（决定暂时不开）：不报", () => {
+    expect(consentProblems(prodBase({ COMPANION_REQUIRE_CONSENT: "0" }))).toHaveLength(0);
+  });
+
+  test("打开了：不报", () => {
+    expect(consentProblems(prodBase({ COMPANION_REQUIRE_CONSENT: "1" }))).toHaveLength(0);
+  });
+
+  test("非生产不拦（开发不该被这条挡住）", () => {
+    expect(consentProblems({ NODE_ENV: "development" })).toHaveLength(0);
+  });
+});
+
 describe("生产配置自检 · 既有规则的回归锚", () => {
   // 挑「半配」这一类当锚：它们正是"配了但能跑起来"的典型，而且两个方向都要报
   test("QQ 登录只配一半：两个方向都报", () => {

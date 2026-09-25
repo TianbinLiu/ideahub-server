@@ -57,7 +57,14 @@ function collectConfigProblems(env = process.env) {
     if (!env.CORS_ORIGINS && !env.CLIENT_BASE_URL) {
       problems.push("CORS_ORIGINS / CLIENT_BASE_URL 均未设置，CORS 将对所有来源开放");
     }
-    // ★ 这条原来是硬闸：「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并写明
+    // ★★ 首次告知同意的开关（加州 SB 243 §22602(a)/§22604）。它是**合并之后的一个手工步骤**，
+    //   而「忘了打开」与「功能没上线」在系统里长得一模一样：服务照常跑、用户照常聊，
+    //   只是那道法定告知从来没出现过。所以在生产环境把「没打开」报出来 ——
+    //   真要暂时不开，显式写 COMPANION_REQUIRE_CONSENT=0，让它成为一个有人做过的决定。
+    if (!env.COMPANION_REQUIRE_CONSENT) {
+      problems.push("COMPANION_REQUIRE_CONSENT 未设置：陪聊的首次告知同意（SB 243）不会生效。确实不开就显式写 0");
+    }
+    // ★ 这里原来还有一条硬闸：「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并写明
     //   「接上计费之后要连这条一起删 —— 留着它会让『已经接好了』的那天起不来」。
     //   2026-09-24 那一批已经把 Runway 接进了 billing（`runway.routes.js` 走 chargedCall，
     //   而且**查不到价直接 501、绝不降级成免费**），所以硬闸按当初的约定撤掉。
