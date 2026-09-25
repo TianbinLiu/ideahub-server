@@ -126,6 +126,54 @@ describe('回收（§15.4 R-1/R-2）', () => {
     expect(sum).toBe(150000);
   });
 
+  it('★ 两笔入账并发抵同一笔欠额，只能抵一次（守卫要带 debt 维度）', async () => {
+    // 触发条件是「余额 ≥ 2×欠额」。不守 debt 的话两条都能过：各扣 100 万，而管道里的
+    // $max:[0, debt-pay] 把第二次夹到 0 —— 静默成功，用户白少 100 万，两条流水还各自自洽。
+    const { user } = await makeUser();
+    await setBalance(user._id, 0, 0);
+    await wallet.revokeTokens({ userId: user._id, amount: 1_000_000 });
+    await setBalance(user._id, 0, 5_000_000);
+    await Promise.all([wallet.repayDebt(user._id, '并发 A'), wallet.repayDebt(user._id, '并发 B')]);
+    const w = await walletOf(user._id);
+    expect(w.debt).toBe(0);
+    expect(w.plan + w.addon).toBe(4_000_000); // 只抵了一次
+    expect(await TokenLedger.countDocuments({ user: user._id, reason: 'debt_repaid' })).toBe(1);
+  });
+
+  it('★ 管理员免除与在途抵扣撞车：不会先免除再拿余额去还一笔已经不存在的欠额', async () => {
+    const { user } = await makeUser();
+    await setBalance(user._id, 0, 0);
+    await wallet.revokeTokens({ userId: user._id, amount: 500_000 });
+    await setBalance(user._id, 0, 5_000_000);
+    await Promise.all([wallet.forgiveDebt(user._id, '管理员免除'), wallet.repayDebt(user._id, '同时充值抵扣')]);
+    const w = await walletOf(user._id);
+    expect(w.debt).toBe(0);
+    // 要么免除（余额不动）、要么抵扣（扣 50 万），**不能两件事都发生**
+    expect([5_000_000, 4_500_000]).toContain(w.plan + w.addon);
+    const repaid = await TokenLedger.countDocuments({ user: user._id, reason: 'debt_repaid' });
+    const forgiven = await TokenLedger.countDocuments({ user: user._id, reason: 'debt_forgiven' });
+    expect(repaid + forgiven).toBe(1);
+  });
+
+  it('★ 回收与并发入账撞车：差额不许被放大，也不许写出 delta 为正的回收流水', async () => {
+    // 老写法是「先独立读一次算 beforeTotal、再拿 after 作差」，那个窗口里的任何并发入账
+    // 都会让 clawed 变成负数 ⇒ shortfall 被放大成「退款额 + 充值额」⇒ 给没欠钱的人挂欠额并冻结。
+    const { user } = await makeUser();
+    const N = 100_000;
+    await setBalance(user._id, 0, N);
+    const [r] = await Promise.all([
+      wallet.revokeTokens({ userId: user._id, amount: N, memo: '退款' }),
+      ...Array.from({ length: 6 }, (_, i) => wallet.credit(user._id, 50_000, 'grant', `并发入账 ${i}`)),
+    ]);
+    expect(r.clawed).toBeGreaterThanOrEqual(0);
+    expect(r.clawed).toBeLessThanOrEqual(N);
+    expect(r.shortfall).toBeGreaterThanOrEqual(0);
+    expect(r.shortfall).toBeLessThanOrEqual(N); // 老写法这里会超
+    expect((await walletOf(user._id)).debt).toBeLessThanOrEqual(N);
+    const refunds = await TokenLedger.find({ user: user._id, reason: 'play_refund' }).lean();
+    for (const row of refunds) expect(row.delta).toBeLessThanOrEqual(0); // 回收永远不是入账
+  });
+
   it('并发回收与扣费不会把 addon 扣成负数', async () => {
     const { user } = await makeUser();
     await setBalance(user._id, 0, 10000);
@@ -248,16 +296,21 @@ describe('冻结（R-7/R-8）', () => {
     expect(await TokenLedger.countDocuments({ user: user._id, reason: 'ark_spend' })).toBe(0);
   });
 
-  it('抵扣解冻之后又能用了', async () => {
+  it('抵扣解冻之后又能用了（断言的是「闸真的开了」，不是「没返回 403」）', async () => {
     const { user, token } = await makeUser();
     await setBalance(user._id, 0, 0);
     await wallet.revokeTokens({ userId: user._id, amount: 1000 });
     await wallet.credit(user._id, 500000, 'recharge');
-    const res = await request(app)
+    // ★ 这一发会真的出网（本 suite 没 mock fetch），所以**不能**用 `not.toBe(403)` 当断言 ——
+    //   出网必然失败、状态码必然不是 403，那条断言恒真。真正要证明的是「闸开了、钱扣了」：
+    //   preAuthorize 通过之后 debit 一定先发生，失败再由 refundUnaccepted 退回来。
+    await request(app)
       .post('/api/ark/images/generations')
       .set('Authorization', `Bearer ${token}`)
       .send({ model: 'doubao-seedream-4-0-250828', prompt: '一只猫' });
-    expect(res.status).not.toBe(403);
+    const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
+    expect(spend).toBeTruthy(); // 冻结时这一条根本不会存在
+    expect((await walletOf(user._id)).debt).toBe(0);
   });
 
   it('钱包快照与响应头把冻结状态下发出去（客户端镜像空时不许自己猜）', async () => {

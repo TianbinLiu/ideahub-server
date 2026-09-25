@@ -20,28 +20,20 @@ function prodBase(extra = {}) {
 
 const runwayProblems = (env) => collectConfigProblems(env).problems.filter((p) => p.includes("RUNWAY"));
 
-describe("生产配置自检 · Runway 未接计费就不许在生产开出网", () => {
-  // ★★ 这条闸的由来：runway.routes.js 至今是**纯代理**（两处 fetch 直连上游，一次扣费调用都没有，
-  //   对照方舟那条走的是 billedForward）。生产配上这把钥匙 = 任何拿得到我们 token 的人都能
-  //   无计量地烧钱、而账上一分不记。以前这只是 backlog 与 .env.example 里的一句警告 ——
-  //   2026-09-03 钉成硬闸。
-  test("生产没配 RUNWAY_API_KEY：不报这一条", () => {
-    expect(runwayProblems(prodBase())).toHaveLength(0);
+describe("生产配置自检 · Runway 接上计费之后，那道硬闸按约定撤掉", () => {
+  // ★★ 这条闸原来是「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并在代码里写明
+  //   「接上计费之后要连这条一起删 —— 留着它会让『已经接好了』的那天起不来」。
+  //   2026-09-24 那一批把 Runway 接进了 billing（chargedCall + 查不到价 501），所以撤掉。
+  //   这几条用例留下来，是为了**钉住撤掉这件事本身**：谁再把那句话加回去，这里会红，
+  //   而那时生产一配 key 就起不来。
+  test("生产配了 RUNWAY_API_KEY：不再报（计费已接）", () => {
+    expect(runwayProblems(prodBase({ RUNWAY_API_KEY: "rw_live_xxx" }))).toHaveLength(0);
   });
 
-  test("生产配了 RUNWAY_API_KEY：报出来（生产会因此拒绝启动）", () => {
-    const problems = runwayProblems(prodBase({ RUNWAY_API_KEY: "rw_live_xxx" }));
-    expect(problems).toHaveLength(1);
-    // 话要说清"为什么不许"与"什么时候可以"，不能只写一句"不许配"
-    expect(problems[0]).toMatch(/计费/);
-  });
-
-  test("非生产配了 RUNWAY_API_KEY：**不拦**（开发要能拿它调通上游）", () => {
-    expect(runwayProblems({ NODE_ENV: "development", RUNWAY_API_KEY: "rw_dev_xxx" })).toHaveLength(0);
-  });
-
-  test("空串不算配（漏值的 .env 行不该把生产拦在门外）", () => {
-    expect(runwayProblems(prodBase({ RUNWAY_API_KEY: "" }))).toHaveLength(0);
+  test("Runway 的计费链路确实在（路由引到了 billing，且没价就拒）", () => {
+    const src = require("fs").readFileSync(require("path").join(__dirname, "..", "src", "routes", "runway.routes.js"), "utf8");
+    expect(src).toMatch(/billing\.chargedCall/);
+    expect(src).toMatch(/RUNWAY_NOT_PRICED/);
   });
 });
 

@@ -162,10 +162,14 @@ const ASR_TOKENS_PER_MINUTE = 5000;
  * 预扣用的「每秒多少字节」下界表。**取下界是刻意的**：字节除以一个偏小的数
  * ⇒ 秒数偏大 ⇒ 预扣偏多，再按真实时长退回来。反过来（预扣偏少）就是白送，
  * 而白送不会有任何报错。
- *  · wav：24kHz / 16bit / 单声道 = 48,000 B/s（我们自己的录音参数）
- *  · mp3 / ogg：按 64kbps = 8,000 B/s
+ * ★★ 这里要的是**下界**，不是「我们自己的录音参数」（2026-09-25 评审：原来 wav 写 48,000、
+ *   mp3 写 8,000，取的是官方客户端的参数与 64kbps 的拍值 —— 而 16kHz WAV 是 32,000 B/s、
+ *   32kbps mp3 是 4,000 B/s，两者都**低于**它 ⇒ 秒数估少 ⇒ 预扣偏少 ⇒ 白送）。
+ *   取真正的下界之后典型 mp3 会预扣两倍，再由 settleOverCharge 按真实时长冲正回 plan。
+ *  · wav：16kHz / 16bit / 单声道 = 32,000 B/s（比我们自己的 24kHz 更低，够兜住手搓请求）
+ *  · mp3 / ogg：按 32kbps = 4,000 B/s
  */
-const ASR_BYTES_PER_SECOND = Object.freeze({ wav: 48000, mp3: 8000, ogg: 8000 });
+const ASR_BYTES_PER_SECOND = Object.freeze({ wav: 32000, mp3: 4000, ogg: 4000 });
 /** 一次 Seed3D 建模（约 2.4 元/次 ⇒ 160k）。全站最贵的单次操作 */
 const MODEL3D_TOKENS = 160_000;
 

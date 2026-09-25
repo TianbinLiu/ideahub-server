@@ -41,6 +41,14 @@ const TOKEN_REASONS = [
   "debt_incurred",
   "debt_repaid",
   "debt_forgiven",
+  // MiniMax 真人档未受理时的退款。⚠ 它从 2026-08 就在 `minimax.routes.js` 里当 refundTag 传了，
+  //   却一直不在这张 enum 里 —— 于是余额 $inc 成功、账本那条撞 enum 被上面那个 catch 吞掉，
+  //   表现正是这个文件注释警告的「账本静默缺条」。2026-09-25 评审逮到。
+  //   ★ 加进 enum **只修了一半**：`spentToday` 的 $in 里也要有它，否则退款抵不掉当日用量，
+  //   免费档被敏感词拒两次就被日上限锁到次日，而余额栏还显示满格。
+  "minimax_refund",
+  // ⚠ 目前**没有任何写入方**：受理之后才失败的那一类我们**不退**（见 billing.service 的 W2），
+  //   留着这个取值是为了将来真要区分时有地方落。别照它的字面意思去实现「失败就退」。
   "provider_failed",
 ];
 

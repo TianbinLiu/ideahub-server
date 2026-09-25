@@ -153,7 +153,17 @@ async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund"
   let { wallet: w } = pre;
   const { free, before } = pre;
 
-  const result = await forward();
+  // ★★ forward **抛异常**时钱也必须退（2026-09-25 评审）。原来这里是裸 await：
+  //   `tts.routes.js` 的 `await up.text()` 在它自己的 try 之外，上游 mid-stream 断开
+  //   （不需要超时）就会让异常穿过这里 → 500，而 refundUnaccepted 永不执行 ——
+  //   「报错一次扣一次钱」，正是 W2 要堵的形状。退完再原样抛，路由那边的行为不变。
+  let result
+  try {
+    result = await forward()
+  } catch (e) {
+    await refundUnaccepted({ user, cost, memo: `${memo} 异常`, refundTag })
+    throw e
+  };
   const accepted = Boolean(result && result.accepted);
 
   if (!accepted) {
@@ -176,7 +186,8 @@ async function settleOverCharge({ user, prepaid, actual, memo, refundTag = "ark_
   if (isAdmin(user)) return null;
   const back = Math.floor(prepaid - actual);
   if (!Number.isFinite(back) || back <= 0) return null;
-  return wallet.credit(user._id, back, refundTag, `${memo} 预扣多退`);
+  // ★ 走 creditReversal（进 plan）而不是 credit（进 addon）：见那个函数的 ★★。
+  return wallet.creditReversal(user._id, back, refundTag, `${memo} 预扣多退`);
 }
 
 /** 账号注册到今天多少天（迎新期判据）。拿不到创建时间就当老账号处理（从严） */

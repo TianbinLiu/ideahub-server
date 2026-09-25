@@ -67,7 +67,7 @@ app.use(cors({
   //   APK 里 WebView 的源是 https://localhost，打 api.ideahubs.org 是跨域的，
   //   不放行这两个头的话 /api/ark 回来的余额读不到，App 的钱包镜像就只能靠
   //   每次调用后再 GET 一次 —— 多一趟往返，还会在两次请求之间显示旧余额。
-  exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon"],
+  exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon", "X-Wallet-Debt"],
 }));
 
 // 两处需要放宽 body 上限（默认 100kb 会 413），且必须排在全局 express.json() 之前

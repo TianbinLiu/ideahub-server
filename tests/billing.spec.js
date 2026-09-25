@@ -139,21 +139,26 @@ describe('ASR 进钱包（5,000 token/分钟，预扣多退）', () => {
 
   it('按上游给的真实时长结算：预扣多的退回来', async () => {
     const { user, token } = await makeUser();
-    // 48,000 B/s 的 wav：96,000 字节 = 估 2 秒
     const buf = Buffer.alloc(96000, 1);
+    // ★ 估算秒数**从常数推**，别写死：那个常数是「每秒字节数的下界」，调它是正常维护
+    //   （2026-09-25 就从 48,000 调到了 32,000），写死会让这条用例变成常数的镜子。
+    const estSeconds = buf.length / tokens.ASR_BYTES_PER_SECOND.wav;
     fetchSpy.mockResolvedValueOnce(asrOk(1000)); // 上游说只有 1 秒
     const res = await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(buf);
     expect(res.status).toBe(200);
     const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
     const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
-    expect(-spend.delta).toBe(tokens.priceOf('asr', { seconds: 2 }));
-    expect(refund.delta).toBe(tokens.priceOf('asr', { seconds: 2 }) - tokens.priceOf('asr', { seconds: 1 }));
+    expect(-spend.delta).toBe(tokens.priceOf('asr', { seconds: estSeconds }));
+    expect(refund.delta).toBe(tokens.priceOf('asr', { seconds: estSeconds }) - tokens.priceOf('asr', { seconds: 1 }));
   });
 
-  it('★ 预扣只能多不能少：估的秒数必须是上界，否则就是白送', () => {
-    // wav 每秒 48,000 字节是我们自己的录音参数；取更小的每秒字节数 ⇒ 秒数更大 ⇒ 预扣更多
-    expect(tokens.ASR_BYTES_PER_SECOND.wav).toBeGreaterThanOrEqual(48000);
-    expect(tokens.ASR_BYTES_PER_SECOND.mp3).toBeLessThanOrEqual(8000);
+  it('★ 预扣只能多不能少：每秒字节数必须取**下界**（方向写反就是白送）', () => {
+    // 秒数 = 字节 / 每秒字节数 ⇒ 分母越小、秒数越大、预扣越多。所以这里要的是真实世界里
+    // **最小**的那个码率：16kHz/16bit WAV = 32,000 B/s；32kbps mp3 = 4,000 B/s。
+    // ⚠ 这条原来写成 `wav >= 48000`，方向正好反了 —— 把 wav 改成正确的 32,000 反而会让它变红。
+    expect(tokens.ASR_BYTES_PER_SECOND.wav).toBeLessThanOrEqual(32000);
+    expect(tokens.ASR_BYTES_PER_SECOND.mp3).toBeLessThanOrEqual(4000);
+    expect(tokens.ASR_BYTES_PER_SECOND.ogg).toBeLessThanOrEqual(4000);
   });
 
   it('整段静音（上游受理了但没人说话）→ 退全款，不算失败', async () => {
@@ -172,6 +177,58 @@ describe('ASR 进钱包（5,000 token/分钟，预扣多退）', () => {
     const res = await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(Buffer.alloc(96000, 1));
     expect(res.status).toBe(402);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('冲正与异常路径（2026-09-25 评审补）', () => {
+  it('★ forward 抛异常（上游 mid-stream 断开）→ 照样退款，不是「报错一次扣一次钱」', async () => {
+    const { user, token } = await makeUser();
+    fetchSpy.mockImplementationOnce(async () => ({
+      status: 200,
+      // 响应头回来了、读 body 时才炸 —— tts.routes 的 await up.text() 正是这个形状
+      text: async () => {
+        throw new Error('socket hang up');
+      },
+    }));
+    const res = await request(app).post('/api/tts').set('Authorization', `Bearer ${token}`).send({ text: '你好世界' });
+    expect(res.status).toBe(500);
+    const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
+    const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
+    expect(refund.delta).toBe(-spend.delta);
+    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+  });
+
+  it('★ 预扣的冲正回 plan，不进 addon —— 否则就是一条「把当月额度洗成永久余额」的路', async () => {
+    const { user, token } = await makeUser();
+    await wallet.ensureWallet(user._id);
+    const before = await User.findById(user._id).select('tokenWallet').lean();
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: (k) => (k === 'x-api-status-code' ? '20000000' : '') },
+      text: async () => JSON.stringify({ result: { text: '你好' }, audio_info: { duration: 1000 } }),
+    });
+    await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(Buffer.alloc(96000, 1));
+    const after = await User.findById(user._id).select('tokenWallet').lean();
+    // addon 一分没变（老写法会把冲正塞进 addon）
+    expect(after.tokenWallet.addon).toBe(before.tokenWallet.addon);
+    expect(after.tokenWallet.plan).toBeLessThan(before.tokenWallet.plan); // 净扣的是 plan
+  });
+
+  it('★ 上游没给时长 → 按预扣结算、不退（否则一段 6MB 音频净扣 1 token）', async () => {
+    const { user, token } = await makeUser();
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: (k) => (k === 'x-api-status-code' ? '20000000' : '') },
+      text: async () => JSON.stringify({ result: { text: '一整段转写' } }), // 没有 audio_info
+    });
+    const res = await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(Buffer.alloc(96000, 1));
+    expect(res.status).toBe(200);
+    expect(res.body.text).toBe('一整段转写');
+    expect(await TokenLedger.countDocuments({ user: user._id, reason: 'ark_refund' })).toBe(0);
+    const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
+    expect(-spend.delta).toBe(tokens.priceOf('asr', { seconds: 96000 / tokens.ASR_BYTES_PER_SECOND.wav }));
   });
 });
 
@@ -250,6 +307,21 @@ describe('★ 不许再出现「调了付费上游却不扣费」的链路', () 
       if (!/billing\./.test(src)) missing.push(f);
     }
     expect(missing).toEqual([]);
+  });
+
+  it('★ 每个 refundTag 都在账本 enum 里、也都抵当日用量（漏一个就是账本静默缺条 + 日上限误伤）', () => {
+    const TokenLedger = require('../src/models/TokenLedger');
+    const dir = path.join(__dirname, '..', 'src', 'routes');
+    const tags = new Set();
+    for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
+      const src = fs.readFileSync(path.join(dir, f), 'utf8');
+      for (const m of src.matchAll(/refundTag:\s*"([a-z_]+)"/g)) tags.add(m[1]);
+    }
+    expect(tags.size).toBeGreaterThan(0);
+    for (const t of tags) {
+      expect(TokenLedger.TOKEN_REASONS ? TokenLedger.TOKEN_REASONS : require('../src/models/TokenLedger').TOKEN_REASONS).toContain(t);
+      expect(wallet.SPEND_REASONS).toContain(t);
+    }
   });
 
   it('priceOf 认得四条链路的 kind（缺一个就是一条白跑的链路）', () => {

@@ -100,13 +100,22 @@ router.post(
     if (rec.failedCode) {
       return res.status(502).json({ ok: false, message: "asr failed", code: rec.failedCode });
     }
-    // 按上游给的真实时长结算，多退（少了不补：那会让一次调用扣两次）
-    await billing.settleOverCharge({
-      user: req.user,
-      prepaid,
-      actual: priceOf("asr", { seconds: rec.durationMs / 1000 }),
-      memo: `asr ${format}`,
-    });
+    // 按上游给的真实时长结算，多退（少了不补：那会让一次调用扣两次）。
+    // ★★ 上游没给时长（字段缺失 / null / 响应体读失败）时**按预扣结算，不退**
+    //   （2026-09-25 评审）：`durationMs` 原本只用于展示、缺省兜底为 0，被提拔成结算判据之后，
+    //   一个 6MB 的音频会按「0 秒」退掉几乎全部预扣 —— 用户拿到完整转写、净扣 1 token，
+    //   而且对当日上限的贡献恒为 1，日上限永远拦不住。与同一批里 Runway
+    //   「查不到价就 501、绝不降级成免费」是同一条口径。
+    if (!(rec.durationMs > 0)) {
+      console.error(`[asr] 上游没给 audio_info.duration，按预扣 ${prepaid} 结算（不退）user=${req.user._id}`);
+    } else {
+      await billing.settleOverCharge({
+        user: req.user,
+        prepaid,
+        actual: priceOf("asr", { seconds: rec.durationMs / 1000 }),
+        memo: `asr ${format}`,
+      });
+    }
     res.setHeader("Cache-Control", "no-store");
     return res.json({ ok: true, text: rec.text, durationMs: rec.durationMs });
 

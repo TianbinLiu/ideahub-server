@@ -228,9 +228,6 @@ async function revokeTokens({ userId, amount, memo = "", isTest = false, reason 
   if (n === null) return null;
   const before = await ensureWallet(userId, now);
   if (!before) return null;
-  // ★ before 是 **shape**（{plan, addon, …}），不是 lean 文档 —— `total()` 吃的是后者
-  //   （doc.tokenWallet）。两者混用不会报错，只会算出一个负的 clawed，然后把差额记成欠额。
-  const beforeTotal = Number(before.plan) + Number(before.addon);
   if (n === 0) return { clawed: 0, shortfall: 0, debt: debtOf(before), wallet: before };
 
   const updated = await User.findOneAndUpdate(
@@ -250,21 +247,35 @@ async function revokeTokens({ userId, amount, memo = "", isTest = false, reason 
         },
       },
     ],
-    { returnDocument: "after", updatePipeline: true },
+    // ★★ 要的是**更新前那一瞬**的文档（2026-09-25 评审）。原来是「先独立读一次算 beforeTotal、
+    //   再拿 after 作差」——那个窗口里任何一次并发 credit / debit 都会把 clawed 算错，而且两个方向都坏：
+    //     · 并发 credit ⇒ clawed 为负 ⇒ shortfall 被放大成「退款额 + 充值额」，给**没欠钱的人**挂上欠额并冻结，
+    //       还会写出一条 delta 为正的 play_refund；
+    //     · 并发 debit ⇒ clawed 虚高 ⇒ shortfall=0 少收回，账本的 -clawed 与真实余额变化对不上，
+    //       破坏「逐笔 delta 累加 ≡ balanceAfter」这条唯一的对账抓手。
+    //   拿 pre-image 就没有那个窗口：管道扣的恰好是 min(总额, n)，所以 clawed 能从它**算准**。
+    { returnDocument: "before", updatePipeline: true },
   )
     .select(SELECT)
     .lean();
   if (!updated) return null;
 
-  const clawed = beforeTotal - total(updated);
+  // 管道两桶各扣 min(...)，合计恒等于 min(扣前总额, n) —— 与上面那条 pre-image 一起，这个值是精确的
+  const beforeTotal = total(updated);
+  const clawed = Math.min(beforeTotal, n);
   const shortfall = n - clawed;
-  await writeEntry(userId, -clawed, reason, total(updated), memo, isTest ? { isTest: true } : {});
+  // ★ balanceAfter 用**推导值**而不是回头再读一次：再读会把这一拍之后的并发写也算进去，
+  //   而这一行要回答的是「这笔操作之后余额是多少」。
+  const afterTotal = beforeTotal - clawed;
+  await writeEntry(userId, -clawed, reason, afterTotal, memo, isTest ? { isTest: true } : {});
 
-  if (shortfall <= 0) return { clawed, shortfall: 0, debt: debtOf(updated), wallet: shape(updated) };
+  // 下面几处要回给调用方的是**当前**钱包（含 debt），这属于展示，读一次即可
+  const fresh = await User.findById(userId).select(SELECT).lean();
+  if (shortfall <= 0) return { clawed, shortfall: 0, debt: debtOf(fresh?.tokenWallet), wallet: shape(fresh) };
   if (isTest) {
     // 豁免也要留痕：否则「为什么这笔差额没转欠额」在事后完全看不出来
-    await writeEntry(userId, 0, "debt_incurred", total(updated), `${memo} 测试购买差额豁免`, { costTokens: shortfall, isTest: true });
-    return { clawed, shortfall, debt: debtOf(updated), wallet: shape(updated), exempt: true };
+    await writeEntry(userId, 0, "debt_incurred", afterTotal, `${memo} 测试购买差额豁免`, { costTokens: shortfall, isTest: true });
+    return { clawed, shortfall, debt: debtOf(fresh?.tokenWallet), wallet: shape(fresh), exempt: true };
   }
 
   const owed = await User.findOneAndUpdate(
@@ -286,8 +297,10 @@ async function revokeTokens({ userId, amount, memo = "", isTest = false, reason 
   // ★ delta=0、金额记 costTokens —— 照抄 admin_free 的形状（TokenLedger 里写了理由：
   //   balanceAfter 存在的唯一意义就是「账本能和余额对上」，把欠额记成负 delta 会让账本
   //   凭空比余额少一大截）。
-  await writeEntry(userId, 0, "debt_incurred", total(owed || updated), `${memo} 差额转欠额`, { costTokens: shortfall });
-  return { clawed, shortfall, debt: debtOf(owed || updated), wallet: shape(owed || updated) };
+  await writeEntry(userId, 0, "debt_incurred", afterTotal, `${memo} 差额转欠额`, { costTokens: shortfall });
+  // ★ debtOf 吃的是 **tokenWallet 子文档**，不是 User 文档。传错不报错，只会让返回的 debt 恒为 0
+  //   （而同一个对象里的 wallet.debt 却是对的）—— JSDoc 已经把 debt 写进返回契约了。
+  return { clawed, shortfall, debt: debtOf(owed?.tokenWallet), wallet: shape(owed || fresh) };
 }
 
 /**
@@ -303,7 +316,16 @@ async function repayDebt(userId, memo = "", now = new Date()) {
   if (pay <= 0) return shape(cur);
 
   const updated = await User.findOneAndUpdate(
-    { _id: userId, $expr: { $gte: [{ $add: ["$tokenWallet.plan", "$tokenWallet.addon"] }, pay] } },
+    {
+      _id: userId,
+      // ★★ **debt 也要进守卫**（2026-09-25 评审）：`pay` 来自上面那次独立的读，
+      //   只守余额的话，两笔充值并发时两条都能过 —— 各扣 pay、而管道里的
+      //   `$max: [0, debt - pay]` 把第二次夹到 0，于是**静默成功**：
+      //   用户白少一份 pay，两条 debt_repaid 的 balanceAfter 还各自自洽，对账查不出来。
+      //   触发条件是「余额 ≥ 2×欠额」，一点都不罕见。这正是本文件头 W1 写的「严禁读-改-写」。
+      "tokenWallet.debt": debt,
+      $expr: { $gte: [{ $add: ["$tokenWallet.plan", "$tokenWallet.addon"] }, pay] },
+    },
     [
       {
         $set: {
@@ -334,15 +356,40 @@ async function forgiveDebt(userId, memo = "", now = new Date()) {
   if (!cur?.tokenWallet) return null;
   const debt = debtOf(cur.tokenWallet);
   if (debt <= 0) return shape(cur);
+  // ★ 同样要守 debt：免除与在途的 repayDebt 撞车时，不守的话会「先免除、再用余额去还一笔
+  //   已经不存在的欠额」—— 用户白花一笔钱，而两条流水看起来都正常。
   const updated = await User.findOneAndUpdate(
-    { _id: userId },
+    { _id: userId, "tokenWallet.debt": debt },
     { $set: { "tokenWallet.debt": 0, "tokenWallet.debtSince": null } },
     { returnDocument: "after" },
   )
     .select(SELECT)
     .lean();
-  await writeEntry(userId, 0, "debt_forgiven", total(updated || cur), memo || "管理员免除欠额", { costTokens: debt });
+  if (!updated) return shape(await User.findById(userId).select(SELECT).lean()); // 抢不到：别人刚改过，不落账
+  await writeEntry(userId, 0, "debt_forgiven", total(updated), memo || "管理员免除欠额", { costTokens: debt });
   return shape(updated || cur);
+}
+
+/**
+ * **冲正**：预扣多了，把多的那部分还回去。★ 与 `credit` 的去向**刻意相反** ——
+ * 它进 **plan**（会作废的那一桶），不进 addon。
+ *
+ * ★★ 为什么不能共用 credit（2026-09-25 评审）：`debit` 是 plan 优先、plan 跨月清零、
+ *   addon 永不过期。冲正进 addon 就等于给了一条「把当月额度洗成永久余额」的路：
+ *   传一段静音音频 → 预扣从 plan 扣、退款进 addon，反复几次就把整月额度搬成永久的。
+ *   冲正的语义是「这笔钱本来就不该扣」，所以要按扣的那一侧还回去。
+ * ★ 失败调用的退款（W2）仍然走 credit 进 addon —— 那是我们亏待了用户，月末不该蒸发。
+ */
+async function creditReversal(userId, amount, reason, memo = "", now = new Date()) {
+  const n = toTokens(amount);
+  if (n === null || n === 0) return getWallet(userId, now);
+  await ensureWallet(userId, now);
+  const updated = await User.findOneAndUpdate({ _id: userId }, { $inc: { "tokenWallet.plan": n } }, { returnDocument: "after" })
+    .select(SELECT)
+    .lean();
+  if (!updated) return null;
+  await writeEntry(userId, n, reason, total(updated), memo);
+  return shape(updated);
 }
 
 /**
@@ -401,10 +448,15 @@ async function buyPlan(userId, planId, now = new Date()) {
  *   这是日上限的代价 —— 换成"读一个计数器字段"就要处理跨日重置与并发自增，
  *   那条路踩坑的成本远高于这一次查询。
  */
+/** 计入「今天花了多少」的账本类别：一条支出 + 所有会把它退回来的类别 */
+const SPEND_REASONS = ["ark_spend", "ark_refund", "minimax_refund"];
+
 async function spentToday(userId, now = new Date()) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const rows = await TokenLedger.aggregate([
-    { $match: { user: new mongoose.Types.ObjectId(String(userId)), reason: { $in: ["ark_spend", "ark_refund"] }, createdAt: { $gte: start } } },
+    // ★ 退款要抵掉当日用量 —— 每一个 refundTag 都得在这个列表里（`minimax_refund` 漏过一次）。
+    //   tests/billing.spec.js 有一条把「所有 refundTag ⊆ 这里」钉死的用例。
+    { $match: { user: new mongoose.Types.ObjectId(String(userId)), reason: { $in: SPEND_REASONS }, createdAt: { $gte: start } } },
     { $group: { _id: null, sum: { $sum: "$delta" } } },
   ]);
   const net = rows.length ? Number(rows[0].sum) : 0;
@@ -442,6 +494,8 @@ module.exports = {
   getWallet,
   debit,
   debtOf,
+  creditReversal,
+  SPEND_REASONS,
   spentToday,
   revokeTokens,
   repayDebt,
