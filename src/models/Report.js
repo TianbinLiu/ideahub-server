@@ -36,7 +36,7 @@ const TARGET_TYPES = ["video", "comment", "danmaku"];
  *   ★ 加新取值时**服务端先上**：客户端那份是子集时只是少一项可选，反过来则是用户选了一个
  *   服务端不认的 key → 400，而他正要报的可能是最紧急的那一类。
  */
-const REASONS = ["csae", "porn", "violence", "abuse", "spam", "infringe", "other"];
+const REASONS = ["csae", "ncii", "porn", "violence", "abuse", "spam", "infringe", "other"];
 
 /**
  * 要**插队**的理由。
@@ -45,12 +45,20 @@ const REASONS = ["csae", "porn", "violence", "abuse", "spam", "infringe", "other
  *   porn 是"这条要下架"，csae 是"这条要下架、账号要封、证据要留存、还要依法报告主管机关"。
  *   分成两个 key 是为了让**队列**分得开 —— 合进 porn 的话它就躺在几十条刷屏举报中间，
  *   而这正是唯一一类"晚一天处理后果完全不同"的举报。
+ * ★★ `ncii`（未经同意的私密影像）2026-09-24 加入，理由同上：TAKE IT DOWN Act §3 给的是
+ *   **48 小时**法定时限，混在 `porn` 里就等于没有时限。
+ *   ⚠ **它不是 NCII 的法定通道**——法条要求的那条是**免登录**的 `POST /api/takedown`
+ *   （受害者通常不是我们的用户），本项只是给已登录用户的站内快捷入口，
+ *   **不产生 `TakedownRequest` 的 48 小时计时**。两条都要有：一条满足法条，一条满足
+ *   Play 的「应用内可举报」。见 routes/takedown.routes.js 的文件头。
+ *   ⚠ 加它的时候 `priority` 那条「不用写迁移」的论证要重新过一遍：③ 成立（ncii 是全新 key，
+ *   存量里一条都没有），所以这次同样不需要迁移。
  * ★★ 这一项同时是 **Google Play 上架的硬要求**（UGC 儿童安全标准：应用内要有让人报告
  *   CSAE 的入口），并且对外承诺写在 ideahub-client 的 /child-safety 上
  *   （「这一类举报优先于其他所有举报进入人工复核」）—— 那句话靠下面的 priority 兑现，
  *   不是靠管理员自己留意。改这里之前先读那一页。
  */
-const URGENT_REASONS = ["csae"];
+const URGENT_REASONS = ["csae", "ncii"];
 
 /**
  * 管理员能做的处置，以及它各自落到哪个状态。
@@ -165,6 +173,7 @@ module.exports.REASONS = REASONS;
  */
 module.exports.REASON_LABELS = Object.freeze({
   csae: "涉及未成年人",
+  ncii: "未经同意的私密影像",
   porn: "色情低俗",
   violence: "血腥暴力",
   abuse: "人身攻击 / 辱骂",

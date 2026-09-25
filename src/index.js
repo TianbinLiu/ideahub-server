@@ -144,6 +144,15 @@ async function start() {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === undefined || instanceId === "0") {
       startAiWorker();
+      // NCII 移除请求的到期提醒（TAKE IT DOWN Act §3 的 48 小时是**法定上限**）。
+      // ★ 同样只在 0 号实例跑：每个实例各跑一份 = 管理员每次收到 N 封同样的信。
+      // ★ 15 分钟一轮：时限以小时计，更密没有意义，更疏则「剩 12 小时」这一档会失真。
+      // ★ 失败只记日志，绝不让它把进程带崩 —— 它是提醒，不是主链路（铁律八）。
+      const { sweepDueReminders } = require("./services/nciiTakedown.service");
+      const takedownTimer = setInterval(() => {
+        sweepDueReminders().catch((e) => console.error("[takedown] 到期清扫失败:", (e && e.message) || e));
+      }, 15 * 60 * 1000);
+      takedownTimer.unref?.(); // 别因为它让进程退不出去（优雅退出时 server.close 之后还在等定时器）
       // Play 的「已作废购买」每小时拉一次。★ 它是 RTDN 的**兜底**，不是替代：
       //   RTDN 可能丢、也可能我们正好在重启，而漏一条退款 = 用户白拿一整包 token。
       //   ⚠ 两条路必然重叠 ⇒ 回收本身必须幂等（revokedAt 的条件原子抢占）。
@@ -168,7 +177,7 @@ async function start() {
         playSweep.unref?.();
       }
     } else {
-      console.log(`实例 ${instanceId}：跳过 AI worker（只在 0 号实例运行）`);
+      console.log(`实例 ${instanceId}：跳过 AI worker、NCII 到期清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
     }
 
     setupGracefulShutdown(server);
