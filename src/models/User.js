@@ -146,6 +146,17 @@ const userSchema = new mongoose.Schema(
           plan: { type: Number, required: true, min: 0 },
           addon: { type: Number, required: true, min: 0 },
           planId: { type: String, default: "free" },
+          /**
+           * 退款欠额（**正数 = 欠多少**），>0 时冻结一切消费。
+           * ★★ 为什么不用「addon 记负数」：plan/addon 都是 `min:0`，`debit` 的
+           *   `$expr` 守卫与 `$min` 两桶管道都假设非负，而且跨月刷新会 `$set` 重写 plan，
+           *   负数会被**静默抹掉** —— 退款套利就此免费。所以欠额必须是独立的一桶。
+           * ★ 老账号没有这两个字段（undefined）：一律按 0 / null 读
+           *   （tokenWallet.service 的 debtOf 一处实现），别在这里加 required。
+           */
+          debt: { type: Number, default: 0, min: 0 },
+          /** 冻结起始时间；界面文案与账龄报表用 */
+          debtSince: { type: Date, default: null },
           /** 计费周期 "YYYY-MM"（UTC）。跨月刷新靠它做条件原子更新抢占 */
           cycle: { type: String, required: true },
         },

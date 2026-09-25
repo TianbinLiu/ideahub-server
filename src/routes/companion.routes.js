@@ -63,6 +63,8 @@ const {
   recordConsent,
 } = require("../services/companionSetting.service");
 const { voiceFieldSchema, resolveVoiceSettings } = require("../utils/voiceSettings");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 
 const router = express.Router();
 
@@ -230,6 +232,13 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
         res.end();
         return;
       }
+      // ★★ 计费（方案 9.1 的 R1.5）：陪聊此前**一分钱不扣** —— `CHAT_TURN_TOKENS` 早就有价，
+      //   只是从来没有一处调用过扣费。按闸门本身算（20 次/分钟），单账号理论日上限是四位数美元。
+      //   ★ 顺序：**危机检查在前、扣费在后**。反过来的话，危机那一轮 early-return 会跳过
+      //   下面的退款与结算 —— 扣了 400 既不退也不记账，而 #76 对外宣称那一轮是 0 token。
+      const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat companion" });
+      if (!pre.ok) return res.status(pre.status).json(pre.body);
+      let produced = false;
       await companion.streamCompanionReply({
         res,
         // ★ 客户端自带的历史也要过一遍占位替换：不然那句危机原话会在此后每一轮回灌给模型
@@ -242,7 +251,16 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
         // ★ 旧写法原来**一次告知都不发**：这条链路服务端不存历史、没有 lastDisclosureAt 可依据，
         //   那就每一轮都告知 —— 宁可多说一次，也不能让「交互开始时告知」在这条链路上不存在。
         prelude: [{ event: "notice", data: { kind: "ai_disclosure", text: aiNoticeText(companionName(), lang) } }],
+        // ★★ 这一行是计费的命根子：丢了它 `produced` 永远 false ⇒ 每轮扣 400 再退 400，
+        //   陪聊静默回到不计费，而所有测试照样绿（评审预言的正是这个合并事故）。
+        finish: ({ text }) => {
+          produced = Boolean(text);
+          return {};
+        },
       });
+      // 一个字都没出来 = 上游没受理（敏感词 / 限流 / 挂了）⇒ 退款，与方舟那条口径逐字相同
+      if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+      else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
       return;
     }
 
@@ -280,6 +298,9 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
     }
 
     const { messages, estPrompt } = await chatMemory.buildContextMessages({ thread, prefix });
+    const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat companion" });
+    if (!pre.ok) return res.status(pre.status).json(pre.body);
+    let produced = false;
     await companion.streamCompanionReply({
       res,
       messages,
@@ -300,9 +321,15 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
           const card = chatSafety.crisisCard({ trigger: "output", country, lang });
           await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) });
         }
+        // ★★ 计费的命根子（见 #78 正文那四条）：丢了这一行 `produced` 永远 false ⇒ 每轮扣 400 再退 400。
+        //   输出侧被拦下时**模型已经调过了**（钱已经花出去），所以照 text 判、该扣就扣；
+        //   0 token 的承诺只对**输入侧**那一轮成立（上面 early-return，压根没到这里）。
+        produced = Boolean(text);
         return chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted });
       },
     });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+    else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
     // 用量到阈值 → 回复发完之后再提纯（不让用户等），失败只记日志
     chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[companion] compact failed:", (e && e.message) || e));
   } catch (e) {

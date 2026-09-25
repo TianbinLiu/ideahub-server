@@ -64,17 +64,12 @@ function collectConfigProblems(env = process.env) {
     if (!env.COMPANION_REQUIRE_CONSENT) {
       problems.push("COMPANION_REQUIRE_CONSENT 未设置：陪聊的首次告知同意（SB 243）不会生效。确实不开就显式写 0");
     }
-    // Runway 至今是**纯代理**：runway.routes.js 里两处 fetch 直连上游，一次扣费调用都没有
-    // （对照方舟那条走的是 billedForward）。生产配上这把钥匙 = 任何拿得到我们 token 的人
-    // 都能无计量地烧钱，而账上一分不记 —— 这类"配了就能跑、错了没人知道"正是本文件存在的理由。
-    // ★ 这条以前只是 backlog 与 .env.example 里的一句警告。2026-09-03 核过：生产 .env 与
-    //   进程环境里都没有它（约束一直被遵守），所以现在把它钉成硬闸不会影响任何在跑的东西。
-    // ★ 接上计费之后要连这条一起删 —— 留着它会让"已经接好了"的那天起不来。
-    if (env.RUNWAY_API_KEY) {
-      problems.push(
-        "生产配了 RUNWAY_API_KEY，但 Runway 的计费链路还没接（纯代理、零扣费）——接上之前不许在生产开这条出网",
-      );
-    }
+    // ★ 这里原来还有一条硬闸：「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并写明
+    //   「接上计费之后要连这条一起删 —— 留着它会让『已经接好了』的那天起不来」。
+    //   2026-09-24 那一批已经把 Runway 接进了 billing（`runway.routes.js` 走 chargedCall，
+    //   而且**查不到价直接 501、绝不降级成免费**），所以硬闸按当初的约定撤掉。
+    //   ⚠ 撤掉的是「不许出网」，不是「随便出网」：价目表 `RUNWAY_TOKENS_PER_SECOND` 里
+    //   只有三档有价，别的档位在路由层就被 501 挡住。往那张表里加档位时要拿真实账单校准。
   }
 
   return { problems, isProd };

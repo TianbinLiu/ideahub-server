@@ -83,7 +83,12 @@ afterAll(async () => {
   if (mongod) await mongod.stop();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // ★ 每条用例先清掉 token 流水：2026-09-24 起有**每日 token 上限**
+  //   （config/tokens.DAILY_LIMITS，付费档 3M/日），而本文件用同一个 owner 连发几十发
+  //   白模化，每发都是几十万 token —— 不清就会从某一条开始集体变成 429。
+  //   这里测的是模板链路，不是日上限；日上限自己的用例在 tests/billing.spec.js。
+  await require("../src/models/TokenLedger").deleteMany({});
   // 资源详情：按传入的 public_id 回一份合格回执（单条用例里再按需覆写）
   resourceSpy = jest
     .spyOn(cloudinary.api, "resource")
@@ -1613,7 +1618,10 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     const pid = `ideahub/template-videos/${owner.id}-8015`;
     const w = await walletSvc.getWallet(owner.id);
     // 只留下"够看一次帧、不够出片"的额度（r2v 那一笔是几十万级）
+    // ★ 压余额用 debit 会写一行 ark_spend，于是这一发先撞**每日上限**（429）而不是余额不足（402）。
+    //   这条用例要的是「钱不够」，所以直接改库压余额，不经过流水。
     await walletSvc.debit(owner.id, w.plan + w.addon - CHAT_TURN_TOKENS * 2, "测试：压到看帧够、出片不够");
+    await require("../src/models/TokenLedger").deleteMany({});
     const res = await post(baseBody({ publicId: pid }));
     expect(res.status).toBe(402);
     expect(res.body.billed).toBe(true);
@@ -1745,6 +1753,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
         height: 512,
         bytes: 1_000_000,
       }));
+      // 一发 30 秒的 2.5 就是 3,045,600 token，刚好越过付费档 3M/日的硬线 ⇒ 第二发起会被日上限拒。
+      // 这条用例连发四次，测的是「锚点取整」，所以每轮先清当天流水（日上限自己的用例在 billing.spec）。
+      await require("../src/models/TokenLedger").deleteMany({});
       const started = await post(baseBody({ durSec: 30, startSec: 0 }));
       const res = await finish(started.body.jobId);
       expect(res.status).toBe(201);

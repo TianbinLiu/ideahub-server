@@ -17,9 +17,9 @@
 //    且那笔账等转发回来、确认受理了才落 —— 敏感词 400 那种根本没被受理的调用
 //    记进去，等于自己给自己造对不上的账。
 const wallet = require("./tokenWallet.service");
+const billing = require("./billing.service");
 const { priceOf, paidOnlyDenial } = require("../config/tokens");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
-const { isAdmin } = require("../utils/roles");
 
 const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
@@ -86,6 +86,10 @@ function setWalletHeaders(res, w) {
   if (!w) return;
   res.setHeader("X-Wallet-Plan", String(w.plan));
   res.setHeader("X-Wallet-Addon", String(w.addon));
+  // ★ 欠额也要进镜像：App 的 canAfford 在镜像为空时一律放行，冻结状态不下发的话
+  //   被冻结的用户会看到正常报价、点下去才吃 403（§15.4.4 的实现坑之一）。
+  //   老客户端不认这个头，只是照旧显示余额 —— 不会坏。
+  if (w.debt) res.setHeader("X-Wallet-Debt", String(w.debt));
 }
 
 async function chargedArkCall({
@@ -118,11 +122,7 @@ async function chargedArkCall({
     return { ok: false, reason: "model", status: 400, body: { ok: false, message: "model not allowed" }, wallet: null };
   }
 
-  // 管理员免单。★ 判据来自 req.user.role，而 requireAuth **每次请求都从库里重读** role
-  //   （不信 JWT 里的快照）—— 撤掉某人的管理员身份立刻生效，不用等他的 token 过期。
-  const free = isAdmin(user);
-
-  // ★ 一趟读，三个用途：套餐门禁的判据、402 时报给用户的余额、顺带完成钱包初始化与跨月刷新。
+  // ★ 一趟读，两个用途：套餐门禁的判据、顺带完成钱包初始化与跨月刷新。
   //   故意选"每次都读"这种贵写法：换成"只有 paidOnly 的模型才去读套餐"就等于把门禁的判据
   //   劈成两半，以后往 PAID_ONLY_MODELS 里加第二个模型时漏改任何一半都不报错，只会静默放行。
   const before = await wallet.getWallet(user._id);
@@ -135,62 +135,38 @@ async function chargedArkCall({
   if (r2v?.templateId) memo += ` r2v tpl:${r2v.templateId}`;
   else if (r2v) memo += ` r2v src:${String(r2v.sourcePublicId || "?")}`;
 
-  // ★ 管理员这一路的 w 保持 before（余额没动）。**不能给 null**：钱包头一个都不写的话，
-  //   App 的镜像就停在"本地先减过一次"的值上，界面显示的余额比真实值少 —— 一个不报错的假账。
-  let w = before;
+  // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端置灰是提示，不是边界）
+  const denied = paidOnlyDenial(before?.planId, model);
+  if (denied) console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
 
-  if (!free) {
-    // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端置灰是提示，不是边界）
-    const denied = paidOnlyDenial(before?.planId, model);
-    if (denied) {
-      console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
-      // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，得换套餐。
-      // 合并成同一个码，用户会一直充值一直被拒。
-      return {
-        ok: false,
-        reason: "plan",
-        status: 403,
-        body: { ok: false, code: "PLAN_REQUIRED", message: denied, planId: before?.planId ?? null, model },
-        wallet: before,
-      };
-    }
+  // ★★ 「钱」的序列（冻结 → 门禁 → 原子扣 → 转发 → 没受理退 → 免单记账）搬到了
+  //   services/billing.service.js，**四条链路共用那一份**（铁律六）。这里只负责
+  //   方舟特有的两件事：模型白名单与 priceOf 报价。
+  let upstream = { status: 0, text: "" };
+  const r = await billing.chargedCall({
+    user,
+    cost,
+    memo,
+    refundTag,
+    denyReason: denied || "",
+    forward: async () => {
+      upstream = forward ? await forward() : await callArk({ method: "POST", path, body, timeoutMs });
+      const ok = acceptedOf ? acceptedOf(upstream.status, upstream.text) : upstream.status >= 200 && upstream.status < 300;
+      return { accepted: ok };
+    },
+  });
 
-    w = await wallet.debit(user._id, cost, memo);
-    if (!w) {
-      // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
-      return {
-        ok: false,
-        reason: "funds",
-        status: 402,
-        body: {
-          ok: false,
-          code: "INSUFFICIENT_TOKENS",
-          message: "token 余额不足",
-          need: cost,
-          balance: before ? before.plan + before.addon : 0,
-        },
-        wallet: before,
-      };
-    }
+  if (!r.ok) {
+    // 拒绝的三种形态（冻结 / 套餐 / 余额）在 billing 里已经拼好整句，这里只补回
+    // 调用方按 reason 分支时要的那个标签（既有测试按它断言）。
+    const reason = r.body.code === "WALLET_FROZEN" ? "debt" : r.body.code === "PLAN_REQUIRED" ? "plan" : "funds";
+    if (reason === "plan") r.body.model = model;
+    return { ok: false, reason, status: r.status, body: r.body, wallet: r.wallet };
   }
 
-  const { status, text } = forward ? await forward() : await callArk({ method: "POST", path, body, timeoutMs });
-  const accepted = acceptedOf ? acceptedOf(status, text) : status >= 200 && status < 300;
-
-  // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
-  // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
-  //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
-  if (!accepted && !free) {
-    const back = await wallet.credit(user._id, cost, refundTag, `${memo} 上游 ${status}`);
-    w = back ?? w;
-    console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
-  }
-
-  // ★★ 管理员那笔账记在转发之后、且只在上游受理时记，与扣费的顺序正好相反：
-  //   扣费必须在前（并发双花），而免单这一路不动余额，可以等"确实花出去了"再落账。
-  if (accepted && free) {
-    await wallet.noteAdminFree(user._id, cost, `admin ${memo}`, before);
-  }
+  const { status, text } = upstream;
+  const { accepted, wallet: w, free } = r;
+  if (!accepted && !free) console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
 
   return { ok: true, status, text, accepted, wallet: w, cost, free };
 }

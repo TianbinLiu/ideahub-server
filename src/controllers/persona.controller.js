@@ -11,6 +11,8 @@ const { generatePersonaDraft, analyzeMaterials } = require("../services/personaA
 const { styleDescriptorOf } = require("../services/personaAccess.service");
 const { personaPromptLine } = require("../services/companionSetting.service");
 const companion = require("../services/companion.service");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 const chatSafety = require("../services/chatSafety.service");
 const { hasAiKey } = require("../services/aiClient");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
@@ -377,6 +379,10 @@ async function previewChat(req, res, next) {
       lang: req.body.lang || "zh",
       personaLine: personaPromptLine({ name: String(draft.name || "").trim().slice(0, 120), styleDescriptor: styleDescriptorOf(draft.name, style) }),
     });
+    // ★★ 计费（R1.5）：试聊也是一条真的模型调用，此前一分钱不扣，而它的闸门是 20 次/分钟。
+    const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat persona-preview" });
+    if (!pre.ok) return res.status(pre.status).json(pre.body);
+    let produced = false;
     await companion.streamCompanionReply({
       res,
       messages: [
@@ -401,7 +407,14 @@ async function previewChat(req, res, next) {
           },
         },
       ],
+      // ★★ 计费的命根子（#78 正文第 ① 条点名的第二处）：丢了它每轮扣 400 再退 400。
+      finish: ({ text }) => {
+        produced = Boolean(text);
+        return {};
+      },
     });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat persona-preview" });
+    else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat persona-preview", snapshot: pre.before });
   } catch (err) {
     next(err);
   }

@@ -138,6 +138,38 @@ function imageTokensOf(model) {
 
 /** 一次豆包对话往返（含人设与历史的保守值） */
 const CHAT_TURN_TOKENS = 400;
+
+/**
+ * 语音合成：**每个字符** 33 token（豆包 TTS，大陆价）。
+ *
+ * ★ 数的来历（方案 §14.6，2026-09-24）：豆包语音合成按字符计费，折进全仓的
+ *   token 锚（15 元/百万 = 系数 1）就是这个数。非大陆供应商是 27 token/字符 ——
+ *   等多模型目录落地后按地区取，现在只有大陆这一档。
+ * ⚠ **这条链路此前一分钱不扣**（`tts.routes.js` 里 priceOf / charge / wallet 零命中）。
+ *   按它自己的闸门（30 次/分钟 × 300 字）算，单账号理论日上限约 **¥2,160/日** ——
+ *   「把免费额度从 300,000 调小」对一个从来不扣款的链路一分钱都省不下来。
+ */
+const TTS_TOKENS_PER_CHAR = 33;
+
+/**
+ * 语音识别：**每分钟** 5,000 token（豆包 ASR，大陆价 ¥4.5/小时）。非大陆 2,800。
+ * ★ 计费口径是**上游认定的时长**，不是文件大小 —— 但时长要等识别完才知道，
+ *   所以路由先按字节数估一个**上界**预扣，拿到真实时长后多退（billing.settleOverCharge）。
+ */
+const ASR_TOKENS_PER_MINUTE = 5000;
+
+/**
+ * 预扣用的「每秒多少字节」下界表。**取下界是刻意的**：字节除以一个偏小的数
+ * ⇒ 秒数偏大 ⇒ 预扣偏多，再按真实时长退回来。反过来（预扣偏少）就是白送，
+ * 而白送不会有任何报错。
+ * ★★ 这里要的是**下界**，不是「我们自己的录音参数」（2026-09-25 评审：原来 wav 写 48,000、
+ *   mp3 写 8,000，取的是官方客户端的参数与 64kbps 的拍值 —— 而 16kHz WAV 是 32,000 B/s、
+ *   32kbps mp3 是 4,000 B/s，两者都**低于**它 ⇒ 秒数估少 ⇒ 预扣偏少 ⇒ 白送）。
+ *   取真正的下界之后典型 mp3 会预扣两倍，再由 settleOverCharge 按真实时长冲正回 plan。
+ *  · wav：16kHz / 16bit / 单声道 = 32,000 B/s（比我们自己的 24kHz 更低，够兜住手搓请求）
+ *  · mp3 / ogg：按 32kbps = 4,000 B/s
+ */
+const ASR_BYTES_PER_SECOND = Object.freeze({ wav: 32000, mp3: 4000, ogg: 4000 });
 /** 一次 Seed3D 建模（约 2.4 元/次 ⇒ 160k）。全站最贵的单次操作 */
 const MODEL3D_TOKENS = 160_000;
 
@@ -244,6 +276,76 @@ function paidOnlyDenial(planId, model) {
   if (!PAID_ONLY_MODELS.has(String(model || ""))) return null;
   if (!isFreePlan(planId)) return null;
   return `这一档（${model}）仅对付费套餐开放：单段消耗超过免费版整月额度，升级套餐后即可使用。`;
+}
+
+/**
+ * Runway 的按秒价目（token/秒）。**每个数都能回溯到 Runway 自己的价目页**
+ * （docs.dev.runwayml.com/guides/pricing，2026-09-24 读）：credit 面值 $0.01，
+ * 按全仓锚 $1 = 447,563 token 折算、四舍五入到百位。
+ *   gen4_turbo  5 cr/秒  = $0.05/秒 → 22,400
+ *   h3_max      8 cr/秒  = $0.08/秒 → 35,800
+ *   hailuo3    10 cr/秒  = $0.10/秒 → 44,800（与方案 §14.6 的 rw_hailuo3_768p 对上）
+ *
+ * ★★ **查不到价的档位一律拒绝，绝不能降级成免费**：这条链路此前完全不计费，
+ *   而「没价就白跑」等于把那个口子原样留着。新增档位要先有出处再进表。
+ * ★ hailuo3 另按**每张参考图 2 cr**（$0.02 → 9,000）加收；image_to_video 必然带一张
+ *   promptImage，所以命中 hailuo3 时固定加一份。
+ * ⇒ 多模型目录（方案 §15.1）落地后这张表并进目录，这里只留委派。
+ */
+const RUNWAY_TOKENS_PER_SECOND = Object.freeze({ gen4_turbo: 22400, h3_max: 35800, hailuo3: 44800 });
+const RUNWAY_REF_IMAGE_TOKENS = Object.freeze({ hailuo3: 9000 });
+
+/**
+ * **每日 token 上限**（方案 §14.10）。余额是「一个月能花多少」，日上限是「一天能花多少」——
+ * 两者不能互相替代：
+ *  · 免费档：月额度本身就小，日上限防的是「一天之内把整月额度喂给刷子」；
+ *  · **付费档：没有日上限就等于没有上限。** 一个被滥用（或被盗号）的订阅者一天能烧掉
+ *    这个订阅二百多个月的净收入，而账单要到月底才看得见。
+ *
+ * ★ 迎新期单独放宽：刚注册那几天日上限压到 15,000，用户连一段最短的视频都出不了
+ *   （最短一段 67,200），那是个**永远触发不到的死配置**，还正好毁掉第一印象。
+ * ★ 超限**只拒当天、不封号**，且返回的是能直接显示给用户的整句话（照 paidOnlyDenial 的先例）。
+ *
+ * ★★ 判据是「**今天已经花掉的** ≥ 上限」，**刻意不把本次报价算进去**。
+ *   写成 `已花 + 这次 > 上限` 看着更严谨，实际会制造一个**永远点不动的按钮**：
+ *   一段 30 秒的 seedance-2.5 单发就是 3,045,600 token > 3,000,000 的硬线，
+ *   于是这个用户从第一发起就没法用这个功能 —— 而这正是 §14.10 自己点名要避免的死配置形状
+ *   （它举的例子是免费档 15,000/日 挡死 67,200 的视频，同一个错法）。
+ *   代价是单日最多溢出「一发的钱」，这个溢出有上界、且不会重复发生（下一发就被拒了）。
+ */
+const DAILY_LIMITS = Object.freeze({
+  // ⚠ 方案 §14.10 给的是 **15,000/日**，那个数配的是「月额度降到 30,000」之后的免费档。
+  //   今天的免费档仍是 **300,000/月**（`PLANS.free`），15,000/日会让一段最短的视频
+  //   （67,200）**永远出不来** —— 那正是 §14.10 自己点名要避免的「死配置」形状。
+  //   ⇒ 这里先取 150,000/日：既挡住「一天烧光整月额度」，又不会把现有功能锁死。
+  //   **调月额度的那次改动必须同时把这个数改回 15,000**，两者是一对。
+  freeDaily: 150000,
+  newcomerDaily: 150000,
+  newcomerDays: 7,
+  paidWarnDaily: 1_500_000,
+  paidHardDaily: 3_000_000,
+});
+
+/**
+ * 今天还能不能再花 `cost`。**判据只有这一处**（与 paidOnlyDenial 同一格调用）。
+ * @returns {string|null} 整句拒绝理由；null = 放行
+ */
+function dailyCapDenial({ planId, spentToday, cost, accountAgeDays }) {
+  const spent = Math.max(0, Number(spentToday) || 0);
+  void cost; // 见下面 ★★：判据刻意**不含**本次报价
+  if (isFreePlan(planId)) {
+    const newcomer = Number(accountAgeDays) >= 0 && Number(accountAgeDays) < DAILY_LIMITS.newcomerDays;
+    const cap = newcomer ? DAILY_LIMITS.newcomerDaily : DAILY_LIMITS.freeDaily;
+    if (spent < cap) return null;
+    return `今天的免费额度用完了（每日上限 ${cap} token，已用 ${spent}）。明天 0 点（UTC）重置，或升级套餐提高上限。`;
+  }
+  if (spent < DAILY_LIMITS.paidHardDaily) return null;
+  return `今天的用量已达单日上限（${DAILY_LIMITS.paidHardDaily} token，已用 ${spent}）。这是防滥用的保护线，明天 0 点（UTC）重置；确有大批量需求请联系我们。`;
+}
+
+/** 到没到该提醒一声的线（只记日志/告警，不拒） */
+function dailySoftWarn({ planId, spentToday }) {
+  return !isFreePlan(planId) && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
 }
 
 const MODEL3D_ID = "doubao-seed3d-2-0-260328";
@@ -395,6 +497,20 @@ function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
   if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
   if (kind === "chat") return CHAT_TURN_TOKENS;
+  // 语音合成：按字符。★ 与路由里截断后的长度用同一个值（路由把 text 截到 MAX_TEXT
+  //   之后才报价），否则「报价按 5,000 字、实际只念 300 字」——报价与实扣必须同源。
+  if (kind === "tts") return Math.max(1, Math.ceil(String(body?.text ?? "").length * TTS_TOKENS_PER_CHAR));
+  // 语音识别：按秒（调用方把秒数算好递进来；预扣用字节估的上界，结算用上游给的真实时长）
+  if (kind === "asr") return Math.max(1, Math.ceil((Number(body?.seconds) || 0) * (ASR_TOKENS_PER_MINUTE / 60)));
+  // Runway：按秒 × 档位单价（+ 参考图）。**查不到价返回 null**，调用方据此拒绝这次调用 ——
+  // 返回 0 会让它变成一条免费链路，而那正是这次要封的口子。
+  if (kind === "runway") {
+    const perSec = RUNWAY_TOKENS_PER_SECOND[String(body?.model ?? "")];
+    if (!perSec) return null;
+    const seconds = Number(body?.duration);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return Math.ceil(seconds * perSec) + (RUNWAY_REF_IMAGE_TOKENS[String(body?.model ?? "")] || 0);
+  }
   // 真人档：按发查表。路由已把 duration 钉在表内（见 MINIMAX_FLAT_COST 的 ★）；
   // 万一有人绕过路由校验把别的时长带进来，兜底取表内最贵档 —— 报价宁高不低
   // （与 segmentCost 的 r2v 兜底同一取向），并 console.error 点名让人当场看见。
@@ -432,6 +548,14 @@ function priceOf(kind, body, r2v = null) {
 //   留着它就等于在按 model 的价目表旁边放第二处"一张图的价"，而两者迟早分叉
 //   （今天这个缺口正是分叉的产物）。要一张图的价一律走 imageTokensOf(model)。
 module.exports = {
+  RUNWAY_TOKENS_PER_SECOND,
+  RUNWAY_REF_IMAGE_TOKENS,
+  DAILY_LIMITS,
+  dailyCapDenial,
+  dailySoftWarn,
+  TTS_TOKENS_PER_CHAR,
+  ASR_TOKENS_PER_MINUTE,
+  ASR_BYTES_PER_SECOND,
   MINIMAX_FLAT_COST,
   MINIMAX_REAL_MODEL,
   MINIMAX_REAL_RESOLUTION,

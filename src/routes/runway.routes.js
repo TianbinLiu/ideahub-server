@@ -20,6 +20,9 @@
 const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
+const { setWalletHeaders } = require("../services/arkGateway.service");
 
 const router = express.Router();
 
@@ -83,23 +86,48 @@ router.post("/video", requireAuth, genLimit, async (req, res) => {
   const apiKey = process.env.RUNWAY_API_KEY;
   if (!apiKey) return res.status(501).json({ message: "runway not configured" });
 
-  let up;
-  try {
-    up = await fetch(`${RUNWAY_BASE}/image_to_video`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "X-Runway-Version": RUNWAY_VERSION,
-      },
-      body: JSON.stringify(pickCreateBody(req.body)),
-      signal: AbortSignal.timeout(T_CREATE),
-    });
-  } catch (e) {
-    // 超时/连接失败要说出来，不能吞（铁律八）
-    console.error(`[runway] upstream image_to_video ${String((e && e.name) || e)}`);
-    return res.status(504).json({ message: `runway upstream ${String((e && e.name) || "error")}` });
+  const create = pickCreateBody(req.body);
+  // 价目只有 config/tokens.js 一处（铁律六）：查不到价 → null → 501，**绝不降级成免费**
+  const cost = priceOf("runway", create);
+  if (cost === null) {
+    // ★ 没价就不跑。**绝不能降级成免费** —— 那正是这次要封的口子。
+    console.error(`[runway] 没有价目：model=${String(create.model).slice(0, 40)} ratio=${String(create.ratio)} duration=${String(create.duration)}`);
+    return res.status(501).json({ ok: false, code: "RUNWAY_NOT_PRICED", message: "这个 Runway 档位还没有价目，暂不开放" });
   }
+
+  let up;
+  const charged = await billing.chargedCall({
+    user: req.user,
+    cost,
+    memo: `runway ${String(create.model || "?")}`,
+    refundTag: "ark_refund",
+    forward: async () => {
+      try {
+        up = await fetch(`${RUNWAY_BASE}/image_to_video`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            "X-Runway-Version": RUNWAY_VERSION,
+          },
+          body: JSON.stringify(create),
+          signal: AbortSignal.timeout(T_CREATE),
+        });
+      } catch (e) {
+        // 超时/连接失败要说出来，不能吞（铁律八）
+        console.error(`[runway] upstream image_to_video ${String((e && e.name) || e)}`);
+        up = null;
+        return { accepted: false, netError: String((e && e.name) || "error") };
+      }
+      return { accepted: up.status >= 200 && up.status < 300 };
+    },
+  });
+  if (!charged.ok) {
+    setWalletHeaders(res, charged.wallet);
+    return res.status(charged.status).json(charged.body);
+  }
+  setWalletHeaders(res, charged.wallet);
+  if (!up) return res.status(504).json({ message: `runway upstream ${charged.result.netError}` });
   return res.status(up.status).type("application/json").send((await up.text()) || "{}");
 });
 
