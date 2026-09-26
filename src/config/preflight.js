@@ -64,6 +64,15 @@ function collectConfigProblems(env = process.env) {
     if (!env.COMPANION_REQUIRE_CONSENT) {
       problems.push("COMPANION_REQUIRE_CONSENT 未设置：陪聊的首次告知同意（SB 243）不会生效。确实不开就显式写 0");
     }
+    // ★★ MiniMax 两把 key 都配了却没写 MINIMAX_REGION：代码有确定答案（走国际站），
+    //   但「钱从哪个账户出、任务落在哪个站」这种事不该由默认值替人决定 ——
+    //   尤其任务是绑区域的，选错了那一批在途任务查不到而钱已经扣了。
+    if (env.MINIMAX_API_KEY && env.MINIMAX_INTL_API_KEY) {
+      const r = String(env.MINIMAX_REGION || "").trim().toLowerCase();
+      if (r !== "cn" && r !== "intl") {
+        problems.push("MiniMax 中国站与国际站的 key 都配了，但没写 MINIMAX_REGION（cn / intl）—— 不要让默认值替你决定钱从哪边出");
+      }
+    }
     // ★ 这里原来还有一条硬闸：「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并写明
     //   「接上计费之后要连这条一起删 —— 留着它会让『已经接好了』的那天起不来」。
     //   2026-09-24 那一批已经把 Runway 接进了 billing（`runway.routes.js` 走 chargedCall，

@@ -23,7 +23,11 @@ beforeAll(async () => {
   process.env.MONGO_URI = mongod.getUri();
   process.env.JWT_SECRET = process.env.JWT_SECRET || "test-secret";
   // 明确：本套用例默认不带 key（开发机的 .env 可能配了，测试不吃环境的运气）
+  // ★ MiniMax 区域分流之后有**两把** key（中国站 / 国际站）：漏删一把，这套就会在
+  //   配了国际站 key 的机器上变成"带着 key 跑"——501 的用例当场翻脸，转发的用例真出网。
   delete process.env.MINIMAX_API_KEY;
+  delete process.env.MINIMAX_INTL_API_KEY;
+  delete process.env.MINIMAX_REGION;
   delete process.env.RUNWAY_API_KEY;
 
   const { connectDB } = require("../src/config/db");
@@ -85,7 +89,9 @@ describe("未配 key：业务端点全部 501（App 据此把真人档置灰）"
 
   test("health 不需要登录、只说配没配、不真打上游（与 /api/ark/health 同口径）", async () => {
     const mm = await request(app).get("/api/minimax/health").expect(200);
-    expect(mm.body).toEqual({ ok: true, minimax: false });
+    // ★ region 是 2026-09-26 加的：两把 key 长得一样、域名不一样，出问题第一件事就是确认"在往哪打"。
+    //   没配 key 时是 null——注意它**不回 key、也不回完整 base**（对外没用，对攻击者是提示）。
+    expect(mm.body).toEqual({ ok: true, minimax: false, region: null });
     const rw = await request(app).get("/api/runway/health").expect(200);
     expect(rw.body).toEqual({ ok: true, runway: false });
     expect(fetchSpy).not.toHaveBeenCalled();

@@ -1,7 +1,8 @@
 /**
  * MiniMax（海螺）视频生成代理 —— App「真人视频档」的供应商之一。
  *
- * ★ 未配 MINIMAX_API_KEY 时全部业务端点回 501，App 据此把真人档整段置灰
+ * ★ 两把 key（中国站 MINIMAX_API_KEY / 国际站 MINIMAX_INTL_API_KEY）一把都没配时
+ *   全部业务端点回 501，App 据此把真人档整段置灰
  *   （与 /api/tts 未配密钥退回浏览器合成器是同一个约定：降级要明说，不要静默装死）。
  *
  * 为什么必须放服务端（与 ark.routes.js / tts.routes.js 同一个理由、同一个事故）：
@@ -23,22 +24,16 @@ const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { chargedArkCall, setWalletHeaders } = require("../services/arkGateway.service");
 const { MINIMAX_FLAT_COST, MINIMAX_REAL_MODEL, MINIMAX_REAL_RESOLUTION } = require("../config/tokens");
+// ★★ 往哪个站打、用哪把 key **只有这一处判据**（config/minimax）：中国站与国际站是
+//   两套账号两个域名，把国际站的 key 配到中国站地址上只会一路鉴权失败，而那时钱已经扣过。
+const { minimaxBase, minimaxKey, minimaxConfigured } = require("../config/minimax");
 
 const router = express.Router();
-
-const MINIMAX_BASE = "https://api.minimaxi.com/v1";
 
 /** 上游超时。创建体可能带 base64 首帧（压到 720p 仍有 2-3MB，照 ark 的实测经验
  *  给宽），轮询与 ark 的 T_POLL 同一个量级。 */
 const T_CREATE = 120_000;
 const T_POLL = 30_000;
-
-/** 这台服务器配没配 key。健康端点与"要不要白跑一趟"都只问这一处
- *  （照 arkGateway.arkConfigured 的读法：每次现读 env，不在模块顶层缓存 ——
- *  测试与热改配置都靠这一点）。 */
-function minimaxConfigured() {
-  return Boolean(process.env.MINIMAX_API_KEY);
-}
 
 /** 任务 id 的字符集。要拼进上游 URL 的东西一律先收口（与 ark 的 TASK_ID_RE 同一条口径） */
 const TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -68,7 +63,9 @@ function pickCreateBody(body) {
  * 与 /api/ark/health 同口径：部署自检与人工 curl 用它判断"真人档到底通不通"。
  */
 router.get("/health", (_req, res) => {
-  res.json({ ok: true, minimax: minimaxConfigured() });
+  // ★ 带上 region：两把 key 长得一样、域名不一样，出问题时第一件要确认的就是"在往哪打"。
+  //   只回区域名，不回 key、不回完整 base（后者对外没用，对攻击者是提示）。
+  res.json({ ok: true, minimax: minimaxConfigured(), region: require("../config/minimax").minimaxRegion() });
 });
 
 // 限流桶照 ark 的分法：创建贵而低频、轮询便宜而高频，共用一个桶的话
@@ -78,13 +75,14 @@ const pollLimit = aiRateLimit({ max: 90, scope: "minimax-poll" });
 
 /**
  * POST /api/minimax/video —— 创建视频生成任务。
- * 转发 POST {MINIMAX_BASE}/video_generation，回 { task_id, base_resp }。
+ * 转发 POST {base}/video_generation（base 按区域取，见 config/minimax），回 { task_id, base_resp }。
  * ★ 上游状态码与 JSON 原样透传：MiniMax 习惯 200 + base_resp.status_code 报错，
  *   聚合成 502 会把客户端能读的真实原因抹掉。
  */
 router.post("/video", requireAuth, genLimit, async (req, res, next) => {
-  const apiKey = process.env.MINIMAX_API_KEY;
-  if (!apiKey) return res.status(501).json({ message: "minimax not configured" });
+  const apiKey = minimaxKey();
+  const base = minimaxBase();
+  if (!apiKey || !base) return res.status(501).json({ message: "minimax not configured" });
 
   // ── 计价参数在扣费**之前**钉死（照 resolveR2v 的先例：算钱与校验同一拍）──
   // 价目表只锚了 海螺2.3 · 768P · 6/10 秒（config/tokens.MINIMAX_FLAT_COST 的 ★）。
@@ -117,7 +115,7 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
         //   （chargedArkCall 只对返回的 status 判退）。超时/断连一律折成 504 返回，
         //   让退款路正常走，同时把真实原因记进日志。
         try {
-          const up = await fetch(`${MINIMAX_BASE}/video_generation`, {
+          const up = await fetch(`${base}/video_generation`, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
             body: JSON.stringify(body),
@@ -161,18 +159,21 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
 
 /**
  * GET /api/minimax/video/:taskId —— 查询任务状态。
- * 上游是官方 v1 的 query 形状：GET {MINIMAX_BASE}/query/video_generation?task_id=<id>
+ * 上游是官方 v1 的 query 形状：GET {base}/query/video_generation?task_id=<id>
  * （2026-08-24 已实测：query 与 files/retrieve 两条路径直连打通，形状与此一致）。
  * 不计费的轮询走单独的 pollLimit（理由见 ark 同名端点）。
  */
 router.get("/video/:taskId", requireAuth, pollLimit, async (req, res) => {
-  const apiKey = process.env.MINIMAX_API_KEY;
-  if (!apiKey) return res.status(501).json({ message: "minimax not configured" });
+  // ★★ 任务是**绑区域**的：在哪个站建的只能在同一个站查。切换 MINIMAX_REGION 会让在途任务
+  //   查不到（钱已扣），所以要切就等在途任务跑完再切（见 config/minimax 的 ★★）。
+  const apiKey = minimaxKey();
+  const base = minimaxBase();
+  if (!apiKey || !base) return res.status(501).json({ message: "minimax not configured" });
   if (!TASK_ID_RE.test(req.params.taskId)) return res.status(400).json({ message: "bad task id" });
 
   let up;
   try {
-    up = await fetch(`${MINIMAX_BASE}/query/video_generation?task_id=${req.params.taskId}`, {
+    up = await fetch(`${base}/query/video_generation?task_id=${req.params.taskId}`, {
       method: "GET",
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(T_POLL),
@@ -191,13 +192,15 @@ router.get("/video/:taskId", requireAuth, pollLimit, async (req, res) => {
  * 与 /video/:taskId 同一套纪律：id 收口、不计费限流、超时 504、原样透传。
  */
 router.get("/file/:fileId", requireAuth, pollLimit, async (req, res) => {
-  const apiKey = process.env.MINIMAX_API_KEY;
-  if (!apiKey) return res.status(501).json({ message: "minimax not configured" });
+  // 同 /video/:taskId：file_id 也是**绑区域**的，只能回它生成的那个站去取
+  const apiKey = minimaxKey();
+  const base = minimaxBase();
+  if (!apiKey || !base) return res.status(501).json({ message: "minimax not configured" });
   if (!TASK_ID_RE.test(req.params.fileId)) return res.status(400).json({ message: "bad file id" });
 
   let up;
   try {
-    up = await fetch(`${MINIMAX_BASE}/files/retrieve?file_id=${req.params.fileId}`, {
+    up = await fetch(`${base}/files/retrieve?file_id=${req.params.fileId}`, {
       method: "GET",
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(T_POLL),
