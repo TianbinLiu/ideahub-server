@@ -183,6 +183,7 @@ describe("真人档计费", () => {
   // ★ 本组用**专属账号**：白名单转发那组现在也走真扣费（假 key + 假上游照扣照退），
   //   共用账号的话余额随用例顺序漂移，断言全变成"看排期的运气"
   let billToken;
+  let billUserId;
   beforeAll(async () => {
     const name = `bill_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const r = await request(app)
@@ -190,8 +191,19 @@ describe("真人档计费", () => {
       .send({ username: name, email: `${name}@test.local`, password: "secret123" })
       .expect(201);
     billToken = r.body.token;
+    billUserId = r.body.user?.id || r.body.user?._id || null;
   });
   const bauth = () => ({ Authorization: `Bearer ${billToken}` });
+  // ★ 每条用例前把余额摆回一个够花的数：这一组里有好几发真扣钱的用例，
+  //   而免费档只发 300,000 —— 不回填的话从某一条起集体 402，
+  //   而 402 会把「受理判据」「退款口径」这些真正要测的东西挡在门外（症状还长得像"扣费坏了"）。
+  beforeEach(async () => {
+    const User = require("../src/models/User");
+    const wallet = require("../src/services/tokenWallet.service");
+    if (!billUserId) return;
+    await wallet.ensureWallet(billUserId);
+    await User.updateOne({ _id: billUserId }, { $set: { "tokenWallet.plan": 2_000_000, "tokenWallet.addon": 0, "tokenWallet.debt": 0 } });
+  });
   const walletOf = async () => {
     const r = await request(app).get("/api/me/wallet").set(bauth()).expect(200);
     return r.body.wallet; // 形状是 {ok, wallet:{plan,addon,…}, plans}
@@ -202,11 +214,40 @@ describe("真人档计费", () => {
       text: async () => JSON.stringify({ task_id: "42", base_resp: { status_code: 0, status_msg: "success" } }),
     }));
 
-  test("价目钉子：与 app 的 economy.ts real 档 flatCost 逐条相等", () => {
-    // ★★ 跨仓钉子：app/src/data/economy.ts VIDEO_TIERS id:"real" 的 flatCost = {6:135_000, 10:270_000}。
+  test("价目钉子：与 app 的 economy.ts real 档（2.3-Fast）flatCost 逐条相等", () => {
+    // ★★ 跨仓钉子：app/src/data/economy.ts VIDEO_TIERS id:"real" 现在是
+    //   model:"MiniMax-Hailuo-2.3-Fast"、flatCost = {6:85_000, 10:143_200}。
     //   改价必须两仓同一个提交（汇率变动也算改价）。这条红了 = 报价与实扣分家了。
     const { MINIMAX_FLAT_COST } = require("../src/config/tokens");
-    expect(MINIMAX_FLAT_COST).toEqual({ 6: 135000, 10: 270000 });
+    expect(MINIMAX_FLAT_COST["MiniMax-Hailuo-2.3-Fast"]).toEqual({ 6: 85000, 10: 143200 });
+  });
+
+  test("★ 老客户端发的 2.3 仍然在册且有价（App ≤2.52 发的就是它）", () => {
+    // 删掉这一行 = 所有还没更新的用户，真人档当场全挂。
+    const { MINIMAX_FLAT_COST } = require("../src/config/tokens");
+    expect(MINIMAX_FLAT_COST["MiniMax-Hailuo-2.3"]).toEqual({ 6: 125300, 10: 250600 });
+  });
+
+  test("★★ 价钱挂在 model 上：两个模型不能报同一个数", () => {
+    // 这正是本仓头号事故的形状（priceOf 拿到请求体却不读 model ⇒ 顶档按最低档收费）。
+    const { priceOf, minimaxFlatCost } = require("../src/config/tokens");
+    const fast = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3-Fast", duration: 6 });
+    const std = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3", duration: 6 });
+    expect(fast).toBe(85000);
+    expect(std).toBe(125300);
+    expect(fast).not.toBe(std);
+    // 表外组合没有价 —— null，不是 0（0 会让它变成一条免费链路）
+    expect(minimaxFlatCost("MiniMax-Hailuo-2.3-Fast", 7)).toBeNull();
+    expect(minimaxFlatCost("nope", 6)).toBeNull();
+  });
+
+  test("★ 表外时长的兜底取全表最贵一格，不是 NaN", () => {
+    // 表从一层变两层之后，`Math.max(...Object.values(表))` 会对一堆对象取 max ⇒ NaN，
+    // 而 NaN 流进扣费的结果是**不扣钱**——正好是"报价宁高不低"想防的反面。
+    const { priceOf } = require("../src/config/tokens");
+    const v = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3", duration: 7 });
+    expect(Number.isFinite(v)).toBe(true);
+    expect(v).toBe(250600);
   });
 
   test("表外时长整发 400，不出网不扣钱", async () => {
@@ -240,7 +281,9 @@ describe("真人档计费", () => {
     }
   });
 
-  test("受理即扣 135k（6s），响应头带扣后余额", async () => {
+  test("受理即扣（2.3 老客户端 6s = 125,300），响应头带扣后余额", async () => {
+    // ★ 125,300 而不是原来的 135,000：2026-09-26 把这一行的锚从旧汇率 7.2 对回全仓现行锚
+    //   （$1 = 447,563）。官方价没变（$0.28/发），变的是我们折算用的那把尺子。
     process.env.MINIMAX_API_KEY = "test-key";
     try {
       okUpstream();
@@ -251,8 +294,45 @@ describe("真人档计费", () => {
         .send({ model: "MiniMax-Hailuo-2.3", prompt: "p", duration: 6, resolution: "768P" });
       expect(res.status).toBe(200);
       const after = await walletOf();
-      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(135000);
+      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(125300);
       expect(Number(res.headers["x-wallet-plan"]) + Number(res.headers["x-wallet-addon"])).toBe(after.plan + after.addon);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+    }
+  });
+
+  test("★ 2.3-Fast 走同一条路，扣的是**它自己**的价（85,000），不是 2.3 的", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    try {
+      okUpstream();
+      const before = await walletOf();
+      const res = await request(app)
+        .post("/api/minimax/video")
+        .set(bauth())
+        .send({ model: "MiniMax-Hailuo-2.3-Fast", prompt: "p", duration: 6, resolution: "768P" });
+      expect(res.status).toBe(200);
+      const after = await walletOf();
+      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(85000);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+    }
+  });
+
+  test("★ 不在册的模型整发 400：不出网、不扣钱", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    try {
+      const before = await walletOf();
+      const res = await request(app)
+        .post("/api/minimax/video")
+        .set(bauth())
+        .send({ model: "MiniMax-H3", prompt: "p", duration: 6, resolution: "768P" });
+      expect(res.status).toBe(400);
+      // ★ 连「因为什么被拦」一起断言：只断 400 的话，这条判据被换成别的写法也测不出来。
+      //   H3 是真实存在但走 /v2 的模型 —— 正是最容易被误放行的那一类。
+      expect(String(res.body.message)).toContain("在册");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const after = await walletOf();
+      expect(after.plan + after.addon).toBe(before.plan + before.addon);
     } finally {
       delete process.env.MINIMAX_API_KEY;
     }

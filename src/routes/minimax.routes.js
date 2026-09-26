@@ -23,7 +23,7 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { chargedArkCall, setWalletHeaders } = require("../services/arkGateway.service");
-const { MINIMAX_FLAT_COST, MINIMAX_REAL_MODEL, MINIMAX_REAL_RESOLUTION } = require("../config/tokens");
+const { MINIMAX_FLAT_COST, MINIMAX_REAL_MODELS, minimaxFlatCost, MINIMAX_REAL_RESOLUTION } = require("../config/tokens");
 // ★★ 往哪个站打、用哪把 key **只有这一处判据**（config/minimax）：中国站与国际站是
 //   两套账号两个域名，把国际站的 key 配到中国站地址上只会一路鉴权失败，而那时钱已经扣过。
 const { minimaxBase, minimaxKey, minimaxConfigured } = require("../config/minimax");
@@ -85,14 +85,27 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
   if (!apiKey || !base) return res.status(501).json({ message: "minimax not configured" });
 
   // ── 计价参数在扣费**之前**钉死（照 resolveR2v 的先例：算钱与校验同一拍）──
-  // 价目表只锚了 海螺2.3 · 768P · 6/10 秒（config/tokens.MINIMAX_FLAT_COST 的 ★）。
+  // 价目表锚了 海螺2.3 / 2.3-Fast · 768P · 6/10 秒（config/tokens.MINIMAX_FLAT_COST 的 ★★）。
   // 表外组合没有价，放行就是"按某个数收费、按另一个规格出片"——所以整发 400，
   // 不是悄悄改写参数（改写 = 用户要 1080P 我们发 768P 还照收钱，偷换商品）。
   const body = pickCreateBody(req.body);
+  // ★ model 不填时按老客户端处理（App ≤2.52 其实一直都填，这里只是别让缺字段变成 500）
+  const model = String(body.model ?? MINIMAX_REAL_MODELS[0]);
   const duration = Number(body.duration ?? 6);
-  if (!(duration in MINIMAX_FLAT_COST)) {
-    return res.status(400).json({ ok: false, message: `真人档只有 ${Object.keys(MINIMAX_FLAT_COST).join("/")} 秒两档（duration=${String(body.duration)}）` });
+  // ★★ **一条判据管两件事**（铁律六）：不在册的模型、表外的时长，都是"这个组合没有价"
+  //   的同一种情况，而 `minimaxFlatCost` 返回 null 就是它的唯一答案。
+  //   写成两个 if 看着更"周全"，实际是同一条规则的两份实现 —— 删掉其中一份，
+  //   另一份照样拦得住，于是没有任何测试能证明那一份还活着（实测：变异它，全绿）。
+  if (minimaxFlatCost(model, duration) === null) {
+    const durs = MINIMAX_FLAT_COST[model] ? Object.keys(MINIMAX_FLAT_COST[model]).join("/") : "";
+    return res.status(400).json({
+      ok: false,
+      message: durs
+        ? `${model} 只有 ${durs} 秒两档（duration=${String(body.duration)}）`
+        : `真人档只在册 ${MINIMAX_REAL_MODELS.join(" / ")}（model=${String(body.model)}）`,
+    });
   }
+  body.model = model;
   if (body.resolution !== undefined && body.resolution !== MINIMAX_REAL_RESOLUTION) {
     return res.status(400).json({ ok: false, message: `真人档只按 ${MINIMAX_REAL_RESOLUTION} 计价出片（resolution=${String(body.resolution)}）` });
   }
@@ -105,7 +118,7 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
     const out = await chargedArkCall({
       user: req.user,
       // 在册 = 计价表里有它。别的模型没有价，管理员也不该能点名一个没估过价的模型
-      modelAllowed: (m) => m === MINIMAX_REAL_MODEL,
+      modelAllowed: (m) => MINIMAX_REAL_MODELS.includes(m),
       kind: "minimax_video",
       path: "(minimax)/video_generation",
       body,

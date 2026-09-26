@@ -476,22 +476,55 @@ function materialRefTokens(inputDurationSec, outputDurationSec, model) {
  *     报价函数（mintQuote / blockoutTemplateCost）必须一起改。
  */
 /**
- * 真人档（MiniMax 海螺 2.3 · 768P）按发一口价（token/发，键 = 时长秒）。
+ * 真人档（MiniMax 海螺 · 768P）按发一口价（token/发）。**键是 model，再按时长秒**。
+ *
+ * ★★ 为什么必须挂在 model 上（2026-09-26 改）：这张表原来只按时长开，而路由把模型
+ *   写死成一个常量 —— 多一个模型就变成「两种单价按同一个数收费」。本文件上方那段
+ *   `IMAGE_TOKENS` 的事故（priceOf 拿到请求体却不读 model ⇒ 顶档按最低档收费、
+ *   零症状每张白送 0.4 元）就是同一个形状，不要再犯第二遍。
  *
  * ★★ 跨仓钉子：app 的 src/data/economy.ts VIDEO_TIERS 里 id:"real" 的 flatCost
- *   必须与这张表**逐条相等**（报价=实扣；realPersonProxy.spec.js 末尾钉着）。
- * ★ 数的来历（2026-08-24）：MiniMax 官方 $0.28/发(768P·6s)、$0.56/发(768P·10s)，
- *   汇率 7.2 ⇒ ¥2.016/¥4.032；按全仓 token 锚（15 元/百万 = 系数 1）折算
- *   = 134,400 / 268,800，取整 135k / 270k。成本价 1.0x（仓库主人拍板）。
- * ⚠ 汇率会动：调价时**两仓同一个提交**改这两处，别让报价悄悄偏离实扣。
- * ★ 只有 768P 一档分辨率、6/10 两档时长 —— 路由在扣费**之前**把参数钉死在这
- *   张表能报价的范围内（计价参数与扣费同一拍，照 resolveR2v 的先例），
- *   表里查不到的组合根本走不到扣费。
+ *   必须与**它当前所用那个 model** 这一行逐条相等（报价=实扣；realPersonProxy.spec.js 钉着）。
+ *
+ * ★ 数的来历（2026-09-26 从 platform.minimax.io/docs/guides/pricing-paygo 读的官方价，
+ *   国际站与中国站同价 —— 已逐条核对）：
+ *     MiniMax-Hailuo-2.3        $0.28 / 768P·6s    $0.56 / 768P·10s
+ *     MiniMax-Hailuo-2.3-Fast   $0.19 / 768P·6s    $0.32 / 768P·10s
+ *   按全仓锚 **$1 = 447,563 token** 折算、取整到百位。成本价 1.0x。
+ *
+ * ⚠ **2026-09-26 更正了一处锚偏移**：2.3 那两个数原本是 135,000 / 270,000，
+ *   按的是**汇率 7.2 的旧锚**（隐含 482,142 token/$）。全仓 9/24 已改成 6.71345
+ *   （447,563 token/$），于是真人档每发**多收约 7.7%** —— 没有任何症状，
+ *   只有把两个锚摆在一起算才看得见。现在两处同源。
+ * ⚠ 汇率会动：调价时**两仓同一个提交**改，别让报价悄悄偏离实扣。
+ *
+ * ★ `MiniMax-Hailuo-2.3-Fast` **只支持图生视频**（2026-09-26 裸 API 实测：纯文生视频
+ *   回 `2013 does not support Text-to-Video mode`）。真人档首帧恒为真人照片，天然是图生视频，
+ *   所以这条限制对我们不构成问题 —— 但别把它开给别的链路。
+ * ★ 2.3 那一行**不能删**：已经发出去的 App（≤2.52）发的就是它，删了老用户真人档当场全挂。
+ * ★ 只有 768P 一档分辨率 —— 路由在扣费**之前**把参数钉死在这张表能报价的范围内
+ *   （计价参数与扣费同一拍，照 resolveR2v 的先例），表里查不到的组合根本走不到扣费。
  */
-const MINIMAX_FLAT_COST = Object.freeze({ 6: 135000, 10: 270000 });
-/** 真人档唯一在册的模型与分辨率（价目只锚了它们，别的组合没有价） */
+const MINIMAX_FLAT_COST = Object.freeze({
+  "MiniMax-Hailuo-2.3": Object.freeze({ 6: 125300, 10: 250600 }),
+  "MiniMax-Hailuo-2.3-Fast": Object.freeze({ 6: 85000, 10: 143200 }),
+});
+/** 在册的真人档模型（价目只锚了它们，别的没有价）。★ 判据只有这一处 */
+const MINIMAX_REAL_MODELS = Object.freeze(Object.keys(MINIMAX_FLAT_COST));
+/** App ≤2.52 发的那个模型；留作老客户端的兼容锚点，别拿它当"当前主力" */
 const MINIMAX_REAL_MODEL = "MiniMax-Hailuo-2.3";
 const MINIMAX_REAL_RESOLUTION = "768P";
+
+/**
+ * 某个模型某个时长要多少 token；表外组合返回 **null**（不是 0）。
+ * ★ null 的含义是「这个组合没有价」，调用方必须据此**拒绝**——返回 0 会让它变成
+ *   一条免费链路，正是 Runway 那条注释里点名的口子。
+ */
+function minimaxFlatCost(model, duration) {
+  const row = MINIMAX_FLAT_COST[String(model || "")];
+  if (!row) return null;
+  return row[Number(duration)] ?? null;
+}
 
 function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
@@ -515,10 +548,15 @@ function priceOf(kind, body, r2v = null) {
   // 万一有人绕过路由校验把别的时长带进来，兜底取表内最贵档 —— 报价宁高不低
   // （与 segmentCost 的 r2v 兜底同一取向），并 console.error 点名让人当场看见。
   if (kind === "minimax_video") {
-    const hit = MINIMAX_FLAT_COST[Number(body?.duration)];
+    // ★★ 必须同时读 model 与 duration（见 MINIMAX_FLAT_COST 的 ★★）：
+    //   只读 duration 就是"两种单价按同一个数收费"，而两个模型差 32%。
+    const hit = minimaxFlatCost(body?.model, body?.duration);
     if (hit) return hit;
-    console.error(`[tokens] minimax_video 计价表里没有 duration=${String(body?.duration)}（调用方该先校验）`);
-    return Math.max(...Object.values(MINIMAX_FLAT_COST));
+    console.error(`[tokens] minimax_video 计价表里没有 model=${String(body?.model)} duration=${String(body?.duration)}（调用方该先校验）`);
+    // ★ 兜底取**全表**最贵的一格（报价宁高不低）。★★ 表改成两层之后不能再写
+    //   `Math.max(...Object.values(表))` —— 那是在对一堆对象取 max，结果是 NaN，
+    //   而 NaN 一路流进扣费只会得到"不扣钱"，正好是兜底想防的反面。
+    return Math.max(...Object.values(MINIMAX_FLAT_COST).flatMap((row) => Object.values(row)));
   }
   if (kind === "task") {
     const model = String(body?.model ?? "");
@@ -557,6 +595,8 @@ module.exports = {
   ASR_TOKENS_PER_MINUTE,
   ASR_BYTES_PER_SECOND,
   MINIMAX_FLAT_COST,
+  MINIMAX_REAL_MODELS,
+  minimaxFlatCost,
   MINIMAX_REAL_MODEL,
   MINIMAX_REAL_RESOLUTION,
   PLANS,
