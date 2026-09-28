@@ -10,6 +10,7 @@ const { TUTOR_PRICES } = require("../config/tokens");
 const { setWalletHeaders } = require("../services/arkGateway.service");
 const { CourseCtx, validateCourseInput, normalizeCourseInput } = require("../services/tutorStore.service");
 const ai = require("../services/tutorAi.service");
+const file = require("../services/tutorFile.service");
 const session = require("../services/tutorSession.service");
 const distill = require("../services/tutorDistill.service");
 const docs = require("../services/tutorDoc.service");
@@ -53,7 +54,7 @@ module.exports = {
   sign: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.body.courseId); if (!ctx) return; return ai.handleSign(ctx, req, res); }),
   confirm: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.body.courseId); if (!ctx) return; return ai.handleConfirm(ctx, req, res); }),
   materialLicense: wrap(async (req, res) => { const hit = await materialCtx(req, res, req.params.sha, req.body.courseId); if (!hit) return; try { const r = await hit.ctx.setMaterialLicense(hit.material, req.body.license.source); res.json({ ok: true, ...r, course: await hit.ctx.summary() }); } catch (e) { fail(res, 400, e.message); } }),
-  materialFile: wrap(async (req, res) => { const hit = await materialCtx(req, res, req.params.sha); if (!hit) return; const url = ai.materialFileUrl(hit.material); if (!url) return fail(res, 404, "教材原件不在服务器上（上传没完成或还没配文件存储）—— 阅读面会退化成老师面板念", { code: "MATERIAL_MISSING" }); res.set("Cache-Control", "private, no-store"); res.redirect(302, url); }),
+  materialFile: wrap(async (req, res) => { const hit = await materialCtx(req, res, req.params.sha); if (!hit) return; const url = ai.materialFileUrl(hit.material); if (!url) return fail(res, 404, "教材原件不在服务器上（上传没完成或还没配文件存储）—— 阅读面会退化成老师面板念", { code: "MATERIAL_MISSING" }); await file.pipeSignedDownload({ url, req, res, filename: hit.material.name, mime: hit.material.mime }); }), // ★ 不 302：理由在 tutorFile.service 头部
   materialText: wrap(async (req, res) => { const hit = await materialCtx(req, res, req.params.sha); if (!hit) return; const pages = await hit.ctx.pagesOf(hit.material); if (!pages) return fail(res, 404, "这份教材没有块级文本"); res.json({ sha: hit.material.sha, pages }); }),
   usageLedger: wrap(async (req, res) => res.json({ ok: true, ...(await readLedger({ user: req.user._id, since: req.query.since ? String(req.query.since) : undefined })) })),
 
