@@ -52,6 +52,16 @@ const personaSchema = new mongoose.Schema(
     // 「音频」板块：人格自带的豆包嗓子（音色 / 语速 / 音高 / 语调指令），null = 没设置、跟随数字人默认。
     // 形状与合并规则见 utils/voiceSettings.js；数字人（首页看板娘 / App 客服）装上这个人格就按它说话。
     voice: { type: voiceSettingsSchema, default: null },
+    // ── 老师人格（tutor 仓 docs/04 §5 S3，2026-09-28）──────────────────────────────────────────────
+    // kind：undefined = 老数据 = 客服 / 陪聊人格。★ 判否定、**不设 default**：存量几千条不会回填，写 default:"companion"
+    //   再按 === "companion" 判就会把它们整批判成"不是"（app CLAUDE.md 坑表「后加的字段用 === 判」）。
+    //   "tutor" 只由 tutor 服务端在发布（M2）时写；客户端 body 里的 kind 一律被 zod strip（persona.schemas.js）。
+    //   列表缺省过滤在 services/personaKind.js（唯一实现），controller 里不再出现第二处 kind 判断（docs/06 D2）。
+    kind: { type: String, enum: ["tutor"] },
+    // 老师人格才有：所属课程 / 当前版文档 / 复刻自谁（M2「另存为我的人格」）。M1 没有写入方，字段先在、读的一方判否定。
+    course: { type: mongoose.Schema.Types.ObjectId, ref: "TutorCourse" },
+    currentDoc: { type: mongoose.Schema.Types.ObjectId, ref: "TutorDoc" },
+    remixOf: { type: mongoose.Schema.Types.ObjectId, ref: "Persona" },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },

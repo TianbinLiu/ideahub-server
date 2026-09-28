@@ -4,6 +4,7 @@
 const mongoose = require("mongoose");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
+const { personaKindFilter } = require("../services/personaKind");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
 const PersonaPurchase = require("../models/PersonaPurchase");
@@ -228,6 +229,8 @@ async function listPersonas(req, res, next) {
       filter = { shared: true, takenDown: { $ne: true } };
     }
     if (tag) filter.tags = tag;
+    // 老师人格的列表过滤只在 services/personaKind.js 那一处：缺省不带、查询参数点名要老师才给（老 App 会把列表里任何一条装成客服人格）
+    Object.assign(filter, personaKindFilter(req.query.kind));
     // 2026-09-05 起搜索 / 排序 / 分页都在数据库做（此前是全量 find 再 JS 过滤，市场一长就先死在这）
     if (q) {
       const re = new RegExp(escapeRegex(q), "i");

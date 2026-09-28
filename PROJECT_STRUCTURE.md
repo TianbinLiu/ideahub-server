@@ -1727,6 +1727,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `tutorDistill.service.js` - 蒸馏：自上次以来的 turns → typed ops → 白名单 → 修订记录；四条触发（手动 / 8 轮 / 阶段完成 / 30 分钟 worker 扫）；chargedCall 扣 tutor_distill（回了正文即受理，形状不对重试一次不再扣）。
 - `tutorDoc.service.js` - 导出（按 audience 裁剪 → 标识 → 校验 → 教材泄漏核查 → md/json/zip + TutorExport 留痕）/ 导入（优先 json，.md 按固定标题解析，改过正文整句拒）/ 使用记录（复旦承诺书四项）；核心实现在 src/tutor/core/export。
 - `tutorFile.service.js` - 教材原件取回：把 Cloudinary 签名下载（api.cloudinary.com 的 download 端点，raw 公开投递 401）的字节**流式转发**给客户端，不 302（那一跳过不过 CORS 没量过）；Range → 206 原样转、客户端断开就 abort 上游、只对首字节设超时。
+- `personaKind.js` - 老师人格与客服人格在 `/api/personas` 列表里的缺省隔离（唯一实现）：缺省 `kind:{$ne:"tutor"}`、`?kind=tutor` 只要老师；`Persona.kind` 判否定、没有 default。
 - `tutorLedger.service.js` - 订阅 core/ai/client 的 onUsage，每一发模型调用落一行 TutorUsage；`GET /api/tutor/usage-ledger` 用 core/measure 汇总（dogfood / 定价的量具）。
 
 #### `server/src/controllers/scraper.controller.js`

@@ -1825,6 +1825,8 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 
 ## 老师人格（tutor：用自己的教材铸一位 AI 老师）
 
+**与 `/api/personas` 的关系（2026-09-28，tutor 仓 docs/04 S3 / S4）**：`Persona` 多了 `kind`（只认 `"tutor"`，缺省 = 老数据 = 客服人格，判否定）与 `course / currentDoc / remixOf`（M2 发布时由服务端写，客户端 body 里这几格一律被 strip）；`GET /api/personas` **缺省不列老师人格**，`?kind=tutor` 只列老师人格 —— 老 App 会把列表里任何一条 `PUT /api/companion/settings` 装成客服人格。判断只在 `services/personaKind.js` 一处。
+
 只在 `TUTOR_ENABLED=true` 时挂载（`src/app.js`），全部端点 **requireAuth**，不是本人的课一律 404。请求体上限 8mb（`TUTOR_TEXT_JSON_LIMIT`）。
 产品与格式的正本在 tutor 仓（`docs/03` 人格文件格式 `ideahub-tutor/1.1`、`docs/05` §5.6 会话契约、`docs/06` §3.2 端点表）；本仓 `src/tutor/core/` 是那边同步过来的纯函数核心。
 成功 `{ ok: true, … }`，失败 `{ ok: false, message, code? }`。**M1 只有作者自己学**：Run 的 id 对外就是课程 id。
