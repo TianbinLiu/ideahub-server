@@ -15,6 +15,8 @@ const TutorCourse = require("../models/TutorCourse");
 const User = require("../models/User");
 const { listBlockedUserIds, hasAnyBlockBetween } = require("../utils/blocking");
 const { CourseCtx } = require("./tutorStore.service");
+// ★ 详情页预览的形状（① 教学面 + ③ 课程地图计数 + ⑥ 复刻指南，不带 ② ④ 正文）只在核心包 core/publish.previewOf 一处：参考实现与客户端类型都按它来。
+const { previewOf } = require("../tutor/core/publish/index");
 
 const TUTOR_KIND = "tutor";
 const LIMIT_MAX = 40;
@@ -63,19 +65,6 @@ function toMarketCard(p, { installedSet = new Set(), userId = null } = {}) {
     stats: { downloadCount: Number((p.stats && p.stats.downloadCount) || 0), likeCount: Number((p.stats && p.stats.likeCount) || 0), ratingAvg: Number((p.stats && p.stats.ratingAvg) || 0), ratingCount: Number((p.stats && p.stats.ratingCount) || 0) },
     installed: installedSet.has(String(p._id)), isOwner: !!userId && String(userId) === authorOf(p)._id,
     publishedAt: p.aigcDeclaredAt || p.updatedAt || p.createdAt, createdAt: p.createdAt, updatedAt: p.updatedAt,
-  };
-}
-
-/** 详情页的只读预览：① 人格卡的教学面 + ③ 课程地图（每阶段几步 / 几条必背 / 几道自检）+ ⑥ 复刻指南 —— 不带 ② ④ 正文（那是下载后才有的） */
-function previewOf(doc) {
-  const card = (doc && doc.card) || {};
-  const rules = Array.isArray(card.hard_rules) ? card.hard_rules : [];
-  const st = (id) => (doc.distill && doc.distill[id]) || {};
-  return {
-    card: { who: card.who || "", teaching_style: card.teaching_style || "", catchphrases: Array.isArray(card.catchphrases) ? card.catchphrases : [], hard_rules: rules.map((r) => (typeof r === "string" ? { text: r, locked: false } : { text: r.text || "", locked: !!r.locked })) },
-    stages: ((doc.map && doc.map.stages) || []).map((s) => ({ stage_id: s.stage_id, title: s.title, summary: s.summary || "", steps: (st(s.stage_id).walkthrough || []).length, memo: (st(s.stage_id).must_memorize || []).length, checks: (st(s.stage_id).self_checks || []).length })),
-    guide: typeof doc.guide === "string" ? doc.guide : "",
-    subject: doc.subject || "", course: doc.course || null, language: doc.language || "", policy: doc.policy || null, license: doc.license || null,
   };
 }
 

@@ -2,7 +2,7 @@
 /**
  * 老师人格的发布（docs/02 §6、docs/06 §4.1）：五道门 → 铸发布版快照（TutorRelease）→ Persona{kind:"tutor", shared:true}。
  *
- * ★ 五道门只在 checkGates 一处（服务端）；客户端的灰按钮只是把它的答案画出来。任一不过整句拒并指明是哪一道（回包 gate 字段），顺序：
+ * ★ 五道门只在 core/publish.checkGates 一处（tutor 仓 src/publish 的移植件，参考实现同一份）；客户端的灰按钮只是把它的答案画出来。任一不过整句拒并指明是哪一道（回包 gate 字段），顺序：
  *   ① 教材授权：参与的全部教材 license.source ≠ unsure（文档头那格也重算过）
  *   ② 泄漏核查：cleanCheck（与「导出发布件」同一份 core/export.buildExport；没有教材文本 = 没查过 = 不许发）
  *   ③ 成人声明：User.tutorAdultDeclaredAt
@@ -15,41 +15,10 @@
 const Persona = require("../models/Persona");
 const TutorRelease = require("../models/TutorRelease");
 const User = require("../models/User");
-const { buildExport } = require("../tutor/core/export/index");
-const { realNameHint } = require("../tutor/core/generate/demo");
 const { sha256Hex } = require("../tutor/core/format/index");
-
-const TAGS_MAX = 6;
-const TAG_MAX_LEN = 20;
-const DEFAULT_COVER = "🎓";
-
-/** 纯函数那一半：给什么判什么，不查库（spec 直接喂假 ctx）。回 { ok:false, gate, message, details? } 或 { ok:true, built, name, tags }。 */
-function checkGates({ doc, materials, materialTexts, adultDeclared, body = {}, now = new Date() }) {
-  if (!doc) return { ok: false, gate: "persona", message: "这门课还没有老师（先生成）" };
-  const name = String(body.name ?? doc.name ?? "").trim().slice(0, 120);
-  const tags = [...new Set((Array.isArray(body.tags) ? body.tags : []).map((t) => String(t).trim().toLowerCase().slice(0, TAG_MAX_LEN)).filter(Boolean))];
-  if (tags.length > TAGS_MAX) return { ok: false, gate: "tags", message: `标签最多 ${TAGS_MAX} 个，给了 ${tags.length} 个` };
-  // ① 授权
-  const mats = Array.isArray(materials) ? materials : [];
-  if (!mats.length) return { ok: false, gate: "license", message: "这门课还没有教材，没有可发布的老师" };
-  const unsure = mats.filter((m) => (m.license && m.license.source) === "unsure");
-  if (unsure.length) return { ok: false, gate: "license", message: `有 ${unsure.length} 份教材的授权来源还是「不确定」：${unsure.map((m) => m.name).join("、")}。先在课程页把每一份改成确定的来源`, details: { unsure: unsure.map((m) => m.sha) } };
-  if (doc.license && doc.license.source === "unsure") return { ok: false, gate: "license", message: "文档头的授权来源还是「不确定」，改一份教材的来源就会重算" };
-  // ② 泄漏核查（最贵的一道放第二：授权不过时不必白算）
-  const texts = Array.isArray(materialTexts) ? materialTexts.filter((t) => t && t.text) : [];
-  if (!texts.length) return { ok: false, gate: "cleanCheck", message: "这门课没有教材文本，泄漏核查没法跑 —— 发布前必须查过（先登记有块级文本的教材）" };
-  const built = buildExport(doc, { audience: "market", materials: texts, now });
-  if (!built.ok) return { ok: false, gate: built.code === "CLEAN_CHECK" ? "cleanCheck" : "doc", message: built.message, ...(built.clean ? { details: { clean: built.clean } } : {}) };
-  // ③ 成人声明
-  if (!adultDeclared) return { ok: false, gate: "adult", message: "先做成人声明（落地页第一次进来那一步）再发布" };
-  // ④ 主动声明
-  if (body.aigcDeclared !== true) return { ok: false, gate: "aigc", message: "发布前要主动声明「这位老师含 AI 生成内容」—— 勾上那一项（《标识办法》第十条）" };
-  // ⑤ 化名
-  if (!name) return { ok: false, gate: "name", message: "老师得有个名字" };
-  const hint = realNameHint(name);
-  if (hint) return { ok: false, gate: "name", message: hint };
-  return { ok: true, built, name, tags };
-}
+// ★ 五道门与常量都从核心包来（tutor 仓 src/publish，port:server 转成 CJS）：参考实现（tutor 仓 devServer）与这里跑的是同一个函数，
+//   e2e 在参考实现上验过的门，这里一道不差；改门先回 tutor 仓改、再重跑 port —— 别在这儿另抄一份（2026-09-28 之前这里确实有一份手抄的，已删）。
+const { checkGates, TAGS_MAX, DEFAULT_COVER } = require("../tutor/core/publish/index");
 
 function publishView(p, rel) {
   return {
