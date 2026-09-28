@@ -1823,6 +1823,60 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 ★ 老服务端没有这个端点（404）：App 一律按尽力而为处理，本机记录才是 UI 判据 —— 判否定
 （`termsAcceptedVersion` 缺省/空串 = 没同意过），别判相等（「后加字段判否定」那条铁则）。
 
+## 老师人格（tutor：用自己的教材铸一位 AI 老师）
+
+只在 `TUTOR_ENABLED=true` 时挂载（`src/app.js`），全部端点 **requireAuth**，不是本人的课一律 404。请求体上限 8mb（`TUTOR_TEXT_JSON_LIMIT`）。
+产品与格式的正本在 tutor 仓（`docs/03` 人格文件格式 `ideahub-tutor/1.1`、`docs/05` §5.6 会话契约、`docs/06` §3.2 端点表）；本仓 `src/tutor/core/` 是那边同步过来的纯函数核心。
+成功 `{ ok: true, … }`，失败 `{ ok: false, message, code? }`。**M1 只有作者自己学**：Run 的 id 对外就是课程 id。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/tutor/health` | 无 | `{ ok, tutor:true, demo, demoAllowed }`；`demo` = 没配 `AI_API_KEY`（演示模式：确定性老师，生产不许） |
+| GET | `/api/tutor/config` | 必须 | `{ prices:{ tutor_turn, tutor_distill, tutor_extract }, demo, adultDeclared }`（价目只在 `config/tokens.js` 的 `TUTOR_PRICES`） |
+| POST | `/api/tutor/declare-adult` | 必须 | 成人声明（v1 只做成人），幂等；`User.tutorAdultDeclaredAt` |
+| GET / POST | `/api/tutor/courses` | 必须 | 本人的课 / 建课 `{ title, subject, code?, term?, policy:{ ai, homework_mode, allowed_uses?, text? }, key_dates? }`；缺必填 400 带 `field` |
+| GET / PATCH | `/api/tutor/courses/:id` | 必须 | `{ course, materials, nameHint }` / 改元数据 |
+| GET / HEAD | `/api/tutor/courses/:id/materials?sha256=` | 必须 | 去重探测 `{ exists, material }`（HEAD 200/404） |
+| GET | `/api/tutor/courses/:id/rules` · `/quote` | 必须 | 从政策派生的 🔒 硬规则 / 生成报价 `{ materials, sections, stages, quote:{ lines, total }, demo }` |
+| POST | `/api/tutor/materials/sign` | 必须 | `{ courseId, format, bytes, name }` → Cloudinary **raw** 直传票 `{ ticket(=publicId), putUrl, params, chunkBytes, maxBytes }`；格式白名单 pdf/pptx/docx/md/txt、`overwrite:false`、public_id 服务端签死（形状 `ideahub/tutor-materials/<userId>-<ts>-<6hex>.<ext>`） |
+| POST | `/api/tutor/materials/confirm` | 必须 | `{ ticket, courseId, sha256, name, bytes, license:{source}, pages:[{ idx, title?, blocks:[{ hash(12hex), text, bbox? }] }], warnings }` → 201 `{ material }`；同 sha 200 `{ duplicate:true }`（副本回收）；Admin API 核对字节真的在（404 → 409 NOT_UPLOADED） |
+| PATCH | `/api/tutor/materials/:sha` | 必须 | `{ courseId?, license:{ source } }` 事后改授权来源；文档头 `license.source` 按全体教材取最差重算，回 `{ docLicense, course }` |
+| GET | `/api/tutor/materials/:sha/file` · `/text` | 必须 | 原件：302 到 5 分钟签名下载地址（raw 公开投递 401）；没原件 404 `MATERIAL_MISSING` / 块级文本 `{ sha, pages }` |
+| GET | `/api/tutor/usage-ledger?since=` | 必须 | 本人的模型用量账本 `{ count, summary, records }`（数字与 kind，不含正文；tutor 仓 docs/10 的量具） |
+| POST | `/api/tutor/personas/generate` | 必须 | `{ courseId, questionnaire:{ name, style?, catchphrase?, strictness?, address?, examples_from?, extra_rules? } }` → 202 `{ jobId, quote, nameHint }`；**受理那一拍按报价扣 tutor_extract × N**，之后失败不退；同课在跑 409 BUSY |
+| GET | `/api/tutor/jobs/:id` | 必须 | `{ job:{ status, progress:{ step, done, total, message, mode }, result, failures, error } }`（worker 在 0 号实例串行跑，检查点续跑） |
+| POST | `/api/tutor/personas/:id/preview` | 必须 | 试教（SSE，不落 Turn、不翻状态、**同价**）`{ kind?: teach|ask, stage?, text? }` |
+| POST | `/api/tutor/personas/:id/scan` · `/patches/:pid/accept` | 必须 | 新教材 → 阶段提议 `{ patchId, proposals }`（扣 tutor_extract × 新教材数）→ 点头 `{ indices? }` 追加成新版 |
+| GET | `/api/tutor/personas/:id/export?format=md\|json\|zip&audience=market\|self&keepStuckPoints&keepStudentQa` | 必须 | 导出件；头 `X-Tutor-Checksum / -Produce-Id / -Clean-Check / -Export-Id`；发布件对 `license.source=unsure` 400、教材泄漏核查不过 409 `CLEAN_CHECK`；每次留痕 |
+| GET | `/api/tutor/personas/:id/exports` | 必须 | 留痕列表 `{ exports, retainDays:180 }` |
+| POST | `/api/tutor/personas/import` | 必须 | `{ courseId?, text?\|json?, filename? }`：同一位老师回读成 `kind:import` 修订（`same:true`），别人的老师新开一门课（`created:true`）；删标识 / 改正文 400 |
+| GET | `/api/tutor/runs/:id` | 必须 | 学习页 bundle `{ run:{ status, progress, currentStage, usage, lastTurnSeq, demo, distill, dueReviews, pendingReview }, doc, materials, turns(最近 60) }` |
+| GET | `/api/tutor/runs/:id/turns?after=` · `/review-card` · `/review-due` · `/review-quiz?stage=` · `/revisions` · `/usage-export?format=md\|csv\|json&from&to` | 必须 | 增量轮次 / 复习卡 / 到期回访 / 回访题 / 修订记录（新的在上 + 等点头数）/ 使用记录（复旦承诺书四项，csv 带 BOM） |
+| PATCH | `/api/tutor/runs/:id/progress` | 必须 | `{ stage, stepIdx }` 漫游进度；走到最后一步 pending → taught |
+| POST | `/api/tutor/runs/:id/turns` | 必须 | 一轮（**SSE**）`{ kind: ask|teach|quiz-from-selection|select|memorize, stage?, text?, selection?, direct?, selfExplain? }`；`select` / `memorize` 不过模型按 JSON 回 |
+| POST | `/api/tutor/runs/:id/quiz` | 必须 | `{ stage?, answers[], review? }` → `{ results, correct, asked, passed, progress, nextStage, nextReviewAt, dueReviews, distillQueued }`；通过线 2/3 只在 `core/session/progress.js`；模型判卷形状不对退回确定性判法（今天不计费） |
+| POST | `/api/tutor/runs/:id/skip` · `/feedback` | 必须 | 作者跳过自检 / 给某一轮 👍👎 `{ seq, value: 1|-1|null }` |
+| POST | `/api/tutor/runs/:id/distill` | 必须 | 手动「整理一下」→ `{ status: done|empty|nothing|failed, revision, learned, pendingReview, version }`；扣 tutor_distill（模型回了正文即受理，形状不对重试一次不再扣） |
+| POST | `/api/tutor/runs/:id/revisions/:rid/review` · `/revert` | 必须 | 逐条点头 / 否掉 `{ accept[], reject[] }`（点头了至少一条 = 版次 +1）/ 逐条撤销 `{ opIds[] }`（追加 `kind:revert`，历史不删） |
+
+SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {index,text}` · `done {seq,kind,text,flags,demo,preview,stage,progress,status,changed,distillQueued}` · `error {message}`；每 15 秒一行 `: ping` 注释帧。
+
+```jsonc
+// POST /api/tutor/runs/:id/turns —— 圈着教材原文问
+{ "kind": "ask", "stage": "stage-02", "text": "这一句怎么理解？",
+  "selection": { "anchor": { "material": "ed7455bfc594", "page": 12, "quote": "传播时延 = d / s" } } }
+```
+
+状态码约定：
+
+- `402 INSUFFICIENT_TOKENS` / `403 PLAN_REQUIRED|WALLET_FROZEN` / `429 DAILY_LIMIT`：开流之前就拒，一分不扣（billing 的形状原样回）
+- `409 BUSY`：老师还在回上一句 / 这门课正在生成；`409 NO_PERSONA`：还没生成老师；`409 NOT_PASSED`：没通过的阶段谈不上回访
+- `501 AI_NOT_CONFIGURED`：没配模型且不许演示（生产）
+
+★ **钱的序列**（tutor 仓 docs/05 §6.2）：教学轮在开流**之前** `billing.preAuthorize` 原子扣 `tutor_turn`，第一个 token 之前上游抛 ⇒ `refundUnaccepted`（`refundTag:"tutor_refund"`，进 `TOKEN_REASONS` 与 `SPEND_REASONS`），之后断流不退（W2 同口径）；管理员免单照 `noteFreeCall` 记账。生成受理即扣整份报价（`core/generate/pricing.generateQuote`，与端点报价同一个函数）。
+★ **三个单价是建议值**（tutor 仓 docs/08 #4、docs/10）：`tutor_turn` 钉在 `CHAT_TURN_TOKENS`，另两个按 dogfood 量出的 p95 相对教学轮的比例定；改数只改 `TUTOR_PRICES` 一处，tutor 仓 `src/generate/pricing.js` 镜像（`tests/tutorCore.spec.js` 钉着两处相等）。
+★ **私有**：教材原件在 Cloudinary raw（公开投递 401，只能签名下载）；块级文本、对话、修订记录永不进任何导出件；导出件本身永不含教材（`materials_included` 恒 false，导出前 `cleanCheck` 逐段核查）。
+
 ## 语音合成（工坊 NPC 的嗓子）
 
 | 方法 | 路径 | 鉴权 | 说明 |

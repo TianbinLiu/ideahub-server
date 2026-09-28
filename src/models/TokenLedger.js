@@ -50,6 +50,9 @@ const TOKEN_REASONS = [
   // ⚠ 目前**没有任何写入方**：受理之后才失败的那一类我们**不退**（见 billing.service 的 W2），
   //   留着这个取值是为了将来真要区分时有地方落。别照它的字面意思去实现「失败就退」。
   "provider_failed",
+  // 老师人格（tutor）的一轮教学 / 蒸馏 / 生成没被上游受理时的退款（docs/05 §6.2）。与 minimax_refund 同一条纪律：
+  // 加进 enum 的同时也要进 tokenWallet.service 的 SPEND_REASONS，否则退款抵不掉当日用量。
+  "tutor_refund",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(

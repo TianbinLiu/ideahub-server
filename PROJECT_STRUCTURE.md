@@ -1605,6 +1605,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `BranchProject.js` - 已发布作品的「工坊工程」（画布快照，回炉重做用），按 `video` 唯一。**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 lean，挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）；**不加 TTL**（用户资产不是任务行）；`canvas` 里不许出现 `data:` / `idb:` / 方舟临时地址（PUT 的 zod 与客户端断言两道门）。⚠ `videoRevision`（这份画布描述的是哪一版）**只能靠 `putProject` 往前走**，回炉成功时只把 `stale` 置真 —— 替一份还没换的画布盖章说"我是新版"会把「陈旧画布」这一档唯一的检出信号抹掉
 
 ---
+- `TutorCourse.js` / `TutorMaterial.js` / `TutorChunk.js` / `TutorDoc.js` / `TutorRun.js` / `TutorTurn.js` / `TutorRevision.js` / `TutorExport.js` / `TutorJob.js` / `TutorUsage.js` - **老师人格（tutor，2026-09-28 从 tutor 仓移植）**：课程（永不发布）/ 教材（{course, sha} 唯一，原件在 Cloudinary raw）/ 块级文本（一页一条，永不进导出件）/ 头文档（一门课一条、可变，= 自用件 persona.md）/ 学习过程（{course, user} 唯一，progress 只由 core/session/progress.js 的 advance 写）/ 轮次（{run, seq} 唯一）/ 修订记录（append-only）/ 导出留痕（≥180 天）/ 生成作业（partial unique：一门课同时一个未完成）/ 模型用量账本（只有数字，TTL 180 天）。ER 见 tutor 仓 docs/05 §3。
 
 #### `server/src/controllers/`
 **16个控制器**（核心如下）:
@@ -1624,6 +1625,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `branchProject.controller.js` - 工坊工程读/写/删（`putProject` / `getProject` / `deleteProject` / `listProjects`）。只有作者能碰；`bytes` 服务端自己量；配额 100 条 / 50MB **不自动淘汰**（超了整句拒）
 
 ---
+- `tutor.controller.js` - 老师人格全部端点的控制器：每个入口先 `CourseCtx.load(courseId, req.user)`（不是本人的课 404），再交给 tutor*.service；契约见 docs/api-contract.md「老师人格（tutor）」。
 
 #### `server/src/routes/`
 **16个路由模块**:
@@ -1660,6 +1662,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `live2dModel.routes.js` - **Live2D 模型市场**（数字人套装 = 模型包 + 推荐人格 + 推荐嗓子），base `/api/live2d-models`：广场列表（sort=new|hot、q、tag、scope=all|installed|mine；第一页最前面是固定 id `official-mascot` 的官方内置条目，modelJsonUrl 留空 = 前端用自己打包的看板娘）、详情、上传（multipart：`bundle` zip ≤25MB + name/description/coverImageUrl/tags/shared/personaId/voice(JSON)，按用户 5 次/分钟）、作者改/删（删除连解压目录、收藏、点赞一起删，正在用它的用户回到官方）、收藏下载、点赞。解压白名单 / zip-bomb 记账 / model3.json 校验（只认 Cubism 4，引用的 moc3 与贴图必须在包里）在 `services/live2dBundle.service.js`，与 `/api/me/components/live2d/upload` 同一份；产物落在 `uploads/live2d-market/<uid>/`；**2026-09-05 创作中心**：`POST /inspect`（只看不存：zip → 能力档案 capabilities + 自动映射 mapping + completeness + 入口候选 entries，按用户 10 次/分钟）、上传 / 修改多收 `mapping`（companion.json 内容，按能力档案校验后写到 model3.json 旁边）/ `entry` / `selfMade`，payload 多 `capabilities` / `mapping` / `license` / `takenDown`；下架（takenDown）的不进市场、他人详情 404、`loadUsableModel` 回 null；**2026-09-07** 加 `POST /bundle/sign`（Cloudinary raw(zip) 直传票，5 次/分钟 + 20 次/天；App 的 25MB zip 走 multipart 必被 CF 125 秒读超时掐断），`/inspect` 与 `POST /` 都可以用 `bundleRef`（直传回来的 public_id，过归属校验后取回）代替 `bundle` 文件；create 用完把那份 raw 资产 destroy 掉
 
 ---
+- `tutor.routes.js` - `/api/tutor`（**只在 `TUTOR_ENABLED=true` 时被 app.js 挂上**）：建课 / 教材直传票与验收 / 生成作业 / 试教 SSE / 扫描点头 / 学习会话（turns SSE、quiz、progress、review-due…）/ 蒸馏与修订审阅 / 导出导入 / 使用记录 / 用量账本。限流：AI 端点 aiRateLimit（scope `tutor:*`），上传 userRateLimit。
 
 #### `server/src/middleware/`
 - `auth.js` - 认证中间件（requireAuth, requireRole）
@@ -1718,6 +1721,12 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 > 的回包都带它，`billed:false` 的一律不带（没花钱就没有账要对）。
 
 ---
+- `tutorStore.service.js` - 老师人格的「课程上下文」`CourseCtx`：tutor 仓文件版课程工作区（store.js）的 Mongo 版，方法名一一对应（materials / pagesOf / addMaterial / setMaterialLicense / persistDoc / applyAdvance / nextSeq / logTurn / readTurns / revisionStore / summary）；头文档每次改动都过 validateTutorDoc；修订记录经 store（read / append / write）落 TutorRevision。
+- `tutorAi.service.js` - 生成作业（受理即按报价扣 tutor_extract × N，`runNextJob` 是 worker 的一步、检查点续跑）、教材直传票（Cloudinary raw，public_id 服务端签死）与验收（Admin API 核对 + 按 sha 去重）、扫描目录 → 阶段提议 → 点头追加；`demoAllowed()` = 生产不许静默走演示。
+- `tutorSession.service.js` - 一轮教学 SSE（token / sentence / done / error，与 companion 同一份 openSse）：开流前 preAuthorize 扣 tutor_turn、第一个 token 前失败退（tutor_refund）；提示词拼装一处（buildMessages）；自检（模型判卷形状不对退回确定性判法，今天不计费）；「没懂」「加入必背」不过模型直接成 typed op。
+- `tutorDistill.service.js` - 蒸馏：自上次以来的 turns → typed ops → 白名单 → 修订记录；四条触发（手动 / 8 轮 / 阶段完成 / 30 分钟 worker 扫）；chargedCall 扣 tutor_distill（回了正文即受理，形状不对重试一次不再扣）。
+- `tutorDoc.service.js` - 导出（按 audience 裁剪 → 标识 → 校验 → 教材泄漏核查 → md/json/zip + TutorExport 留痕）/ 导入（优先 json，.md 按固定标题解析，改过正文整句拒）/ 使用记录（复旦承诺书四项）；核心实现在 src/tutor/core/export。
+- `tutorLedger.service.js` - 订阅 core/ai/client 的 onUsage，每一发模型调用落一行 TutorUsage；`GET /api/tutor/usage-ledger` 用 core/measure 汇总（dogfood / 定价的量具）。
 
 #### `server/src/controllers/scraper.controller.js`
 **功能**: 外部内容抓取与批量导入控制器  
@@ -1939,6 +1948,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 - `aiReview.worker.js` - AI评审轮询 worker（基于 `AiJob` 抢占 pending 任务）
 
 ---
+- `tutor.worker.js` - 老师人格的长活：生成作业（TutorJob pending → runGenerate，串行）+ 30 分钟无动作的蒸馏（扫 TutorRun.lastTurnAt，`distill.idleFor` 防重复）。只在 0 号实例、开关就是 TUTOR_ENABLED。
 
 ## 账号安全联调 Checklist
 
@@ -1963,6 +1973,7 @@ CORS → Body Parser → Session → Passport → 路由 → 错误处理
 
 | 日期 | 版本 | 更新内容 |
 |------|------|---------|
+| 2026-09-28 | — | **老师人格（tutor）整体移植进 server（tutor 仓 docs/04 §5 S23–S27；分支 claude/sleepy-edison-fha1q8）**。① `src/tutor/core/`：tutor 仓的格式 / typed ops / 切块与锚点 / 生成流水线 / 会话规则 / 导出 / 量具 / 泄漏核查用 esbuild 转成 CJS 的**生成物**（那边 `npm run port:server` 同步，这里不手改），手写四份适配（`ai/client.js` 套 services/aiClient、`ai/prompts.js`、`ops/revision.js` 改 store、`materials/index.js` 只留纯函数）。② 十张模型 `Tutor*`、`tutor.schemas.js`、`tutor.controller.js`、`tutor.routes.js`（`/api/tutor`，**只在 `TUTOR_ENABLED=true` 时挂**，为假不 require）、五个 `tutor*.service.js`、`tutor.worker.js`（0 号实例）。③ 钱：`config/tokens.js` 加 `TUTOR_PRICES`（tutor_turn=CHAT_TURN_TOKENS、tutor_distill 600、tutor_extract 400，建议值）与 `priceOf` 三个 kind；`TokenLedger` / `SPEND_REASONS` 加 `tutor_refund`；教学轮开流前 `preAuthorize`、第一个 token 前失败退，生成受理即扣整份报价，蒸馏走 `chargedCall`。④ `aiClient.aiComplete / aiChatStream` 加 `opts.model / messages / temperature / responseFormat / onFinish`（老调用点行为不变），`bigJson.jsonGateWith(limit)` 工厂（老 `jsonGate` 逐字不变），`preflight` 加「TUTOR_ENABLED=true 但没配模型 / Cloudinary」，`User.tutorAdultDeclaredAt`。⑤ 测试：`tutorCore.spec.js`（核心包装载 + 演示模式全链 + 价目同源）、`tutorAiClient.spec.js`（适配层，mock openai）、`tutor.spec.js`（端到端：建课 → 直传票 / 验收 → 生成 → 上课 → 自检 → 蒸馏 → 点头 → 导出 → 导入 → 使用记录）、`tutorBilling.spec.js`（扣 / 退 / 402）。⚠ 后两条要 mongodb-memory-server 下得到二进制（本次开发容器被网络策略挡在 fastdl.mongodb.org 外，**只跑过前两条**）。⚠ 治理那几件（Persona.kind、举报 / 下架 registry、删号级联、通知类型）是 M2 市场的事，这次没动。 |
 | 2026-09-26 | — | **真人档换 2.3-Fast + 价表改成按 model 挂价 + 修一处锚偏移**。① `MINIMAX_FLAT_COST` 从「只按时长」改成 **{model: {秒: token}}** —— 原来路由把模型写死成常量，多一个模型就是「两种单价按同一个数收费」，与本文件 `IMAGE_TOKENS` 那次事故（priceOf 拿到请求体却不读 model ⇒ 顶档按最低档收费）同形。② 新增 `MiniMax-Hailuo-2.3-Fast`（官方 $0.19/发 768P·6s、$0.32/10s ⇒ **85,000 / 143,200**，比 2.3 便宜 37%）；裸 API 实测：它**只支持图生视频**（纯文生视频回 `2013 does not support Text-to-Video mode`），而真人档首帧恒为真人照片，天然就是图生视频。③ **修正锚偏移**：2.3 的 135,000/270,000 是按**汇率 7.2 的旧锚**（隐含 482,142 token/$）折的，而全仓 9/24 已改成 447,563 token/$ ⇒ 真人档每发多收 **7.7%**，零症状。现改为 **125,300 / 250,600**，两处同源。⚠ 2.3 那一行**不能删**：已发布的 App（≤2.52）发的就是它。④ 路由的校验收敛成**一条判据**（`minimaxFlatCost(...) === null` 管「模型不在册」与「时长表外」两件事）——原本写成两个 if 是同一条规则的两份实现，实测删掉其中一份全绿（没有任何测试能证明它还活着）。⑤ 表外兜底改成 `Object.values(表).flatMap(...)` 取全表最贵格：表变两层后 `Math.max(...Object.values(表))` 是**对一堆对象取 max = NaN**，而 NaN 流进扣费的结果是**不扣钱**，正好是「报价宁高不低」的反面。测试：`realPersonProxy.spec.js` 加 5 条并把跨仓钉子改挂到 2.3-Fast 那一行，**4 个变异全被抓到**；该组补了每条用例回填余额（免费档 300k 不够连发几笔真扣费）。⚠ **必须与 app 同一批发**：app `economy.ts` 的 real 档已改 model 与 flatCost；老客户端（≤2.52）仍发 2.3，会按 125,300 实扣而界面报 135,000 —— 报价偏高、方向安全，更新后即一致。 |
 | 2026-09-26 | — | **MiniMax 区域分流**：新增 `config/minimax.js` —— 中国站与国际站是**两套账号、两把 key、两个域名**（`MINIMAX_API_KEY`→`api.minimaxi.com/v1`、`MINIMAX_INTL_API_KEY`→`api.minimax.io/v1`，路径形状两边逐字相同，2026-09-26 核过官方 API 文档）。`minimax.routes.js` 里写死的 base 与 `process.env.MINIMAX_API_KEY` 全部改走这一处判据（★ base 与 key **必须同区域**：配错站的症状只是一路 401，而那时扣费与退款各已走过一遍，没有任何东西会说是配错了）。判据顺序：显式 `MINIMAX_REGION`（cn/intl，且那侧确实有 key）→ 谁有 key 走谁 → 都没有则 501；两把都配又没写 `MINIMAX_REGION` 时**生产自检拒绝启动**（不让默认值替人决定钱从哪边出）。`/api/minimax/health` 多回一个 `region`（只回区域名，不回 key 与完整 base）。⚠ **任务绑区域**：在哪个站建的只能在同一个站查询与取件，切区域会让在途任务查不到而钱已扣 —— 要切等在途任务跑完。测试 `tests/minimaxRegion.spec.js`（12），3 个变异全被抓到；`realPersonProxy.spec.js` 的 beforeAll 补删国际站那把 key（它自己写着「测试不吃环境的运气」，漏一把就会在配了 key 的机器上真出网）。顺带更正 `.env.example` 一段**过期的话**：「生产配了 `RUNWAY_API_KEY` 启动自检会拒绝启动」那道硬闸在 #78 里已按约定撤掉。⚠ 海螺 3 的**模型 id 与价格还没进表**：那要拿国际站的真实价目核过才能加（照 `MINIMAX_FLAT_COST` 的纪律，不查到价就不放行）。 |
 | 2026-09-25 | — | **新增 `tests/chatCharge.spec.js`（12）：四条聊天链路「真的扣钱」的断言**。起因是 #78（陪聊/客服/试聊接进钱包）与 #76（自伤危机协议）改的是 `companion.routes.js` **同一个 `finish` 回调**，合并时取错一侧会得到一段语法完全正确、看起来就是原作者写法的代码，只是 `produced` 永远 false ⇒ **每轮扣 400 再退 400、陪聊静默回到不计费**；而合并前唯一相关的断言是 `billing.spec.js` 那条登记册自检，它只 grep 源码里有没有 `require`——把三处 `produced = Boolean(text)` 全删掉它照样绿（实测）。新套件按链路 × 三种结局钉死账本：成功一轮 = `ark_spend` 一条且**没有退款**；上游一个字都没吐 = `ark_spend` + `ark_refund` 成对、余额归位；危机那一轮 = 账本一条都不写（这条同时钉住「危机 early-return 必须排在 `preAuthorize` 之前」的顺序）。4 个变异全被抓到（三处 `produced` 赋值各一个 + 把 `preAuthorize` 挪到危机闸之前）。⚠ 陪聊与试聊的退款发生在 `res.end()` **之后**，断言前必须等账本读数稳定，否则「该退没退」与「不该退却退了」两种错都测不出来。 |

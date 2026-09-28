@@ -47,6 +47,15 @@ function collectConfigProblems(env = process.env) {
     problems.push(`火山 AK/SK 只配了一半（${volcAk ? "有 VOLC_AK 缺 VOLC_SK" : "有 VOLC_SK 缺 VOLC_AK"}）—— 真人肖像授权会签名失败`);
   }
 
+  // 老师人格（tutor）：TUTOR_ENABLED=true 才挂 /api/tutor。开了就要有模型与文件存储，否则又是「配了但能跑起来」——
+  // 生成 501、教材上传 503，用户点下去才知道。演示模式（确定性回复、不调模型）在生产必须是显式写下来的决定。
+  if (env.TUTOR_ENABLED === "true") {
+    const hasKey = env.AI_API_KEY || env.OPENAI_API_KEY;
+    if (!hasKey && env.TUTOR_ALLOW_DEMO !== "1") problems.push("TUTOR_ENABLED=true 但没配 AI_API_KEY：老师人格的生成 / 教学 / 蒸馏都要模型（确实要演示模式就显式写 TUTOR_ALLOW_DEMO=1）");
+    if (isProd && env.TUTOR_ALLOW_DEMO === "1") problems.push("生产环境不该开 TUTOR_ALLOW_DEMO=1：老师会是确定性演示回复而不报错");
+    if (isProd && !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET)) problems.push("TUTOR_ENABLED=true 但 Cloudinary 三项没配齐：教材直传会 503");
+  }
+
   if (isProd) {
     if (!env.OTP_PEPPER || env.OTP_PEPPER === "dev_pepper_change_me") {
       problems.push("OTP_PEPPER 未设置或仍是默认值（6 位验证码的 sha256 可离线暴破）");

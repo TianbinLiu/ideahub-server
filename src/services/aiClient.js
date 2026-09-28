@@ -131,7 +131,8 @@ function getClient() {
  * @returns {Promise<{ text: string, model: string, usage: object|null }>}
  */
 async function aiComplete(prompt, opts = {}) {
-  const model = resolveModel(opts.fallbackModel || "gpt-5.2");
+  // opts.model 是**调用点点名**的模型（老师人格：讲解一个、蒸馏一个），比 env 的全站 AI_MODEL 优先；没给就照旧
+  const model = opts.model || resolveModel(opts.fallbackModel || "gpt-5.2");
 
   // ★ timeout / max_tokens 是必须的，不是可选优化：
   //   - 没有 timeout：上游挂起时这条请求会一直占着 Node 的连接与内存，
@@ -141,11 +142,14 @@ async function aiComplete(prompt, opts = {}) {
   const resp = await getClient().chat.completions.create(
     {
       model,
-      messages: [{ role: "user", content: String(prompt || "") }],
+      // opts.messages：多轮 / 带 system 的调用自己给整段 messages（prompt 忽略）；不给就是老样子的单条 user
+      messages: Array.isArray(opts.messages) && opts.messages.length ? opts.messages : [{ role: "user", content: String(prompt || "") }],
       max_tokens: Number(opts.maxTokens || process.env.AI_MAX_TOKENS || 2048),
+      ...(typeof opts.temperature === "number" ? { temperature: opts.temperature } : {}),
+      ...(opts.responseFormat ? { response_format: opts.responseFormat } : {}),
       ...extraBody(),
     },
-    { timeout: Number(process.env.AI_TIMEOUT_MS || 60_000) },
+    { timeout: Number(opts.timeoutMs || process.env.AI_TIMEOUT_MS || 60_000) },
   );
 
   const text =
@@ -156,7 +160,9 @@ async function aiComplete(prompt, opts = {}) {
       resp.choices[0].message.content) ||
     "";
 
-  return { text, model, usage: normalizeUsage(resp && resp.usage, (resp && resp.model) || model) };
+  // finishReason：调用方要能判「被 max_tokens 截断」（length）—— 截断的 JSON 不许解析半截（tutor 仓 docs/02 2.5）
+  const finishReason = (resp && resp.choices && resp.choices[0] && resp.choices[0].finish_reason) || null;
+  return { text, model: (resp && resp.model) || model, usage: normalizeUsage(resp && resp.usage, (resp && resp.model) || model), finishReason, rawUsage: (resp && resp.usage) || null };
 }
 
 /**
@@ -181,9 +187,9 @@ async function aiComplete(prompt, opts = {}) {
  * @returns {AsyncGenerator<string>}
  */
 async function* aiChatStream(messages, opts = {}) {
-  const model = resolveModel(opts.fallbackModel || "gpt-5.2");
+  const model = opts.model || resolveModel(opts.fallbackModel || "gpt-5.2");
   const maxTokens = Number(opts.maxTokens || process.env.AI_MAX_TOKENS || 1024);
-  const timeout = Number(process.env.AI_TIMEOUT_MS || 60_000);
+  const timeout = Number(opts.timeoutMs || process.env.AI_TIMEOUT_MS || 60_000);
   const base = {
     model,
     messages,
@@ -219,6 +225,9 @@ async function* aiChatStream(messages, opts = {}) {
   let usageSent = false;
   for await (const chunk of stream) {
     const delta = chunk && chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content;
+    // opts.onFinish：finish_reason 到了就交出去（length = 被 max_tokens 截断），老调用点不传就什么都不发生
+    const fin = chunk && chunk.choices && chunk.choices[0] && chunk.choices[0].finish_reason;
+    if (fin && typeof opts.onFinish === "function") opts.onFinish(fin, chunk.model || model);
     if (delta) yield delta;
     if (!usageSent && chunk && chunk.usage && typeof opts.onUsage === "function") {
       const usage = normalizeUsage(chunk.usage, chunk.model || model);

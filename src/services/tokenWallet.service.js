@@ -449,7 +449,7 @@ async function buyPlan(userId, planId, now = new Date()) {
  *   那条路踩坑的成本远高于这一次查询。
  */
 /** 计入「今天花了多少」的账本类别：一条支出 + 所有会把它退回来的类别 */
-const SPEND_REASONS = ["ark_spend", "ark_refund", "minimax_refund"];
+const SPEND_REASONS = ["ark_spend", "ark_refund", "minimax_refund", "tutor_refund"];
 
 async function spentToday(userId, now = new Date()) {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));

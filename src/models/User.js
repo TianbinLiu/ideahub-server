@@ -97,6 +97,8 @@ const userSchema = new mongoose.Schema(
     // ✅ 账号注销（软删除）：只打时间戳标记，不删任何内容数据，可恢复。
     // null = 正常账号；有值 = 已注销，auth 中间件一律视为未授权。
     deactivatedAt: { type: Date, default: null },
+    // 老师人格（tutor）：v1 只做成人（tutor 仓 docs/08 #7），首次进 /tutor 要点一次成人声明；为空 = 没声明过
+    tutorAdultDeclaredAt: { type: Date, default: null },
 
     // ✅ 平台封禁（管理员的开关，与 deactivatedAt 那把「用户自己的开关」是两回事）。
     // **没有这个键 = 没封**（与 BranchVideo.takedown 同一种给法：$set 整个子文档 = 封，

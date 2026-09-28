@@ -144,6 +144,8 @@ async function start() {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === undefined || instanceId === "0") {
       startAiWorker();
+      // 老师人格的长活（生成作业 + 30 分钟无动作蒸馏）：与模块同一个开关 TUTOR_ENABLED，只在 0 号实例（同上面的理由）
+      if (process.env.TUTOR_ENABLED === "true") require("./workers/tutor.worker").startTutorWorker();
       // NCII 移除请求的到期提醒（TAKE IT DOWN Act §3 的 48 小时是**法定上限**）。
       // ★ 同样只在 0 号实例跑：每个实例各跑一份 = 管理员每次收到 N 封同样的信。
       // ★ 15 分钟一轮：时限以小时计，更密没有意义，更疏则「剩 12 小时」这一档会失真。

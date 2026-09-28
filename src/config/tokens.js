@@ -138,6 +138,8 @@ function imageTokensOf(model) {
 
 /** 一次豆包对话往返（含人设与历史的保守值） */
 const CHAT_TURN_TOKENS = 400;
+/** 老师人格三个单价（docs/08 #4：tutor_turn 钉在 CHAT_TURN_TOKENS；其余按「相对一次教学轮花多少 token」按比例，建议值） */
+const TUTOR_PRICES = Object.freeze({ tutor_turn: CHAT_TURN_TOKENS, tutor_distill: 600, tutor_extract: 400 });
 
 /**
  * 语音合成：**每个字符** 33 token（豆包 TTS，大陆价）。
@@ -530,6 +532,9 @@ function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
   if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
   if (kind === "chat") return CHAT_TURN_TOKENS;
+  // 老师人格（tutor，docs/08 #4）：一轮教学 / 试教 = 一次 chat 的量纲；蒸馏与生成 / 扫描的每一块另有价。
+  //   ★ 三个数都是**建议值**（tutor 仓 docs/10：`npm run dogfood` 用真模型量过 p95 再改这里 + tutor 仓 pricing.js 两处同改）。
+  if (kind in TUTOR_PRICES) return TUTOR_PRICES[kind];
   // 语音合成：按字符。★ 与路由里截断后的长度用同一个值（路由把 text 截到 MAX_TEXT
   //   之后才报价），否则「报价按 5,000 字、实际只念 300 字」——报价与实扣必须同源。
   if (kind === "tts") return Math.max(1, Math.ceil(String(body?.text ?? "").length * TTS_TOKENS_PER_CHAR));
@@ -607,6 +612,7 @@ module.exports = {
   IMAGE_MODELS,
   imageTokensOf,
   CHAT_TURN_TOKENS,
+  TUTOR_PRICES,
   MODEL3D_TOKENS,
   MODEL3D_ID,
   SEEDANCE_2_5,

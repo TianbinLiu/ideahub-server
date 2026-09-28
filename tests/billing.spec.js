@@ -297,7 +297,13 @@ describe('★ 不许再出现「调了付费上游却不扣费」的链路', () 
     const MUST_CHARGE = ['tts.routes.js', 'asr.routes.js', 'runway.routes.js', 'companion.routes.js', 'support.routes.js', 'minimax.routes.js', 'ark.routes.js'];
     // ⚠ 控制器里也有直接调模型的（人格试聊）—— 只扫 routes/ 会漏掉它，而这次真的漏过一次
     const MUST_CHARGE_CTRL = ['persona.controller.js'];
+    // 老师人格（tutor）：路由只做分发，钱在 service 里（教学轮 preAuthorize、生成 / 蒸馏 / 扫描 chargedCall）—— 所以登记的是这三份 service
+    const MUST_CHARGE_SVC = ['tutorSession.service.js', 'tutorAi.service.js', 'tutorDistill.service.js'];
     const missing = [];
+    for (const f of MUST_CHARGE_SVC) {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', f), 'utf8');
+      if (!/billing\./.test(src)) missing.push(f);
+    }
     for (const f of MUST_CHARGE) {
       const src = fs.readFileSync(path.join(dir, f), 'utf8');
       if (!/billing\.|chargedArkCall/.test(src)) missing.push(f);
@@ -311,11 +317,13 @@ describe('★ 不许再出现「调了付费上游却不扣费」的链路', () 
 
   it('★ 每个 refundTag 都在账本 enum 里、也都抵当日用量（漏一个就是账本静默缺条 + 日上限误伤）', () => {
     const TokenLedger = require('../src/models/TokenLedger');
-    const dir = path.join(__dirname, '..', 'src', 'routes');
     const tags = new Set();
-    for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
-      const src = fs.readFileSync(path.join(dir, f), 'utf8');
-      for (const m of src.matchAll(/refundTag:\s*"([a-z_]+)"/g)) tags.add(m[1]);
+    // routes/ 之外 services/ 也扫：tutor 的 refundTag 写在 service 里
+    for (const dir of [path.join(__dirname, '..', 'src', 'routes'), path.join(__dirname, '..', 'src', 'services')]) {
+      for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
+        const src = fs.readFileSync(path.join(dir, f), 'utf8');
+        for (const m of src.matchAll(/refundTag:\s*"([a-z_]+)"/g)) tags.add(m[1]);
+      }
     }
     expect(tags.size).toBeGreaterThan(0);
     for (const t of tags) {
