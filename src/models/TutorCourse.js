@@ -25,10 +25,15 @@ const tutorCourseSchema = new mongoose.Schema(
     key_dates: { type: [keyDateSchema], default: [] },
     // 从别人的导出件「导入一位老师」开出来的课（docs/02 5.5）：course 信息派生自 frontmatter，没有教材
     importedFromPersona: { type: Boolean, default: false },
+    // 从市场「开始跟这位老师学」开出来的课（docs/02 5.7）：指向那位老师与当时的发布版；同一人对同一位老师只开一门（幂等，靠 {owner, sourcePersona} 查）
+    sourcePersona: { type: mongoose.Schema.Types.ObjectId, ref: "Persona", index: true },
+    sourceRelease: { type: mongoose.Schema.Types.ObjectId, ref: "TutorRelease" },
+    sourceVersion: { type: Number },
   },
   { timestamps: true },
 );
 
 tutorCourseSchema.index({ owner: 1, updatedAt: -1 });
+tutorCourseSchema.index({ owner: 1, sourcePersona: 1 });
 
 module.exports = mongoose.model("TutorCourse", tutorCourseSchema);

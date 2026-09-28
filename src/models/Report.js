@@ -20,7 +20,8 @@ const mongoose = require("mongoose");
  * 能举报的对象类型。★ 跨仓字符串：App 侧发什么这里就得认什么，
  * 新增取值必须同步 docs/api-contract.md「举报」与 App 的提交入口。
  */
-const TARGET_TYPES = ["video", "comment", "danmaku"];
+// 2026-09-28 加 "persona"（治理 P5：人格线此前没有任何下架端点）；处理器在 services/takedown.service.js 的 registry 里，两处一致由 tests/takedownRegistry.spec.js 钉住
+const TARGET_TYPES = ["video", "comment", "danmaku", "persona"];
 
 /**
  * 理由分类。★ 存的是**英文 key**，中文文案在客户端。
@@ -36,7 +37,9 @@ const TARGET_TYPES = ["video", "comment", "danmaku"];
  *   ★ 加新取值时**服务端先上**：客户端那份是子集时只是少一项可选，反过来则是用户选了一个
  *   服务端不认的 key → 400，而他正要报的可能是最紧急的那一类。
  */
-const REASONS = ["csae", "ncii", "porn", "violence", "abuse", "spam", "infringe", "other"];
+// ★ instructorClaim（2026-09-28，老师人格）：教授认领「这是我的课 / 要求下架」—— 与 infringe 分开是因为处理不一样：
+//   它要**人工核实身份**再下架，不能像刷屏那样批处理；App 的 REPORT_REASONS 还没有它（服务端先上，子集只是少一项可选）。
+const REASONS = ["csae", "ncii", "porn", "violence", "abuse", "spam", "infringe", "instructorClaim", "other"];
 
 /**
  * 要**插队**的理由。
@@ -179,6 +182,7 @@ module.exports.REASON_LABELS = Object.freeze({
   abuse: "人身攻击 / 辱骂",
   spam: "垃圾营销 / 刷屏",
   infringe: "侵权 / 冒用他人作品",
+  instructorClaim: "教授认领 / 要求下架（人工核实）",
   other: "其他",
 });
 module.exports.URGENT_REASONS = URGENT_REASONS;

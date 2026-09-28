@@ -247,6 +247,8 @@ class CourseCtx {
   async readExports() { const rows = await TutorExport.find({ course: this.course._id }).sort({ createdAt: 1 }).lean(); return rows.map(({ _id, course, user, xid, createdAt, updatedAt, ...r }) => { void _id; void course; void user; void createdAt; void updatedAt; return { id: xid, ...r }; }); }
   async logExport(rec) { const { id, ...rest } = rec; await TutorExport.create({ course: this.course._id, user: this.user._id, xid: id, ...rest }); return rec; }
 
+  /** 这门课发成的那位老师（一门课一条 Persona{kind:tutor}）：形状与端点回包同一份（tutorPublish.publishView）。★ 延迟 require：tutorPublish 不引本文件，不成环，但放顶层会让模块装载顺序变得脆弱 */
+  publishedView() { return require("./tutorPublish.service").publishState(this.course._id); }
   async summary() {
     const mats = await this.materials();
     const pending = this.doc ? (await this.pendingOps()).length : 0;
@@ -255,6 +257,8 @@ class CourseCtx {
       unsure: mats.filter((m) => m.license.source === "unsure").length,
       persona: this.doc ? { id: this.doc.id, name: this.doc.name, version: this.doc.version, stages: this.doc.map.stages.length, format: this.doc.format, generatedAt: this.doc.provenance?.generated_at, method: this.doc.provenance?.method } : null,
       publishable: !!this.doc && mats.length > 0 && !mats.some((m) => m.license.source === "unsure"),
+      published: await this.publishedView(), // 发布状态（M2）：null = 没发布过；shared:false = 取消了分享；takenDown = 被平台下架（带原因）
+      source: this.course.sourcePersona ? { personaId: String(this.course.sourcePersona), version: this.course.sourceVersion || 0 } : null, // 从市场「开始学」开出来的课指向那位老师
       run: this.doc ? {
         status: this.run.status,
         currentStage: this.doc.map.stages.find((s) => this.run.progress?.[s.stage_id]?.status !== "passed")?.stage_id ?? null,

@@ -7,6 +7,7 @@ const Report = require("../models/Report");
 const BranchVideo = require("../models/BranchVideo");
 const BranchComment = require("../models/BranchComment");
 const BranchDanmaku = require("../models/BranchDanmaku");
+const Persona = require("../models/Persona");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
 const { invalidId, notFound } = require("../utils/http");
@@ -187,7 +188,7 @@ async function createReport(req, res, next) {
  *   否则举报一次就能查出某条弹幕是谁发的，整面弹幕墙都被去匿名化了。
  */
 async function resolveTargets(rows) {
-  const idsByType = { video: [], comment: [], danmaku: [] };
+  const idsByType = { video: [], comment: [], danmaku: [], persona: [] };
   for (const r of rows) {
     if (idsByType[r.targetType]) idsByType[r.targetType].push(r.targetId);
   }
@@ -195,7 +196,7 @@ async function resolveTargets(rows) {
   const out = new Map(); // `${type}:${id}` → payload
   const put = (type, id, payload) => out.set(`${type}:${String(id)}`, payload);
 
-  const [videos, comments, danmaku] = await Promise.all([
+  const [videos, comments, danmaku, personas] = await Promise.all([
     idsByType.video.length
       ? BranchVideo.find({ _id: { $in: idsByType.video } })
           // ★ `revision` / `revisedAt`：让复核的人知道「这条作品被回炉重做过 N 次」。
@@ -215,6 +216,12 @@ async function resolveTargets(rows) {
     idsByType.danmaku.length
       ? BranchDanmaku.find({ _id: { $in: idsByType.danmaku } })
           .select("_id video text at author createdAt")
+          .populate("author", USER_FIELDS)
+          .lean()
+      : [],
+    idsByType.persona.length
+      ? Persona.find({ _id: { $in: idsByType.persona } })
+          .select("_id name kind shared takenDown takenDownReason author createdAt")
           .populate("author", USER_FIELDS)
           .lean()
       : [],
@@ -262,6 +269,21 @@ async function resolveTargets(rows) {
       at: d.at,
       author: toUserPayload(d.author), // ← 见函数头 ★★：admin-only
       createdAt: d.createdAt,
+    });
+  }
+
+  for (const p of personas) {
+    // 人格（含老师人格）：管理端要看的是名字 / 作者 / 现在公开着没有 / 已经下架过没有
+    put("persona", p._id, {
+      exists: true,
+      personaId: p._id,
+      name: p.name || "",
+      kind: p.kind || "companion",
+      shared: !!p.shared,
+      takenDown: !!p.takenDown,
+      takenDownReason: p.takenDown ? p.takenDownReason || "" : "",
+      author: toUserPayload(p.author),
+      createdAt: p.createdAt,
     });
   }
 

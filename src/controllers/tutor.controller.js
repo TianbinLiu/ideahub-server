@@ -10,6 +10,8 @@ const { TUTOR_PRICES } = require("../config/tokens");
 const { setWalletHeaders } = require("../services/arkGateway.service");
 const { CourseCtx, validateCourseInput, normalizeCourseInput } = require("../services/tutorStore.service");
 const ai = require("../services/tutorAi.service");
+const market = require("../services/tutorMarket.service");
+const pub = require("../services/tutorPublish.service");
 const file = require("../services/tutorFile.service");
 const session = require("../services/tutorSession.service");
 const distill = require("../services/tutorDistill.service");
@@ -67,6 +69,13 @@ module.exports = {
   exportPersona: wrap(async (req, res) => { const ctx = await needPersona(req, res, req.params.id); if (!ctx) return; return docs.handleExport(ctx, req, res); }),
   listExports: wrap(async (req, res) => { const ctx = await needPersona(req, res, req.params.id); if (!ctx) return; res.json({ ok: true, exports: [...(await ctx.readExports())].reverse(), retainDays: EXPORT_RETENTION_DAYS }); }),
   importPersona: wrap(async (req, res) => docs.handleImport(req, res)),
+
+  // ── 发布 / 市场（docs/02 §6 / §7，M2）
+  publish: wrap(async (req, res) => { const ctx = await needPersona(req, res, req.params.id); if (!ctx) return; const r = await pub.publish(ctx, req.user, req.body || {}); res.status(r.status).json(r.body); }),
+  unpublish: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.params.id); if (!ctx) return; const r = await pub.unpublish(ctx); res.status(r.status).json(r.body); }),
+  market: wrap(async (req, res) => res.json({ ok: true, ...(await market.listMarket({ user: req.user || null, query: req.query })) })),
+  marketDetail: wrap(async (req, res) => { const d = await market.getMarketDetail({ user: req.user || null, personaId: req.params.id }); if (!d) return fail(res, 404, "没有这位老师（不存在、未发布或已下架）"); res.json({ ok: true, ...d }); }),
+  startRun: wrap(async (req, res) => { const r = await market.startLearning({ user: req.user, personaId: req.body.persona }); res.status(r.status).json(r.body); }),
 
   // ---- Run（学习页）
   getRun: wrap(async (req, res) => {

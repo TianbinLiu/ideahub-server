@@ -463,6 +463,8 @@ async function updatePersona(req, res, next) {
     if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
+    // 被平台下架（举报处置）的人格，作者不能自己再翻成公开；想申诉走工单。原因给作者看，处置人不给（docs/02 6.6）
+    if (req.body.shared && doc.takenDown) forbidden(`这个人格已被平台下架（${doc.takenDownReason || "原因见站内通知"}），不能再公开`);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.voice !== undefined) doc.voice = await expandVoiceInput(req.body.voice, req.user._id);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）

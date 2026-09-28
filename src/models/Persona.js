@@ -58,14 +58,29 @@ const personaSchema = new mongoose.Schema(
     //   "tutor" 只由 tutor 服务端在发布（M2）时写；客户端 body 里的 kind 一律被 zod strip（persona.schemas.js）。
     //   列表缺省过滤在 services/personaKind.js（唯一实现），controller 里不再出现第二处 kind 判断（docs/06 D2）。
     kind: { type: String, enum: ["tutor"] },
-    // 老师人格才有：所属课程 / 当前版文档 / 复刻自谁（M2「另存为我的人格」）。M1 没有写入方，字段先在、读的一方判否定。
+    // 老师人格才有（2026-09-28 M2 发布起有写入方：services/tutorPublish.service.js）：所属课程（一门课 = 一位老师，partial unique）、
+    // 最新发布版快照（TutorRelease，不可变）、版号（列表卡片不用 populate）、学科（市场筛选）、复刻自谁（「另存为我的人格」，还没有写入方）。读的一方判否定。
     course: { type: mongoose.Schema.Types.ObjectId, ref: "TutorCourse" },
-    currentDoc: { type: mongoose.Schema.Types.ObjectId, ref: "TutorDoc" },
+    currentDoc: { type: mongoose.Schema.Types.ObjectId, ref: "TutorRelease" },
+    releaseVersion: { type: Number },
+    subject: { type: String, trim: true, maxlength: 60 },
     remixOf: { type: mongoose.Schema.Types.ObjectId, ref: "Persona" },
+    // 发布时「主动声明含 AI 生成内容」的那一拍（《标识办法》第十条，显式勾选不是脚注）。判否定：没声明过 = 发布五道门第 ④ 道不过
+    aigcDeclaredAt: { type: Date },
+    // 发布时从课程拷过来并锁住的授权来源与 AI 政策（🔒 硬规则的源头），详情页只读展示
+    license: { source: { type: String, trim: true, maxlength: 40 } },
+    policy: { type: mongoose.Schema.Types.Mixed },
+    // 下架处置（治理 P5，services/takedown.service.js 的 persona 处理器写）：作者看得见 reason、看不见 by（docs/02 6.6）
+    takenDownAt: { type: Date },
+    takenDownReason: { type: String, default: "", maxlength: 500 },
+    takenDownBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },
       likeCount: { type: Number, default: 0 },
+      // 老师人格的评分（TutorRating 回写，countDocuments / aggregate 不 $inc）：市场 sort=rating 读这两格，票数 < 3 沉底
+      ratingAvg: { type: Number, default: 0 },
+      ratingCount: { type: Number, default: 0 },
       _id: false,
     },
   },
@@ -74,5 +89,11 @@ const personaSchema = new mongoose.Schema(
 
 personaSchema.index({ shared: 1, createdAt: -1 });
 personaSchema.index({ shared: 1, "stats.downloadCount": -1 });
+// 老师人格市场（/api/tutor/market）的几种排法与筛法；一门课只能发成一位老师（course 上 partial unique，只对有 course 的行生效）
+personaSchema.index({ kind: 1, shared: 1, createdAt: -1 });
+personaSchema.index({ kind: 1, shared: 1, "stats.downloadCount": -1 });
+personaSchema.index({ kind: 1, shared: 1, "stats.ratingAvg": -1 });
+personaSchema.index({ kind: 1, shared: 1, subject: 1 });
+personaSchema.index({ course: 1 }, { unique: true, partialFilterExpression: { course: { $exists: true } } });
 
 module.exports = mongoose.model("Persona", personaSchema);

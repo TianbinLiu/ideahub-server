@@ -42,7 +42,7 @@
  * @registered_in src/app.js（TUTOR_ENABLED=true）
  */
 const router = require("express").Router();
-const { requireAuth } = require("../middleware/auth");
+const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const S = require("../schemas/tutor.schemas");
@@ -52,6 +52,9 @@ const { attachLedger } = require("../services/tutorLedger.service");
 attachLedger(); // 用量账本：模块装上就订阅 AI 出口
 
 router.get("/health", ctrl.health);
+// 市场（docs/02 §7）：游客可逛、看详情（分享链落地不被登录墙挡）；登录了多两样：已下载态、拉黑过滤、scope=mine|installed
+router.get("/market", optionalAuth, ctrl.market);
+router.get("/market/:id", optionalAuth, ctrl.marketDetail);
 router.use(requireAuth);
 router.get("/config", ctrl.config);
 router.post("/declare-adult", validate({ body: S.emptyBody }), ctrl.declareAdult);
@@ -81,6 +84,11 @@ router.post("/personas/:id/scan", aiRateLimit({ max: 5, scope: "tutor:scan" }), 
 router.post("/personas/:id/patches/:pid/accept", validate({ body: S.acceptBody }), ctrl.accept);
 router.get("/personas/:id/export", userRateLimit({ max: 20, scope: "tutor:export" }), ctrl.exportPersona);
 router.get("/personas/:id/exports", ctrl.listExports);
+// 发布 / 取消分享（docs/02 §6）：五道门在服务端一处，任一不过 422 + gate 指明哪一道
+router.post("/personas/:id/publish", userRateLimit({ max: 10, scope: "tutor:publish" }), validate({ body: S.publishBody }), ctrl.publish);
+router.delete("/personas/:id/publish", ctrl.unpublish);
+// 「开始跟这位老师学」：从发布版复制出自己的一门课（幂等）
+router.post("/runs", userRateLimit({ max: 20, scope: "tutor:start" }), validate({ body: S.startRunBody }), ctrl.startRun);
 
 router.get("/runs/:id", ctrl.getRun);
 router.get("/runs/:id/turns", ctrl.getTurns);

@@ -570,6 +570,8 @@ B 站式弹幕：一句话 + 它该在**视频第几秒**飘过去。与评论�
 
 ## 举报
 
+> **2026-09-28（老师人格 M2，治理 P5）**：`targetType` 加 `persona`（人格线此前没有任何下架端点）；理由加 `instructorClaim`（教授认领 / 要求下架，**人工核实**再处置；App 的 `REPORT_REASONS` 还没有它 —— 服务端先上，老版本只是少一项可选）。处置走 `services/takedown.service.js` 的 **registry**（按 targetType 注册，不再往 if-chain 加分支）：`persona` 只有 `takedown`（写 `Persona.takenDown:true, shared:false, takenDownAt / takenDownReason / takenDownBy`；作者看得见原因、看不见处置人；下架后作者不能再 `PUT { shared:true }`，`/api/tutor/market` 与详情对非作者 404，也不能再发布），`delete` 一律 400（人格是作者的资产，要删由作者自己 `DELETE /api/personas/:id`）。管理端列表的 `target` 多一种形状 `{ exists, personaId, name, kind, shared, takenDown, takenDownReason, author, createdAt }`。
+
 能举报**三种对象**：作品（`video`）、评论（`comment`）、弹幕（`danmaku`）。
 三者共用一张 `Report` 表与同一条处理流程（待处理 → 下架 / 删除 / 驳回）——
 管理端要的是"一个按时间排的待处理队列"，拆三张表那个队列就得三查一合再排序。
@@ -1852,6 +1854,11 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 | GET | `/api/tutor/personas/:id/export?format=md\|json\|zip&audience=market\|self&keepStuckPoints&keepStudentQa` | 必须 | 导出件；头 `X-Tutor-Checksum / -Produce-Id / -Clean-Check / -Export-Id`；发布件对 `license.source=unsure` 400、教材泄漏核查不过 409 `CLEAN_CHECK`；每次留痕 |
 | GET | `/api/tutor/personas/:id/exports` | 必须 | 留痕列表 `{ exports, retainDays:180 }` |
 | POST | `/api/tutor/personas/import` | 必须 | `{ courseId?, text?\|json?, filename? }`：同一位老师回读成 `kind:import` 修订（`same:true`），别人的老师新开一门课（`created:true`）；删标识 / 改正文 400 |
+| POST | `/api/tutor/personas/:id/publish` | 必须（作者） | **发布到市场**（tutor 仓 docs/02 §6）`{ name?, description?, tags?(≤6), coverEmoji?, aigcDeclared, note? }`：五道门在服务端一处（`tutorPublish.service.checkGates`），任一不过 **422 `GATE`** + `gate ∈ license\|cleanCheck\|adult\|aigc\|name\|tags` 指明哪一道 + 整句人话；全过 → 201 `{ persona:{ personaId, version, sha256, checksum, produceId, marketPath, shared, … }, warnings }`：铸一条 `TutorRelease`（market 口径的快照：② 只种子、学生问答不带、③ 状态列清空，与导出发布件同一份实现，**不可变**）+ `Persona{ kind:"tutor", shared:true, course, currentDoc, releaseVersion, subject, aigcDeclaredAt, license, policy }`；再发一次 = v(n+1)，旧版留着。被平台下架的 403 `TAKEN_DOWN` |
+| DELETE | `/api/tutor/personas/:id/publish` | 必须（作者） | 取消分享：只翻 `shared:false`，快照 / 版号 / 评论都留；没发布过 404 |
+| GET | `/api/tutor/market?q&tag&subject&sort=new\|hot\|rating&scope=all\|installed\|mine&author&page&limit≤40` | 可选 | 市场列表（游客可逛；**不借 `/api/personas?kind=`**，监管若停陪聊线不连坐）：只回 `kind:"tutor" && shared && !takenDown`（`mine` 含自己没公开的；未登录 scope 退 all）；`hot` = 下载 → 点赞 → 时间，`rating` 均分、票数 < 3 沉底；登录用户看不到拉黑 / 被拉黑的作者；`{ items:[卡片], page, totalPages, total, sort, scope }`，卡片 `{ id, name, description, coverEmoji, coverImageUrl, tags, subject, author:{_id,username}, price, version, stats:{ downloadCount, likeCount, ratingAvg, ratingCount }, installed, isOwner, publishedAt }` |
+| GET | `/api/tutor/market/:id` | 可选 | 详情：`{ persona(卡片), release:{ version, sha256, checksum, produceId, publishedAt, note, stages }, preview:{ card(① 教学面：who / teaching_style / catchphrases / hard_rules[{text,locked}]), stages[{ stage_id, title, summary, steps, memo, checks }], guide, policy, license }, others(作者的其它老师，≤6), relation:{ isOwner, installed, learning:{ courseId, version }\|null, ownCourse } }`；② ④ 正文不给（下载后才有）；未发布 / 已下架的只有作者看得到（多 `takedown:{ at, reason }`），其他人 **404**（不泄露存在性）；拉黑互不可见 |
+| POST | `/api/tutor/runs` | 必须 | 「开始跟这位老师学」`{ persona }`（docs/02 5.7）：从发布版复制出自己的一门课（与「导入一位老师」同一条路：`createFromDoc` + `writePersona`；教材不复制、进度全 pending、🔒 硬规则随行；课上记 `sourcePersona / sourceVersion`）→ 201 `{ courseId, version, downloadCount }`，并 `PersonaInstall` +1（幂等）；同一人再点 → 200 同一门课 `created:false`；作者自己点 → 200 `own:true` 回自己那门课；付费老师没结算 403 `unpaid`（v1 全免费，只是闸的形状）；拉黑 403 `BLOCKED`；没发布版 409 `NO_RELEASE` |
 | GET | `/api/tutor/runs/:id` | 必须 | 学习页 bundle `{ run:{ status, progress, currentStage, usage, lastTurnSeq, demo, distill, dueReviews, pendingReview }, doc, materials, turns(最近 60) }` |
 | GET | `/api/tutor/runs/:id/turns?after=` · `/review-card` · `/review-due` · `/review-quiz?stage=` · `/revisions` · `/usage-export?format=md\|csv\|json&from&to` | 必须 | 增量轮次 / 复习卡 / 到期回访 / 回访题 / 修订记录（新的在上 + 等点头数）/ 使用记录（复旦承诺书四项，csv 带 BOM） |
 | PATCH | `/api/tutor/runs/:id/progress` | 必须 | `{ stage, stepIdx }` 漫游进度；走到最后一步 pending → taught |
