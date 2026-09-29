@@ -42,7 +42,8 @@
  * @registered_in src/app.js（TUTOR_ENABLED=true）
  */
 const router = require("express").Router();
-const { requireAuth, optionalAuth } = require("../middleware/auth");
+const { requireRole, requireAuth, optionalAuth } = require("../middleware/auth");
+const { ADMIN_ROLE } = require("../utils/roles");
 const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const S = require("../schemas/tutor.schemas");
@@ -93,6 +94,11 @@ router.post("/runs", userRateLimit({ max: 20, scope: "tutor:start" }), validate(
 router.put("/market/:id/rating", userRateLimit({ max: 20, scope: "tutor:rate" }), validate({ body: S.ratingBody }), ctrl.rate); // 一人一票可改
 router.delete("/market/:id/rating", ctrl.unrate);
 router.post("/courses/:id/merge-release", userRateLimit({ max: 10, scope: "tutor:merge" }), validate({ body: S.emptyBody }), ctrl.mergeRelease); // 学习者合并作者的新版（docs/03 §6.3）
+// 管理后台：教授认领（instructorClaim）的人工核实队列（tutor 仓 docs/06 §4.2）。requireRole 与通用举报队列同一把（utils/roles.ADMIN_ROLE）；
+// 处置正文与 PATCH /api/admin/branch/reports/:id 同一份（reportResolve.service），这里只是单独一条车道 + 联系举报人那一步
+router.get("/admin/claims", requireRole(ADMIN_ROLE), ctrl.claims);
+router.post("/admin/claims/:id/contact", requireRole(ADMIN_ROLE), validate({ body: S.claimContactBody }), ctrl.claimContact);
+router.post("/admin/claims/:id/verdict", requireRole(ADMIN_ROLE), validate({ body: S.claimVerdictBody }), ctrl.claimVerdict);
 
 router.get("/runs/:id", ctrl.getRun);
 router.get("/runs/:id/turns", ctrl.getTurns);

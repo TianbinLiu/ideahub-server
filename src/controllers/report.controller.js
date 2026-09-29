@@ -4,6 +4,7 @@
 // 契约见 app 仓 docs/api-contract.md「举报」（铁律九）。
 const mongoose = require("mongoose");
 const Report = require("../models/Report");
+const { resolveReportRecord } = require("../services/reportResolve.service");
 const BranchVideo = require("../models/BranchVideo");
 const BranchComment = require("../models/BranchComment");
 const BranchDanmaku = require("../models/BranchDanmaku");
@@ -433,66 +434,29 @@ async function resolveReport(req, res, next) {
       });
     }
 
-    let takedownResult = null;
-    if (touchesContent) {
-      const takedown = loadTakedown();
-      if (!takedown) {
-        // ★★ 如实说：状态原地不动，什么都没被下架 / 删除。
-        //   501 = "这个服务端还没实现这件事"，与 4xx（你请求错了）分得开。
-        console.warn(
-          `[report] 收到 ${action} 请求但 services/takedown.service.js 未落地 report=${id} target=${report.targetType}:${report.targetId}`
-        );
-        throw new AppError({
-          code: "TAKEDOWN_UNAVAILABLE",
-          status: 501,
-          message:
-            "下架/删除尚未接入（缺 services/takedown.service.js 的 takedownTarget）：这条举报仍是待处理，没有任何内容被动过。可先用 action=dismiss 驳回。",
-          details: {
-            reportId: report._id,
-            status: report.status || "pending",
-            action,
-            applied: false,
-          },
-        });
-      }
-      // 下架本身失败（内容已不存在、权限问题…）也**绝不**改状态：交给 errorHandler，
-      // 管理员看到的是失败，队列里那条还在，可以重来。
-      takedownResult = await takedown({
-        targetType: report.targetType,
-        targetId: report.targetId,
-        operatorId: req.user._id,
-        // ★ 给作者看的是人话，不是理由 key：这一句会原样出现在他的作品页上
-        //   （Report.REASON_LABELS 的 ★）。表里没有的 key 退回原值，别变成空串。
-        reason: Report.REASON_LABELS[report.reason] || report.reason,
-        hard: action === "delete",
+    if (touchesContent && !loadTakedown()) {
+      // ★★ 如实说：状态原地不动，什么都没被下架 / 删除。
+      //   501 = "这个服务端还没实现这件事"，与 4xx（你请求错了）分得开。
+      console.warn(
+        `[report] 收到 ${action} 请求但 services/takedown.service.js 未落地 report=${id} target=${report.targetType}:${report.targetId}`
+      );
+      throw new AppError({
+        code: "TAKEDOWN_UNAVAILABLE",
+        status: 501,
+        message:
+          "下架/删除尚未接入（缺 services/takedown.service.js 的 takedownTarget）：这条举报仍是待处理，没有任何内容被动过。可先用 action=dismiss 驳回。",
+        details: {
+          reportId: report._id,
+          status: report.status || "pending",
+          action,
+          applied: false,
+        },
       });
     }
-
-    const patch = {
-      status: Report.ACTION_STATUS[action],
-      handler: req.user._id,
-      handledAt: new Date(),
-      handleNote: typeof note === "string" ? note : "",
-    };
-
-    const updated = await Report.findByIdAndUpdate(id, { $set: patch }, { returnDocument: "after" })
-      .populate("reporter", USER_FIELDS)
-      .populate("handler", USER_FIELDS)
-      .lean();
-
-    let alsoResolved = 0;
-    if (touchesContent) {
-      const r = await Report.updateMany(
-        {
-          targetType: report.targetType,
-          targetId: report.targetId,
-          status: "pending",
-          _id: { $ne: report._id },
-        },
-        { $set: patch }
-      );
-      alsoResolved = Number(r?.modifiedCount || 0);
-    }
+    // 处置正文（下架 → 状态 / 处理人 → 同一对象其余待处理一起收尾）在 services/reportResolve.service **一处**：
+    // 老师人格「教授认领」的人工核实队列裁定时走的也是它（2026-09-29 抽出来的，这里的行为一个字没变）。
+    // 下架本身失败（内容已不存在、权限问题…）也**绝不**改状态：交给 errorHandler，管理员看到的是失败，队列里那条还在，可以重来。
+    const { updated, takedownResult, alsoResolved } = await resolveReportRecord({ report, action, note, operatorId: req.user._id });
 
     res.json({
       ok: true,

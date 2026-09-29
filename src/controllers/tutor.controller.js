@@ -14,6 +14,7 @@ const market = require("../services/tutorMarket.service");
 const pub = require("../services/tutorPublish.service");
 const rating = require("../services/tutorRating.service");
 const mergeSvc = require("../services/tutorMerge.service");
+const claims = require("../services/tutorClaims.service");
 const file = require("../services/tutorFile.service");
 const session = require("../services/tutorSession.service");
 const distill = require("../services/tutorDistill.service");
@@ -82,6 +83,10 @@ module.exports = {
   ratings: wrap(async (req, res) => { const r = await rating.list({ user: req.user || null, personaId: req.params.id, page: req.query.page }); if (!r) return fail(res, 404, "没有这位老师（不存在、未发布或已下架）"); res.json({ ok: true, ...r }); }),
   rate: wrap(async (req, res) => { const r = await rating.rate({ user: req.user, personaId: req.params.id, body: req.body || {} }); res.status(r.status).json(r.body); }),
   unrate: wrap(async (req, res) => { const r = await rating.unrate({ user: req.user, personaId: req.params.id }); res.status(r.status).json(r.body); }),
+  // ---- 管理后台：教授认领的人工核实队列（requireRole 在路由上）
+  claims: wrap(async (req, res) => { res.json({ ok: true, ...(await claims.list({ stage: req.query.stage, page: req.query.page, limit: req.query.limit })) }); }),
+  claimContact: wrap(async (req, res) => { const r = await claims.contact({ id: req.params.id, operator: req.user, message: req.body.message }); res.status(r.status).json(r.body); }),
+  claimVerdict: wrap(async (req, res) => { const r = await claims.verdict({ id: req.params.id, operator: req.user, verdict: req.body.verdict, note: req.body.note }); res.status(r.status).json(r.body); }),
   // ---- 合并新版（docs/03 §6.3）
   mergeRelease: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.params.id); if (!ctx) return; const r = await mergeSvc.merge(ctx); res.status(r.status).json(r.body); }),
 

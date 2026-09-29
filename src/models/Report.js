@@ -123,6 +123,16 @@ const reportSchema = new mongoose.Schema(
     handler: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     handledAt: { type: Date, default: null },
     handleNote: { type: String, trim: true, maxlength: 500, default: "" },
+
+    /**
+     * 人工核实的留痕（老师人格的「教授认领」车道，那条线自己的队列服务写它）：联系过举报人没有、联系了几次、每一步谁做的。
+     * ★ 不新增 status 取值（那是跨仓枚举，见上面 STATUSES）：队列里的「阶段」由 status + review.contactedAt **派生**，其它理由的举报这一格一直空着。
+     */
+    review: {
+      contactedAt: { type: Date, default: null },
+      contactCount: { type: Number, default: 0 },
+      log: { type: [{ at: { type: Date }, by: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, action: { type: String, maxlength: 20 }, note: { type: String, maxlength: 500, default: "" } }], default: [] },
+    },
   },
   { timestamps: true }
 );

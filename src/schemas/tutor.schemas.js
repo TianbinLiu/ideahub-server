@@ -66,6 +66,9 @@ const publishBody = z.object({ name: z.string().trim().min(1).max(120).optional(
 const startRunBody = z.object({ persona: z.string().regex(/^[a-f0-9]{24}$/i, "persona 要是 24 位 hex 的 id") });
 // 评分（docs/02 9.6）：1~5 星 + ≤500 字；能不能评在 core/publish/rating.canRate
 const ratingBody = z.object({ stars: z.number().int().min(1).max(5), text: z.string().trim().max(500).optional() });
+// 管理后台：教授认领的人工核实队列（tutorClaims.service）
+const claimContactBody = z.object({ message: z.string().trim().min(1).max(500) });
+const claimVerdictBody = z.object({ verdict: z.enum(["upheld", "rejected"]), note: z.string().trim().max(500).optional() });
 const importBody = z.object({ courseId: z.string().min(1).optional(), text: z.string().max(2 * 1024 * 1024).optional(), json: z.unknown().optional(), filename: z.string().max(200).optional() });
 
-module.exports = { ratingBody, publishBody, startRunBody, createCourseBody, patchCourseBody, signBody, confirmBody, licenseBody, generateBody, acceptBody, emptyBody, turnBody, previewBody, quizBody, progressBody, skipBody, feedbackBody, reviewBody, revertBody, importBody };
+module.exports = { claimContactBody, claimVerdictBody, ratingBody, publishBody, startRunBody, createCourseBody, patchCourseBody, signBody, confirmBody, licenseBody, generateBody, acceptBody, emptyBody, turnBody, previewBody, quizBody, progressBody, skipBody, feedbackBody, reviewBody, revertBody, importBody };
