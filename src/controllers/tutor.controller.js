@@ -12,6 +12,8 @@ const { CourseCtx, validateCourseInput, normalizeCourseInput } = require("../ser
 const ai = require("../services/tutorAi.service");
 const market = require("../services/tutorMarket.service");
 const pub = require("../services/tutorPublish.service");
+const rating = require("../services/tutorRating.service");
+const mergeSvc = require("../services/tutorMerge.service");
 const file = require("../services/tutorFile.service");
 const session = require("../services/tutorSession.service");
 const distill = require("../services/tutorDistill.service");
@@ -76,6 +78,12 @@ module.exports = {
   market: wrap(async (req, res) => res.json({ ok: true, ...(await market.listMarket({ user: req.user || null, query: req.query })) })),
   marketDetail: wrap(async (req, res) => { const d = await market.getMarketDetail({ user: req.user || null, personaId: req.params.id }); if (!d) return fail(res, 404, "没有这位老师（不存在、未发布或已下架）"); res.json({ ok: true, ...d }); }),
   startRun: wrap(async (req, res) => { const r = await market.startLearning({ user: req.user, personaId: req.body.persona }); res.status(r.status).json(r.body); }),
+  // ---- 评分（M2 后半）：规则在 core/publish/rating，存取在 tutorRating.service
+  ratings: wrap(async (req, res) => { const r = await rating.list({ user: req.user || null, personaId: req.params.id, page: req.query.page }); if (!r) return fail(res, 404, "没有这位老师（不存在、未发布或已下架）"); res.json({ ok: true, ...r }); }),
+  rate: wrap(async (req, res) => { const r = await rating.rate({ user: req.user, personaId: req.params.id, body: req.body || {} }); res.status(r.status).json(r.body); }),
+  unrate: wrap(async (req, res) => { const r = await rating.unrate({ user: req.user, personaId: req.params.id }); res.status(r.status).json(r.body); }),
+  // ---- 合并新版（docs/03 §6.3）
+  mergeRelease: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.params.id); if (!ctx) return; const r = await mergeSvc.merge(ctx); res.status(r.status).json(r.body); }),
 
   // ---- Run（学习页）
   getRun: wrap(async (req, res) => {

@@ -20,7 +20,7 @@ const { previewOf } = require("../tutor/core/publish/index");
 
 const TUTOR_KIND = "tutor";
 const LIMIT_MAX = 40;
-const RATING_MIN_VOTES = 3; // 票数低于这个数的老师在 sort=rating 里沉底（先量再定）
+const { RATING_MIN_VOTES } = require("../tutor/core/publish/rating"); // 票数低于这个数的老师在 sort=rating 里沉底（先量再定；与评分规则同一处）
 const SORTS = ["new", "hot", "rating"];
 const SCOPES = ["all", "installed", "mine"];
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

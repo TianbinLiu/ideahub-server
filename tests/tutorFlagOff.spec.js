@@ -43,6 +43,8 @@ describe("docs/06 D1 / D3 的 rg 验法", () => {
       "models/Persona.js": "kind / course / currentDoc / remixOf（S3，判否定）",
       "services/personaKind.js": "列表缺省过滤（S4，唯一实现）",
       "schemas/persona.schemas.js": "说明不收 kind（D4）",
+      "models/Notification.js": "TUTOR_* 四类通知类型（跨仓枚举服务端先上，D4；写入只在 tutorNotify.service）",
+      "routes/persona.routes.js": "评论钩子 onCreated → TUTOR_COMMENT（开关关着不 require 那棵树，D3）",
     };
     const hits = walk(SRC)
       .filter((f) => f.endsWith(".js") && !/tutor/i.test(path.basename(f)) && !/[\\/]tutor[\\/]/.test(f))

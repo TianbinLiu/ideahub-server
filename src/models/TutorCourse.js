@@ -29,6 +29,7 @@ const tutorCourseSchema = new mongoose.Schema(
     sourcePersona: { type: mongoose.Schema.Types.ObjectId, ref: "Persona", index: true },
     sourceRelease: { type: mongoose.Schema.Types.ObjectId, ref: "TutorRelease" },
     sourceVersion: { type: Number },
+    mergedAt: { type: Date }, // 上一次「合并新版」的时间（sourceVersion 随之前移）
   },
   { timestamps: true },
 );

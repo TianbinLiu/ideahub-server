@@ -19,7 +19,7 @@ const TutorExport = require("../models/TutorExport");
 const { parseTutorDoc, renderTutorDoc, validateTutorDoc, expectedProduceId } = require("../tutor/core/format/index");
 const { POLICY_AI, HOMEWORK_MODES, LICENSE_SOURCES, KEY_DATE_KINDS } = require("../tutor/core/format/constants");
 const { pagesToText, shortSha } = require("../tutor/core/materials/blocks");
-const { initProgress, advance, progressToDoc, runStatusOf, dueReviews } = require("../tutor/core/session/index");
+const { nextReviewAt, initProgress, advance, progressToDoc, runStatusOf, dueReviews } = require("../tutor/core/session/index");
 const { pendingOps } = require("../tutor/core/ops/revision");
 const { licenseSourceOf } = require("../tutor/core/generate/assemble");
 
@@ -217,6 +217,7 @@ class CourseCtx {
     const wasDone = this.run.status === "done";
     this.run.progress = r.progress; this.run.status = r.status;
     if (r.status === "done" && !wasDone) this.run.doneAt = new Date();
+    const nra = nextReviewAt(r.progress); this.run.nextReviewAt = nra ? new Date(nra) : null; // 回访到期的扫表键（TutorRun 那格注释）
     await this.persistRun();
     if (r.changed.length) await this.persistDoc(progressToDoc(this.doc, this.run.progress)); // ③ 状态列跟着写回自用件
     return r;
@@ -258,7 +259,7 @@ class CourseCtx {
       persona: this.doc ? { id: this.doc.id, name: this.doc.name, version: this.doc.version, stages: this.doc.map.stages.length, format: this.doc.format, generatedAt: this.doc.provenance?.generated_at, method: this.doc.provenance?.method } : null,
       publishable: !!this.doc && mats.length > 0 && !mats.some((m) => m.license.source === "unsure"),
       published: await this.publishedView(), // 发布状态（M2）：null = 没发布过；shared:false = 取消了分享；takenDown = 被平台下架（带原因）
-      source: this.course.sourcePersona ? { personaId: String(this.course.sourcePersona), version: this.course.sourceVersion || 0 } : null, // 从市场「开始学」开出来的课指向那位老师
+      source: await require("./tutorMerge.service").sourceState(this.course), // 从市场「开始学」开出来的课：钉的版本 + 最新版 + updateAvailable（懒 require：tutorMerge 依赖本模块）
       run: this.doc ? {
         status: this.run.status,
         currentStage: this.doc.map.stages.find((s) => this.run.progress?.[s.stage_id]?.status !== "passed")?.stage_id ?? null,

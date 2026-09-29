@@ -365,6 +365,17 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   ⚠⚠ **老 App（≤v2.45）收不到这一类**：它的 `BRANCH_NOTIFICATION_TYPES` 是**请求层白名单**
   （列表筛选 / 未读数 / 全部已读三处从它派生），老包压根不会把这个 type 放进查询。
   ⇒ 对未升级用户，**观众知情为零**。这不是"降级显示"，别写成降级显示。
+- `Notification.type` 另增**老师人格四类**（2026-09-29，tutor 仓 docs/02 9.6 / 4.9 / 5.9；写入只在 `services/tutorNotify.service.js` 一处：
+  拉黑双向判 + 同人同事 24 小时一条 + 失败只记日志）：
+  `TUTOR_RATING`（有人给你的老师评了分，`payload { personaId, personaName, stars, text }`）、
+  `TUTOR_COMMENT`（有人在你的老师下留言，`payload { personaId, personaName, commentId, preview, parentId }`）→ 收件人 = 作者；
+  `TUTOR_REVIEW_DUE`（有阶段到了回访时间，`payload { courseId, personaName, count, stages[], stageId }`，**没有 actorId**，
+  worker 每分钟扫 `TutorRun.nextReviewAt`，同一个到期时间只发一次）、
+  `TUTOR_DOC_UPDATED`（作者发了新版可合并，`payload { personaId, personaName, version, courseId, note }`，扇出上限 500 / 并发 8）→ 收件人 = 学习者。
+  deeplink **一律在 payload 里**（personaId → `/tutor/market/:id`，courseId → `/tutor/courses/:id` 或 `/tutor/run/:id`），刻意不加顶层字段
+  （加字段就要同时改 App 的映射，见上一条）。
+  ⚠⚠ **老 App（含 2.48）收不到这四类**：`BRANCH_NOTIFICATION_TYPES` 是请求层白名单，老包压根不会把它们放进查询 ——
+  对 App 用户是「收不到」，不是降级显示；官网通知页认得（`NotificationsPage` 四个 case + 落点链接）。
 - `Notification.videoId`（ref `BranchVideo`）。★ **不要复用 `ideaId`** —— 它 ref 的是 `Idea`，
   塞一个 BranchVideo 的 id 进去不会报错，只会 populate 成 `null`，标题和跳转地址一起没了，全程零日志。
 - 列表接口的 `actorId` 现在 populate `username displayName avatarUrl role`，并额外 populate
@@ -1859,6 +1870,10 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 | GET | `/api/tutor/market?q&tag&subject&sort=new\|hot\|rating&scope=all\|installed\|mine&author&page&limit≤40` | 可选 | 市场列表（游客可逛；**不借 `/api/personas?kind=`**，监管若停陪聊线不连坐）：只回 `kind:"tutor" && shared && !takenDown`（`mine` 含自己没公开的；未登录 scope 退 all）；`hot` = 下载 → 点赞 → 时间，`rating` 均分、票数 < 3 沉底；登录用户看不到拉黑 / 被拉黑的作者；`{ items:[卡片], page, totalPages, total, sort, scope }`，卡片 `{ id, name, description, coverEmoji, coverImageUrl, tags, subject, author:{_id,username}, price, version, stats:{ downloadCount, likeCount, ratingAvg, ratingCount }, installed, isOwner, publishedAt }` |
 | GET | `/api/tutor/market/:id` | 可选 | 详情：`{ persona(卡片), release:{ version, sha256, checksum, produceId, publishedAt, note, stages }, preview:{ card(① 教学面：who / teaching_style / catchphrases / hard_rules[{text,locked}]), stages[{ stage_id, title, summary, steps, memo, checks }], guide, policy, license }, others(作者的其它老师，≤6), relation:{ isOwner, installed, learning:{ courseId, version }\|null, ownCourse } }`；② ④ 正文不给（下载后才有）；未发布 / 已下架的只有作者看得到（多 `takedown:{ at, reason }`），其他人 **404**（不泄露存在性）；拉黑互不可见 |
 | POST | `/api/tutor/runs` | 必须 | 「开始跟这位老师学」`{ persona }`（docs/02 5.7）：从发布版复制出自己的一门课（与「导入一位老师」同一条路：`createFromDoc` + `writePersona`；教材不复制、进度全 pending、🔒 硬规则随行；课上记 `sourcePersona / sourceVersion`）→ 201 `{ courseId, version, downloadCount }`，并 `PersonaInstall` +1（幂等）；同一人再点 → 200 同一门课 `created:false`；作者自己点 → 200 `own:true` 回自己那门课；付费老师没结算 403 `unpaid`（v1 全免费，只是闸的形状）；拉黑 403 `BLOCKED`；没发布版 409 `NO_RELEASE` |
+| GET | `/api/tutor/market/:id/ratings?page` | 可选 | **评分**（tutor 仓 docs/02 9.6；全站第一张 1~5 星表 `TutorRating`，2026-09-29）：`{ summary:{ avg, count, dist:{1..5} }, items:[{ id, user:{_id,username}, stars, text, atVersion, createdAt, updatedAt }], page, totalPages, total, mine, canRate:{ ok } \| { ok:false, reason: login\|owner\|blocked\|notStarted\|noneDone, message } }`；未发布 / 已下架对非作者 404（与详情同口径） |
+| PUT | `/api/tutor/market/:id/rating` | 必须 | `{ stars:1~5, text?(≤500) }` 一人一票可改（201 建 / 200 改）→ `{ created, mine, summary }`。**前置**（规则只在 `core/publish/rating.canRate` 一处）：从这位老师开出的课至少一个阶段 passed 或整门 done，否则 **403 `NOT_ELIGIBLE` + `reason`**；作者评自己 / 拉黑同样 403；`Persona.stats.ratingAvg / ratingCount` 从评分表 aggregate **重算**回写（不 `$inc`，`BranchAssetLike.js` 头上的理由）；第一次评作者收 `TUTOR_RATING`，改票不重发 |
+| DELETE | `/api/tutor/market/:id/rating` | 必须 | 删自己那一票并重算；没评过 404 |
+| POST | `/api/tutor/courses/:id/merge-release` | 必须（课主） | **合并新版**（tutor 仓 docs/03 §6.3，2026-09-29）：把从市场开出来的课合到那位老师的最新发布版 —— 三方合并（我手里的 / 当初复制的那版 `sourceRelease` / 最新版，规则只在 `core/publish/merge`）只换 ③ 结构与 ④ 内容：② 与进度按 `stage_id` 保留、`renamed_from` 搬进度、消失的阶段进 `run.archived` 不删；学习者自己加的必背 / 自检 / 易错点与全部学生问答留着（没有 `sourceRelease` 的老数据只保问答，`baseKnown:false`）。→ `{ version(自用件新版号), note, report:{ added, removed, renamed, changed, kept, learnerKept, studentQaKept, truncated, baseKnown }, source }`。409：`NOT_FORKED`（不是从市场开的）/ `SOURCE_GONE`（老师下架或取消分享）/ `UP_TO_DATE`。课程 summary 的 `source` 多 `personaName / latest / updateAvailable / gone / mergedAt` |
 | GET | `/api/tutor/runs/:id` | 必须 | 学习页 bundle `{ run:{ status, progress, currentStage, usage, lastTurnSeq, demo, distill, dueReviews, pendingReview }, doc, materials, turns(最近 60) }` |
 | GET | `/api/tutor/runs/:id/turns?after=` · `/review-card` · `/review-due` · `/review-quiz?stage=` · `/revisions` · `/usage-export?format=md\|csv\|json&from&to` | 必须 | 增量轮次 / 复习卡 / 到期回访 / 回访题 / 修订记录（新的在上 + 等点头数）/ 使用记录（复旦承诺书四项，csv 带 BOM） |
 | PATCH | `/api/tutor/runs/:id/progress` | 必须 | `{ stage, stepIdx }` 漫游进度；走到最后一步 pending → taught |

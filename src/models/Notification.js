@@ -49,6 +49,14 @@ const NotificationSchema = new mongoose.Schema(
         //   两条都不带 actorId 之外的身份信息给对方：用户看不到是哪个管理员在处理（与 ADMIN_NOTICE 同口径）。
         "SUPPORT_TICKET",
         "SUPPORT_REPLY",
+        // 老师人格（/api/tutor，2026-09-29 M2 后半；写入只在 services/tutorNotify.service.js 一处）四类。deeplink 一律在 payload 里、
+        // **不加顶层字段**（加字段就要同时改 App 的映射，BRANCH_REVISED 那段说过为什么）：
+        //   TUTOR_RATING      → 作者：有人给你的老师评了分 { personaId, personaName, stars, text }（→ /tutor/market/:personaId）
+        //   TUTOR_COMMENT     → 作者：有人在你的老师下留言 { personaId, personaName, commentId, preview, parentId }
+        //   TUTOR_REVIEW_DUE  → 学习者：有阶段到了回访时间 { courseId, personaName, count, stages[], stageId }（→ /tutor/run/:courseId），不带 actorId
+        //   TUTOR_DOC_UPDATED → 学习者：作者发了新版可合并 { personaId, personaName, version, courseId, note }（→ /tutor/courses/:courseId）
+        // ⚠ 老 App 的 BRANCH_NOTIFICATION_TYPES 是请求层白名单，这四类它压根不查 —— App 用户**收不到**，契约里写的是「收不到」不是降级显示。
+        "TUTOR_RATING", "TUTOR_COMMENT", "TUTOR_REVIEW_DUE", "TUTOR_DOC_UPDATED",
       ],
       index: true,
     },

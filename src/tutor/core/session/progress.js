@@ -25,6 +25,7 @@ __export(progress_exports, {
   currentStageId: () => currentStageId,
   dueReviews: () => dueReviews,
   initProgress: () => initProgress,
+  nextReviewAt: () => nextReviewAt,
   progressToDoc: () => progressToDoc,
   runStatusOf: () => runStatusOf,
   stageOrder: () => stageOrder,
@@ -129,6 +130,11 @@ function dueReviews(doc, progress, now = /* @__PURE__ */ new Date()) {
   const t = now.getTime();
   return doc.map.stages.map((s) => ({ s, p: progress?.[s.stage_id] })).filter(({ p }) => p?.status === "passed" && p.nextReviewAt && Date.parse(p.nextReviewAt) <= t).map(({ s, p }) => ({ stage_id: s.stage_id, title: s.title, nextReviewAt: p.nextReviewAt, reviewRound: p.reviewRound || 0, overdueDays: Math.floor((t - Date.parse(p.nextReviewAt)) / 864e5) })).sort((a, b) => a.nextReviewAt.localeCompare(b.nextReviewAt));
 }
+function nextReviewAt(progress) {
+  let min = null;
+  for (const p of Object.values(progress || {})) if (p && p.status === "passed" && p.nextReviewAt && (!min || p.nextReviewAt < min)) min = p.nextReviewAt;
+  return min;
+}
 function progressToDoc(doc, progress) {
   const next = JSON.parse(JSON.stringify(doc));
   for (const st of next.map.stages) {
@@ -150,6 +156,7 @@ function addDays(d, n) {
   currentStageId,
   dueReviews,
   initProgress,
+  nextReviewAt,
   progressToDoc,
   runStatusOf,
   stageOrder,

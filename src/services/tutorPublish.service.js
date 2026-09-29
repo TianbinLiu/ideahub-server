@@ -15,6 +15,8 @@
 const Persona = require("../models/Persona");
 const TutorRelease = require("../models/TutorRelease");
 const User = require("../models/User");
+const TutorCourse = require("../models/TutorCourse");
+const notify = require("./tutorNotify.service");
 const { sha256Hex } = require("../tutor/core/format/index");
 // ★ 五道门与常量都从核心包来（tutor 仓 src/publish，port:server 转成 CJS）：参考实现（tutor 仓 devServer）与这里跑的是同一个函数，
 //   e2e 在参考实现上验过的门，这里一道不差；改门先回 tutor 仓改、再重跑 port —— 别在这儿另抄一份（2026-09-28 之前这里确实有一份手抄的，已删）。
@@ -55,7 +57,17 @@ async function publish(ctx, user, body = {}) {
   });
   persona.currentDoc = rel._id;
   await persona.save();
+  if (version > 1) void notifyLearners(persona, rel, user); // 学习者收 TUTOR_DOC_UPDATED（docs/02 5.9 / 6.5）：不等、不影响发布成败
   return { status: 201, body: { ok: true, persona: publishView(persona, rel), warnings: g.built.warnings || [] } };
+}
+
+/** 作者发了 v(n+1) → 每个从这位老师开过课的学习者一条（作者自己那门不算；同人同版 24 小时一条；上限 / 并发在 tutorNotify） */
+async function notifyLearners(persona, rel, author) {
+  try {
+    const courses = await TutorCourse.find({ sourcePersona: persona._id, owner: { $ne: author._id } }).select("_id owner").lean();
+    const n = await notify.notifyMany("TUTOR_DOC_UPDATED", courses.map((c) => ({ userId: c.owner, payload: { personaId: String(persona._id), personaName: persona.name, version: rel.version, courseId: String(c._id), note: rel.note || "" } })), { actorId: author._id, dedupeOf: (pl) => ({ personaId: pl.personaId, version: pl.version }) });
+    if (courses.length) console.log(`[tutor] ${persona.name} v${rel.version}：通知了 ${n}/${courses.length} 位学习者`);
+  } catch (e) { console.error("[tutor] 新版通知失败:", (e && e.message) || e); }
 }
 
 /** 取消分享：只翻 shared；快照、版号、评论都留着（再发布是 v(n+1)） */

@@ -20,6 +20,13 @@ const tutorRunSchema = new mongoose.Schema(
     doneAt: { type: Date },
     busy: { type: Boolean, default: false }, // 老师还在回上一句（同一 Run 同时只开一条流）
     distilling: { type: Boolean, default: false },
+    // 回访到期通知（docs/02 4.9，M2 后半 2026-09-29）：nextReviewAt = 已通过阶段里最早的回访时间（core/session.nextReviewAt，applyAdvance 每一拍写）——
+    //   progress 是 Mixed 建不了索引，抬成一列给 worker 扫；reviewNotifiedAt = 上一次为哪个到期时间发过 TUTOR_REVIEW_DUE（同一个到期时间只发一次，回访过后 nextReviewAt 会变，下一轮再发）。
+    //   老 run 没有这一列 = 下次 advance 才补上（判否定：缺失 = 不扫）。
+    nextReviewAt: { type: Date, index: true },
+    reviewNotifiedAt: { type: Date },
+    // 合并新版时消失的阶段（docs/03 §6.3「归档不删」）：{ [stage_id]: { progress, distill } }
+    archived: { type: mongoose.Schema.Types.Mixed, default: {} },
   },
   { timestamps: true, minimize: false },
 );

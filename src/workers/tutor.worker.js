@@ -7,7 +7,8 @@ const TutorRun = require("../models/TutorRun");
 const { runNextJob } = require("../services/tutorAi.service");
 const { runDistill } = require("../services/tutorDistill.service");
 const { CourseCtx } = require("../services/tutorStore.service");
-const { DISTILL_IDLE_MS } = require("../tutor/core/session/index");
+const { DISTILL_IDLE_MS, dueReviews } = require("../tutor/core/session/index");
+const notify = require("../services/tutorNotify.service");
 
 const POLL_MS = Number(process.env.TUTOR_WORKER_POLL_MS || 3000);
 const IDLE_SWEEP_MS = 60 * 1000;
@@ -37,13 +38,37 @@ async function sweepIdle(now = new Date()) {
   return n;
 }
 
+/**
+ * 回访到期 → TUTOR_REVIEW_DUE（docs/02 4.9，M2 后半）：扫 TutorRun.nextReviewAt ≤ now 且还没为这个到期时间发过（reviewNotifiedAt ≠ nextReviewAt）。
+ * 一次到期一条（列出到期的阶段，最多点名 3 个）；发没发成都把 reviewNotifiedAt 钉到这个 nextReviewAt，同一个到期时间不重扫 —— 学习者回访过后 nextReviewAt 会变，下一轮自然再发。
+ */
+async function sweepReviewDue(now = new Date()) {
+  const runs = await TutorRun.find({ nextReviewAt: { $lte: now }, $expr: { $ne: ["$nextReviewAt", { $ifNull: ["$reviewNotifiedAt", null] }] } }).limit(50);
+  let n = 0;
+  for (const run of runs) {
+    try {
+      const ctx = await CourseCtx.load(run.course, { _id: run.user });
+      const due = ctx && ctx.doc ? dueReviews(ctx.doc, run.progress || {}, now) : [];
+      if (due.length) {
+        const sent = await notify.notifyTutor("TUTOR_REVIEW_DUE", { userId: run.user, payload: { courseId: String(run.course), personaName: ctx.doc.name, count: due.length, stages: due.slice(0, 3).map((d) => d.title), stageId: due[0].stage_id } });
+        if (sent) n++;
+      }
+    } catch (e) { console.error(`[tutor] 回访到期通知 ${run.course} 失败:`, (e && e.message) || e); }
+    await TutorRun.updateOne({ _id: run._id }, { $set: { reviewNotifiedAt: run.nextReviewAt } });
+  }
+  return n;
+}
+
 function startTutorWorker() {
   const jobs = setInterval(() => { tickJobs(); }, POLL_MS);
   jobs.unref?.();
-  const idle = setInterval(() => { sweepIdle().catch((e) => console.error("[tutor] idle 清扫失败:", (e && e.message) || e)); }, IDLE_SWEEP_MS);
+  const idle = setInterval(() => {
+    sweepIdle().catch((e) => console.error("[tutor] idle 清扫失败:", (e && e.message) || e));
+    sweepReviewDue().catch((e) => console.error("[tutor] 回访到期清扫失败:", (e && e.message) || e));
+  }, IDLE_SWEEP_MS);
   idle.unref?.();
-  console.log(`[tutor] worker 已启动（作业每 ${POLL_MS}ms 抢一次，30 分钟无动作蒸馏每分钟扫一次）`);
+  console.log(`[tutor] worker 已启动（作业每 ${POLL_MS}ms 抢一次，30 分钟无动作蒸馏与回访到期每分钟扫一次）`);
   return () => { clearInterval(jobs); clearInterval(idle); };
 }
 
-module.exports = { startTutorWorker, tickJobs, sweepIdle };
+module.exports = { startTutorWorker, tickJobs, sweepIdle, sweepReviewDue };

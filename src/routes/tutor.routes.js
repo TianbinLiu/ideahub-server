@@ -55,6 +55,7 @@ router.get("/health", ctrl.health);
 // 市场（docs/02 §7）：游客可逛、看详情（分享链落地不被登录墙挡）；登录了多两样：已下载态、拉黑过滤、scope=mine|installed
 router.get("/market", optionalAuth, ctrl.market);
 router.get("/market/:id", optionalAuth, ctrl.marketDetail);
+router.get("/market/:id/ratings", optionalAuth, ctrl.ratings); // 评分列表 + 均分 / 分布 + 我的 + 能不能评（游客可看）
 router.use(requireAuth);
 router.get("/config", ctrl.config);
 router.post("/declare-adult", validate({ body: S.emptyBody }), ctrl.declareAdult);
@@ -89,6 +90,9 @@ router.post("/personas/:id/publish", userRateLimit({ max: 10, scope: "tutor:publ
 router.delete("/personas/:id/publish", ctrl.unpublish);
 // 「开始跟这位老师学」：从发布版复制出自己的一门课（幂等）
 router.post("/runs", userRateLimit({ max: 20, scope: "tutor:start" }), validate({ body: S.startRunBody }), ctrl.startRun);
+router.put("/market/:id/rating", userRateLimit({ max: 20, scope: "tutor:rate" }), validate({ body: S.ratingBody }), ctrl.rate); // 一人一票可改
+router.delete("/market/:id/rating", ctrl.unrate);
+router.post("/courses/:id/merge-release", userRateLimit({ max: 10, scope: "tutor:merge" }), validate({ body: S.emptyBody }), ctrl.mergeRelease); // 学习者合并作者的新版（docs/03 §6.3）
 
 router.get("/runs/:id", ctrl.getRun);
 router.get("/runs/:id/turns", ctrl.getTurns);

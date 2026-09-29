@@ -70,7 +70,8 @@ function ownedBy(doc, user) {
   return !!user && String(user._id) === String(doc.author?._id || doc.author);
 }
 
-function makeCommentHandlers({ targetType, loadTarget }) {
+// onCreated（可选）：评论落库后的钩子 ({ target, comment, req })，给目标那一线发通知用（老师人格的留言提醒挂在 persona.routes）。钩子失败只记日志，不影响评论本身。
+function makeCommentHandlers({ targetType, loadTarget, onCreated = null }) {
   const label = TARGET_LABEL[targetType] || "Target";
 
   // 目标存在性 + 可见性门禁：未 shared 且请求者不是目标作者一律 403，
@@ -139,7 +140,7 @@ function makeCommentHandlers({ targetType, loadTarget }) {
 
   async function create(req, res, next) {
     try {
-      await requireVisibleTarget(req);
+      const target = await requireVisibleTarget(req);
 
       const { id } = req.params;
       const parentId = await resolveParentId(req.body.parentId, id);
@@ -154,6 +155,7 @@ function makeCommentHandlers({ targetType, loadTarget }) {
       });
 
       const populated = await ArenaComment.findById(doc._id).populate("author", "_id username").lean();
+      if (onCreated) { try { await onCreated({ target, comment: populated, req }); } catch (e) { console.error(`[comments] onCreated 钩子失败（评论本身已落库）:`, (e && e.message) || e); } }
       res.status(201).json({ ok: true, comment: serializeComment(populated) });
     } catch (err) {
       next(err);
