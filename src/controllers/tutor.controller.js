@@ -98,8 +98,8 @@ module.exports = {
   // ---- Run（学习页）
   getRun: wrap(async (req, res) => {
     const ctx = await needPersona(req, res, req.params.id); if (!ctx) return;
-    const turns = await ctx.readTurns();
-    res.json({ ok: true, run: { id: ctx.id, status: ctx.run.status, progress: ctx.run.progress, currentStage: currentStageId(ctx.doc, ctx.run.progress), usage: ctx.run.usage, lastTurnSeq: ctx.run.turnSeq || 0, demo: !aiConfig(), startedAt: ctx.run.startedAt, doneAt: ctx.run.doneAt, distill: ctx.run.distill, dueReviews: dueReviews(ctx.doc, ctx.run.progress), pendingReview: (await ctx.pendingOps()).length }, doc: ctx.doc, materials: await ctx.materials(), turns: turns.slice(-60) });
+    const [turns, companion] = await Promise.all([ctx.readTurns(), pub.companionOf(ctx)]); // companion：App 上课页「老师能不能开口」（M4），判定只在 personaAccess
+    res.json({ ok: true, run: { id: ctx.id, status: ctx.run.status, progress: ctx.run.progress, currentStage: currentStageId(ctx.doc, ctx.run.progress), usage: ctx.run.usage, lastTurnSeq: ctx.run.turnSeq || 0, demo: !aiConfig(), startedAt: ctx.run.startedAt, doneAt: ctx.run.doneAt, distill: ctx.run.distill, dueReviews: dueReviews(ctx.doc, ctx.run.progress), pendingReview: (await ctx.pendingOps()).length }, doc: ctx.doc, materials: await ctx.materials(), turns: turns.slice(-60), companion });
   }),
   getTurns: wrap(async (req, res) => { const ctx = await needPersona(req, res, req.params.id); if (!ctx) return; const after = Number(req.query.after || 0); res.json({ ok: true, turns: (await ctx.readTurns()).filter((t) => t.seq > after) }); }),
   getReviewCard: wrap(async (req, res) => { const ctx = await needPersona(req, res, req.params.id); if (!ctx) return; res.json({ ok: true, card: reviewCard(ctx.doc, ctx.run, await ctx.readTurns()) }); }),

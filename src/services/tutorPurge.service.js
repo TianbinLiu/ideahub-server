@@ -9,6 +9,8 @@
  *     → TutorChunk → TutorDoc → TutorRun（他的课上的 + 他作为 user 的）→ TutorTurn → TutorRevision → TutorExport → TutorJob → TutorUsage
  *     → Persona{kind:tutor, author}（他发布的老师）→ TutorRelease（那些老师的发布版）→ TutorRating（那些老师收的 + 他给别人的，后者重算别人的均分）
  *     → PersonaInstall / ArenaComment / Report（指向那些老师的；儿童安全举报按 Report.URGENT_REASONS 留下，与主级联 ⑧ 同一条例外）
+ *     → TutorReferral（M3 引流度量里他的那几行：subject "u:<id>" / user 指向他 —— 只记不奖励、90 天自过期，但行上挂着账号 id，删号就一并删；
+ *       游客那些 "ip:<hash>" 行不认人、不动。2026-09-29 M4 补上：M3 加表时两份清单都没落，正是头上那格坑，spec 抓到的）
  *   不删（PURGE_KEEP，刻意的）：
  *     · 别人从他的老师开出来的 TutorCourse / TutorRun / TutorDoc —— 那是别人的学习过程与自用件（教材本来就没复制）；只把 sourceOrphanedAt 标上，
  *       课程 summary 的 source 回 gone:true / orphaned:true，「合并新版」从此 409 SOURCE_GONE。
@@ -30,6 +32,7 @@ const TutorJob = require("../models/TutorJob");
 const TutorUsage = require("../models/TutorUsage");
 const TutorRelease = require("../models/TutorRelease");
 const TutorRating = require("../models/TutorRating");
+const TutorReferral = require("../models/TutorReferral");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
 const ArenaComment = require("../models/ArenaComment");
@@ -38,7 +41,7 @@ const PendingAssetPurge = require("../models/PendingAssetPurge");
 const { recompute } = require("./tutorRating.service");
 
 /** 删的那一份清单（模型名）——spec 拿 src/models/Tutor*.js 逐个对：每一张要么在这儿要么在 PURGE_KEEP 里 */
-const PURGE_DELETE = ["TutorCourse", "TutorMaterial", "TutorChunk", "TutorDoc", "TutorRun", "TutorTurn", "TutorRevision", "TutorExport", "TutorJob", "TutorUsage", "TutorRelease", "TutorRating"];
+const PURGE_DELETE = ["TutorCourse", "TutorMaterial", "TutorChunk", "TutorDoc", "TutorRun", "TutorTurn", "TutorRevision", "TutorExport", "TutorJob", "TutorUsage", "TutorRelease", "TutorRating", "TutorReferral"];
 /** 不删的那一份（刻意的）：键 = 模型名，值 = 理由 */
 const PURGE_KEEP = {};
 
@@ -78,6 +81,7 @@ async function purgeTutorForUser(userId) {
   // ④ 他给别人的评分：删行 + 重算那几位老师的均分（不 $inc，与评分服务同一把尺）
   const given = await TutorRating.find({ user: uid }).select("persona").lean();
   removed.tutorRatingsGiven = (await TutorRating.deleteMany({ user: uid })).deletedCount;
+  removed.tutorReferrals = (await TutorReferral.deleteMany({ $or: [{ subject: `u:${String(uid)}` }, { user: uid }] })).deletedCount; // 引流度量里他的行（subject 形状见 tutorMetrics.service）
   const mine = new Set(personaIds.map(String));
   for (const pid of new Set(given.map((g) => String(g.persona)))) if (!mine.has(pid)) await recompute(pid);
   removed.tutorPersonaInstalls = personaIds.length ? (await PersonaInstall.deleteMany({ persona: { $in: personaIds } })).deletedCount : 0;

@@ -8,7 +8,7 @@ const mongoose = require("mongoose");
 const chain = (v) => { const c = { select: () => c, lean: async () => v, sort: () => c, limit: () => c, then: (f, r) => Promise.resolve(v).then(f, r) }; return c; };
 const del = () => jest.fn(async () => ({ deletedCount: 1 }));
 const models = {};
-for (const name of ["TutorCourse", "TutorMaterial", "TutorChunk", "TutorDoc", "TutorRun", "TutorTurn", "TutorRevision", "TutorExport", "TutorJob", "TutorUsage", "TutorRelease", "TutorRating", "Persona", "PersonaInstall", "ArenaComment", "Report", "PendingAssetPurge"]) {
+for (const name of ["TutorCourse", "TutorMaterial", "TutorChunk", "TutorDoc", "TutorRun", "TutorTurn", "TutorRevision", "TutorExport", "TutorJob", "TutorUsage", "TutorRelease", "TutorRating", "TutorReferral", "Persona", "PersonaInstall", "ArenaComment", "Report", "PendingAssetPurge"]) {
   jest.doMock(`../src/models/${name}`, () => { const m = { deleteMany: del(), find: jest.fn(() => chain([])), updateMany: jest.fn(async () => ({ modifiedCount: 2 })), bulkWrite: jest.fn(async () => ({})), URGENT_REASONS: ["csae"] }; models[name] = m; return m; });
 }
 jest.doMock("../src/services/tutorRating.service", () => ({ recompute: jest.fn(async () => ({})) }));
@@ -60,6 +60,7 @@ describe("purgeTutorForUser", () => {
     expect(models.Persona.deleteMany).toHaveBeenCalledWith({ _id: { $in: [p1] } });
     // ④ 他给别人的评分：删 + 只重算别人的（自己的老师随人格一起没了）
     expect(models.TutorRating.deleteMany.mock.calls[1][0]).toEqual({ user: uid });
+    expect(models.TutorReferral.deleteMany.mock.calls[0][0]).toEqual({ $or: [{ subject: `u:${String(uid)}` }, { user: uid }] }); // 引流度量里他的行（游客 ip: 行不动）
     expect(rating.recompute).toHaveBeenCalledTimes(1);
     expect(rating.recompute).toHaveBeenCalledWith(String(other));
     // ⑤ 别人的课只标 orphan

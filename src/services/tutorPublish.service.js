@@ -14,6 +14,8 @@
  * ★ 「同时发布为启梦人格 / 可装进看板娘」（M3 反向勾选，docs/06 §5.1）：body.alsoCompanion 显式 true 才算勾（core/publish/companion.companionOptIn，默认关），
  *   勾了才由 ① 教学面生成 Persona.style（companionStyleOf，只带说话风格）并写 Persona.companion；每次发布重新表态，不勾 = 关且清掉 style。
  *   没勾的老师不进 /api/personas 缺省列表、装不进看板娘（personaKind.js / personaAccess.service 各一处判）。
+ * ★ App 上课页「这位老师能不能开口」（M4，docs/06 §6.1）= `companionOf`：与「能不能装进看板娘」**同一条判定**（personaAccess.checkPersonaAccess），
+ *   不在这里另抄一份「勾了 + 发布着」—— 两份规则迟早分叉成「市场页说能装、上课页不出声」。
  */
 const Persona = require("../models/Persona");
 const TutorRelease = require("../models/TutorRelease");
@@ -25,6 +27,7 @@ const { sha256Hex } = require("../tutor/core/format/index");
 //   e2e 在参考实现上验过的门，这里一道不差；改门先回 tutor 仓改、再重跑 port —— 别在这儿另抄一份（2026-09-28 之前这里确实有一份手抄的，已删）。
 const { checkGates, forkIdOf, TAGS_MAX, DEFAULT_COVER } = require("../tutor/core/publish/index");
 const { companionOptIn, companionStyleOf } = require("../tutor/core/publish/companion");
+const { checkPersonaAccess } = require("./personaAccess.service");
 
 function publishView(p, rel, extra = {}) {
   const remix = p.remixOf ? { id: String(p.remixOf._id || p.remixOf), name: (p.remixOf && p.remixOf.name) || extra.remixName || "" } : null; // 血缘（docs/02 9.1「复刻链」）
@@ -104,4 +107,20 @@ async function publishState(courseId) {
   return publishView(p, rel);
 }
 
-module.exports = { checkGates, publish, unpublish, publishState, publishView, TAGS_MAX, DEFAULT_COVER };
+/**
+ * App 上课页 bundle 里的 `companion`（M4）：这次 run 对应的老师人格能不能给这个人开口说话（TTS + Live2D 只对它开）。
+ * run 对应的人格：从市场开的课指向 `sourcePersona`；作者自己的课就是这门课发布出的那条 `Persona{kind:tutor, course}`。
+ * ★ `enabled` 只问 checkPersonaAccess（可见 / 勾了「同时发布为启梦人格」/ 付费三件一起）—— App 里「会说话」⇔ 看板娘里「能装」，同一份答案。
+ *   没发布过 / 人格已删 → null；判否定：App 把 null 与 enabled:false 都画成「不会说话」。denied 时 `reason` 原样带回（not_companion / private / unpaid），只给排障看。
+ */
+async function companionOf(ctx) {
+  let pid = ctx.course.sourcePersona || null;
+  if (!pid) { const own = await Persona.findOne({ kind: "tutor", course: ctx.course._id }).select("_id").lean(); pid = own ? own._id : null; }
+  if (!pid) return null;
+  const { persona, reason } = await checkPersonaAccess(pid, ctx.user && ctx.user._id);
+  const p = persona || (await Persona.findById(pid).select("name").lean());
+  if (!p) return null;
+  return { personaId: String(pid), name: p.name || "", enabled: reason === "", ...(reason ? { reason } : {}) };
+}
+
+module.exports = { checkGates, publish, unpublish, publishState, publishView, companionOf, TAGS_MAX, DEFAULT_COVER };
