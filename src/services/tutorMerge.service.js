@@ -20,7 +20,7 @@ async function sourceState(course) {
   const visible = !!(p && p.shared && !p.takenDown);
   const latest = visible ? Number(p.releaseVersion || 0) : null;
   const version = course.sourceVersion || 0;
-  return { personaId: String(course.sourcePersona), personaName: (p && p.name) || "", version, latest, updateAvailable: !!(latest && latest > version), mergedAt: course.mergedAt || null, gone: !visible };
+  return { personaId: String(course.sourcePersona), personaName: (p && p.name) || "", version, latest, updateAvailable: !!(latest && latest > version), mergedAt: course.mergedAt || null, gone: !visible, orphaned: !!course.sourceOrphanedAt }; // orphaned = 作者删号了（tutorPurge）
 }
 
 async function merge(ctx) {

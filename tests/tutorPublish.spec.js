@@ -66,3 +66,21 @@ describe("checkGates（五道门，顺序固定）", () => {
     expect(checkGates({ ...good(), doc: null })).toMatchObject({ ok: false, gate: "persona" });
   });
 });
+
+describe("复刻件（另存为我的人格，核心包 checkGates 的 fork 支路）", () => {
+  const { forkIdOf } = require("../src/tutor/core/publish/index");
+  it("没有自己的教材：① 沿用来源授权、② 不跑；新 id / 版次 1 / fork_of / 作者换人；来源授权不确定整句拒；自己传了教材按普通规则", () => {
+    const fork = { newId: forkIdOf("64b000000000000000000001"), version: 1, sourceId: doc.id, sourceDocVersion: doc.version, license: { source: "self" }, author: { username: "learner", uid: 0 } };
+    const r = checkGates({ doc, materials: [], materialTexts: [], adultDeclared: true, body: { aigcDeclared: true, name: "老包（我的版本）" }, fork });
+    expect(r.ok).toBe(true);
+    expect(r.built.doc).toMatchObject({ id: fork.newId, version: 1, fork_of: { id: doc.id, version: doc.version }, author: { username: "learner" } });
+    expect(r.built.cleanSkipped).toBe(true);
+    expect(r.fork).toEqual({ id: fork.newId, of: { id: doc.id, version: doc.version } });
+    expect(forkIdOf("64b000000000000000000001")).toBe(fork.newId);
+    expect(forkIdOf("64b000000000000000000002")).not.toBe(fork.newId);
+    expect(checkGates({ doc, materials: [], materialTexts: [], adultDeclared: true, body: { aigcDeclared: true }, fork: { ...fork, license: { source: "unsure" } } })).toMatchObject({ ok: false, gate: "license" });
+    expect(checkGates({ doc, materials: [{ ...mats[0], license: { source: "unsure" } }], materialTexts: texts, adultDeclared: true, body: { aigcDeclared: true }, fork })).toMatchObject({ ok: false, gate: "license" });
+    expect(checkGates({ doc: leaked(), materials: mats, materialTexts: texts, adultDeclared: true, body: { aigcDeclared: true }, fork })).toMatchObject({ ok: false, gate: "cleanCheck" });
+    expect(checkGates({ doc, materials: [], materialTexts: [], adultDeclared: true, body: { aigcDeclared: true } })).toMatchObject({ ok: false, gate: "license" }); // 没有 fork 的老规则不变
+  });
+});

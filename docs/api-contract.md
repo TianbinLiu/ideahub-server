@@ -376,6 +376,10 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   （加字段就要同时改 App 的映射，见上一条）。
   ⚠⚠ **老 App（含 2.48）收不到这四类**：`BRANCH_NOTIFICATION_TYPES` 是请求层白名单，老包压根不会把它们放进查询 ——
   对 App 用户是「收不到」，不是降级显示；官网通知页认得（`NotificationsPage` 四个 case + 落点链接）。
+- **删号级联多了老师人格这一线**（2026-09-29，`services/tutorPurge.service.js`，由 `purgeUserCascade` ⑩.7 懒 require）：十二张 `Tutor*` 表 +
+  他发布的老师人格及其发布版 / 评分 / 安装 / 评论 / 举报（儿童安全举报按 `Report.URGENT_REASONS` 留下）；教材原件句柄进 `PendingAssetPurge`
+  （`resourceType` 多一档 **raw**）。**别人从他的老师开出来的课不删**，只标 `sourceOrphanedAt`：那些学习者的课程 summary `source.gone / orphaned` 为真、
+  「合并新版」409 `SOURCE_GONE`。删号不看 `TUTOR_ENABLED`：开关管功能挂不挂，不管数据在不在。
 - `Notification.videoId`（ref `BranchVideo`）。★ **不要复用 `ideaId`** —— 它 ref 的是 `Idea`，
   塞一个 BranchVideo 的 id 进去不会报错，只会 populate 成 `null`，标题和跳转地址一起没了，全程零日志。
 - 列表接口的 `actorId` 现在 populate `username displayName avatarUrl role`，并额外 populate
@@ -1865,7 +1869,7 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 | GET | `/api/tutor/personas/:id/export?format=md\|json\|zip&audience=market\|self&keepStuckPoints&keepStudentQa` | 必须 | 导出件；头 `X-Tutor-Checksum / -Produce-Id / -Clean-Check / -Export-Id`；发布件对 `license.source=unsure` 400、教材泄漏核查不过 409 `CLEAN_CHECK`；每次留痕 |
 | GET | `/api/tutor/personas/:id/exports` | 必须 | 留痕列表 `{ exports, retainDays:180 }` |
 | POST | `/api/tutor/personas/import` | 必须 | `{ courseId?, text?\|json?, filename? }`：同一位老师回读成 `kind:import` 修订（`same:true`），别人的老师新开一门课（`created:true`）；删标识 / 改正文 400 |
-| POST | `/api/tutor/personas/:id/publish` | 必须（作者） | **发布到市场**（tutor 仓 docs/02 §6）`{ name?, description?, tags?(≤6), coverEmoji?, aigcDeclared, note? }`：五道门在服务端一处（`tutorPublish.service.checkGates`），任一不过 **422 `GATE`** + `gate ∈ license\|cleanCheck\|adult\|aigc\|name\|tags` 指明哪一道 + 整句人话；全过 → 201 `{ persona:{ personaId, version, sha256, checksum, produceId, marketPath, shared, … }, warnings }`：铸一条 `TutorRelease`（market 口径的快照：② 只种子、学生问答不带、③ 状态列清空，与导出发布件同一份实现，**不可变**）+ `Persona{ kind:"tutor", shared:true, course, currentDoc, releaseVersion, subject, aigcDeclaredAt, license, policy }`；再发一次 = v(n+1)，旧版留着。被平台下架的 403 `TAKEN_DOWN` |
+$1 **复刻件（另存为我的人格，2026-09-29）**：从市场「开始学」开出来的课发同一个端点、同一套五道门 —— 没有自己的教材时 ① 沿用当初复制那一版（`sourceRelease`）的授权、② 不跑（那一版发布时查过；学习者多出来的只有自己的问答与条目），自己传了教材的按普通规则；发布件 `id` 从课 id 确定性派生（`fork-<12hex>`）、版次从 1 起、`fork_of {id, version}` 记血缘、`Persona.remixOf` 指回来源；回包与市场卡片 / 详情多 `remixOf { id, name }` |
 | DELETE | `/api/tutor/personas/:id/publish` | 必须（作者） | 取消分享：只翻 `shared:false`，快照 / 版号 / 评论都留；没发布过 404 |
 | GET | `/api/tutor/market?q&tag&subject&sort=new\|hot\|rating&scope=all\|installed\|mine&author&page&limit≤40` | 可选 | 市场列表（游客可逛；**不借 `/api/personas?kind=`**，监管若停陪聊线不连坐）：只回 `kind:"tutor" && shared && !takenDown`（`mine` 含自己没公开的；未登录 scope 退 all）；`hot` = 下载 → 点赞 → 时间，`rating` 均分、票数 < 3 沉底；登录用户看不到拉黑 / 被拉黑的作者；`{ items:[卡片], page, totalPages, total, sort, scope }`，卡片 `{ id, name, description, coverEmoji, coverImageUrl, tags, subject, author:{_id,username}, price, version, stats:{ downloadCount, likeCount, ratingAvg, ratingCount }, installed, isOwner, publishedAt }` |
 | GET | `/api/tutor/market/:id` | 可选 | 详情：`{ persona(卡片), release:{ version, sha256, checksum, produceId, publishedAt, note, stages }, preview:{ card(① 教学面：who / teaching_style / catchphrases / hard_rules[{text,locked}]), stages[{ stage_id, title, summary, steps, memo, checks }], guide, policy, license }, others(作者的其它老师，≤6), relation:{ isOwner, installed, learning:{ courseId, version }\|null, ownCourse } }`；② ④ 正文不给（下载后才有）；未发布 / 已下架的只有作者看得到（多 `takedown:{ at, reason }`），其他人 **404**（不泄露存在性）；拉黑互不可见 |

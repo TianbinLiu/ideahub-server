@@ -24,7 +24,8 @@ const pendingAssetPurgeSchema = new mongoose.Schema(
     /** image | video。★ 从 URL 路径段解出来的，**绝不写死**：workshop-media 里两种都有，
      *  写死的表现是"合并成片删得掉、封面删不掉"，而 Cloudinary 对不存在的资源回
      *  "not found" 不报错 —— 零症状。 */
-    resourceType: { type: String, required: true, enum: ["image", "video"] },
+    //  raw = 老师人格的教材原件（pdf / pptx / docx 直传签的就是 raw 空间；删号级联 ⑩.7 落的句柄）
+    resourceType: { type: String, required: true, enum: ["image", "video", "raw"] },
     /** 谁的资产（只为排查，不参与判定：判定在落这一行之前就做完了） */
     owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: undefined },
     /** 从哪条记录来的（作品 id / 卡片 cardId），只为排查 */

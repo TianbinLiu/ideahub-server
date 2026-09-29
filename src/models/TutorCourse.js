@@ -30,6 +30,7 @@ const tutorCourseSchema = new mongoose.Schema(
     sourceRelease: { type: mongoose.Schema.Types.ObjectId, ref: "TutorRelease" },
     sourceVersion: { type: Number },
     mergedAt: { type: Date }, // 上一次「合并新版」的时间（sourceVersion 随之前移）
+    sourceOrphanedAt: { type: Date }, // 那位老师的作者删号了（tutorPurge.service）：课留着、只是再也收不到新版；判否定 = 缺失就是没删
   },
   { timestamps: true },
 );

@@ -63,6 +63,7 @@ function toMarketCard(p, { installedSet = new Set(), userId = null } = {}) {
     tags: Array.isArray(p.tags) ? p.tags : [], subject: p.subject || "", author: authorOf(p), price: Number(p.price || 0),
     version: Number(p.releaseVersion || 0), shared: !!p.shared, takenDown: !!p.takenDown,
     stats: { downloadCount: Number((p.stats && p.stats.downloadCount) || 0), likeCount: Number((p.stats && p.stats.likeCount) || 0), ratingAvg: Number((p.stats && p.stats.ratingAvg) || 0), ratingCount: Number((p.stats && p.stats.ratingCount) || 0) },
+    remixOf: p.remixOf ? { id: String(p.remixOf._id || p.remixOf), name: (p.remixOf && p.remixOf.name) || "" } : null, // 复刻链（docs/02 9.1）
     installed: installedSet.has(String(p._id)), isOwner: !!userId && String(userId) === authorOf(p)._id,
     publishedAt: p.aigcDeclaredAt || p.updatedAt || p.createdAt, createdAt: p.createdAt, updatedAt: p.updatedAt,
   };
@@ -71,16 +72,17 @@ function toMarketCard(p, { installedSet = new Set(), userId = null } = {}) {
 const sortSpec = (sort) => (sort === "hot" ? { "stats.downloadCount": -1, "stats.likeCount": -1, createdAt: -1 } : { createdAt: -1 });
 
 async function fetchPage(f, sort, page, limit) {
-  if (sort !== "rating") return Persona.find(f).sort(sortSpec(sort)).skip((page - 1) * limit).limit(limit).populate("author", "_id username").lean();
+  if (sort !== "rating") return Persona.find(f).sort(sortSpec(sort)).skip((page - 1) * limit).limit(limit).populate("author", "_id username").populate("remixOf", "_id name").lean();
   const rows = await Persona.aggregate([
     { $match: f },
     { $addFields: { ratingRank: { $cond: [{ $gte: [{ $ifNull: ["$stats.ratingCount", 0] }, RATING_MIN_VOTES] }, { $ifNull: ["$stats.ratingAvg", 0] }, -1] } } },
     { $sort: { ratingRank: -1, "stats.ratingCount": -1, createdAt: -1 } },
     { $skip: (page - 1) * limit }, { $limit: limit },
   ]);
-  const users = await User.find({ _id: { $in: rows.map((r) => r.author) } }).select("_id username").lean();
+  const [users, sources] = await Promise.all([User.find({ _id: { $in: rows.map((r) => r.author) } }).select("_id username").lean(), Persona.find({ _id: { $in: rows.map((r) => r.remixOf).filter(Boolean) } }).select("_id name").lean()]);
   const byId = new Map(users.map((u) => [String(u._id), u]));
-  return rows.map((r) => ({ ...r, author: byId.get(String(r.author)) || r.author }));
+  const srcById = new Map(sources.map((s) => [String(s._id), s]));
+  return rows.map((r) => ({ ...r, author: byId.get(String(r.author)) || r.author, remixOf: r.remixOf ? srcById.get(String(r.remixOf)) || r.remixOf : null }));
 }
 
 async function installedSetFor(user, rows) {
@@ -102,7 +104,7 @@ async function listMarket({ user = null, query = {} }) {
 /** 详情：未发布 / 已下架的只有作者看得到（非作者 404，不泄露存在性，docs/02 6.6）；拉黑互不可见 */
 async function getMarketDetail({ user = null, personaId }) {
   if (!mongoose.isValidObjectId(personaId)) return null;
-  const p = await Persona.findOne({ _id: personaId, kind: TUTOR_KIND }).populate("author", "_id username").lean();
+  const p = await Persona.findOne({ _id: personaId, kind: TUTOR_KIND }).populate("author", "_id username").populate("remixOf", "_id name").lean();
   if (!p) return null;
   const authorId = authorOf(p)._id;
   const isOwner = !!user && String(user._id) === authorId;
