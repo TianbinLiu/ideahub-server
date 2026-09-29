@@ -47,6 +47,8 @@ describe("docs/06 D1 / D3 的 rg 验法", () => {
       "routes/persona.routes.js": "评论钩子 onCreated → TUTOR_COMMENT（开关关着不 require 那棵树，D3）",
       "controllers/branchAdmin.controller.js": "删号级联 ⑩.7 懒 require tutorPurge（开关关着不装，但删号不看开关，S14）",
       "services/personaAccess.service.js": "选用门：老师人格没勾「同时发布为启梦人格」不能装进看板娘（M3 反向勾选，判否定，与 personaKind 同一条规则的两半）",
+      "controllers/users.controller.js": "自助硬删 DELETE /api/users/:id 懒 require tutorPurge（三条删账号入口都调，开关关着不装但删号不看开关，S14 / S22）",
+      "controllers/admin.controller.js": "老管理后台 DELETE /api/admin/users/:id 懒 require tutorPurge（同上）",
     };
     const hits = walk(SRC)
       .filter((f) => f.endsWith(".js") && !/tutor/i.test(path.basename(f)) && !/[\\/]tutor[\\/]/.test(f))

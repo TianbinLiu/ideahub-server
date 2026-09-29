@@ -1,6 +1,8 @@
 "use strict";
 /**
- * 删号级联里老师人格这一线（tutor 仓 docs/06 §4.1「级联」、docs/04 S14）。由 branchAdmin.controller.purgeUserCascade ⑩.7 **懒 require** 调用：
+ * 删号级联里老师人格这一线（tutor 仓 docs/06 §4.1「级联」、docs/04 S14）。**三条删账号入口都调**（与 chatMemory.purgeUserChatData 同一条纪律，
+ *   tests/tutorPurgeEntries.spec.js 钉住）：branchAdmin.controller.purgeUserCascade ⑩.7、users.controller.deleteAccount（自助硬删）、
+ *   admin.controller.adminDeleteUser（老管理后台），都是 **懒 require**、都在删 User 之前 —— 2026-09-29 之前只挂了第一条，自助删号会把课 / 教材 / 老师原样留下。
  *   开关关着也要删数据 —— TUTOR_ENABLED 管的是功能挂不挂，不是数据在不在；懒 require 是为了开关关着时 tutor 树零加载（D3）。
  *
  * ★★ 两份清单（BranchTemplate 曾经两份都不在、纯遗漏，app CLAUDE.md 坑表）。新加一张 Tutor* 表必须落在其中一份，tests/tutorPurge.spec.js 拿模型目录对着查：

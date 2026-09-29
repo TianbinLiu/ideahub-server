@@ -146,6 +146,9 @@ async function adminDeleteUser(req, res, next) {
 
     // 数字人对话数据（会话 / 消息 / 用量 / 记忆卡）
     await purgeUserChatData(user._id);
+    // 老师人格那一线（tutor 仓 docs/04 S14，2026-09-29）：与 chat 数据同一条纪律，三条删账号入口都调、都在删 User 之前；
+    //   懒 require 的理由见 branchAdmin.purgeUserCascade ⑩.7（开关关着 tutor 树零加载，但删号不看开关）
+    await require("../services/tutorPurge.service").purgeTutorForUser(user._id);
 
     // 删除用户
     await User.deleteOne({ _id: user._id });
