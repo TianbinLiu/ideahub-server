@@ -10,8 +10,9 @@ const { createBody, updateBody } = require("../src/schemas/persona.schemas");
 require("../src/models/Persona");
 
 describe("personaKindFilter（唯一实现）", () => {
-  it("缺省 / 空 / 乱值 → 排除老师人格；存量没有 kind 字段的文档对 $ne 恒真", () => {
-    for (const v of [undefined, "", "companion", "TUTOR", "all", 0]) expect(personaKindFilter(v)).toEqual({ kind: { $ne: "tutor" } });
+  it("缺省 / 空 / 乱值 → 排除没勾「同时发布为启梦人格」的老师人格（M3）；存量没有 kind 字段的文档不被 $nor 那一支命中；单个 $nor 键，不与 controller 的 $or / $and 打架", () => {
+    for (const v of [undefined, "", "companion", "TUTOR", "all", 0]) expect(personaKindFilter(v)).toEqual({ $nor: [{ kind: "tutor", "companion.enabled": { $ne: true } }] });
+    expect(Object.keys(personaKindFilter())).toEqual(["$nor"]);
   });
   it("kind=tutor → 只要老师人格", () => {
     expect(personaKindFilter("tutor")).toEqual({ kind: TUTOR_KIND });
@@ -28,6 +29,11 @@ describe("Persona 模型：老师那几格全部判否定", () => {
     expect(new P(base()).kind).toBeUndefined();
     expect(new P({ ...base(), kind: "tutor" }).validateSync()).toBeUndefined();
     expect(new P({ ...base(), kind: "companion" }).validateSync()?.errors?.kind).toBeTruthy();
+  });
+  it("companion.enabled / companion.at（M3 反向勾选）没有 default：存量老师人格 = 没勾", () => {
+    expect(P.schema.path("companion.enabled").defaultValue).toBeUndefined();
+    expect(P.schema.path("companion.at").defaultValue).toBeUndefined();
+    expect(new P({ ...base(), kind: "tutor" }).companion?.enabled).toBeUndefined();
   });
   it("course / currentDoc / remixOf 是可选的 ObjectId 引用", () => {
     for (const k of ["course", "currentDoc", "remixOf"]) {

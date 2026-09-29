@@ -84,3 +84,20 @@ describe("复刻件（另存为我的人格，核心包 checkGates 的 fork 支�
     expect(checkGates({ doc, materials: [], materialTexts: [], adultDeclared: true, body: { aigcDeclared: true } })).toMatchObject({ ok: false, gate: "license" }); // 没有 fork 的老规则不变
   });
 });
+
+describe("M3 反向勾选「同时发布为启梦人格 / 可装进看板娘」（core/publish/companion，ported；规则只在核心包一处）", () => {
+  const { companionOptIn, companionStyleOf } = require("../src/tutor/core/publish/companion");
+  it("默认关：只认显式 true", () => {
+    for (const b of [undefined, {}, { alsoCompanion: "yes" }, { alsoCompanion: 1 }, { alsoCompanion: false }]) expect(companionOptIn(b)).toBe(false);
+    expect(companionOptIn({ alsoCompanion: true })).toBe(true);
+  });
+  it("① 教学面 → Persona.style：口头禅逐字一致、硬规则成边界、示例对话成 few-shot；只有说话风格那几格，② ③ ④ 不进", () => {
+    const s = companionStyleOf(doc.card);
+    expect(Object.keys(s).sort()).toEqual(["addressUser", "boundaries", "catchphrases", "examples", "greeting", "summary", "tone"]);
+    expect(s.catchphrases).toEqual([...new Set(doc.card.catchphrases.map((x) => x.trim()).filter(Boolean))]);
+    expect(s.boundaries).toEqual([...new Set(doc.card.hard_rules.map((r) => r.text.trim()))]);
+    expect(s.summary.startsWith(doc.card.who.trim())).toBe(true);
+    expect(s.summary.length).toBeLessThanOrEqual(2000); // Persona.style.summary 的 maxlength
+    expect(s.catchphrases.length).toBeGreaterThan(0);
+  });
+});

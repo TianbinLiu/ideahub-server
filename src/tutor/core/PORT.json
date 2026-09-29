@@ -1,6 +1,6 @@
 {
   "from": "ideahub-tutor",
-  "at": "2026-09-29T01:09:11.719Z",
+  "at": "2026-09-29T05:08:12.476Z",
   "files": [
     "cleanCheck.js",
     "format/checksum.js",
@@ -40,9 +40,11 @@
     "session/reviewCard.js",
     "export/index.js",
     "measure/index.js",
+    "publish/companion.js",
     "publish/index.js",
     "publish/merge.js",
-    "publish/rating.js"
+    "publish/rating.js",
+    "publish/referral.js"
   ],
   "skipped": [
     "ai/client.js",

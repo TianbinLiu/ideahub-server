@@ -61,7 +61,7 @@ const feedbackBody = z.object({ seq: z.number().int().min(1), value: z.union([z.
 const reviewBody = z.object({ accept: z.array(z.string().regex(/^[0-9a-f]{64}$/)).max(50).optional(), reject: z.array(z.string().regex(/^[0-9a-f]{64}$/)).max(50).optional() });
 const revertBody = z.object({ opIds: z.array(z.string().regex(/^[0-9a-f]{64}$/)).min(1).max(50) });
 // 发布（docs/02 §6）：五道门在服务端 tutorPublish.service.checkGates；这里只管形状。分类锁 teaching，所以没有 category 字段；kind 不收（服务端写死 tutor）
-const publishBody = z.object({ name: z.string().trim().min(1).max(120).optional(), description: z.string().trim().max(1000).optional(), tags: z.array(z.string().trim().min(1).max(20)).max(6).optional(), coverEmoji: z.string().trim().max(8).optional(), aigcDeclared: z.boolean().optional(), note: z.string().trim().max(200).optional() });
+const publishBody = z.object({ name: z.string().trim().min(1).max(120).optional(), description: z.string().trim().max(1000).optional(), tags: z.array(z.string().trim().min(1).max(20)).max(6).optional(), coverEmoji: z.string().trim().max(8).optional(), aigcDeclared: z.boolean().optional(), note: z.string().trim().max(200).optional(), alsoCompanion: z.boolean().optional() }); // alsoCompanion：M3 反向勾选，只认显式 true（core companionOptIn）
 // 「开始跟这位老师学」（docs/02 5.7）
 const startRunBody = z.object({ persona: z.string().regex(/^[a-f0-9]{24}$/i, "persona 要是 24 位 hex 的 id") });
 // 评分（docs/02 9.6）：1~5 星 + ≤500 字；能不能评在 core/publish/rating.canRate
@@ -69,6 +69,8 @@ const ratingBody = z.object({ stars: z.number().int().min(1).max(5), text: z.str
 // 管理后台：教授认领的人工核实队列（tutorClaims.service）
 const claimContactBody = z.object({ message: z.string().trim().min(1).max(500) });
 const claimVerdictBody = z.object({ verdict: z.enum(["upheld", "rejected"]), note: z.string().trim().max(500).optional() });
+// 引流位度量（M3，tutor 仓 docs/06 §5.1）：from 白名单在 core/publish/referral，这里只挡形状
+const referralBody = z.object({ from: z.string().trim().min(1).max(40), path: z.string().trim().max(120).optional() });
 const importBody = z.object({ courseId: z.string().min(1).optional(), text: z.string().max(2 * 1024 * 1024).optional(), json: z.unknown().optional(), filename: z.string().max(200).optional() });
 
-module.exports = { claimContactBody, claimVerdictBody, ratingBody, publishBody, startRunBody, createCourseBody, patchCourseBody, signBody, confirmBody, licenseBody, generateBody, acceptBody, emptyBody, turnBody, previewBody, quizBody, progressBody, skipBody, feedbackBody, reviewBody, revertBody, importBody };
+module.exports = { referralBody, claimContactBody, claimVerdictBody, ratingBody, publishBody, startRunBody, createCourseBody, patchCourseBody, signBody, confirmBody, licenseBody, generateBody, acceptBody, emptyBody, turnBody, previewBody, quizBody, progressBody, skipBody, feedbackBody, reviewBody, revertBody, importBody };

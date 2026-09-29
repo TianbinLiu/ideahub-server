@@ -65,6 +65,10 @@ const personaSchema = new mongoose.Schema(
     releaseVersion: { type: Number },
     subject: { type: String, trim: true, maxlength: 60 },
     remixOf: { type: mongoose.Schema.Types.ObjectId, ref: "Persona" },
+    // 「同时发布为启梦人格 / 可装进看板娘」（tutor 仓 docs/06 §5.1 反向勾选，2026-09-29 M3）：作者发布时显式勾选、默认关，只对 kind:"tutor" 有意义。
+    //   判否定：`companion.enabled !== true` = 没勾 = 这位老师**不进** /api/personas 缺省列表、不能被选用（services/personaKind.js 与 personaAccess.service 各一处判）；
+    //   勾了才由 ① 教学面生成 `style`（core/publish/companion.companionStyleOf，只带说话风格，课件内容一个字不带）。没有 default：存量老师人格 = 没勾。
+    companion: { enabled: { type: Boolean }, at: { type: Date } },
     // 发布时「主动声明含 AI 生成内容」的那一拍（《标识办法》第十条，显式勾选不是脚注）。判否定：没声明过 = 发布五道门第 ④ 道不过
     aigcDeclaredAt: { type: Date },
     // 发布时从课程拷过来并锁住的授权来源与 AI 政策（🔒 硬规则的源头），详情页只读展示

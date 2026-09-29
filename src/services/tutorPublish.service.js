@@ -11,6 +11,9 @@
  * ★ 发布件 = applyAudience("market") 裁过的文档（② 只带种子、学生问答不带、③ 状态列清空）—— 导出能发出去的，市场也能发；导出被拒的，市场同样拒。
  * ★ 一门课 = 一位老师 = 一条 Persona（course 上 partial unique）；再次发布 = 新版本（TutorRelease v(n+1)），旧版快照原样留着，已开的 Run 钉在旧版。
  * ★ 被平台下架的老师不能再发布（docs/02 6.6）；取消分享（unpublish）只翻 shared，快照与版号都留着。
+ * ★ 「同时发布为启梦人格 / 可装进看板娘」（M3 反向勾选，docs/06 §5.1）：body.alsoCompanion 显式 true 才算勾（core/publish/companion.companionOptIn，默认关），
+ *   勾了才由 ① 教学面生成 Persona.style（companionStyleOf，只带说话风格）并写 Persona.companion；每次发布重新表态，不勾 = 关且清掉 style。
+ *   没勾的老师不进 /api/personas 缺省列表、装不进看板娘（personaKind.js / personaAccess.service 各一处判）。
  */
 const Persona = require("../models/Persona");
 const TutorRelease = require("../models/TutorRelease");
@@ -21,6 +24,7 @@ const { sha256Hex } = require("../tutor/core/format/index");
 // ★ 五道门与常量都从核心包来（tutor 仓 src/publish，port:server 转成 CJS）：参考实现（tutor 仓 devServer）与这里跑的是同一个函数，
 //   e2e 在参考实现上验过的门，这里一道不差；改门先回 tutor 仓改、再重跑 port —— 别在这儿另抄一份（2026-09-28 之前这里确实有一份手抄的，已删）。
 const { checkGates, forkIdOf, TAGS_MAX, DEFAULT_COVER } = require("../tutor/core/publish/index");
+const { companionOptIn, companionStyleOf } = require("../tutor/core/publish/companion");
 
 function publishView(p, rel, extra = {}) {
   const remix = p.remixOf ? { id: String(p.remixOf._id || p.remixOf), name: (p.remixOf && p.remixOf.name) || extra.remixName || "" } : null; // 血缘（docs/02 9.1「复刻链」）
@@ -30,6 +34,7 @@ function publishView(p, rel, extra = {}) {
     shared: !!p.shared, takenDown: !!p.takenDown, ...(p.takenDown ? { takenDownReason: p.takenDownReason || "" } : {}),
     version: rel ? rel.version : p.releaseVersion || 0, sha256: rel ? rel.sha256 : undefined, checksum: rel ? rel.checksum : undefined, produceId: rel ? rel.produceId : undefined,
     publishedAt: rel ? rel.publishedAt : undefined, aigcDeclaredAt: p.aigcDeclaredAt || null, marketPath: `/tutor/market/${String(p._id)}`,
+    companion: { enabled: !!(p.companion && p.companion.enabled), at: (p.companion && p.companion.at) || null }, // M3 反向勾选（判否定：老数据 = 没勾）
   };
 }
 
@@ -49,8 +54,10 @@ async function publish(ctx, user, body = {}) {
   if (!g.ok) return { status: 422, body: { ok: false, code: "GATE", gate: g.gate, message: g.message, ...(g.details ? { details: g.details } : {}) } };
   const existing = await Persona.findOne({ kind: "tutor", course: ctx.course._id });
   if (existing && existing.takenDown) return { status: 403, body: { ok: false, code: "TAKEN_DOWN", message: `这位老师已被平台下架（${existing.takenDownReason || "原因见站内通知"}），不能再发布` } };
+  const optIn = companionOptIn(body); // 显式 true 才算勾；每次发布重新表态
   const fields = {
     kind: "tutor", author: user._id, course: ctx.course._id, name: g.name,
+    companion: { enabled: optIn, at: optIn ? new Date() : null }, style: optIn ? companionStyleOf(g.built.doc.card) : {},
     description: String(body.description ?? (existing && existing.description) ?? "").trim().slice(0, 1000),
     coverEmoji: String(body.coverEmoji || (existing && existing.coverEmoji) || DEFAULT_COVER).slice(0, 8),
     tags: g.tags.length ? g.tags : (existing && existing.tags) || [],

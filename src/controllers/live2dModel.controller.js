@@ -65,7 +65,7 @@ async function resolvePersonaBinding(personaId, user) {
     throw new AppError({
       code: reason === "not_found" ? CODES.NOT_FOUND : CODES.FORBIDDEN,
       status: reason === "not_found" ? 404 : 403,
-      message: reason === "unpaid" ? "Buy the persona before binding it" : reason === "private" ? "That persona is private" : "Persona not found",
+      message: reason === "unpaid" ? "Buy the persona before binding it" : reason === "private" ? "That persona is private" : reason === "not_companion" ? "That persona is not offered as a companion persona" : "Persona not found",
       details: { reason },
     });
   }

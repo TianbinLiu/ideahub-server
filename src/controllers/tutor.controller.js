@@ -15,6 +15,8 @@ const pub = require("../services/tutorPublish.service");
 const rating = require("../services/tutorRating.service");
 const mergeSvc = require("../services/tutorMerge.service");
 const claims = require("../services/tutorClaims.service");
+const metricsSvc = require("../services/tutorMetrics.service");
+const { clientIp } = require("../middleware/rateLimit");
 const file = require("../services/tutorFile.service");
 const session = require("../services/tutorSession.service");
 const distill = require("../services/tutorDistill.service");
@@ -87,6 +89,9 @@ module.exports = {
   claims: wrap(async (req, res) => { res.json({ ok: true, ...(await claims.list({ stage: req.query.stage, page: req.query.page, limit: req.query.limit })) }); }),
   claimContact: wrap(async (req, res) => { const r = await claims.contact({ id: req.params.id, operator: req.user, message: req.body.message }); res.status(r.status).json(r.body); }),
   claimVerdict: wrap(async (req, res) => { const r = await claims.verdict({ id: req.params.id, operator: req.user, verdict: req.body.verdict, note: req.body.note }); res.status(r.status).json(r.body); }),
+  // ---- M3 与启梦互通（tutor 仓 docs/06 §5.1「度量」）：引流位 ?from= 记一行（optionalAuth：游客也记，按 IP 指纹）+ 管理员看三条度量
+  referral: wrap(async (req, res) => { const r = await metricsSvc.recordReferral({ user: req.user || null, ip: clientIp(req), from: req.body.from, path: req.body.path }); res.status(r.status).json(r.body); }),
+  metrics: wrap(async (req, res) => { res.json(await metricsSvc.metrics()); }),
   // ---- 合并新版（docs/03 §6.3）
   mergeRelease: wrap(async (req, res) => { const ctx = await loadOr404(req, res, req.params.id); if (!ctx) return; const r = await mergeSvc.merge(ctx); res.status(r.status).json(r.body); }),
 

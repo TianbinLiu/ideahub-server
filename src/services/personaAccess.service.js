@@ -38,7 +38,7 @@ function styleDescriptorOf(name, style) {
 
 /**
  * 判定 + 取回人格（lean）。
- * @returns {Promise<{ persona: object|null, reason: ""|"not_found"|"private"|"unpaid" }>}
+ * @returns {Promise<{ persona: object|null, reason: ""|"not_found"|"private"|"unpaid"|"not_companion" }>}
  */
 async function checkPersonaAccess(personaId, userId) {
   const id = String(personaId || "");
@@ -48,6 +48,10 @@ async function checkPersonaAccess(personaId, userId) {
   const authorId = String(persona.author?._id || persona.author);
   const isOwner = !!userId && authorId === String(userId);
   if (!persona.shared && !isOwner) return { persona: null, reason: "private" };
+  // 老师人格（kind:"tutor"）只有作者发布时勾了「同时发布为启梦人格 / 可装进看板娘」才能被选用（tutor 仓 docs/06 §5.1 反向勾选，2026-09-29 M3；
+  //   与 personaKind.js 的列表过滤是同一条规则的两半：列表看得见 ⇔ 能装）。没勾的 style 是空的、装进去也没有人设；作者自己也不例外 ——
+  //   这一格是「这位老师要不要进陪伴线」的表态，不是可见性。判否定：没这一格 = 没勾
+  if (persona.kind === "tutor" && !(persona.companion && persona.companion.enabled === true)) return { persona: null, reason: "not_companion" };
   if (Number(persona.price || 0) > 0 && !isOwner) {
     const bought = userId
       ? await PersonaPurchase.exists({ user: userId, persona: persona._id, settledAt: { $ne: null } })

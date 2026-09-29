@@ -28,6 +28,7 @@
  * @endpoint GET    /personas/:id/export?format&audience · /exports · POST /personas/import
  * @endpoint GET    /runs/:id · /turns?after · /review-card · /usage-export · /review-due · /review-quiz?stage · /revisions
  * @endpoint PATCH  /runs/:id/progress · POST /runs/:id/turns(SSE) · /quiz · /skip · /feedback · /distill · /revisions/:rid/review|revert
+ * @endpoint POST   /referral                            - 引流位 ?from= 记一行（可选登录；只记不奖励）· GET /admin/metrics 三条度量（管理员）（M3）
  *
  * SSE（turns / preview）：token {t} · sentence {index,text} · done {seq,kind,text,flags,demo,preview,stage,progress,status,changed,distillQueued} · error {message}；
  *   每 15 秒一行 `: ping` 注释帧。与 companion 同一份 openSse 响应头。
@@ -44,7 +45,7 @@
 const router = require("express").Router();
 const { requireRole, requireAuth, optionalAuth } = require("../middleware/auth");
 const { ADMIN_ROLE } = require("../utils/roles");
-const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
+const { aiRateLimit, userRateLimit, rateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const S = require("../schemas/tutor.schemas");
 const ctrl = require("../controllers/tutor.controller");
@@ -57,6 +58,8 @@ router.get("/health", ctrl.health);
 router.get("/market", optionalAuth, ctrl.market);
 router.get("/market/:id", optionalAuth, ctrl.marketDetail);
 router.get("/market/:id/ratings", optionalAuth, ctrl.ratings); // 评分列表 + 均分 / 分布 + 我的 + 能不能评（游客可看）
+// M3 与启梦互通（tutor 仓 docs/06 §5.1「度量」）：各引流位带 ?from=，落到 /tutor 时客户端发一发 —— 游客也记（按 IP 指纹），只记不奖励；按 IP 限流，服务端再按天去重
+router.post("/referral", optionalAuth, rateLimit({ max: 30, scope: "tutor:referral" }), validate({ body: S.referralBody }), ctrl.referral);
 router.use(requireAuth);
 router.get("/config", ctrl.config);
 router.post("/declare-adult", validate({ body: S.emptyBody }), ctrl.declareAdult);
@@ -99,6 +102,7 @@ router.post("/courses/:id/merge-release", userRateLimit({ max: 10, scope: "tutor
 router.get("/admin/claims", requireRole(ADMIN_ROLE), ctrl.claims);
 router.post("/admin/claims/:id/contact", requireRole(ADMIN_ROLE), validate({ body: S.claimContactBody }), ctrl.claimContact);
 router.post("/admin/claims/:id/verdict", requireRole(ADMIN_ROLE), validate({ body: S.claimVerdictBody }), ctrl.claimVerdict);
+router.get("/admin/metrics", requireRole(ADMIN_ROLE), ctrl.metrics); // M3 三条度量（引流 / 跨产品激活 / 反哺 + fork 7 天），只读
 
 router.get("/runs/:id", ctrl.getRun);
 router.get("/runs/:id/turns", ctrl.getTurns);

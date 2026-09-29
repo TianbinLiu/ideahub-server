@@ -68,7 +68,7 @@ async function updateCompanionSetting({ userId, req, patch }) {
         throw new AppError({
           code: reason === "not_found" ? CODES.NOT_FOUND : CODES.FORBIDDEN,
           status: reason === "not_found" ? 404 : 403,
-          message: reason === "unpaid" ? "This persona must be purchased first" : reason === "private" ? "This persona is private" : "Persona not found",
+          message: reason === "unpaid" ? "This persona must be purchased first" : reason === "private" ? "This persona is private" : reason === "not_companion" ? "This persona is not offered as a companion persona" : "Persona not found",
           details: { reason },
         });
       }
