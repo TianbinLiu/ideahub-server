@@ -11,40 +11,69 @@
  */
 const TEST_URL = process.env.REDIS_TEST_URL || "redis://127.0.0.1:6379";
 
+// ★ require 放在模块顶层，不能挪回 beforeAll 里。
+//   载入 redis 包是同步的（600+ 个模块），而 hook 的超时从 hook 开始就在计时；
+//   同步代码执行期间任何定时器都插不进来，connectTimeout 更管不到这一段。
+//   实测（2026-09-30，Windows 11 / Node 24）：这一步空闲时 ~0.35 s，CPU 8 倍超订
+//   （32 个逻辑核跑 256 个满载线程）时 6–7 s —— 单它就超过 Jest 默认 5 s 的 hook
+//   超时，三条用例一起报「Exceeded timeout of 5000 ms for a hook」，而连接本身
+//   几毫秒就 ECONNREFUSED 了。模块求值阶段 Jest 不计超时，放这里慢也只是慢。
+const { createClient } = require("redis");
+
+// ★ 探测（connect + ping）的总预算，到点就按「不可用」跳过。
+//   connectTimeout 只管 TCP 握手：TCP 连上之后的 HELLO / CLIENT SETINFO 握手
+//   没有超时，ping 走 node-redis 6 默认的 5 s 命令超时，又恰好等于 Jest 的 hook
+//   超时 —— 对端「收连接但不回话」时，没有这道预算 hook 一定超时（与负载无关）。
+//   预算要宽：本机 Redis 几毫秒就回 PONG，给窄了会在高负载下把可用的 Redis
+//   误判成不可用，悄悄丢掉覆盖。连接被拒（最常见的跳过原因）几毫秒就结束，不受它影响。
+const PROBE_BUDGET_MS = 3_000;
+// hook 自己的超时只是兜底，必须明显大于预算：要让预算来裁决，而不是 Jest。
+const PROBE_HOOK_TIMEOUT_MS = 10_000;
+
 let available = false;
 let probeClient = null;
 
 beforeAll(async () => {
+  let client = null;
+  let budgetTimer;
   try {
-    const { createClient } = require("redis");
-    probeClient = createClient({
+    client = createClient({
       url: TEST_URL,
       // ★ reconnectStrategy:false 必不可少 —— node-redis 默认会不断重连，
       //   connect() 因此迟迟不 reject，把这个 hook 拖到 Jest 超时（表现为
       //   「测试失败」而不是「优雅跳过」）。探测用的客户端要的就是快速失败。
       socket: { connectTimeout: 800, reconnectStrategy: false },
     });
-    probeClient.on("error", () => {});
-    await probeClient.connect();
-    await probeClient.ping();
+    client.on("error", () => {});
+    await Promise.race([
+      client.connect().then(() => client.ping()),
+      new Promise((_, reject) => {
+        budgetTimer = setTimeout(
+          () => reject(new Error(`探测 ${PROBE_BUDGET_MS} ms 内未完成`)),
+          PROBE_BUDGET_MS
+        );
+      }),
+    ]);
+    probeClient = client;
     available = true;
-  } catch {
+  } catch (err) {
     available = false;
-    if (probeClient) {
-      try { await probeClient.disconnect(); } catch {}
-      probeClient = null;
-    }
+    // 用 destroy() 而不是 quit()/close()：后两者要等服务端回话，正是可能挂住的那一步。
+    // destroy() 是同步的；连接早已失败时它抛 ClientClosedError，吞掉即可。
+    try { client?.destroy(); } catch {}
     console.warn(
-      `\n[跳过] Redis 限流集成测试：连不上 ${TEST_URL}。` +
+      `\n[跳过] Redis 限流集成测试：连不上 ${TEST_URL}（${err?.code || err?.message}）。` +
       `\n       这不是失败，但意味着 Redis 分支未被覆盖。` +
       `\n       需要覆盖时启动本地 Redis 或设 REDIS_TEST_URL。\n`
     );
+  } finally {
+    clearTimeout(budgetTimer);
   }
-});
+}, PROBE_HOOK_TIMEOUT_MS);
 
-afterAll(async () => {
+afterAll(() => {
   if (probeClient) {
-    try { await probeClient.disconnect(); } catch {}
+    try { probeClient.destroy(); } catch {}
   }
 });
 
