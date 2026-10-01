@@ -18,7 +18,9 @@ const TEST_URL = process.env.REDIS_TEST_URL || "redis://127.0.0.1:6379";
 //   （32 个逻辑核跑 256 个满载线程）时 6–7 s —— 单它就超过 Jest 默认 5 s 的 hook
 //   超时，三条用例一起报「Exceeded timeout of 5000 ms for a hook」，而连接本身
 //   几毫秒就 ECONNREFUSED 了。模块求值阶段 Jest 不计超时，放这里慢也只是慢。
-const { createClient } = require("redis");
+//   用例里的 loadWithRedis() 也复用这同一份，原因见那里。
+const redisPkg = require("redis");
+const { createClient } = redisPkg;
 
 // ★ 探测（connect + ping）的总预算，到点就按「不可用」跳过。
 //   connectTimeout 只管 TCP 握手：TCP 连上之后的 HELLO / CLIENT SETINFO 握手
@@ -77,9 +79,18 @@ afterAll(() => {
   }
 });
 
-/** 载入一个「已配置 Redis」的限流器实例 */
+/**
+ * 载入一个「已配置 Redis」的限流器实例
+ *
+ * ★ resetModules 要的只是【独立的 src 模块实例】（各自的进程内 Map、各自 createClient
+ *   出来的连接），redis 包本身不必重载 —— 计数照样只能经 Redis 共享。所以用 doMock
+ *   把顶层已载入的那一份递给 config/redis。不这么做，每次 resetModules 后整个 redis 包
+ *   （600+ 个模块）都要同步重载一遍，而且算在用例 5 s 的超时里：与 beforeAll 是同一个坑，
+ *   CPU 吃紧时单次重载 6–7 s，第一条用例要重载两次。
+ */
 function loadWithRedis() {
   jest.resetModules();
+  jest.doMock("redis", () => redisPkg);
   process.env.REDIS_URL = TEST_URL;
   process.env.NODE_ENV = "development"; // test 环境限流整体关闭，这里要打开
   return require("../src/middleware/rateLimit");
@@ -104,6 +115,11 @@ async function waitReady(redisMod, ms = 3000) {
   }
   return false;
 }
+
+// ★ 用例自己的等待预算加起来就超过 Jest 默认的 5 s：第一条要等两个实例各自连上
+//   （waitReady 各 3 s）。超时给足，让 waitReady 后面的断言报出「没连上」，
+//   而不是被 Jest 一句笼统的超时抢先。
+const REDIS_TEST_TIMEOUT_MS = 15_000;
 
 describe("Redis 后端限流", () => {
   test("计数跨【独立模块实例】共享 —— 这是 cluster 下配额准确的前提", async () => {
@@ -139,7 +155,7 @@ describe("Redis 后端限流", () => {
 
     await redisA.quit();
     await redisB.quit();
-  });
+  }, REDIS_TEST_TIMEOUT_MS);
 
   test("不同 key 互不影响", async () => {
     if (!available) return;
@@ -164,7 +180,7 @@ describe("Redis 后端限流", () => {
     expect(again.statusCode).toBe(429);   // 同 IP 第 2 次被拒
 
     await r.quit();
-  });
+  }, REDIS_TEST_TIMEOUT_MS);
 
   test("键设置了 TTL —— 没有 TTL 的话用户会被永久限流", async () => {
     if (!available) return;
@@ -183,5 +199,5 @@ describe("Redis 后端限流", () => {
     expect(ttl).toBeLessThanOrEqual(5_000);
 
     await r.quit();
-  });
+  }, REDIS_TEST_TIMEOUT_MS);
 });
