@@ -28,6 +28,23 @@ function videoUrlOf(userId, ts) {
   return `${CLOUD_PREFIX}/ideahub/template-videos/${userId}-${ts}.mp4`;
 }
 
+/**
+ * 一个本文件里还没人用过的 `${userId}-<ts>` 编号（nextPid 也从这里取）。
+ * ★★ 不许拿 Date.now() 造：服务端自己也在这条时间轴上起名 —— 分段登记切出来的每一段是
+ *   `${userId}-${Date.now() + i}`（branchTemplate.routes）。用例拿 `Date.now() + k` 当源编号，
+ *   请求恰好跑到第 k-i 毫秒时，切出来的那段就与源**同名**。2026-09-30 实测：「切过段的源视频」
+ *   那条（k=6）在第 5 毫秒给第 2 段起名，孤儿口第一道 exists 先命中「已登记为白模模板」——
+ *   间歇性红（1/4～1/15，看机器快慢），报的错与真正原因毫不相干。
+ * 从 10^10 起数（11 位）：比文件里写死的编号都长（最长是 10 位的 1712000000），又比服务端
+ *   起名用的 13 位毫秒时间戳短 —— 三方永不相撞，看位数就知道是谁起的名。
+ *   库是每个文件独占的 MongoMemoryServer，文件内唯一就够了。
+ */
+let tsSeq = 10_000_000_000;
+function nextTs() {
+  tsSeq += 1;
+  return tsSeq;
+}
+
 /** Cloudinary 资源详情的假回执（服务端登记元数据的唯一来源） */
 function fakeResource(publicId, over = {}) {
   return {
@@ -879,11 +896,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
   // ★ 每条用例默认用一段**没用过**的素材：白模化对同一段素材只许做一次
   //   （第一次的 source 就占住它了）。共用同一个 id 的话，后面的用例全会撞上
   //   "这段素材已经做过"，而错误信息与它们要测的东西对不上 —— 排查起来极其误导。
-  // 8500 起：与下面几条用例里写死的 8002~8015 分开，免得撞成"这段素材已经做过"
-  let pidSeq = 8500;
+  // 编号取文件级的 nextTs()（11 位），与下面几条用例里写死的 8002~8015 天然分开
   function nextPid() {
-    pidSeq += 1;
-    return `ideahub/template-videos/${owner.id}-${pidSeq}`;
+    return `ideahub/template-videos/${owner.id}-${nextTs()}`;
   }
 
   function baseBody(over = {}) {
@@ -1615,7 +1630,7 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     // ★ 造一个"付得起看帧、付不起出片"的余额：这条路走的是 chargedArkCall 的
     //   `ok:false / reason:funds` 分支 —— 它自己那一笔一分钱没动，但看帧那笔已经花了。
     //   审查前这里回的是 billed:false，与「roles 为空」那条（同样在看帧之后）自相矛盾。
-    const pid = `ideahub/template-videos/${owner.id}-8015`;
+    const pid = nextPid();
     const w = await walletSvc.getWallet(owner.id);
     // 只留下"够看一次帧、不够出片"的额度（r2v 那一笔是几十万级）
     // ★ 压余额用 debit 会写一行 ark_spend，于是这一发先撞**每日上限**（429）而不是余额不足（402）。
@@ -3427,7 +3442,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   }
 
   it("34.2s + splits=[17] → 两段独立模板，group 齐全，标题带第 N/M 段", async () => {
-    const ts = Date.now();
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3463,7 +3478,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("分出 <4s 的段整单 400，一个资产都不切", async () => {
-    const ts = Date.now() + 1;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3480,7 +3495,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("分出 >30s 的段整单 400（服务端只验不修）", async () => {
-    const ts = Date.now() + 2;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 40 }));
     const up = mockPartUpload();
     try {
@@ -3497,7 +3512,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("第二段切失败 → 已切资产回收、库里零残留、502 可重试", async () => {
-    const ts = Date.now() + 3;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     let n = 0;
     const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
@@ -3529,7 +3544,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("低于像素硬门的源（836×480=401,280）→ 切段变换自动放大过门，c_scale 接在 so_/du_ 之后", async () => {
-    const ts = Date.now() + 4;
+    const ts = nextTs();
     // 作者手上那段真实素材的形状：34.18s、836×480 —— 只差 1.6% 就过 407,696 的门
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18, width: 836, height: 480 }));
     const seen = [];
@@ -3573,7 +3588,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("切过段的源视频：孤儿回收口整句拒；删到最后一段时连组源一起回收", async () => {
-    const ts = Date.now() + 6;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3602,7 +3617,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("像素够的源切段时不带 c_scale（放大只在不够时做）", async () => {
-    const ts = Date.now() + 5;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 })); // 720×1280，过门
     const seen = [];
     const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
