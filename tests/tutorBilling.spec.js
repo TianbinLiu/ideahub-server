@@ -7,7 +7,8 @@ const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
 const pages = require("./fixtures/tutor/week1-delay.pages.json");
 
-let streamMode = "ok"; // ok | failBeforeFirst
+// ★ 名字必须以 mock 开头：babel-jest 会把 jest.mock 提到文件顶，工厂里引用别的外部变量整份 spec 直接编译失败（2026-09-30 本机首跑就是这么挂的）
+let mockStreamMode = "ok"; // ok | failBeforeFirst
 jest.mock("../src/services/aiClient", () => {
   const actual = jest.requireActual("../src/services/aiClient");
   return {
@@ -21,7 +22,7 @@ jest.mock("../src/services/aiClient", () => {
       return { text: "{}", model: "mock", finishReason: "stop", usage: { promptTokens: 10, completionTokens: 2 } };
     },
     aiChatStream: async function* (messages, opts = {}) {
-      if (streamMode === "failBeforeFirst") { const e = new Error("upstream 502"); e.status = 502; throw e; }
+      if (mockStreamMode === "failBeforeFirst") { const e = new Error("upstream 502"); e.status = 502; throw e; }
       for (const c of ["先算一道。", "你手上有几个数？"]) { await new Promise((r) => setTimeout(r, 5)); yield c; }
       if (opts.onFinish) opts.onFinish("stop", "mock");
       if (opts.onUsage) opts.onUsage({ model: "mock", promptTokens: 300, completionTokens: 20, cacheHitTokens: 0, cacheMissTokens: 300, reasoningTokens: 0 });
@@ -93,10 +94,10 @@ describe("tutor 计费", () => {
     expect((await request(app).post(`/api/tutor/personas/${cid}/preview`).set(auth(token)).send({ kind: "teach" })).text).toMatch(/event: done/);
     expect(b2 - (await balance(user._id))).toBe(400);
     // 第一个 token 之前上游抛：SSE 里是 error 事件、钱退回、账本有 tutor_refund
-    streamMode = "failBeforeFirst";
+    mockStreamMode = "failBeforeFirst";
     const b3 = await balance(user._id);
     const failed = await request(app).post(`/api/tutor/runs/${cid}/turns`).set(auth(token)).send({ kind: "ask", stage: s1, text: "再问" });
-    streamMode = "ok";
+    mockStreamMode = "ok";
     expect(failed.status).toBe(200);
     expect(failed.text).toMatch(/event: error/);
     expect(failed.text).toMatch(/已退回/);

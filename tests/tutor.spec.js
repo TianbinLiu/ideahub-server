@@ -25,7 +25,7 @@ beforeAll(async () => {
   const { connectDB } = require("../src/config/db");
   await connectDB();
   app = require("../src/app");
-  cloudinary = require("../src/config/cloudinary");
+  ({ cloudinary } = require("../src/config/cloudinary")); // ★ 要解构：spy 必须装在服务用的同一个 v2 对象上
 });
 afterAll(async () => { await mongoose.disconnect(); if (mongod) await mongod.stop(); });
 
@@ -95,9 +95,19 @@ describe("老师人格：建课 → 教材 → 生成 → 上课 → 蒸馏 → 
     const text = (await request(app).get(`/api/tutor/materials/${SHA.slice(0, 12)}/text`).set(auth(token))).body;
     expect(text.pages.map((p) => p.blocks.map((b) => b.hash))).toEqual(pages.map((p) => p.blocks.map((b) => b.hash)));
     expect((await request(app).get(`/api/tutor/materials/${SHA}/text`).set(auth(other.token))).status).toBe(404);
-    const file = await request(app).get(`/api/tutor/materials/${SHA}/file`).set(auth(token)).redirects(0);
-    expect(file.status).toBe(302);
-    expect(file.headers.location).toMatch(/cloudinary\.com/);
+    // 原件：2026-09-28 起不 302、由服务端签 5 分钟下载地址流式转回（理由在 tutorFile.service 头部，Range / 上游失败的细节在 tutorFile.spec）。
+    //   这里只验接线：本人 200、字节原样、inline，去的是 Cloudinary 的签名下载；上游用 fetch 的 spy 顶替（supertest 不走 fetch，不受影响）。
+    const fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async () => new Response("%PDF-1.7 fake", { status: 200, headers: { "content-type": "application/octet-stream", "content-length": "13" } }));
+    const binary = (res, cb) => { const chunks = []; res.on("data", (c) => chunks.push(c)); res.on("end", () => cb(null, Buffer.concat(chunks))); };
+    const file = await request(app).get(`/api/tutor/materials/${SHA}/file`).set(auth(token)).redirects(0).buffer(true).parse(binary);
+    expect(file.status).toBe(200);
+    expect(file.body.toString()).toBe("%PDF-1.7 fake");
+    expect(file.headers["content-disposition"]).toMatch(/^inline;/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/^https:\/\/api\.cloudinary\.com\/v1_1\/demo-cloud\/raw\/download\?/);
+    expect((await request(app).get(`/api/tutor/materials/${SHA}/file`).set(auth(other.token))).status).toBe(404); // 别人的课 404，不去上游
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockRestore();
 
     // 报价（演示免费）→ 生成受理 202 → worker 的一步 → succeeded
     const quote = (await request(app).get(`/api/tutor/courses/${cid}/quote`).set(auth(token))).body;
@@ -139,9 +149,11 @@ describe("老师人格：建课 → 教材 → 生成 → 上课 → 蒸馏 → 
     expect(turn.text).toMatch(/event: sentence/);
     const done = JSON.parse([...turn.text.matchAll(/event: done\ndata: (.*)\n/g)].at(-1)[1]);
     expect(done).toMatchObject({ kind: "answer", demo: true, stage: s1 });
-    expect(done.seq).toBe(2);
+    // ★ seq 是 3 不是 2：上面「没讲完不能自检」那一发虽然回 409，handleQuiz 是先判卷、落 quizResult（seq 1）、再 advance 才拒的。
+    //   参考实现 devServer.handleQuiz 同序，这里照实钉住；要不要改成「拒了不落」是产品决定，两边得一起改（2026-09-30 本机首跑发现）。
+    expect(done.seq).toBe(3);
     const turns = (await request(app).get(`/api/tutor/runs/${cid}/turns?after=0`).set(auth(token))).body.turns;
-    expect(turns.map((t) => [t.role, t.kind])).toEqual([["user", "ask"], ["assistant", "answer"]]);
+    expect(turns.map((t) => [t.seq, t.role, t.kind])).toEqual([[1, "user", "quizResult"], [2, "user", "ask"], [3, "assistant", "answer"]]);
     // 「没懂」不过模型：自动落卡点
     const mark = await request(app).post(`/api/tutor/runs/${cid}/turns`).set(auth(token)).send({ kind: "select", stage: s1, selection: { anchor: { material: SHA.slice(0, 12), page: 3, quote: "存储转发" } } });
     expect(mark.body).toMatchObject({ ok: true, status: "applied" });
@@ -154,7 +166,12 @@ describe("老师人格：建课 → 教材 → 生成 → 上课 → 蒸馏 → 
     expect(good.body.passed).toBe(true);
     expect(good.body.nextReviewAt).toBeTruthy();
     expect(good.body.nextStage).not.toBe(s1);
-    expect((await request(app).post(`/api/tutor/runs/${cid}/quiz`).set(auth(token)).send({ stage: s1, answers: [], review: true })).status).toBe(400); // 回访：刚过、凑不出题就 400（不是 409）
+    // 回访只认已通过的阶段：下一阶段还没过 → 409 NOT_PASSED。
+    //   ★ 原先这里断言「s1 刚过、凑不出题 → 400」，与规则不符：reviewQuestions 不看到期，s1 有自检题就总能出题，
+    //   那一发空答卷会被判成回访没过、把 s1 退回已讲，后面的到期断言跟着全错（参考实现 server.test.mjs 测的也是 409 这条）
+    const notPassed = await request(app).post(`/api/tutor/runs/${cid}/quiz`).set(auth(token)).send({ stage: good.body.nextStage, answers: [], review: true });
+    expect(notPassed.status).toBe(409);
+    expect(notPassed.body.code).toBe("NOT_PASSED");
     // 回访到期：直接把时间往前拨（time-travel 端点不移植）
     const TutorRun = require("../src/models/TutorRun");
     const runDoc = await TutorRun.findOne({ course: cid });

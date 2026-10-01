@@ -7,7 +7,10 @@
 //   · 扫描目录（docs/05 §4.6）：清单里还没进 ③ 的教材 → 阶段提议（pending）→ 作者点头才追加成新版。
 // ★ 演示模式（没配 AI key）：生成走 core/generate/demo 的确定性产物。生产不许静默走演示：demoAllowed() 只在非生产、或显式 TUTOR_ALLOW_DEMO=1 时为真。
 const crypto = require("node:crypto");
-const cloudinary = require("../config/cloudinary");
+// ★ config/cloudinary 导出的是 { cloudinary, validateCloudinaryConfig }，必须解构（全仓其它十几处都这么写）。
+//   2026-09-30 之前这里整体 require：.api / .uploader 都是 undefined，配了 Cloudinary 的生产上每份教材验收都被下面的 catch 接成 502，
+//   同 sha 重复传则 destroy 同步抛成 500。tests/tutor.spec.js 那条整链要 Mongo，此前没在任何机器上跑过，所以一直没暴露。
+const { cloudinary } = require("../config/cloudinary");
 const { cloudinaryReady, signDirectUpload, directDownloadUrl } = require("./directUpload.service");
 const billing = require("./billing.service");
 const { priceOf } = require("../config/tokens");
@@ -121,7 +124,9 @@ async function runNextJob() {
     const out = await runGenerate({
       course: ctx.meta, materials: mats.map((m) => ({ sha: m.sha, name: m.name, ext: m.ext, pages: m.pages, license: m.license })), questionnaire: job.questionnaire,
       checkpoint, onProgress: (p) => { job.progress = p; const now = Date.now(); if (now - lastTick > 500) { lastTick = now; TutorJob.updateOne({ _id: job._id }, { $set: { progress: p } }).catch(() => {}); } },
-      docId: ctx.doc && ctx.doc.id, version: ((ctx.doc && ctx.doc.version) || 0) + 1, supersedes: ctx.doc && ctx.doc.version,
+      // ★ 用 ?. 不用 &&：还没生成过的课 ctx.doc 是 null，`null && …` 得 null，而 seedDoc 的 `id = newDocId()` 只对 undefined 生效 →
+      //   文档 id 为 null、组装校验整份拒，任务 3 次后 failed、受理时扣的报价不退（2026-09-30 本机首跑 tutorBilling.spec 才发现；参考实现一直是 ?.）
+      docId: ctx.doc?.id, version: (ctx.doc?.version || 0) + 1, supersedes: ctx.doc?.version,
       author: { username: "author", uid: 0 }, env: { ...process.env, TUTOR_META_USER: String(job.owner) },
     });
     await ctx.writePersona(out.text, { provenance: { method: out.mode === "demo" ? "demo" : "model", calls: out.calls, mode: out.mode } });
