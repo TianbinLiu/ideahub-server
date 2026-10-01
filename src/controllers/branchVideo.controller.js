@@ -36,7 +36,7 @@ const { badRequest, forbidden, notFound, invalidId, failWith } = require("../uti
 const { listQuery, commentListQuery, danmakuListQuery } = require("../schemas/branchVideo.schemas");
 // 卡片多图参考的"哪几张能存/能发出去"只有一处实现，卡片那条路与作品快照这条路共用；
 // mapWithConcurrency 是仓里唯一一份"有上限的并发 map"，回炉给收藏者扇出通知时复用它
-const { shareableViews, mapWithConcurrency } = require("./branchAsset.controller");
+const { shareableViews, shareableStartFrames, mapWithConcurrency } = require("./branchAsset.controller");
 const { createNotification } = require("../services/notification.service");
 // @提及解析全仓只有这一份（ideas 那两个 controller 走同一个模块的另一个入口），
 // 别在这里另写一个正则、更别在这里另写一遍 span 的核对规则
@@ -235,6 +235,10 @@ async function transferAssetsFor(input, userId, report) {
         // 固定身份句跟着快照走：观众装走这套卡组后靠它锚人物长相（理由见 model 的 ★★）。
         // 尺子与 branchAsset.controller 那几处同一把（slice(0, 200)）
         idLine: typeof c.idLine === "string" ? c.idLine.slice(0, 200) : "",
+        // 按模型适配的两份专用内容跟着快照走（观众收入卡组后标准/极速、真人档靠它们用上这张卡）。
+        // 真人卡的起拍画面是同一张脸 —— 下发侧与 views 一起扣（toDeckPayload）
+        textDesc: typeof c.textDesc === "string" ? c.textDesc.slice(0, 200) : "",
+        startFrames: shareableStartFrames(c.startFrames),
         // 真人声明跟着快照走：观众「收入卡组」拿到的就是这份卡对象，掉了它，
         // 真人卡经作品这条路洗一遍就变回"非真人"，出片档位分流静默失效
         realPerson: c.realPerson === true,
@@ -349,7 +353,8 @@ function toDeckPayload(deck, ctx) {
   return {
     ...deck,
     cards: deck.cards.map((c) =>
-      c && c.realPerson === true ? { ...c, views: [], portraitWithheld: true } : c
+      // ★ 起拍画面（按模型适配，2026-09-30）画的是同一张脸，与 views 一起扣
+      c && c.realPerson === true ? { ...c, views: [], startFrames: undefined, portraitWithheld: true } : c
     ),
   };
 }

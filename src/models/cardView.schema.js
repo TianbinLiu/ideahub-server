@@ -34,4 +34,18 @@ const cardViewSchema = new mongoose.Schema(
   { _id: false }
 );
 
-module.exports = { cardViewSchema };
+/**
+ * 真人档（海螺只认一张起拍画面）的起拍画面，按画幅各一张（2026-09-30，按模型适配）。
+ * 只可能是 http(s)（入库前由 zod 拒掉 dataURL / idb:，理由同 views）。
+ * ★ BranchCard / BranchDeck 快照 / BranchVideo 卡组快照共用这一份：三处各写一遍，漏一处就是
+ *   mongoose 落库时静默剥掉（views / idLine 都栽过）。
+ */
+const startFramesSchema = new mongoose.Schema(
+  {
+    portrait: { type: String, trim: true, maxlength: 2000 },
+    landscape: { type: String, trim: true, maxlength: 2000 },
+  },
+  { _id: false }
+);
+
+module.exports = { cardViewSchema, startFramesSchema };

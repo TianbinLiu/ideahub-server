@@ -25,6 +25,7 @@ const {
   CARD_VIEW_TAG_MAX,
   MAX_CARD_VIEWS,
   isShareableViewUrl,
+  START_FRAME_ASPECTS,
 } = require("../schemas/branchAsset.schemas");
 const { searchRegex } = require("../utils/regex");
 
@@ -114,6 +115,22 @@ function shareableViews(raw) {
   return out;
 }
 
+/**
+ * 起拍画面（按模型适配，真人档用）能不能带出去 —— **唯一实现**：只留认得的画幅键、只留 http(s)
+ * （与 views 同一条 URL 规则 isShareableViewUrl）；一张都不剩回 undefined = 没勾「真人档适用」。
+ * ★ 入库、回执、分享、安装、卡组快照、作品快照全走这一处 —— 逐字段重建的搬运点各写一遍，
+ *   漏一处就是"装走的卡少了起拍画面"且零报错（views / idLine 都是这么丢的）。
+ */
+function shareableStartFrames(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out = {};
+  for (const k of START_FRAME_ASPECTS) {
+    const u = raw[k];
+    if (typeof u === "string" && isShareableViewUrl(u)) out[k] = u.trim().slice(0, 2000);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 // ── 序列化 ────────────────────────────────────────────────────────
 // 客户端 Card 形状是 { id, type, name, summary, cover, hot?, tags?, modelUrl?, genPrompt?, realPerson?, views? }，
 // 这里同时给出 id 与 cardId，前端两种写法都能直接吃。
@@ -133,6 +150,9 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     modelUrl: doc.modelUrl || "",
     genPrompt: doc.genPrompt || "",
     idLine: doc.idLine || "",
+    // 按模型适配：文字版形象描述 / 真人档起拍画面（没勾的那一份就是空串 / 不发这个键）
+    textDesc: doc.textDesc || "",
+    startFrames: shareableStartFrames(doc.startFrames),
     // 真人声明：老文档没有这个字段 → false（与"声明过不是"同义，读侧判否定）
     realPerson: doc.realPerson === true,
     // ★ 肖像授权绑定只在**卡主自己**这份回执里（toSharedCardPayload / installCard 刻意不带，
@@ -355,6 +375,9 @@ async function addCards(req, res, next) {
         modelUrl: typeof raw.modelUrl === "string" ? raw.modelUrl.slice(0, 2000) : "",
         genPrompt: typeof raw.genPrompt === "string" ? raw.genPrompt.slice(0, 4000) : "",
         idLine: typeof raw.idLine === "string" ? raw.idLine.slice(0, 200) : "",
+        // 按模型适配的两份专用内容（铸卡时就勾上的那几张）。漏在这里 = zod 放行、入库时剥掉
+        textDesc: typeof raw.textDesc === "string" ? raw.textDesc.slice(0, 200) : "",
+        startFrames: shareableStartFrames(raw.startFrames),
         // 真人声明只认布尔 true：老客户端不发（undefined → false），怪值不当真。
         // 漏在这里 = zod 放行了、入库文档逐字段重建时剥掉，零报错（modelUrl 的老坑）
         realPerson: raw.realPerson === true,
@@ -465,6 +488,8 @@ async function updateCard(req, res, next) {
     // ★★ 出片句：给空串是**明确地不要**（回到"只报卡名"），所以判类型不判真假值 —— 写成
     //   `if (req.body.idLine)` 的话"清掉出片句"这件事永远做不到，而屏幕上会显示已保存。
     if (typeof req.body.idLine === "string") $set.idLine = req.body.idLine;
+    // 按模型适配：文字版形象描述给空串 = 取消「标准/极速适用」（判类型不判真假值，理由同上）
+    if (typeof req.body.textDesc === "string") $set.textDesc = req.body.textDesc;
     // 真人声明只在这次真给了布尔时才动：PATCH 是定向 $set，不带 = 保留库里原值。
     // （当前客户端不发它；schema 里声明是留门，见 schemas 里 updateCardBody 的注释）
     if (typeof req.body.realPerson === "boolean") $set.realPerson = req.body.realPerson;
@@ -479,6 +504,13 @@ async function updateCard(req, res, next) {
         note: typeof req.body.portrait.note === "string" ? req.body.portrait.note : "",
         boundAt: new Date(),
       };
+    }
+    // 真人档起拍画面：null = 取消「真人档适用」（$unset）、对象 = 整份替换（一张合法的都没有也按取消算）、不带 = 不动
+    if (req.body.startFrames === null) $unset.startFrames = 1;
+    else if (req.body.startFrames && typeof req.body.startFrames === "object") {
+      const sf = shareableStartFrames(req.body.startFrames);
+      if (sf) $set.startFrames = sf;
+      else $unset.startFrames = 1;
     }
     // 空的 $set / $unset 不发：老版本 Mongo 对空操作符整句拒（"'$set' is empty"）
     const update = {};
@@ -651,6 +683,9 @@ async function publishDeck(req, res, next) {
         genPrompt: c.genPrompt || "",
         // 身份句跟着快照走：掉了它，装走的人出片时形象锚定退回"名字+简介"
         idLine: c.idLine || "",
+        // 按模型适配的两份专用内容跟着快照走（真人卡在上面那道闸就拦下了，这里不会有真人脸）
+        textDesc: c.textDesc || "",
+        startFrames: shareableStartFrames(c.startFrames),
         // 真人声明必须跟着快照走：掉了它，装走的人出片时档位分流按"非真人"放行
         realPerson: c.realPerson === true,
         // 参考图必须跟着快照走：少了它，装走的人炼出来的人物就不是同一个人
@@ -788,6 +823,8 @@ async function installDeck(req, res, next) {
                 modelUrl: shareableModelUrl(c.modelUrl),
                 genPrompt: c.genPrompt || "",
                 idLine: c.idLine || "", // 老快照缺省空串，客户端读侧兜底成"名字+简介"
+                textDesc: c.textDesc || "", // 按模型适配（老快照没有 = 没勾）
+                startFrames: shareableStartFrames(c.startFrames),
                 // 老快照（本字段上线前发布的）没有它 → false，与"非真人"同义
                 realPerson: c.realPerson === true,
                 views: shareableViews(c.views),
@@ -898,6 +935,9 @@ function toSharedCardPayload(doc, stats = EMPTY_STATS) {
     modelUrl: shareableModelUrl(doc.modelUrl),
     genPrompt: doc.genPrompt || "",
     idLine: doc.idLine || "", // 身份句随分享走：装走的人出片要靠它锚形象
+    // 按模型适配的两份专用内容随分享走（真人卡发不到广场，见 publishCard 的硬 400）
+    textDesc: doc.textDesc || "",
+    startFrames: shareableStartFrames(doc.startFrames),
     // 真人声明**不剥**：它不是隐私字段，是内容属性——逛广场的人有权在装之前知道
     // "这张卡出片要过真人审核"，装回去的档位分流也靠它
     realPerson: doc.realPerson === true,
@@ -1136,6 +1176,8 @@ async function installCard(req, res, next) {
           modelUrl: shareableModelUrl(src.modelUrl),
           genPrompt: src.genPrompt || "",
           idLine: src.idLine || "", // 身份句跟着装（同 genPrompt 一批的搬运点）
+          textDesc: src.textDesc || "", // 按模型适配的两份专用内容跟着装（同一批搬运点）
+          startFrames: shareableStartFrames(src.startFrames),
           // 真人声明跟着装：装走的人出片同样要按真人档分流
           realPerson: src.realPerson === true,
           views: shareableViews(src.views),
@@ -1362,6 +1404,7 @@ module.exports = {
   // ★ 导出给 branchVideo.controller：随作品发布的卡组快照也要带 views，
   //   而"哪几张能存/能发出去"这条规则只能有一处实现（铁律六）
   shareableViews,
+  shareableStartFrames,
   listDecks,
   createDeck,
   updateDeck,

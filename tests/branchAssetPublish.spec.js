@@ -961,6 +961,56 @@ describe("卡片/卡组发布到创意工坊", () => {
     await patch({ idLine: "长".repeat(201) }).expect(400);
   });
 
+  test("A15d 按模型适配：文字版形象描述与起拍画面存得下、读得回、随分享与安装走，空串 / null 才清", async () => {
+    const author = await registerUser();
+    const taker = await registerUser();
+    const card = cardOf({ name: "按模型适配的卡" });
+    await addCards(author.token, [card]).expect(201);
+    const patch = (body) =>
+      request(app).patch(`/api/branch/cards/${card.cardId}`).set("Authorization", `Bearer ${author.token}`).send(body);
+    const desc = "黑色短发，深灰连帽衫配牛仔裤，左耳一枚银色耳钉，身形偏瘦";
+    const frames = { portrait: "https://cdn.example.com/start-9x16.jpg", landscape: "https://cdn.example.com/start-16x9.jpg" };
+
+    const set = await patch({ textDesc: desc, startFrames: frames }).expect(200);
+    expect(set.body.card.textDesc).toBe(desc);
+    expect(set.body.card.startFrames).toEqual(frames);
+    expect(set.body.card.name).toBe("按模型适配的卡"); // 没给的字段不动
+
+    // ★ 回读才算数（"发了、被 strip、读回来是空的"正是这条要防的）
+    const listed = await auth(request(app).get("/api/branch/cards"), author.token).expect(200);
+    const mine = listed.body.cards.find((c) => c.cardId === card.cardId);
+    expect(mine.textDesc).toBe(desc);
+    expect(mine.startFrames).toEqual(frames);
+
+    // 只改名字不许把它们带走（定向 $set）
+    const renamed = await patch({ name: "改了名" }).expect(200);
+    expect(renamed.body.card.textDesc).toBe(desc);
+    expect(renamed.body.card.startFrames).toEqual(frames);
+
+    // 随分享与安装走（逐字段重建的搬运点最容易漏）
+    await auth(request(app).post(`/api/branch/cards/${card.cardId}/publish`), author.token).send({}).expect(200);
+    const one = await request(app).get(`/api/branch/cards/${card.cardId}`).expect(200);
+    expect(one.body.card.textDesc).toBe(desc);
+    expect(one.body.card.startFrames).toEqual(frames);
+    await auth(request(app).post(`/api/branch/cards/${card.cardId}/install`), taker.token).expect(201);
+    const takerList = await auth(request(app).get("/api/branch/cards"), taker.token).expect(200);
+    const copy = takerList.body.cards.find((c) => c.cardId === card.cardId);
+    expect(copy.textDesc).toBe(desc);
+    expect(copy.startFrames).toEqual(frames);
+
+    // 起拍画面只收 http(s)（dataURL / idb: 整发 400，同 views），库里那份不动
+    await patch({ startFrames: { portrait: "data:image/jpeg;base64,AAAA" } }).expect(400);
+    await patch({ textDesc: "长".repeat(201) }).expect(400);
+
+    // 空串 / null = 取消（判类型不判真假值），回读也要是空的
+    await patch({ textDesc: "", startFrames: null }).expect(200);
+    const cleared = await auth(request(app).get("/api/branch/cards"), author.token).expect(200);
+    const after = cleared.body.cards.find((c) => c.cardId === card.cardId);
+    expect(after.textDesc).toBe("");
+    expect(after.startFrames).toBeUndefined();
+    expect(after.name).toBe("改了名");
+  });
+
   test("A16 肖像授权绑定随账号走：PATCH 存得下、我的列表读得回、广场与安装都不带、null 解绑", async () => {
     const author = await registerUser();
     const taker = await registerUser();
