@@ -5,7 +5,7 @@
 // ★ Mongoose 9 的 pre hook 不接收 next——本模型刻意不写任何 hook。
 const mongoose = require("mongoose");
 // 多图参考的子文档形状与 BranchCard 共用同一份（见那个文件的文件头）
-const { cardViewSchema } = require("./cardView.schema");
+const { cardViewSchema, startFramesSchema } = require("./cardView.schema");
 
 // 发布到工坊时对卡片内容做的快照。
 // 卡片是按 { owner, cardId } 私有存的，别人装这套卡组时需要给他自己建一份；
@@ -27,6 +27,10 @@ const snapshotCardSchema = new mongoose.Schema(
     /** 固定身份句（与 BranchCard.idLine 同批，2026-08-28）。快照漏声明的后果同上：
      *  随卡组装走的卡出片时退回"名字+简介"，形象锚定变弱且看不出为什么 */
     idLine: { type: String, default: "", trim: true, maxlength: 200 },
+    /** 按模型适配的两份专用内容（与 BranchCard.textDesc / startFrames 同批，2026-09-30）。快照漏声明的后果：
+     *  装走的卡在标准/极速、真人档上退回"只有出片句 / 拿形象图起拍"，零报错 */
+    textDesc: { type: String, default: "", trim: true, maxlength: 200 },
+    startFrames: { type: startFramesSchema, default: undefined },
     /** 真人声明。★ 快照里漏声明的后果：真人卡随卡组装走后变回"非真人"，出片档位
      *  分流静默失效——审核该严的没严，直到供应商拒单才暴露，而那时用户看到的只是
      *  "别人的卡组出片失败"，不会怀疑是装的时候掉了一个布尔 */

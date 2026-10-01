@@ -5,7 +5,7 @@
 // 转存失败的单个资源会降级保留原值（见 branchVideo.controller.js 的 transferDraftAssets）。
 const mongoose = require("mongoose");
 // 卡片多图参考的子文档形状与 BranchCard / BranchDeck 快照共用同一份（见那个文件的文件头）
-const { cardViewSchema } = require("./cardView.schema");
+const { cardViewSchema, startFramesSchema } = require("./cardView.schema");
 
 const segmentSchema = new mongoose.Schema(
   {
@@ -73,6 +73,10 @@ const deckCardSchema = new mongoose.Schema(
      *  观众花真钱出片，只会觉得"这套卡本来就不太稳"。同 views / realPerson 那两次。
      *  上限 200 与 BranchCard.idLine 取同一个数。 */
     idLine: { type: String, default: "", trim: true, maxlength: 200 },
+    /** 按模型适配的两份专用内容（与 BranchCard 同批，2026-09-30）。观众收入卡组 / 做同款后，标准/极速与
+     *  真人档靠它们用上这张卡；漏声明 = mongoose 落库时静默剥掉。真人卡的起拍画面同 views 一样在下发侧扣下 */
+    textDesc: { type: String, default: "", trim: true, maxlength: 200 },
+    startFrames: { type: startFramesSchema, default: undefined },
     /** 真人声明。与 views 同一个理由入快照（modelUrl/genPrompt 是"卡主私有"才不入）：
      *  观众收入卡组后要按它分流出片档位，漏声明 = mongoose 落库时静默剥掉，
      *  真人卡经作品这条路走一遭就变回"非真人"，零报错 */

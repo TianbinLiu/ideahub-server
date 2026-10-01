@@ -292,8 +292,17 @@ describe("作品编辑（PATCH）", () => {
       name: "阿姨",
       realPerson: true,
       views: [{ url: "https://cdn.example.com/a-real-face.jpg", kind: "face" }],
+      // 按模型适配的起拍画面画的是同一张脸 —— 必须与 views 一起扣
+      startFrames: { portrait: "https://cdn.example.com/a-real-face-start.jpg" },
+      textDesc: "短发，戴眼镜",
     };
-    const propCard = { id: "c_prop", name: "道具", views: [{ url: "https://cdn.example.com/prop.jpg", kind: "body" }] };
+    const propCard = {
+      id: "c_prop",
+      name: "道具",
+      views: [{ url: "https://cdn.example.com/prop.jpg", kind: "body" }],
+      startFrames: { landscape: "https://cdn.example.com/prop-start.jpg" },
+      textDesc: "一盏铜制油灯",
+    };
     const id = String(
       (await publish(author.token, { deck: { name: "带真人卡的卡组", cards: [realCard, propCard] } })).body.video._id
     );
@@ -303,6 +312,10 @@ describe("作品编辑（PATCH）", () => {
     const anonCards = anon.body.video.deck.cards;
     expect(anonCards.find((c) => c.cardId === "c_real").views).toEqual([]);
     expect(anonCards.find((c) => c.cardId === "c_real").portraitWithheld).toBe(true);
+    expect(anonCards.find((c) => c.cardId === "c_real").startFrames).toBeUndefined();
+    // 文字描述不是肖像，照常下发；非真人卡的起拍画面也照常下发
+    expect(anonCards.find((c) => c.cardId === "c_real").textDesc).toBe("短发，戴眼镜");
+    expect(anonCards.find((c) => c.cardId === "c_prop").startFrames).toEqual({ landscape: "https://cdn.example.com/prop-start.jpg" });
     // ★ realPerson 那一位**不许跟着剥**：它是出片档位分流的判据
     expect(anonCards.find((c) => c.cardId === "c_real").realPerson).toBe(true);
     // 非真人卡不受影响（闸只拦该拦的）
@@ -321,6 +334,9 @@ describe("作品编辑（PATCH）", () => {
       .set("Authorization", `Bearer ${author.token}`)
       .expect(200);
     expect(mine.body.video.deck.cards.find((c) => c.cardId === "c_real").views).toHaveLength(1);
+    expect(mine.body.video.deck.cards.find((c) => c.cardId === "c_real").startFrames).toEqual({
+      portrait: "https://cdn.example.com/a-real-face-start.jpg",
+    });
 
     // ④ 列表这一路同样要剥（它也 optionalAuth，且 deck 同样下发）
     const feed = await request(app).get("/api/branch/videos?limit=30").expect(200);
