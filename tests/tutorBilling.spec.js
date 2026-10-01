@@ -122,4 +122,29 @@ describe("tutor 计费", () => {
     expect([402, 403]).toContain(poor.status);
     expect(poor.body.ok).toBe(false);
   });
+
+  // docs/06 §3.3「管理员免扣但记流水」：教学轮走 preAuthorize（首字那一拍 noteFreeCall），生成 / 蒸馏走 chargedCall（受理后 noteFreeCall）
+  it("管理员：余额一分不动，但受理了的每一发都在账本落 admin_free（delta 0、costTokens = 单价 / 报价）", async () => {
+    const { user, token } = await createUser("ad");
+    await require("../src/models/User").updateOne({ _id: user._id }, { $set: { role: "admin" } }); // 角色每次请求从库里重读（utils/roles），不用重签 token
+    const wallet = require("../src/services/tokenWallet.service");
+    await wallet.ensureWallet(user._id);
+    const b0 = await balance(user._id);
+    const cid = (await request(app).post("/api/tutor/courses").set(auth(token)).send({ title: "网络", subject: "计算机网络", policy: { ai: "limited", homework_mode: "principles_only", text: "" } })).body.course.id;
+    const { CourseCtx } = require("../src/services/tutorStore.service");
+    await (await CourseCtx.load(cid, user)).addMaterial({ name: "w.pdf", sha: "e".repeat(64), ext: "pdf", bytes: 1, pages, license: { source: "self" }, warnings: [] });
+    const quote = (await request(app).get(`/api/tutor/courses/${cid}/quote`).set(auth(token))).body;
+    expect((await request(app).post("/api/tutor/personas/generate").set(auth(token)).send({ courseId: cid, questionnaire: { name: "老包" } })).status).toBe(202);
+    expect((await require("../src/services/tutorAi.service").runNextJob()).status).toBe("succeeded");
+    const s1 = (await request(app).get(`/api/tutor/runs/${cid}`).set(auth(token))).body.doc.map.stages[0].stage_id;
+    expect((await request(app).post(`/api/tutor/runs/${cid}/turns`).set(auth(token)).send({ kind: "ask", stage: s1, text: "为什么？" })).text).toMatch(/event: done/);
+    expect((await request(app).post(`/api/tutor/runs/${cid}/distill`).set(auth(token)).send({})).body.status).toBe("done");
+    expect(await balance(user._id)).toBe(b0);
+    const TokenLedger = require("../src/models/TokenLedger");
+    const free = await TokenLedger.find({ user: user._id, reason: "admin_free" }).sort({ _id: 1 }).lean();
+    expect(free.map((e) => [e.delta, e.costTokens])).toEqual([[0, quote.quote.total], [0, 400], [0, 600]]);
+    // 一分没扣（没有负数流水），也就没有可退的（建钱包时那条正数的初始额度不算）
+    expect(await TokenLedger.countDocuments({ user: user._id, delta: { $lt: 0 } })).toBe(0);
+    expect(await TokenLedger.countDocuments({ user: user._id, reason: "tutor_refund" })).toBe(0);
+  });
 });
