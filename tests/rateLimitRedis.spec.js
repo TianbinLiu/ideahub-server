@@ -80,6 +80,24 @@ afterAll(() => {
 });
 
 /**
+ * 用例里经 config/redis 建出来的连接，由 afterEach 统一 destroy()。
+ *
+ * ★ 关连接不能写在用例末尾：断言一失败，用例体在那之前就抛出了，连接没人关，
+ *   Jest 打完结果后退不出去（实测：「Jest did not exit one second after the test
+ *   run has completed.」，一直挂到被外部 kill）。afterEach 不论用例成败都执行。
+ * ★ 用 destroy() 而不是 quit()：quit() 要等服务端回 OK，而失败的用例里连接可能
+ *   根本没连上 —— 实测对没就绪的客户端 quit() 5 s 后还挂着，destroy() 立即返回。
+ *   config/redis 只露出 quit()，所以在 loadWithRedis 的 doMock 里把客户端记下来。
+ */
+const openedClients = [];
+
+afterEach(() => {
+  for (const client of openedClients.splice(0)) {
+    try { client.destroy(); } catch {}
+  }
+});
+
+/**
  * 载入一个「已配置 Redis」的限流器实例
  *
  * ★ resetModules 要的只是【独立的 src 模块实例】（各自的进程内 Map、各自 createClient
@@ -87,10 +105,18 @@ afterAll(() => {
  *   把顶层已载入的那一份递给 config/redis。不这么做，每次 resetModules 后整个 redis 包
  *   （600+ 个模块）都要同步重载一遍，而且算在用例 5 s 的超时里：与 beforeAll 是同一个坑，
  *   CPU 吃紧时单次重载 6–7 s，第一条用例要重载两次。
+ *   顺带在这里记下 config/redis 建出来的每个连接，见 openedClients。
  */
 function loadWithRedis() {
   jest.resetModules();
-  jest.doMock("redis", () => redisPkg);
+  jest.doMock("redis", () => ({
+    ...redisPkg,
+    createClient: (...args) => {
+      const client = redisPkg.createClient(...args);
+      openedClients.push(client);
+      return client;
+    },
+  }));
   process.env.REDIS_URL = TEST_URL;
   process.env.NODE_ENV = "development"; // test 环境限流整体关闭，这里要打开
   return require("../src/middleware/rateLimit");
@@ -152,9 +178,6 @@ describe("Redis 后端限流", () => {
     expect(passed).toBe(2);
     expect(r3.statusCode).toBe(429);      // 若走进程内计数，这里会放行（各自才第 2 次）
     expect(r3.headers["Retry-After"]).toBeDefined();
-
-    await redisA.quit();
-    await redisB.quit();
   }, REDIS_TEST_TIMEOUT_MS);
 
   test("不同 key 互不影响", async () => {
@@ -178,8 +201,6 @@ describe("Redis 后端限流", () => {
     const again = mkRes();
     await mw(mk("198.51.100.1"), again, next);
     expect(again.statusCode).toBe(429);   // 同 IP 第 2 次被拒
-
-    await r.quit();
   }, REDIS_TEST_TIMEOUT_MS);
 
   test("键设置了 TTL —— 没有 TTL 的话用户会被永久限流", async () => {
@@ -197,7 +218,5 @@ describe("Redis 后端限流", () => {
     const ttl = await probeClient.pTTL(`rl:${scope}:${ip}`);
     expect(ttl).toBeGreaterThan(0);       // -1 表示无 TTL = 永久限流
     expect(ttl).toBeLessThanOrEqual(5_000);
-
-    await r.quit();
   }, REDIS_TEST_TIMEOUT_MS);
 });
