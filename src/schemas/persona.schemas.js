@@ -31,6 +31,8 @@ const styleBody = z.object({
 
 const tagsSchema = z.union([z.array(z.string()), z.string()]);
 
+// ★ 不收 kind / course / currentDoc / remixOf（老师人格那几格，models/Persona.js）：由 tutor 服务端写，客户端声明的一律被 z.object 默认 strip 掉 ——
+//   这是刻意的：谁都不许把自己的人格标成老师。model 与 zod 同一提交（tutor 仓 docs/06 D4）。
 const createBody = z.object({
   name: z.string().trim().min(1).max(120),
   description: z.string().trim().max(1000).optional().default(""),

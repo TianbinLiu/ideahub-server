@@ -526,6 +526,11 @@ async function deleteAccount(req, res, next) {
 
     // 数字人对话数据先删（记忆卡没有 TTL，账号没了就再没人能删），再删账号本体
     await purgeUserChatData(id);
+    // 老师人格那一线（tutor 仓 docs/04 S14 / S22，2026-09-29）：他的课 / 教材句柄 / 发布的老师 / 评分…… 与 chat 数据同一条纪律 ——
+    //   三条删账号入口（这里 / admin 删用户 / branchAdmin.purgeUserCascade）都要调，且都在删 User 之前（中途挂了还能重来）。
+    //   ★ 懒 require：TUTOR_ENABLED=false 时 tutor 树一个模块都不装（tests/tutorFlagOff.spec 钉着），但删号不看开关 —— 开关管功能挂不挂，不管数据在不在。
+    //   ⚠ 这条自助硬删本身仍**不走**整条 purgeUserCascade（作品 / 卡 / 模板那些），那是 SECURITY_HARDENING 遗留项 5，待主人拍板；这里只保证老师的数据不被落下。
+    await require("../services/tutorPurge.service").purgeTutorForUser(id);
     // Delete the user account
     const result = await User.findByIdAndDelete(id);
     if (!result) {

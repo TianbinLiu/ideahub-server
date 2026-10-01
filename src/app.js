@@ -76,12 +76,15 @@ app.use(cors({
 //   /api/ark     Seedance 任务创建请求带 base64 首尾帧（压到 720p 后仍有 2-3MB）
 // 「大 body 只对持有效签名 token 的请求开放」这条闸门的实现见 middleware/bigJson.js
 // （两处共用一份：改了阈值或判据要两边同时生效）。
-const { jsonGate } = require("./middleware/bigJson");
+const { jsonGate, jsonGateWith } = require("./middleware/bigJson");
 app.use("/api/branch", jsonGate);
 app.use("/api/ark", jsonGate);
 // 真人视频档：创建体带 base64 首帧/参考图（与 /api/ark 同理，不放宽就是 413）
 app.use("/api/minimax", jsonGate);
 app.use("/api/runway", jsonGate);
+// 老师人格：教材直传 confirm 送来浏览器抽好的 pages、导入一份 .md 可到几百 KB —— 比 1mb 大、远比 50mb 小（tutor 仓 docs/05 §2.2）。
+// 与下面的挂载同一个开关：不开就连这道闸也不挂。
+if (process.env.TUTOR_ENABLED === "true") app.use("/api/tutor", jsonGateWith(process.env.TUTOR_TEXT_JSON_LIMIT || "8mb"));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(helmet({
@@ -176,6 +179,9 @@ app.use("/api/standpoint", standpointRoutes);
 app.use("/api/bounties", bountyRoutes);
 app.use("/api/speaking-style", speakingStyleRoutes);
 app.use("/api/personas", personaRoutes);
+// 老师人格（tutor，tutor 仓 docs/04 §5 S1）：TUTOR_ENABLED=true 才 require —— 一个坏 import 就不会让 deploy.sh 的整树装载自检拦住启梦发布；
+// 关开关不回滚代码。挂在 /api/personas 之后：它自己的路径全在 /api/tutor 下，与人格市场不重叠（M2 发布时 Persona{kind:tutor} 再进 personas）。
+if (process.env.TUTOR_ENABLED === "true") app.use("/api/tutor", require("./routes/tutor.routes"));
 app.use("/api/memes", memeRoutes);
 app.use("/api/branch", require("./routes/branchVideo.routes"));
 // 白模模板（blockout r2v）：同一个 /api/branch base（App 只记一个前缀），

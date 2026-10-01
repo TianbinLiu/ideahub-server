@@ -42,6 +42,8 @@ cp .env.example .env
 ⚠️ `.env` 已被 gitignore，**永远不要提交**，也不要把值贴进聊天或文档。
 生产密钥一律在服务器上用 `openssl rand -base64 48` 生成。
 
+**老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
+
 ## 4. 跑起来
 
 ```bash

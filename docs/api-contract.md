@@ -365,6 +365,21 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   ⚠⚠ **老 App（≤v2.45）收不到这一类**：它的 `BRANCH_NOTIFICATION_TYPES` 是**请求层白名单**
   （列表筛选 / 未读数 / 全部已读三处从它派生），老包压根不会把这个 type 放进查询。
   ⇒ 对未升级用户，**观众知情为零**。这不是"降级显示"，别写成降级显示。
+- `Notification.type` 另增**老师人格四类**（2026-09-29，tutor 仓 docs/02 9.6 / 4.9 / 5.9；写入只在 `services/tutorNotify.service.js` 一处：
+  拉黑双向判 + 同人同事 24 小时一条 + 失败只记日志）：
+  `TUTOR_RATING`（有人给你的老师评了分，`payload { personaId, personaName, stars, text }`）、
+  `TUTOR_COMMENT`（有人在你的老师下留言，`payload { personaId, personaName, commentId, preview, parentId }`）→ 收件人 = 作者；
+  `TUTOR_REVIEW_DUE`（有阶段到了回访时间，`payload { courseId, personaName, count, stages[], stageId }`，**没有 actorId**，
+  worker 每分钟扫 `TutorRun.nextReviewAt`，同一个到期时间只发一次）、
+  `TUTOR_DOC_UPDATED`（作者发了新版可合并，`payload { personaId, personaName, version, courseId, note }`，扇出上限 500 / 并发 8）→ 收件人 = 学习者。
+  deeplink **一律在 payload 里**（personaId → `/tutor/market/:id`，courseId → `/tutor/courses/:id` 或 `/tutor/run/:id`），刻意不加顶层字段
+  （加字段就要同时改 App 的映射，见上一条）。
+  ⚠⚠ **老 App（含 2.48）收不到这四类**：`BRANCH_NOTIFICATION_TYPES` 是请求层白名单，老包压根不会把它们放进查询 ——
+  对 App 用户是「收不到」，不是降级显示；官网通知页认得（`NotificationsPage` 四个 case + 落点链接）。
+- **删号级联多了老师人格这一线**（2026-09-29，`services/tutorPurge.service.js`，由 `purgeUserCascade` ⑩.7 懒 require）：十二张 `Tutor*` 表 +
+  他发布的老师人格及其发布版 / 评分 / 安装 / 评论 / 举报（儿童安全举报按 `Report.URGENT_REASONS` 留下）；教材原件句柄进 `PendingAssetPurge`
+  （`resourceType` 多一档 **raw**）。**别人从他的老师开出来的课不删**，只标 `sourceOrphanedAt`：那些学习者的课程 summary `source.gone / orphaned` 为真、
+  「合并新版」409 `SOURCE_GONE`。删号不看 `TUTOR_ENABLED`：开关管功能挂不挂，不管数据在不在。
 - `Notification.videoId`（ref `BranchVideo`）。★ **不要复用 `ideaId`** —— 它 ref 的是 `Idea`，
   塞一个 BranchVideo 的 id 进去不会报错，只会 populate 成 `null`，标题和跳转地址一起没了，全程零日志。
 - 列表接口的 `actorId` 现在 populate `username displayName avatarUrl role`，并额外 populate
@@ -569,6 +584,8 @@ B 站式弹幕：一句话 + 它该在**视频第几秒**飘过去。与评论�
 ★ 返回**必须是 `at` 升序**：播放端是按游标扫时间轴放的，乱序会整段漏放。
 
 ## 举报
+
+> **2026-09-28（老师人格 M2，治理 P5）**：`targetType` 加 `persona`（人格线此前没有任何下架端点）；理由加 `instructorClaim`（教授认领 / 要求下架，**人工核实**再处置；App 的 `REPORT_REASONS` 还没有它 —— 服务端先上，老版本只是少一项可选）。处置走 `services/takedown.service.js` 的 **registry**（按 targetType 注册，不再往 if-chain 加分支）；`instructorClaim` 另有**人工核实队列**（`GET/POST /api/tutor/admin/claims…`，见「老师人格」一节末尾），与这条通用队列同一张表、同一份处置正文（`services/reportResolve.service.js`，2026-09-29 从 `resolveReport` 抽出）：`persona` 只有 `takedown`（写 `Persona.takenDown:true, shared:false, takenDownAt / takenDownReason / takenDownBy`；作者看得见原因、看不见处置人；下架后作者不能再 `PUT { shared:true }`，`/api/tutor/market` 与详情对非作者 404，也不能再发布），`delete` 一律 400（人格是作者的资产，要删由作者自己 `DELETE /api/personas/:id`）。管理端列表的 `target` 多一种形状 `{ exists, personaId, name, kind, shared, takenDown, takenDownReason, author, createdAt }`。
 
 能举报**三种对象**：作品（`video`）、评论（`comment`）、弹幕（`danmaku`）。
 三者共用一张 `Report` 表与同一条处理流程（待处理 → 下架 / 删除 / 驳回）——
@@ -1822,6 +1839,76 @@ openid 由服务端拿 AppKey 向 `graph.qq.com` 换取，客户端没有机会�
 
 ★ 老服务端没有这个端点（404）：App 一律按尽力而为处理，本机记录才是 UI 判据 —— 判否定
 （`termsAcceptedVersion` 缺省/空串 = 没同意过），别判相等（「后加字段判否定」那条铁则）。
+
+## 老师人格（tutor：用自己的教材铸一位 AI 老师）
+
+**与 `/api/personas` 的关系（2026-09-28，tutor 仓 docs/04 S3 / S4）**：`Persona` 多了 `kind`（只认 `"tutor"`，缺省 = 老数据 = 客服人格，判否定）与 `course / currentDoc / remixOf`（M2 发布时由服务端写，客户端 body 里这几格一律被 strip）；`GET /api/personas` **缺省不列老师人格**，`?kind=tutor` 只列老师人格 —— 老 App 会把列表里任何一条 `PUT /api/companion/settings` 装成客服人格。判断只在 `services/personaKind.js` 一处。**2026-09-29 M3**：例外只有一种 —— 作者发布时勾了「同时发布为启梦人格 / 可装进看板娘」的老师（`Persona.companion.enabled === true`，判否定：没这一格 = 没勾）会进缺省列表、也能被选用；`personaAccess.checkPersonaAccess` 对没勾的老师人格回 `reason:"not_companion"`（`PUT /api/companion/settings` / Live2D 绑人格 → 403），作者自己也一样。过滤器写成单个 `$nor` 键（controller 那边 `Object.assign` 进 filter，不与 scope=installed 的 `$or`、搜索的 `$and` 打架）。
+
+只在 `TUTOR_ENABLED=true` 时挂载（`src/app.js`），全部端点 **requireAuth**，不是本人的课一律 404。请求体上限 8mb（`TUTOR_TEXT_JSON_LIMIT`）。
+产品与格式的正本在 tutor 仓（`docs/03` 人格文件格式 `ideahub-tutor/1.1`、`docs/05` §5.6 会话契约、`docs/06` §3.2 端点表）；本仓 `src/tutor/core/` 是那边同步过来的纯函数核心。
+成功 `{ ok: true, … }`，失败 `{ ok: false, message, code? }`。**M1 只有作者自己学**：Run 的 id 对外就是课程 id。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/tutor/health` | 无 | `{ ok, tutor:true, demo, demoAllowed }`；`demo` = 没配 `AI_API_KEY`（演示模式：确定性老师，生产不许） |
+| GET | `/api/tutor/config` | 必须 | `{ prices:{ tutor_turn, tutor_distill, tutor_extract }, demo, adultDeclared }`（价目只在 `config/tokens.js` 的 `TUTOR_PRICES`） |
+| POST | `/api/tutor/declare-adult` | 必须 | 成人声明（v1 只做成人），幂等；`User.tutorAdultDeclaredAt` |
+| GET / POST | `/api/tutor/courses` | 必须 | 本人的课 / 建课 `{ title, subject, code?, term?, policy:{ ai, homework_mode, allowed_uses?, text? }, key_dates? }`；缺必填 400 带 `field` |
+| GET / PATCH | `/api/tutor/courses/:id` | 必须 | `{ course, materials, nameHint }` / 改元数据 |
+| GET / HEAD | `/api/tutor/courses/:id/materials?sha256=` | 必须 | 去重探测 `{ exists, material }`（HEAD 200/404） |
+| GET | `/api/tutor/courses/:id/rules` · `/quote` | 必须 | 从政策派生的 🔒 硬规则 / 生成报价 `{ materials, sections, stages, quote:{ lines, total }, demo }` |
+| POST | `/api/tutor/materials/sign` | 必须 | `{ courseId, format, bytes, name }` → Cloudinary **raw** 直传票 `{ ticket(=publicId), putUrl, params, chunkBytes, maxBytes }`；格式白名单 pdf/pptx/docx/md/txt、`overwrite:false`、public_id 服务端签死（形状 `ideahub/tutor-materials/<userId>-<ts>-<6hex>.<ext>`） |
+| POST | `/api/tutor/materials/confirm` | 必须 | `{ ticket, courseId, sha256, name, bytes, license:{source}, pages:[{ idx, title?, blocks:[{ hash(12hex), text, bbox? }] }], warnings }` → 201 `{ material }`；同 sha 200 `{ duplicate:true }`（副本回收）；Admin API 核对字节真的在（404 → 409 NOT_UPLOADED） |
+| PATCH | `/api/tutor/materials/:sha` | 必须 | `{ courseId?, license:{ source } }` 事后改授权来源；文档头 `license.source` 按全体教材取最差重算，回 `{ docLicense, course }` |
+| GET | `/api/tutor/materials/:sha/file` · `/text` | 必须 | 原件：**流式转发**签名下载的字节（不 302：raw 只有 api.cloudinary.com 的 download 端点能取、公开投递 401，而它给不给 CORS 头没量过 —— 理由在 `tutorFile.service.js` 头部）；`Range` 原样转上游、206 原样转回，`Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges`（pdf.js 分段取页）；客户端要带 Bearer（pdf.js 经 `httpHeaders`）；没原件 404 `MATERIAL_MISSING`；上游非 2xx → 502 `UPSTREAM`（带 `upstreamStatus`，不透传 401） / 块级文本 `{ sha, pages }` |
+| GET | `/api/tutor/usage-ledger?since=` | 必须 | 本人的模型用量账本 `{ count, summary, records }`（数字与 kind，不含正文；tutor 仓 docs/10 的量具） |
+| POST | `/api/tutor/personas/generate` | 必须 | `{ courseId, questionnaire:{ name, style?, catchphrase?, strictness?, address?, examples_from?, extra_rules? } }` → 202 `{ jobId, quote, nameHint }`；**受理那一拍按报价扣 tutor_extract × N**，之后失败不退；同课在跑 409 BUSY |
+| GET | `/api/tutor/jobs/:id` | 必须 | `{ job:{ status, progress:{ step, done, total, message, mode }, result, failures, error } }`（worker 在 0 号实例串行跑，检查点续跑） |
+| POST | `/api/tutor/personas/:id/preview` | 必须 | 试教（SSE，不落 Turn、不翻状态、**同价**）`{ kind?: teach|ask, stage?, text? }` |
+| POST | `/api/tutor/personas/:id/scan` · `/patches/:pid/accept` | 必须 | 新教材 → 阶段提议 `{ patchId, proposals }`（扣 tutor_extract × 新教材数）→ 点头 `{ indices? }` 追加成新版 |
+| GET | `/api/tutor/personas/:id/export?format=md\|json\|zip&audience=market\|self&keepStuckPoints&keepStudentQa` | 必须 | 导出件；头 `X-Tutor-Checksum / -Produce-Id / -Clean-Check / -Export-Id`；发布件对 `license.source=unsure` 400、教材泄漏核查不过 409 `CLEAN_CHECK`；每次留痕 |
+| GET | `/api/tutor/personas/:id/exports` | 必须 | 留痕列表 `{ exports, retainDays:180 }` |
+| POST | `/api/tutor/personas/import` | 必须 | `{ courseId?, text?\|json?, filename? }`：同一位老师回读成 `kind:import` 修订（`same:true`），别人的老师新开一门课（`created:true`）；删标识 / 改正文 400 |
+| POST | `/api/tutor/personas/:id/publish` | 必须（作者） | **发布到市场**（tutor 仓 docs/02 §6）`{ name?, description?, tags?(≤6), coverEmoji?, aigcDeclared, note? }`：五道门在服务端一处（`tutorPublish.service.checkGates`），任一不过 **422 `GATE`** + `gate ∈ license\|cleanCheck\|adult\|aigc\|name\|tags` 指明哪一道 + 整句人话；全过 → 201 `{ persona:{ personaId, version, sha256, checksum, produceId, marketPath, shared, … }, warnings }`：铸一条 `TutorRelease`（market 口径的快照：② 只种子、学生问答不带、③ 状态列清空，与导出发布件同一份实现，**不可变**）+ `Persona{ kind:"tutor", shared:true, course, currentDoc, releaseVersion, subject, aigcDeclaredAt, license, policy }`；再发一次 = v(n+1)，旧版留着。被平台下架的 403 `TAKEN_DOWN` **复刻件（另存为我的人格，2026-09-29）**：从市场「开始学」开出来的课发同一个端点、同一套五道门 —— 没有自己的教材时 ① 沿用当初复制那一版（`sourceRelease`）的授权、② 不跑（那一版发布时查过；学习者多出来的只有自己的问答与条目），自己传了教材的按普通规则；发布件 `id` 从课 id 确定性派生（`fork-<12hex>`）、版次从 1 起、`fork_of {id, version}` 记血缘、`Persona.remixOf` 指回来源；回包与市场卡片 / 详情多 `remixOf { id, name }` **同时发布为启梦人格 / 可装进看板娘（M3，2026-09-29；tutor 仓 docs/06 §5.1 反向勾选）**：body 多 `alsoCompanion?: boolean`（默认 false、只认显式 true，`core/publish/companion.companionOptIn`）：勾了才由 ① 教学面生成 `Persona.style`（`companionStyleOf`：who + teaching_style → summary、catchphrases、tone、address_student → addressUser、greeting、example_turns → examples、hard_rules → boundaries，**只带说话风格**）并写 `Persona.companion { enabled:true, at }`，这位老师才进 `GET /api/personas` 缺省列表、才能 `PUT /api/companion/settings { personaId }` 装进看板娘；不勾 = `companion.enabled:false` 且 style 清空，**每次发布重新表态**。回包 `persona.companion { enabled, at }`（课程 summary 的 `published` 同形） |
+| DELETE | `/api/tutor/personas/:id/publish` | 必须（作者） | 取消分享：只翻 `shared:false`，快照 / 版号 / 评论都留；没发布过 404 |
+| GET | `/api/tutor/market?q&tag&subject&sort=new\|hot\|rating&scope=all\|installed\|mine&author&page&limit≤40` | 可选 | 市场列表（游客可逛；**不借 `/api/personas?kind=`**，监管若停陪聊线不连坐）：只回 `kind:"tutor" && shared && !takenDown`（`mine` 含自己没公开的；未登录 scope 退 all）；`hot` = 下载 → 点赞 → 时间，`rating` 均分、票数 < 3 沉底；登录用户看不到拉黑 / 被拉黑的作者；`{ items:[卡片], page, totalPages, total, sort, scope }`，卡片 `{ id, name, description, coverEmoji, coverImageUrl, tags, subject, author:{_id,username}, price, version, stats:{ downloadCount, likeCount, ratingAvg, ratingCount }, installed, isOwner, publishedAt }` |
+| GET | `/api/tutor/market/:id` | 可选 | 详情：`{ persona(卡片), release:{ version, sha256, checksum, produceId, publishedAt, note, stages }, preview:{ card(① 教学面：who / teaching_style / catchphrases / hard_rules[{text,locked}]), stages[{ stage_id, title, summary, steps, memo, checks }], guide, policy, license }, others(作者的其它老师，≤6), relation:{ isOwner, installed, learning:{ courseId, version }\|null, ownCourse } }`；② ④ 正文不给（下载后才有）；未发布 / 已下架的只有作者看得到（多 `takedown:{ at, reason }`），其他人 **404**（不泄露存在性）；拉黑互不可见 |
+| POST | `/api/tutor/runs` | 必须 | 「开始跟这位老师学」`{ persona }`（docs/02 5.7）：从发布版复制出自己的一门课（与「导入一位老师」同一条路：`createFromDoc` + `writePersona`；教材不复制、进度全 pending、🔒 硬规则随行；课上记 `sourcePersona / sourceVersion`）→ 201 `{ courseId, version, downloadCount }`，并 `PersonaInstall` +1（幂等）；同一人再点 → 200 同一门课 `created:false`；作者自己点 → 200 `own:true` 回自己那门课；付费老师没结算 403 `unpaid`（v1 全免费，只是闸的形状）；拉黑 403 `BLOCKED`；没发布版 409 `NO_RELEASE` |
+| GET | `/api/tutor/market/:id/ratings?page` | 可选 | **评分**（tutor 仓 docs/02 9.6；全站第一张 1~5 星表 `TutorRating`，2026-09-29）：`{ summary:{ avg, count, dist:{1..5} }, items:[{ id, user:{_id,username}, stars, text, atVersion, createdAt, updatedAt }], page, totalPages, total, mine, canRate:{ ok } \| { ok:false, reason: login\|owner\|blocked\|notStarted\|noneDone, message } }`；未发布 / 已下架对非作者 404（与详情同口径） |
+| PUT | `/api/tutor/market/:id/rating` | 必须 | `{ stars:1~5, text?(≤500) }` 一人一票可改（201 建 / 200 改）→ `{ created, mine, summary }`。**前置**（规则只在 `core/publish/rating.canRate` 一处）：从这位老师开出的课至少一个阶段 passed 或整门 done，否则 **403 `NOT_ELIGIBLE` + `reason`**；作者评自己 / 拉黑同样 403；`Persona.stats.ratingAvg / ratingCount` 从评分表 aggregate **重算**回写（不 `$inc`，`BranchAssetLike.js` 头上的理由）；第一次评作者收 `TUTOR_RATING`，改票不重发 |
+| DELETE | `/api/tutor/market/:id/rating` | 必须 | 删自己那一票并重算；没评过 404 |
+| POST | `/api/tutor/courses/:id/merge-release` | 必须（课主） | **合并新版**（tutor 仓 docs/03 §6.3，2026-09-29）：把从市场开出来的课合到那位老师的最新发布版 —— 三方合并（我手里的 / 当初复制的那版 `sourceRelease` / 最新版，规则只在 `core/publish/merge`）只换 ③ 结构与 ④ 内容：② 与进度按 `stage_id` 保留、`renamed_from` 搬进度、消失的阶段进 `run.archived` 不删；学习者自己加的必背 / 自检 / 易错点与全部学生问答留着（没有 `sourceRelease` 的老数据只保问答，`baseKnown:false`）。→ `{ version(自用件新版号), note, report:{ added, removed, renamed, changed, kept, learnerKept, studentQaKept, truncated, baseKnown }, source }`。409：`NOT_FORKED`（不是从市场开的）/ `SOURCE_GONE`（老师下架或取消分享）/ `UP_TO_DATE`。课程 summary 的 `source` 多 `personaName / latest / updateAvailable / gone / mergedAt` |
+| GET | `/api/tutor/admin/claims?stage=new\|awaiting\|upheld\|rejected\|all&page` | 管理员 | **教授认领的人工核实队列**（2026-09-29；tutor 仓 docs/06 §4.2）：与 `GET /api/admin/branch/reports` **同一张 Report 表**，只是按 `targetType:persona × reason:instructorClaim` 切出一条车道。阶段**不新增 status 取值**，由 `status + review.contactedAt` 派生（new = 没联系过、awaiting = 联系过等补证、upheld = taken_down、rejected = dismissed）；待核实按**先来先处理**（createdAt 升序）。`{ items:[{ id, stage, status, detail, createdAt, reporter:{_id,username,displayName}（不回 email）, handler, handledAt, handleNote, review:{ contactedAt, contactCount, log[{at,by,action,note}] }, persona:{ exists, id, name, subject, author, shared, takenDown, takenDownReason, version, downloadCount, ratingCount, marketPath } }], total, page, limit, stage, counts:{new,awaiting,upheld,rejected} }` |
+| POST | `/api/tutor/admin/claims/:id/contact` | 管理员 | `{ message ≤500 }` 联系举报人要证据：给举报人一条 **ADMIN_NOTICE**（平台口径、无 actorId，`payload { text, claimId, personaId }`），写 `review.contactedAt / contactCount / log`，状态不动 → 进「等待补证」。已处理 409 `HANDLED` |
+| POST | `/api/tutor/admin/claims/:id/verdict` | 管理员 | `{ verdict: upheld\|rejected, note? }` 裁定。**处置正文与通用队列同一份**（`services/reportResolve.service`）：upheld = registry 下架（作者看到的原因「教授认领经人工核实成立：备注」）→ `taken_down` → 同一位老师上其余待处理举报一起收尾 → 举报人与作者各一条 ADMIN_NOTICE；rejected = `dismissed`，只通知举报人。老师已不存在 409 `TARGET_GONE`；已处理 409 |
+| POST | `/api/tutor/referral` | 可选 | **引流位度量**（M3，2026-09-29；tutor 仓 docs/06 §5.1「度量（每条都能防刷）」）`{ from, path? }`：各入口带 `?from=`（白名单在 `core/publish/referral.REFERRAL_FROM`：nav / download / settings / tour / persona / gallery / preview / app-settings / app-create），落到 `/tutor` 时客户端发一发再把参数从地址栏抹掉。**只记不奖励**：未知来源不记（200 `recorded:false, reason:"unknown_from"`）、同一主体（登录 = 用户 id；游客 = IP 指纹 sha256 前 32 位，**不存明文 IP**）同一来源每天一条（201 `recorded:true` / 200 `reason:"duplicate"`）、90 天 TTL；按 IP 限流 30 次/分。表 `TutorReferral`，写入只在 `tutorMetrics.service.recordReferral` |
+| GET | `/api/tutor/admin/metrics` | 管理员 | **三条度量**（M3）：`{ days:30, since, referrals:[{ from, count, users }], activation:{ tutorUsers, crossUsers, ratio }, companion:{ personas, accounts }, fork7d:{ days:7, forks, activated, ratio } }` —— 激活 = 同一 `user._id` 既有 `TutorRun` 又是 `BranchVideo` 作者或有 `CompanionSetting`（distinct + `$in`，按人去重）；反哺 = 勾了「同时发布为启梦人格」的老师数 / `CompanionSetting.persona` 指向它们的账号数；fork 7 天 = 从市场开始学的课里 7 天内通过 ≥1 阶段的比例（`core/publish/referral.forkActivated`，没记 passedAt 的不算）。只读 |
+| GET | `/api/tutor/runs/:id` | 必须 | 学习页 bundle `{ run:{ status, progress, currentStage, usage, lastTurnSeq, demo, distill, dueReviews, pendingReview }, doc, materials, turns(最近 60), companion }`。`companion`（M4，2026-09-29；App 上课页「老师能不能开口」）= `{ personaId, name, enabled, reason? } \| null`：run 对应的老师人格（从市场开的课 = `sourcePersona`，作者自己的课 = 这门课发布出的那条），`enabled` 与「能不能装进看板娘」**同一条判定**（`personaAccess.checkPersonaAccess`：可见 + 勾了「同时发布为启梦人格」+ 付费；实现 `tutorPublish.companionOf` 只转述它），denied 时 `reason` 原样带回（`not_companion` / `private` / `unpaid`，只给排障看）；没发布过 / 人格已删 = `null`。客户端**判否定**：`null` 与 `enabled:false` 都画成纯文字，老 App 没有这一格照常上课 |
+| GET | `/api/tutor/runs/:id/turns?after=` · `/review-card` · `/review-due` · `/review-quiz?stage=` · `/revisions` · `/usage-export?format=md\|csv\|json&from&to` | 必须 | 增量轮次 / 复习卡 / 到期回访 / 回访题 / 修订记录（新的在上 + 等点头数）/ 使用记录（复旦承诺书四项，csv 带 BOM） |
+| PATCH | `/api/tutor/runs/:id/progress` | 必须 | `{ stage, stepIdx }` 漫游进度；走到最后一步 pending → taught |
+| POST | `/api/tutor/runs/:id/turns` | 必须 | 一轮（**SSE**）`{ kind: ask|teach|quiz-from-selection|select|memorize, stage?, text?, selection?, direct?, selfExplain? }`；`select` / `memorize` 不过模型按 JSON 回 |
+| POST | `/api/tutor/runs/:id/quiz` | 必须 | `{ stage?, answers[], review? }` → `{ results, correct, asked, passed, progress, nextStage, nextReviewAt, dueReviews, distillQueued }`；通过线 2/3 只在 `core/session/progress.js`；模型判卷形状不对退回确定性判法（今天不计费） |
+| POST | `/api/tutor/runs/:id/skip` · `/feedback` | 必须 | 作者跳过自检 / 给某一轮 👍👎 `{ seq, value: 1|-1|null }` |
+| POST | `/api/tutor/runs/:id/distill` | 必须 | 手动「整理一下」→ `{ status: done|empty|nothing|failed, revision, learned, pendingReview, version }`；扣 tutor_distill（模型回了正文即受理，形状不对重试一次不再扣） |
+| POST | `/api/tutor/runs/:id/revisions/:rid/review` · `/revert` | 必须 | 逐条点头 / 否掉 `{ accept[], reject[] }`（点头了至少一条 = 版次 +1）/ 逐条撤销 `{ opIds[] }`（追加 `kind:revert`，历史不删） |
+
+SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {index,text}` · `done {seq,kind,text,flags,demo,preview,stage,progress,status,changed,distillQueued}` · `error {message}`；每 15 秒一行 `: ping` 注释帧。
+
+```jsonc
+// POST /api/tutor/runs/:id/turns —— 圈着教材原文问
+{ "kind": "ask", "stage": "stage-02", "text": "这一句怎么理解？",
+  "selection": { "anchor": { "material": "ed7455bfc594", "page": 12, "quote": "传播时延 = d / s" } } }
+```
+
+状态码约定：
+
+- `402 INSUFFICIENT_TOKENS` / `403 PLAN_REQUIRED|WALLET_FROZEN` / `429 DAILY_LIMIT`：开流之前就拒，一分不扣（billing 的形状原样回）
+- `409 BUSY`：老师还在回上一句 / 这门课正在生成；`409 NO_PERSONA`：还没生成老师；`409 NOT_PASSED`：没通过的阶段谈不上回访
+- `501 AI_NOT_CONFIGURED`：没配模型且不许演示（生产）
+
+★ **钱的序列**（tutor 仓 docs/05 §6.2）：教学轮在开流**之前** `billing.preAuthorize` 原子扣 `tutor_turn`，第一个 token 之前上游抛 ⇒ `refundUnaccepted`（`refundTag:"tutor_refund"`，进 `TOKEN_REASONS` 与 `SPEND_REASONS`），之后断流不退（W2 同口径）；管理员免单照 `noteFreeCall` 记账。生成受理即扣整份报价（`core/generate/pricing.generateQuote`，与端点报价同一个函数）。
+★ **三个单价是建议值**（tutor 仓 docs/08 #4、docs/10）：`tutor_turn` 钉在 `CHAT_TURN_TOKENS`，另两个按 dogfood 量出的 p95 相对教学轮的比例定；改数只改 `TUTOR_PRICES` 一处，tutor 仓 `src/generate/pricing.js` 镜像（`tests/tutorCore.spec.js` 钉着两处相等）。
+★ **私有**：教材原件在 Cloudinary raw（公开投递 401，只能签名下载）；块级文本、对话、修订记录永不进任何导出件；导出件本身永不含教材（`materials_included` 恒 false，导出前 `cleanCheck` 逐段核查）。
 
 ## 语音合成（工坊 NPC 的嗓子）
 

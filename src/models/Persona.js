@@ -52,10 +52,39 @@ const personaSchema = new mongoose.Schema(
     // 「音频」板块：人格自带的豆包嗓子（音色 / 语速 / 音高 / 语调指令），null = 没设置、跟随数字人默认。
     // 形状与合并规则见 utils/voiceSettings.js；数字人（首页看板娘 / App 客服）装上这个人格就按它说话。
     voice: { type: voiceSettingsSchema, default: null },
+    // ── 老师人格（tutor 仓 docs/04 §5 S3，2026-09-28）──────────────────────────────────────────────
+    // kind：undefined = 老数据 = 客服 / 陪聊人格。★ 判否定、**不设 default**：存量几千条不会回填，写 default:"companion"
+    //   再按 === "companion" 判就会把它们整批判成"不是"（app CLAUDE.md 坑表「后加的字段用 === 判」）。
+    //   "tutor" 只由 tutor 服务端在发布（M2）时写；客户端 body 里的 kind 一律被 zod strip（persona.schemas.js）。
+    //   列表缺省过滤在 services/personaKind.js（唯一实现），controller 里不再出现第二处 kind 判断（docs/06 D2）。
+    kind: { type: String, enum: ["tutor"] },
+    // 老师人格才有（2026-09-28 M2 发布起有写入方：services/tutorPublish.service.js）：所属课程（一门课 = 一位老师，partial unique）、
+    // 最新发布版快照（TutorRelease，不可变）、版号（列表卡片不用 populate）、学科（市场筛选）、复刻自谁（「另存为我的人格」，还没有写入方）。读的一方判否定。
+    course: { type: mongoose.Schema.Types.ObjectId, ref: "TutorCourse" },
+    currentDoc: { type: mongoose.Schema.Types.ObjectId, ref: "TutorRelease" },
+    releaseVersion: { type: Number },
+    subject: { type: String, trim: true, maxlength: 60 },
+    remixOf: { type: mongoose.Schema.Types.ObjectId, ref: "Persona" },
+    // 「同时发布为启梦人格 / 可装进看板娘」（tutor 仓 docs/06 §5.1 反向勾选，2026-09-29 M3）：作者发布时显式勾选、默认关，只对 kind:"tutor" 有意义。
+    //   判否定：`companion.enabled !== true` = 没勾 = 这位老师**不进** /api/personas 缺省列表、不能被选用（services/personaKind.js 与 personaAccess.service 各一处判）；
+    //   勾了才由 ① 教学面生成 `style`（core/publish/companion.companionStyleOf，只带说话风格，课件内容一个字不带）。没有 default：存量老师人格 = 没勾。
+    companion: { enabled: { type: Boolean }, at: { type: Date } },
+    // 发布时「主动声明含 AI 生成内容」的那一拍（《标识办法》第十条，显式勾选不是脚注）。判否定：没声明过 = 发布五道门第 ④ 道不过
+    aigcDeclaredAt: { type: Date },
+    // 发布时从课程拷过来并锁住的授权来源与 AI 政策（🔒 硬规则的源头），详情页只读展示
+    license: { source: { type: String, trim: true, maxlength: 40 } },
+    policy: { type: mongoose.Schema.Types.Mixed },
+    // 下架处置（治理 P5，services/takedown.service.js 的 persona 处理器写）：作者看得见 reason、看不见 by（docs/02 6.6）
+    takenDownAt: { type: Date },
+    takenDownReason: { type: String, default: "", maxlength: 500 },
+    takenDownBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     stats: {
       viewCount: { type: Number, default: 0 },
       downloadCount: { type: Number, default: 0 },
       likeCount: { type: Number, default: 0 },
+      // 老师人格的评分（TutorRating 回写，countDocuments / aggregate 不 $inc）：市场 sort=rating 读这两格，票数 < 3 沉底
+      ratingAvg: { type: Number, default: 0 },
+      ratingCount: { type: Number, default: 0 },
       _id: false,
     },
   },
@@ -64,5 +93,11 @@ const personaSchema = new mongoose.Schema(
 
 personaSchema.index({ shared: 1, createdAt: -1 });
 personaSchema.index({ shared: 1, "stats.downloadCount": -1 });
+// 老师人格市场（/api/tutor/market）的几种排法与筛法；一门课只能发成一位老师（course 上 partial unique，只对有 course 的行生效）
+personaSchema.index({ kind: 1, shared: 1, createdAt: -1 });
+personaSchema.index({ kind: 1, shared: 1, "stats.downloadCount": -1 });
+personaSchema.index({ kind: 1, shared: 1, "stats.ratingAvg": -1 });
+personaSchema.index({ kind: 1, shared: 1, subject: 1 });
+personaSchema.index({ course: 1 }, { unique: true, partialFilterExpression: { course: { $exists: true } } });
 
 module.exports = mongoose.model("Persona", personaSchema);

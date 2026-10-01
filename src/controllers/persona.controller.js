@@ -4,6 +4,7 @@
 const mongoose = require("mongoose");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
+const { personaKindFilter } = require("../services/personaKind");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
 const PersonaPurchase = require("../models/PersonaPurchase");
@@ -228,6 +229,8 @@ async function listPersonas(req, res, next) {
       filter = { shared: true, takenDown: { $ne: true } };
     }
     if (tag) filter.tags = tag;
+    // 老师人格的列表过滤只在 services/personaKind.js 那一处：缺省不带、查询参数点名要老师才给（老 App 会把列表里任何一条装成客服人格）
+    Object.assign(filter, personaKindFilter(req.query.kind));
     // 2026-09-05 起搜索 / 排序 / 分页都在数据库做（此前是全量 find 再 JS 过滤，市场一长就先死在这）
     if (q) {
       const re = new RegExp(escapeRegex(q), "i");
@@ -460,6 +463,8 @@ async function updatePersona(req, res, next) {
     if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
     if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
+    // 被平台下架（举报处置）的人格，作者不能自己再翻成公开；想申诉走工单。原因给作者看，处置人不给（docs/02 6.6）
+    if (req.body.shared && doc.takenDown) forbidden(`这个人格已被平台下架（${doc.takenDownReason || "原因见站内通知"}），不能再公开`);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.voice !== undefined) doc.voice = await expandVoiceInput(req.body.voice, req.user._id);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）

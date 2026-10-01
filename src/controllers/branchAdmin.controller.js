@@ -316,9 +316,15 @@ async function unbanUser(req, res, next) {
  *      （他的搜索记录，用户私有数据）→ deleteMany
  *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
  *      （硬删 + DeletionLog；记忆卡没有 TTL，账号没了就再没人能删它们，所以必须在这里删）
+ *   ⑩.7 老师人格那一线（2026-09-29，tutor 仓 docs/04 S14）→ services/tutorPurge.service.purgeTutorForUser：
+ *      十二张 Tutor* 表 + 他发布的老师人格及其发布版 / 评分 / 安装 / 评论 / 举报；教材原件句柄进 PendingAssetPurge（raw）。
+ *      ★ 懒 require：TUTOR_ENABLED=false 时 tutor 树一个模块都不装，但删号不看开关（开关管功能挂不挂，不管数据在不在）。
+ *      两份清单在那个文件头部（新表必须落在其中一份，tests/tutorPurge.spec.js 钉住）。
  *   ⑪ User 本体（最后删：中途挂了还能重来，先删 User 就再也找不到线索了）
  *
  *   不删（刻意的，不是遗漏）：
+ *   · 别人从他的老师人格「开始学」开出来的 TutorCourse / TutorRun —— 那是别人的学习过程与自用件，只标 sourceOrphanedAt
+ *     （课程页说「这位老师已不在市场上」、合并新版 409），理由在 tutorPurge.service 头部。
  *   · PointsLedger —— 复式记账，硬不变量是「除 signup 外所有分录和为零」（I1，机器可查）。
  *     删掉他那一侧的分录，对手方的分录就永远配不平，整本账从此说不清 ——
  *     账本是只追加的审计记录，人没了账也得在。
@@ -497,6 +503,9 @@ async function purgeUserCascade(userId) {
   const chat = await purgeUserChatData(uid);
   removed.chatThreads = chat.threads;
   removed.chatMemories = chat.memories;
+
+  // ⑩.7 老师人格那一线（清单与理由在 services/tutorPurge.service.js 头部；懒 require 的理由见函数头）
+  Object.assign(removed, await require("../services/tutorPurge.service").purgeTutorForUser(uid));
 
   // ⑪ 用户本体
   removed.user = (await User.deleteOne({ _id: uid })).deletedCount;
