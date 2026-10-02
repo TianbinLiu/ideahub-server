@@ -334,9 +334,43 @@ const branchTemplateSchema = new mongoose.Schema(
      *   方舟受理后才失败不退费，坏模板的那次学费必须由作者自己付，不能摊给每个套用的人。
      */
     provenAt: { type: Date, default: null },
+    /**
+     * 作者本人在**哪些出片模型**上用这个模板真实跑通过（模型 id，去重）。
+     * ★ 与 provenAt 同一条证据链、同一个写入方（ark.routes 的 noteR2vOutcome）：受理时追踪里记下 model，
+     *   轮询到 succeeded 且发起人就是作者时 `$addToSet`。客户端塞不进来（建模板 / 改角色位的 schema 都不收它）。
+     * ★ 为什么要记（2026-10-02，App 侧「模板 × 出片模型」统一口径）：模板对出片模型是硬要求。今天只有一个模型
+     *   做得了白模复刻，"在哪个模型上跑通"看似废话 —— 但开第二个模型的那一天，存量模板"只在旧模型上证明过"
+     *   这件事如果没有底账，就只能靠猜。事实只能从现在开始记，补不回来。
+     * ★ **读它只走 provenModelsOf**（下面的 static）：存量模板没有这一格，那边有一条推得死的兜底。
+     */
+    provenModels: { type: [String], default: undefined },
   },
   { timestamps: true, versionKey: false }
 );
+
+/**
+ * provenModels 上线之前，唯一开着 r2v 的模型（config/tokens 的 VIDEO_MULT_R2V 当时只有这一行，
+ * resolveR2v 对表外模型一律 400）。
+ * ★★ **写死字面量，不引用 `SEEDANCE_2_5` 常量**：这是一条历史事实（"那些模板当时是在这个模型上跑通的"），
+ *   不是"当前的 r2v 模型"。哪天那个常量换成新版本的 id、或者价目表里加了第二行，存量模板证明过的仍然只是这一个。
+ */
+const LEGACY_PROVEN_MODEL = "doubao-seedance-2-5-260628";
+
+/**
+ * 「这个模板在哪些出片模型上真实跑通过」—— 出口的**唯一实现**（toTemplatePayload 读它）。
+ *
+ *   · 记过（provenModels 非空）⇒ 原样出；
+ *   · 没记过但 provenAt 非空 ⇒ **存量**：那一发只可能跑在 LEGACY_PROVEN_MODEL 上（推论，但推得死 ——
+ *     那段时间里 r2v 价目表只有它一行，别的模型发 r2v 是 400、根本受理不了）；
+ *   · provenAt 为空 ⇒ 空数组（还没证明过）。
+ *
+ * ★ 兜底只在**读**这一侧做，不回写库：读写分开，哪天发现推错了，改这一个函数就全量纠正，库里没有脏数据要洗。
+ */
+branchTemplateSchema.statics.provenModelsOf = function provenModelsOf(doc) {
+  const stored = Array.isArray(doc?.provenModels) ? doc.provenModels.filter((m) => typeof m === "string" && m) : [];
+  if (stored.length) return stored;
+  return doc?.provenAt ? [LEGACY_PROVEN_MODEL] : [];
+};
 
 /**
  * 「判这个模板的视频合不合方舟窗口时，该拿哪个秒数」—— **这条口径的唯一实现**（铁律六）。

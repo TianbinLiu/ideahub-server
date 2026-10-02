@@ -215,7 +215,7 @@ describe("videoUrl 三重白名单（host + 目录 + 归属）", () => {
 
 // ─────────────────────────────────────────────────────────────────────
 describe("zod strip 回归：未声明字段发得出、存不下，敏感字段改不动", () => {
-  test("客户端塞 status/provenAt/refVideo/ownerId → 全部被剥掉，服务端的值说了算", async () => {
+  test("客户端塞 status/provenAt/provenModels/refVideo/ownerId → 全部被剥掉，服务端的值说了算", async () => {
     const res = await request(app)
       .post("/api/branch/templates")
       .set(asOwner())
@@ -224,6 +224,8 @@ describe("zod strip 回归：未声明字段发得出、存不下，敏感字段
           // 这些都是「发得出」的：一个都不许「存得下」
           status: "published",
           provenAt: new Date().toISOString(),
+          // 「在哪个模型上跑通过」只由服务端的试炼追踪写，客户端自称不算数
+          provenModels: ["doubao-seedance-2-5-260628", "anything"],
           ownerId: other.id,
           authorName: "假冒者",
           refVideo: { durationSec: 1, width: 1, height: 1, bytes: 0, url: "https://evil.example.com/x.mp4" },
@@ -237,6 +239,7 @@ describe("zod strip 回归：未声明字段发得出、存不下，敏感字段
     const tpl = back.body.template;
     expect(tpl.status).toBe("pending"); // 不是 "published"
     expect(tpl.provenAt).toBeNull();
+    expect(tpl.provenModels).toEqual([]); // 没试炼过 = 空数组，客户端塞的那两个一个都没进来
     expect(tpl.ownerId).toBe(String(owner.id)); // 不是 other
     expect(tpl.refVideo.durationSec).toBe(10); // Cloudinary 的数，不是客户端报的 1
     expect(tpl.refVideo.url).toContain("res.cloudinary.com");
@@ -261,6 +264,14 @@ describe("试炼闸与发布状态机", () => {
     const ok = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
     expect(ok.status).toBe(200);
     expect(ok.body.template.status).toBe("published");
+    // 存量形状（有 provenAt、没记过模型）：出口按当时唯一开着 r2v 的模型出 —— 线上现有的已发布模板全是这个形状
+    expect(ok.body.template.provenModels).toEqual(["doubao-seedance-2-5-260628"]);
+
+    // 记过的原样出，而且**对别人也出**（市场上的人要拿它判断这个模板能在哪个模型上出片）
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { provenModels: ["model-a"] } });
+    const seen = await request(app).get(`/api/branch/templates/${tpl.id}`).set(asOther());
+    expect(seen.status).toBe(200);
+    expect(seen.body.template.provenModels).toEqual(["model-a"]);
   });
 
   test("非作者不能 publish / unpublish / delete（403，身份只认 ownerId）", async () => {

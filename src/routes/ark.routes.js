@@ -174,7 +174,14 @@ function billedForward(kind, path, timeoutMs) {
           const parsed = JSON.parse(out.text || "{}");
           const taskId = String(parsed?.id || "");
           if (TASK_ID_RE.test(taskId)) {
-            await BranchTemplateTrial.create({ taskId, templateId: req.r2v.templateId, userId: req.user._id });
+            await BranchTemplateTrial.create({
+              taskId,
+              templateId: req.r2v.templateId,
+              userId: req.user._id,
+              // 这一发用的出片模型：试炼成功时记进模板的 provenModels（事实底账，见 BranchTemplate.provenModels）。
+              // 走到这里它已过 ALLOWED_MODELS 与 r2v 价目表两道闸，不是任意字符串
+              model: String(req.body?.model ?? "").slice(0, 80),
+            });
           } else {
             console.error(`[ark] r2v 任务受理但响应里没有可用的任务 id（tpl:${req.r2v.templateId}）`);
           }
@@ -505,9 +512,13 @@ function clipOutOfBounds(clip, src) {
 }
 
 /**
- * 轮询响应的试炼闸挂钩：r2v 任务 succeeded 且发起人就是模板作者 → 置 provenAt。
+ * 轮询响应的试炼闸挂钩：r2v 任务 succeeded 且发起人就是模板作者 → 置 provenAt，
+ * 并把这一发用的模型记进 provenModels（「在哪个模型上真实跑通过」，2026-10-02）。
  * 证据链两头都在服务端（受理时的追踪记录 + 方舟自己吐的 succeeded），
  * 轮询者是谁无关紧要 —— 追踪里记的是**创建任务**的人。
+ * ★ 两件事分两句写：provenAt 只置一次（过滤条件带 `provenAt: null`，并发轮询也只有一发写得进）；
+ *   provenModels 是 `$addToSet`（幂等）且**不看 provenAt 置没置过** —— 作者之后在另一个模型上再跑通一次，
+ *   那个模型也要记上，这正是这一格存在的理由。
  * ★ 任何失败都不打断轮询响应（出片进行中的用户不该因为我们的记账问题看到报错），
  *   但要吼出来：吞掉的话作者会遇到"出片成功却还是不能发布"，查无可查（铁律八）。
  */
@@ -517,9 +528,15 @@ async function noteR2vOutcome(taskId, parsed) {
     const trial = await BranchTemplateTrial.findOne({ taskId }).lean();
     if (!trial) return; // 非 r2v 任务（绝大多数轮询），零额外开销地走人
     const tpl = await BranchTemplate.findById(trial.templateId).select("ownerId provenAt").lean();
-    if (tpl && !tpl.provenAt && String(trial.userId) === String(tpl.ownerId)) {
-      await BranchTemplate.updateOne({ _id: tpl._id, provenAt: null }, { $set: { provenAt: new Date() } });
-      console.log(`[ark] 白模模板试炼通过 tpl:${trial.templateId} task:${taskId}`);
+    if (tpl && String(trial.userId) === String(tpl.ownerId)) {
+      if (!tpl.provenAt) {
+        await BranchTemplate.updateOne({ _id: tpl._id, provenAt: null }, { $set: { provenAt: new Date() } });
+        console.log(`[ark] 白模模板试炼通过 tpl:${trial.templateId} task:${taskId}`);
+      }
+      // 老追踪（上线前落的）没有 model：那一发不记，出口由 provenModelsOf 的存量兜底负责
+      if (trial.model) {
+        await BranchTemplate.updateOne({ _id: tpl._id }, { $addToSet: { provenModels: trial.model } });
+      }
     }
     // 任务已出结果，追踪的使命结束（TTL 只是兜底）；消费者的任务同样清掉
     await BranchTemplateTrial.deleteOne({ taskId });
