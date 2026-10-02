@@ -281,8 +281,9 @@ async function resolveR2v(req, res, next) {
         return deny("这个白模模板已被平台下架，暂时不能用它出片——当前请求未被受理，也没有扣费。");
       }
       // 未发布的模板只有作者本人能用（那正是发布前的「试炼」一步）；
-      // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现
-      if (tpl.status !== "published" && String(tpl.ownerId) !== String(req.user._id)) {
+      // 别人拿到 URL 也不能蹭 —— 市场只暴露 published，这里是同一条边界的服务端实现。
+      // retired（被公开流程引用着、作者下了架）对所有人放行：复制了那条流程的人要靠它出片（BranchTemplate model 的 ★）
+      if (tpl.status !== "published" && tpl.status !== "retired" && String(tpl.ownerId) !== String(req.user._id)) {
         return deny("这个白模模板还没有发布，暂时不能用它出片——当前请求未被受理，也没有扣费。");
       }
       // ★★ 模板视频自己过不过方舟窗口 —— 2026-08-16 补上的结构性缺口。

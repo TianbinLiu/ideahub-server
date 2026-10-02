@@ -41,13 +41,33 @@ function videoReadableBy(doc, user) {
   return doc.visibility !== "private";
 }
 
+/**
+ * **列表**口径的可读条件（Mongo 版）—— 与 branchVideo.controller 的 `readableByIdFilter` 同一条规则
+ * （认「凭链接可见」：主人拍板工作流模板必须挂在已发布作品上，"不想进首页流就设成凭链接可见"，
+ *   所以货架上**要**收凭链接可见的作品；私密的、下架的不收）。抄在这里的理由同 videoReadableBy。
+ */
+function videoReadableFilter(user) {
+  const open = {
+    $or: [{ visibility: { $ne: "private" } }, { visibility: "private", linkOnly: true }],
+    "takedown.at": { $exists: false },
+  };
+  return user ? { $or: [open, { author: user._id }] } : open;
+}
+
 /** 作品文档上那个提示位：与配方表**同拍写**（唯一实现）。flag 为 null = 配方没了，把提示位摘掉 */
 async function syncVideoFlag(videoId, flag) {
   if (flag) {
-    await BranchVideo.updateOne({ _id: videoId }, { $set: { recipe: { public: flag.public === true, revision: Number(flag.revision || 0) } } });
+    await BranchVideo.updateOne(
+      { _id: videoId },
+      { $set: { recipe: { public: flag.public === true, revision: Number(flag.revision || 0), listed: flag.listed === true } } }
+    );
   } else {
     await BranchVideo.updateOne({ _id: videoId }, { $unset: { recipe: "" } });
   }
+}
+
+function flagOf(doc) {
+  return { public: doc.public, revision: doc.videoRevision, listed: doc.listed };
 }
 
 /**
@@ -81,7 +101,27 @@ function toMeta(doc, video) {
     stale: Number(doc.videoRevision || 0) !== currentRevision,
     bytes: Number(doc.bytes || 0),
     nodeCount: Number(doc.nodeCount || 0),
+    // 上架到了模板市场（工作流模板）。对别人可见的条件与配方相同（listWorkflowTemplates 再过一遍）
+    listed: doc.listed === true,
     updatedAt: doc.updatedAt,
+  };
+}
+
+/**
+ * 货架上那张卡要的摘要（段数 / 总时长 / 用到的档位 / 用了模板的段数 / 卡 / 空位）—— 服务端从正文里数，
+ * 列表不必把几十份正文整个发下去。与 App 的 data/recipe.recipeSummary 同一个口径。
+ */
+function summaryOf(recipe) {
+  const nodes = Array.isArray(recipe && recipe.nodes) ? recipe.nodes : [];
+  const tiers = [];
+  for (const n of nodes) if (n && typeof n.tier === "string" && !tiers.includes(n.tier)) tiers.push(n.tier);
+  return {
+    segs: nodes.length,
+    totalSec: Math.round(nodes.reduce((s, n) => s + (Number(n && n.durationSec) || 0), 0)),
+    tiers,
+    templated: nodes.filter((n) => n && n.kind === "blockout").length,
+    cards: Array.isArray(recipe && recipe.deck) ? recipe.deck.length : 0,
+    slots: Array.isArray(recipe && recipe.cast) ? recipe.cast.length : 0,
   };
 }
 
@@ -100,7 +140,7 @@ async function putRecipe(req, res, next) {
     if (!video) notFound("Video not found");
     if (!ownedBy(video, req.user)) forbidden("Forbidden");
 
-    const { recipe, videoRevision, public: isPublic } = req.body;
+    const { recipe, videoRevision, public: isPublic, listed: wantListed } = req.body;
     const currentRevision = Number(video.revision || 0);
     if (Number(videoRevision) !== currentRevision) {
       failWith(
@@ -113,15 +153,27 @@ async function putRecipe(req, res, next) {
     await assertShareableCards(req.user._id, recipe);
 
     const bytes = Buffer.byteLength(JSON.stringify(recipe));
+    // 上架位：只有公开着才能挂在货架上。发布页勾了「同时上架」而没勾公开 = 不上架（不报错：开关本来就是从属的）。
+    //   没勾上架时**不动**原来的 listed（回炉重投一份配方不该把作者上过的架悄悄撤掉）；关公开则一并下架。
+    const prev = await BranchRecipe.findOne({ video: video._id }).select("listed listedAt").lean();
+    const listed = isPublic === true && (wantListed === true || (prev && prev.listed === true));
     const doc = await BranchRecipe.findOneAndUpdate(
       { video: video._id },
       {
-        $set: { recipe, bytes, nodeCount: recipe.nodes.length, videoRevision: currentRevision, public: isPublic === true },
+        $set: {
+          recipe,
+          bytes,
+          nodeCount: recipe.nodes.length,
+          videoRevision: currentRevision,
+          public: isPublic === true,
+          listed,
+          ...(listed && !(prev && prev.listed) ? { listedAt: new Date() } : {}),
+        },
         $setOnInsert: { owner: req.user._id, video: video._id },
       },
       { upsert: true, returnDocument: "after" }
     ).lean();
-    await syncVideoFlag(video._id, { public: doc.public, revision: doc.videoRevision });
+    await syncVideoFlag(video._id, flagOf(doc));
 
     res.json({ ok: true, recipe: toMeta(doc, video) });
   } catch (err) {
@@ -129,7 +181,11 @@ async function putRecipe(req, res, next) {
   }
 }
 
-/** PATCH /api/branch/videos/:id/recipe —— 只开 / 关公开（作者本人）。没有配方时 404：打开之前要先 PUT 一份 */
+/**
+ * PATCH /api/branch/videos/:id/recipe —— 开 / 关公开，上 / 下架模板市场（作者本人）。没有配方时 404：打开之前要先 PUT 一份。
+ * ★ 上架的前提是「公开 + 不过期」（400 RECIPE_NOT_LISTABLE）：货架上不能挂一份别人点进去 404 的东西；
+ *   关公开时顺手下架（同一拍、同一条规则的两个方向）。
+ */
 async function patchRecipe(req, res, next) {
   try {
     const { id } = req.params;
@@ -138,15 +194,82 @@ async function patchRecipe(req, res, next) {
     if (!video) notFound("Video not found");
     if (!ownedBy(video, req.user)) forbidden("Forbidden");
 
+    const cur = await BranchRecipe.findOne({ video: video._id }).lean();
+    if (!cur) failWith(404, "RECIPE_NOT_FOUND", "这条作品还没有留存制作过程。");
+    const nextPublic = req.body.public === undefined ? cur.public === true : req.body.public === true;
+    let nextListed = req.body.listed === undefined ? cur.listed === true : req.body.listed === true;
+    // 明确要上架（而不是原来就上着）时把关：没公开 / 过期的整句拒 —— 静默不上架的话作者以为上了（CLAUDE.md「看着生效、实际什么都没做的开关」）
+    if (req.body.listed === true && !(cur.listed === true)) {
+      const stale = Number(cur.videoRevision || 0) !== Number(video.revision || 0);
+      if (!nextPublic || stale) {
+        failWith(
+          400,
+          "RECIPE_NOT_LISTABLE",
+          stale ? "留存的制作过程还是上一版的，先用这一版重新公开，再上架。" : "制作过程没有公开，不能上架到模板市场。"
+        );
+      }
+    }
+    // 关公开顺手下架（同一拍、同一条规则的两个方向）
+    if (!nextPublic) nextListed = false;
     const doc = await BranchRecipe.findOneAndUpdate(
       { video: video._id },
-      { $set: { public: req.body.public === true } },
+      { $set: { public: nextPublic, listed: nextListed, ...(nextListed && !(cur.listed === true) ? { listedAt: new Date() } : {}) } },
       { returnDocument: "after" }
     ).lean();
-    if (!doc) failWith(404, "RECIPE_NOT_FOUND", "这条作品还没有留存制作过程。");
-    await syncVideoFlag(video._id, { public: doc.public, revision: doc.videoRevision });
+    await syncVideoFlag(video._id, flagOf(doc));
 
     res.json({ ok: true, recipe: toMeta(doc, video) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/branch/templates/workflows —— 模板市场的「工作流」货架：上了架、公开着、描述的正是当下这一版、
+ * 作品对这个人可读（列表口径，收凭链接可见）的配方，按上架时间倒序。query `limit`（默认 30，上限 60）、
+ * `before`（上一页最后一条的 listedAt，ISO）。不带正文，只带货架要的摘要。
+ */
+async function listWorkflowTemplates(req, res, next) {
+  try {
+    const limit = Math.min(60, Math.max(1, Number(req.query.limit) || 30));
+    const before = req.query.before ? new Date(String(req.query.before)) : null;
+    const q = { listed: true, public: true, ...(before && !Number.isNaN(before.getTime()) ? { listedAt: { $lt: before } } : {}) };
+    // 多取一倍再按作品可读性筛：被筛掉的（私密 / 下架 / 回炉后过期）不占名额
+    const docs = await BranchRecipe.find(q).sort({ listedAt: -1 }).limit(limit * 2).lean();
+    if (!docs.length) return res.json({ ok: true, items: [] });
+    const videos = await BranchVideo.find({ _id: { $in: docs.map((d) => d.video) }, ...videoReadableFilter(req.user) })
+      .select("_id title cover author revision createdAt")
+      .populate("author", AUTHOR_FIELDS)
+      .lean();
+    const byId = new Map(videos.map((v) => [String(v._id), v]));
+    const ids = videos.map((v) => v._id);
+    // 「有几个人按它做了同款」一次聚合（不含作者自己）
+    const counts = ids.length
+      ? await BranchVideo.aggregate([
+          { $match: { "remixOf.video": { $in: ids }, "takedown.at": { $exists: false } } },
+          { $group: { _id: "$remixOf.video", n: { $sum: 1 }, self: { $sum: { $cond: [{ $eq: ["$author", "$remixOf.author"] }, 1, 0] } } } },
+        ])
+      : [];
+    const remixBy = new Map(counts.map((c) => [String(c._id), Math.max(0, c.n - c.self)]));
+    const items = [];
+    for (const d of docs) {
+      const v = byId.get(String(d.video));
+      if (!v) continue;
+      if (Number(d.videoRevision || 0) !== Number(v.revision || 0)) continue; // 回炉后过期的不上货架
+      const a = v.author || {};
+      items.push({
+        video: v._id,
+        title: v.title || "",
+        cover: v.cover || "",
+        author: { _id: a._id, username: a.username || "", displayName: a.displayName || a.username || "", avatarUrl: a.avatarUrl || "" },
+        summary: summaryOf(d.recipe),
+        remixCount: remixBy.get(String(v._id)) || 0,
+        listedAt: d.listedAt || d.updatedAt,
+        updatedAt: d.updatedAt,
+      });
+      if (items.length >= limit) break;
+    }
+    res.json({ ok: true, items });
   } catch (err) {
     next(err);
   }
@@ -164,7 +287,7 @@ async function getRecipe(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
     const video = await BranchVideo.findById(id)
-      .select("_id title author revision visibility linkOnly takedown")
+      .select("_id title cover author revision visibility linkOnly takedown")
       .populate("author", AUTHOR_FIELDS)
       .lean();
     if (!video) notFound("Video not found");
@@ -183,6 +306,8 @@ async function getRecipe(req, res, next) {
       meta: {
         ...meta,
         title: video.title || "",
+        // 示例视频的封面：制作过程页顶上那张图（工作流模板的模板页就是这一页）
+        cover: video.cover || "",
         author: { _id: a._id, username: a.username || "", displayName: a.displayName || a.username || "", avatarUrl: a.avatarUrl || "" },
         isOwner: mine,
       },
@@ -209,4 +334,4 @@ async function deleteRecipe(req, res, next) {
   }
 }
 
-module.exports = { putRecipe, patchRecipe, getRecipe, deleteRecipe };
+module.exports = { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates };

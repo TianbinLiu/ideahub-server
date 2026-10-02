@@ -25,6 +25,7 @@ const {
   setCategoryBody,
 } = require("../schemas/branchTemplate.schemas");
 const BranchTemplate = require("../models/BranchTemplate");
+const BranchRecipe = require("../models/BranchRecipe");
 // 白模 V2 的**取件凭据**（两阶段的分界线）。为什么非拆不可见该文件的文件头
 const BlockoutJob = require("../models/BlockoutJob");
 const { cloudinary } = require("../config/cloudinary");
@@ -1484,7 +1485,8 @@ router.get("/templates/:id", optionalAuth, async (req, res, next) => {
     // 403 等于承认「这个 id 存在但你不能看」，把私有模板的存在性泄露成可枚举的事实
     if (!doc) notFound("Template not found");
     const isOwner = req.user && String(doc.ownerId) === String(req.user._id);
-    if (doc.status !== "published" && !isOwner) notFound("Template not found");
+    // retired（被公开流程引用着、作者下了架）对所有人可读：按配方复制的人要靠它铺白模段（model 的 ★）
+    if (doc.status !== "published" && doc.status !== "retired" && !isOwner) notFound("Template not found");
     res.json({ ok: true, template: toTemplatePayload(doc, req.user) });
   } catch (err) {
     next(err);
@@ -1753,9 +1755,12 @@ router.patch("/templates/:id/unpublish", requireAuth, async (req, res, next) => 
     if (doc.status === "blocked") {
       badRequest("这个模板已被平台下架，状态由平台管理。");
     }
-    doc.status = "pending";
+    // ★ 被公开流程引用着的只能「退役」不能回 pending（主人 2026-10-02 拍板：只能下架、素材保留到没人引用）：
+    //   pending 对别人不可读也不可用，复制了那条流程的人下一段就出不了片
+    const refs = await BranchRecipe.refsOfTemplate(doc._id);
+    doc.status = refs > 0 ? "retired" : "pending";
     await doc.save();
-    res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
+    res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user), ...(refs > 0 ? { retired: true, refs } : {}) });
   } catch (err) {
     next(err);
   }
@@ -1973,6 +1978,15 @@ router.delete("/templates/:id", requireAuth, async (req, res, next) => {
     const doc = await BranchTemplate.findById(id).lean();
     if (!doc) notFound("Template not found");
     if (String(doc.ownerId) !== String(req.user._id)) forbidden("Forbidden");
+
+    // ★★ 被公开流程引用着的模板**不删素材**（主人 2026-10-02 拍板）：快照抄的是字段，示例视频还是这个地址，
+    //   回收了就是每一条嵌它的流程指向一个死地址，而出片受理即扣费。这里把「删除」降级成「退役」：
+    //   不进市场、对所有人可读可用、引用数降到 0 之后再删一次才真回收。回包说清引用数，App 照实说。
+    const refs = await BranchRecipe.refsOfTemplate(doc._id);
+    if (refs > 0) {
+      if (doc.status !== "blocked") await BranchTemplate.updateOne({ _id: doc._id }, { $set: { status: "retired" } });
+      return res.json({ ok: true, retired: true, refs });
+    }
 
     // ★ 回收模板视频 —— 全仓第一个 uploader.destroy 调用（此前上传即永久占配额）。
     //   为什么必须删：不删的话热门模板删除后视频还挂在公网上，方舟侧任何拿到 URL 的人

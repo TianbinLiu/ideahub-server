@@ -28,6 +28,14 @@ const branchRecipeSchema = new mongoose.Schema(
     videoRevision: { type: Number, default: 0 },
     /** 作者的开关：false = 留着但不给别人看（作者自己照样读得到，随时能再打开） */
     public: { type: Boolean, default: true },
+    /**
+     * 上架到模板市场（「工作流模板」，2026-10-02 模板体系 P2）：工作流模板**就是**上了架的公开配方 ——
+     * 主人拍板它必须挂在一条已发布作品上（示例视频 = 那条作品），所以不另开一张表，一位布尔就够。
+     * ★ 只在 `public && 不过期` 时才许上架（patchRecipe 把关）；关公开时顺手下架。对别人可见的条件与配方本身相同
+     *   （作品可读 + 公开 + 不过期），列表端点（listWorkflowTemplates）照 readableFilter 过一遍。
+     */
+    listed: { type: Boolean, default: false },
+    listedAt: { type: Date },
     /** 服务端自己量的 `JSON.stringify(recipe)` 字节数 */
     bytes: { type: Number, default: 0 },
     /** 段数（列表 / 统计用，不必把正文取出来数） */
@@ -43,5 +51,19 @@ const branchRecipeSchema = new mongoose.Schema(
 
 // 一条作品最多一份配方（PUT 是 upsert，靠这条索引挡住并发重复插入）
 branchRecipeSchema.index({ video: 1 }, { unique: true });
+// 工作流模板货架：上了架的按上架时间倒序
+branchRecipeSchema.index({ listed: 1, listedAt: -1 });
+// 「这张段模板被哪些公开配方引用着」—— Mixed 正文里的路径照样能建多键索引；
+// 被引用的模板作者只能下架不能删素材（branchTemplate.routes 的 recipeRefsOf）
+branchRecipeSchema.index({ "recipe.nodes.tpl.id": 1 });
+
+/**
+ * 引用这张段模板的**公开**配方有几份（下架 / 删除段模板那两条路问的就是它）。
+ * ★ 现算不缓存：量不大（一张模板被几十份配方引用已是极限），而缓存的引用计数漏减一次就是永远删不掉的素材。
+ * ★ 只数公开着的：关了公开的配方对别人不可见，它引用的模板没必要为它留着。
+ */
+branchRecipeSchema.statics.refsOfTemplate = function (templateId) {
+  return this.countDocuments({ public: true, "recipe.nodes.tpl.id": String(templateId) });
+};
 
 module.exports = mongoose.model("BranchRecipe", branchRecipeSchema);

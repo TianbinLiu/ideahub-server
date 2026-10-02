@@ -184,6 +184,11 @@ app.use("/api/personas", personaRoutes);
 if (process.env.TUTOR_ENABLED === "true") app.use("/api/tutor", require("./routes/tutor.routes"));
 app.use("/api/memes", memeRoutes);
 app.use("/api/branch", require("./routes/branchVideo.routes"));
+// 已发布作品的「公开配方」（制作过程：别人能看、能按它复制一条流水线）。同一个 /api/branch base，
+// 路径在 /videos/:id/recipe 下（与 branchVideo.routes 的各条不重叠）外加模板市场的 /templates/workflows ——
+// ★ 所以必须挂在 branchTemplate.routes **之前**：那边的 `/templates/:id` 会把 "workflows" 当 id 吞掉（400）。
+// 配方最大 512KB，jsonGate 已经在上面对整个 /api/branch 生效
+app.use("/api/branch", require("./routes/branchRecipe.routes"));
 // 白模模板（blockout r2v）：同一个 /api/branch base（App 只记一个前缀），
 // 路径全在 /templates 下，与 /videos /cards /decks 不重叠
 app.use("/api/branch", require("./routes/branchTemplate.routes"));
@@ -196,9 +201,6 @@ app.use("/api/branch", require("./routes/agentSkill.routes"));
 // 路径全在 /projects 下，与 /videos /cards /decks /templates 不重叠。
 // jsonGate 已经在上面对整个 /api/branch 生效（画布最大 2MB，默认 100kb 会 413）
 app.use("/api/branch", require("./routes/branchProject.routes"));
-// 已发布作品的「公开配方」（制作过程：别人能看、能按它复制一条流水线）。同一个 /api/branch base，
-// 路径全在 /videos/:id/recipe 下，与 branchVideo.routes 的各条不重叠。配方最大 512KB，jsonGate 同上
-app.use("/api/branch", require("./routes/branchRecipe.routes"));
 // 成片合并（把已转存的 N 段拼成一条）。同一个 /api/branch base，路径全在 /compose 下。
 // 端上原来用 MediaRecorder 实时重录，弱网/低端机上不可靠（2026-08-21 真机复盘）
 app.use("/api/branch", require("./routes/branchCompose.routes"));
