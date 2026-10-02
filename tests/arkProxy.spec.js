@@ -582,6 +582,8 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
       const trial = await BranchTemplateTrial.findOne({ taskId: "cgt-trial-0001" }).lean();
       expect(String(trial.templateId)).toBe(String(pendingTpl._id));
       expect(String(trial.userId)).toBe(String(paidUserId));
+      // 追踪里同时记下这一发用的出片模型（试炼成功时要写进模板的 provenModels）
+      expect(trial.model).toBe(r2vBody(pendingTpl.refVideo.url).model);
 
       // 轮询到 succeeded：provenAt 置上（发起人 = 模板作者），追踪记录清掉
       fetchSpy.mockImplementation(async () => ({
@@ -595,10 +597,45 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
 
       const tpl = await BranchTemplate.findById(pendingTpl._id).lean();
       expect(tpl.provenAt).toBeTruthy();
+      // 「在哪个模型上跑通的」一并记下：就是这一发任务的 model，不多不少
+      expect(tpl.provenModels).toEqual([r2vBody(pendingTpl.refVideo.url).model]);
       expect(await BranchTemplateTrial.findOne({ taskId: "cgt-trial-0001" }).lean()).toBeNull();
+
+      // 再跑通一次（provenAt 早就置上了）：模型照记、不重复，provenAt 不被改写
+      const provenAt0 = tpl.provenAt.getTime();
+      fetchSpy.mockImplementation(async () => ({
+        status: 200,
+        text: async () => JSON.stringify({ id: "cgt-trial-0002" }),
+      }));
+      const again = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send(r2vBody(pendingTpl.refVideo.url));
+      expect(again.status).toBe(200);
+      fetchSpy.mockImplementation(async () => ({
+        status: 200,
+        text: async () => JSON.stringify({ id: "cgt-trial-0002", status: "succeeded" }),
+      }));
+      await request(app)
+        .get("/api/ark/contents/generations/tasks/cgt-trial-0002")
+        .set({ Authorization: `Bearer ${paidToken}` });
+      const tpl2 = await BranchTemplate.findById(pendingTpl._id).lean();
+      expect(tpl2.provenModels).toEqual([r2vBody(pendingTpl.refVideo.url).model]);
+      expect(tpl2.provenAt.getTime()).toBe(provenAt0);
     } finally {
       delete process.env.ARK_API_KEY;
     }
+  });
+
+  test("provenModelsOf：记过的原样出；存量（有 provenAt、没记过模型）按当时唯一的 r2v 模型出；没试炼过是空数组", () => {
+    const of = (doc) => BranchTemplate.provenModelsOf(doc);
+    expect(of({ provenAt: new Date(), provenModels: ["m-a", "m-b"] })).toEqual(["m-a", "m-b"]);
+    // 存量：上线前置上的 provenAt，那一发只可能跑在 2.5 上（写死的历史事实，不跟着常量走）
+    expect(of({ provenAt: new Date() })).toEqual(["doubao-seedance-2-5-260628"]);
+    expect(of({ provenAt: new Date(), provenModels: [] })).toEqual(["doubao-seedance-2-5-260628"]);
+    expect(of({ provenAt: null })).toEqual([]);
+    expect(of({ provenAt: null, provenModels: [] })).toEqual([]);
+    expect(of(null)).toEqual([]);
   });
 
   // ── 套用闸：模板视频自己得过方舟窗口（2026-08-16 补的结构性缺口）────────

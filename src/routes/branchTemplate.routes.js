@@ -194,6 +194,9 @@ function toTemplatePayload(doc, viewer) {
       : {}),
     status: doc.status,
     provenAt: doc.provenAt ?? null,
+    // 「在哪些出片模型上真实跑通过」（模型 id 数组，没证明过 = 空数组）。存量模板的兜底在 provenModelsOf 一处。
+    // ★ 对所有人都出（不只作者）：它是这个模板的公开事实，App 拿它回答"这个模板能在哪个模型上出片"
+    provenModels: BranchTemplate.provenModelsOf(doc),
     // 身份判定只认 ownerId 对当前账号，绝不拿显示名（CLAUDE.md「拿名字当身份」坑）
     isOwner: viewer ? String(doc.ownerId) === String(viewer._id) : false,
     createdAt: doc.createdAt,
