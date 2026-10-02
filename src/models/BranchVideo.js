@@ -141,6 +141,30 @@ const takedownSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 「公开配方」的提示位（正文在 BranchRecipe，见那个文件的文件头）。
+// ★ 只有两格：公开没有、描述的是作品第几版。回包里那颗「查看制作过程」亮不亮按
+//   `public === true && revision === 作品当下的 revision` 判 —— 回炉之后作品的 revision 涨了，
+//   这一格不用任何人来改就自动对不上，键随之熄掉，直到作者的客户端把新一版的配方 PUT 上来。
+// ★ **只由 branchRecipe.controller 的 syncVideoFlag 写**（与配方表同拍）。updateBody 里没有这个键，
+//   作者 PATCH 作品时碰不到它。
+const recipeFlagSchema = new mongoose.Schema(
+  {
+    public: { type: Boolean, default: false },
+    revision: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
+// 「按谁的流程做的」（同款归属）。发布那一刻由服务端核过"这个人读得到那条原作"才落（createVideo 的 resolveRemixOf）。
+// author 一并存下：原作后来被删了，这一格还说得出"原作者是谁"，也让"有几个人按它做了同款"能把作者自己排除掉。
+const remixOfSchema = new mongoose.Schema(
+  {
+    video: { type: mongoose.Schema.Types.ObjectId, ref: "BranchVideo", required: true },
+    author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { _id: false }
+);
+
 const branchVideoSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -228,6 +252,15 @@ const branchVideoSchema = new mongoose.Schema(
      *   所以回填必须在 App 发版**之前**跑完（见 PROJECT_STRUCTURE 的上线顺序）。
      */
     assetUrls: { type: [String], default: undefined, index: true },
+    /**
+     * 公开配方的提示位（见上面 recipeFlagSchema 的 ★）。★ 不给 default：绝大多数作品没有留存过配方，
+     * 判**有值**（同 pricing / takedown 那几处的理由）。
+     * ★★ 必须写进 schema：mongoose strict 模式对 update 同样过滤未声明路径，不声明的话 syncVideoFlag 那句 `$set`
+     *   会被无声丢掉 —— 配方存上了、作品页那颗键永远不亮（同 revision 当年那条疤）。
+     */
+    recipe: { type: recipeFlagSchema, default: undefined },
+    /** 同款归属（见上面 remixOfSchema）。★ 不给 default：没有 = 不是按谁的流程做的 */
+    remixOf: { type: remixOfSchema, default: undefined },
   },
   { timestamps: true }
 );
@@ -244,6 +277,11 @@ branchVideoSchema.index({ category: 1, createdAt: -1 });
 branchVideoSchema.index({ createdAt: -1 });
 // 公开流现在每条查询都带 visibility 条件，给它一条能整条走索引的复合索引
 branchVideoSchema.index({ visibility: 1, createdAt: -1, _id: -1 });
+// 「有几个人按这条作品的流程做了同款」（getVideo 里的 countDocuments）。★ partial：绝大多数作品没有 remixOf
+branchVideoSchema.index(
+  { "remixOf.video": 1 },
+  { partialFilterExpression: { "remixOf.video": { $type: "objectId" } } }
+);
 // 后台「下架列表」用。★ partial 索引：全站绝大多数作品没有这个字段，
 // 建全量索引等于给一张几乎全空的列建一棵树。条件与 controller 的 TAKEN_DOWN
 // **逐字相同**（`takedown.at` 是 date）——不同的话这条索引就永远用不上，

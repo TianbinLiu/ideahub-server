@@ -249,6 +249,8 @@ module.exports = {
   assetKey,
   assetKind,
   cardView,
+  // 公开配方里随带的卡用同一份起拍画面形状（schemas/branchRecipe.schemas.js）
+  startFrames,
   CARD_TYPES,
   ASSET_KINDS,
   ASSET_ACTIONS,

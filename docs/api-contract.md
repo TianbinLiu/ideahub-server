@@ -297,6 +297,10 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | GET | `/api/branch/videos/:id/danmaku` | optional | 弹幕列表（见下「弹幕」）。query `limit`(默认 200，上限 500)。返回 `{ ok, items, truncated }` |
 | POST | `/api/branch/videos/:id/danmaku` | required | 发弹幕 `{ at, text, color? }` → 201 `{ ok, danmaku }`。限流 **30/分钟**（按账号） |
 | GET | `/api/branch/projects` | required | 我留存的工坊工程列表 → `{ ok, items: [{ video, title, bytes, videoRevision, stale, lostCount, updatedAt }] }`，最多 200 条。⛔ **绝不回 `canvas`**（那是"有没有"的问题；回正文等于每次进个人页下载几十 MB） |
+| PUT | `/api/branch/videos/:id/recipe` | required | 公开配方（制作过程）：留存一份白名单形状的流水线描述，见下「公开配方」。body `{ recipe, videoRevision, public? }`，`videoRevision` 对不上作品当下的 `revision` 400 `RECIPE_REVISION_MISMATCH`。限流 12/分钟 |
+| PATCH | `/api/branch/videos/:id/recipe` | required | 开 / 关公开 `{ public }`（仅作者） |
+| GET | `/api/branch/videos/:id/recipe` | optional | 读配方：作者本人任何状态都读得到；别人只在公开且不过期时读得到，否则 404 `RECIPE_NOT_PUBLIC` |
+| DELETE | `/api/branch/videos/:id/recipe` | required | 作者删掉留存的配方 → `{ ok: true }`，作品不受影响 |
 | GET | `/api/branch/projects/by-video/:videoId` | required | 取回画布（**仅作者**）→ `{ ok, project: { video, title, canvas, videoRevision, stale, lostCount, updatedAt } }`。没有 → **404** `{ code: "PROJECT_NOT_FOUND", message: "这条作品没有留存工坊工程。" }`（客户端据此把「回炉重做」画成灰键 + 一句原因，不许摆没有原因的灰）。★★ 客户端**必须**拿 `videoRevision` 与作品当下的 `revision` 比，对不上就**不许铺进工坊**（那份画布描述的是上一版，就着它提交会把线上内容静默退回） |
 | PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。**`videoRevision` 必须等于作品当下的 `revision`**，对不上 400 `PROJECT_REVISION_MISMATCH`（带 `details.currentRevision`）—— 这是「这一格只能靠真的 PUT 新画布往前走」那条纪律的唯一实现。五种 400：版次对不上、画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`（「画布里还有本机地址…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）；另有作品不是你的（403）/ 不存在（404） |
 | DELETE | `/api/branch/projects/by-video/:videoId` | required | 放弃留存（**仅作者**）。作品本身不受影响 |
@@ -326,6 +330,59 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 读端点 `/stats` 故意不校验：它不写库，造不出任何行，而客户端手里合法地存在只在本机有的 `cardId`。
 
 关注沿用既有 `/api/users/:id/follow` 与 `Follow` 模型，不新建。
+
+### 公开配方（制作过程，`/videos/:id/recipe` 四条 + `remixOf`）
+
+**一句话**（2026-10-02，模板体系 P1，方案 app 仓 docs/template-workflow-research.md §三 C）：作者可以把一条作品
+**怎么一段段做出来的**公开给别人看（作品页「查看制作过程」），别人按它把同一条流水线铺到自己的草稿里接着做。
+公开的**不是**回炉用的那份画布：客户端从画布投出一份**白名单形状**（app `data/recipe.projectRecipe`），服务端用
+**同一形状的严格 schema** 再验一遍（`schemas/branchRecipe.schemas.js`，`z.object` 默认 strip，白名单之外的键进不来）。
+加字段要三处一起动：app 的类型 + 投影、server 的 schema。
+
+```
+WorkflowRecipe {
+  v: 1,
+  mode: "workflow" | "simple",
+  nodes: RecipeNode[1..24],            // 逐段：title / plot / shot? / durationSec / tier / model? / aspect / chain / kind / cards[] / slots[] / tpl? / flags[] / preview?
+  deck:  RecipeCard[0..60],            // 随配方带走的卡（cardId / type / name / summary / cover / tags / idLine / textDesc / startFrames? / views），**没有** modelUrl / genPrompt
+  cast:  RecipeSlot[0..30],            // 要使用者自己填的空位：{ type, why: "real" | "foreign" | "private", name }（real 恒空名）
+}
+```
+
+- **红线**（客户端投影 + 服务端按作者卡库复核，两道）：声明过真实人物的卡 → `cast` 里一个 `real` 空位、**不带名字**；
+  从别人那儿装来的卡（`BranchCard.sourceOwner` 有值）→ `foreign` 空位带名字；卡太多带不完 → `private`。
+  服务端在 `deck` 里撞见真人卡 400 `RECIPE_REAL_PERSON`、装来的卡 400 `RECIPE_FOREIGN_CARD`。
+- 段模板**只回指服务端 id**（`tpl: { id, title, part? }`，24 位十六进制），不带快照：出片只认已登记的模板视频，
+  复制时客户端现取（`GET /templates/:id`），取不到那一段退成普通段并说明。
+- 白模段的 `plot` 恒空（点名句里是原作挂的卡名）；`flags` 记原作这一段还用过但没带走的东西
+  （`ref-video` / `mid-frames` / `stage` / `anns` / `revised`），故事板据此说一句。
+- `preview.first / last` 只许 http(s) 且不是方舟临时链接（与工程那条不变量同一判据）；整份 ≤ 512KB，
+  本机地址（`data:` / `idb:`）出现即 400。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| PUT | `/api/branch/videos/:id/recipe` | required，仅作者 | body `{ recipe, videoRevision, public? (默认 true) }`。★ `videoRevision` **必须等于作品当下的 `revision`**，对不上 400 `RECIPE_REVISION_MISMATCH`（带 `details.currentRevision`）。幂等 upsert（一条作品一份）。限流 12/分钟（scope `branch:recipe`）。→ `{ ok, recipe: meta }` |
+| PATCH | `/api/branch/videos/:id/recipe` | required，仅作者 | body `{ public: boolean }` 只开 / 关。限流 30/分钟（scope `branch:recipe:toggle`）。没有配方 404 `RECIPE_NOT_FOUND` |
+| GET | `/api/branch/videos/:id/recipe` | optional | 作品本身要对这个人可读（与作品同一套 `readableBy`）。**作者本人任何状态都读得到**；别人只在 `public && !stale` 时读得到，否则 404 `RECIPE_NOT_PUBLIC`「这条作品没有公开制作过程。」（作品不存在 / 不可读是 404 `NOT_FOUND`，与作品端点同句）。→ `{ ok, recipe, meta: { video, videoRevision, public, stale, bytes, nodeCount, updatedAt, title, author: { _id, username, displayName, avatarUrl }, isOwner } }` |
+| DELETE | `/api/branch/videos/:id/recipe` | required，仅作者 | → `{ ok: true }`。作品不受影响 |
+
+**`stale`**：配方描述的不是作品当下这一版 —— 回炉成功那一拍服务端只在 `BranchVideo.recipe` 上留 `{ public, revision }`
+（revision 是配方描述的版次），`stale = revision !== video.revision`。回炉之后旧配方**自动对外隐藏**，客户端留存工程那一拍
+随新画布重新 PUT 一份（`videoRevision` = 回炉回包的新版次）；作者关着公开的话不发。判否定：不发 `stale` = 不过期。
+
+**作品上随之多出的四位**（`toVideoPayload`）：
+- `recipePublic: true` —— **只在**公开且不过期时发（判有值）。列表与详情都发。
+- `recipeState: { public, stale }` —— 只发给作者本人（编辑页那颗开关的初值）。
+- `remixOf: { id, title, author }` —— 这条是按谁的流程做的。**只有详情端点算**；原作对**这个读者**不可读
+  （私密 / 下架 / 删了）时不发。发布体 `POST /videos` 收可选的 `remixOf: string`（原作 id），服务端只认「发布者读得到的原作」，
+  认不下来当没带、**不挡发布**。回炉体不收它（归属不变）。
+- `remixCount: number` —— 有几条作品按它做了同款（不含作者自己的）。**只有详情端点算**。
+
+**级联**：删作品连带删它的配方；永久删号连带删此人全部配方（`purgeUserCascade` 的清单里）。被引用的原作删掉后，
+同款作品上的 `remixOf` 存着不动、只是不再发（读者读不到原作）。
+
+⚠ 客户端判「这台服务器有没有这个端点」看**回包形状**（`meta.video` 是否存在），不看状态码：Capacitor 对未命中路径
+回 200 + index.html。老服务端上这四条路都不存在 ⇒ App 把它说成「这台服务器还不支持公开制作过程」，不是「没有公开」。
 
 ## 热度（`heat`）
 

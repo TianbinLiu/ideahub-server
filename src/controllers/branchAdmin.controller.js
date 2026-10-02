@@ -23,6 +23,8 @@ const BranchCollect = require("../models/BranchCollect");
 // 工坊工程（画布快照）。★★ 新表**必须两处都落**：purgeVideo（删一条作品）与这里
 //   （删号）。漏了哪一处都零症状，模板那次就是这么漏的。
 const BranchProject = require("../models/BranchProject");
+// 公开配方（制作过程）。与 BranchProject 同一条纪律：purgeVideo 与这里两处都落
+const BranchRecipe = require("../models/BranchRecipe");
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
@@ -307,6 +309,9 @@ async function unbanUser(req, res, next) {
  *      随①的 purgeVideo 一起删。
  *   ⑦.7 BranchProject（他留存的工坊工程画布）→ deleteMany（按 owner 兜底：
  *      挂在还在的作品上的那些已随①删掉，这里收的是孤儿）。
+ *   ⑦.8 BranchRecipe（他公开过的制作过程）→ deleteMany（同上，按 owner 兜底）。
+ *      别人作品上「按他的流程做的」那条归属（BranchVideo.remixOf）**不动**：那是别人的作品，
+ *      原作没了之后回包里自然不再带出这条归属（getVideo 现查原作，查不到就不发）。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
  *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
@@ -457,6 +462,9 @@ async function purgeUserCascade(userId) {
   //     剩下的孤儿（作品早先被管理员删过、而工程当时没跟着走的历史数据）。
   //     按 owner 兜底删干净，否则库里会留下一批谁也查不到、也再删不掉的画布。
   removed.projects = (await BranchProject.deleteMany({ owner: uid })).deletedCount;
+
+  // ⑦.8 他公开过的制作过程（公开配方）。挂在还在的作品上的那些已随①的 purgeVideo 删掉，这里按 owner 兜底
+  removed.recipes = (await BranchRecipe.deleteMany({ owner: uid })).deletedCount;
 
   // ⑧ 举报。
   // ★★ **儿童安全（csae）那些一条都不删** —— 这是删号权利的一个**法定义务例外**，
