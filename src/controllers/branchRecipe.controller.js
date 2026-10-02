@@ -287,7 +287,7 @@ async function getRecipe(req, res, next) {
     const { id } = req.params;
     if (!isValidId(id)) invalidId("Invalid video id");
     const video = await BranchVideo.findById(id)
-      .select("_id title author revision visibility linkOnly takedown")
+      .select("_id title cover author revision visibility linkOnly takedown")
       .populate("author", AUTHOR_FIELDS)
       .lean();
     if (!video) notFound("Video not found");
@@ -306,6 +306,8 @@ async function getRecipe(req, res, next) {
       meta: {
         ...meta,
         title: video.title || "",
+        // 示例视频的封面：制作过程页顶上那张图（工作流模板的模板页就是这一页）
+        cover: video.cover || "",
         author: { _id: a._id, username: a.username || "", displayName: a.displayName || a.username || "", avatarUrl: a.avatarUrl || "" },
         isOwner: mine,
       },

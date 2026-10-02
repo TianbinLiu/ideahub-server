@@ -363,7 +363,7 @@ WorkflowRecipe {
 |---|---|---|---|
 | PUT | `/api/branch/videos/:id/recipe` | required，仅作者 | body `{ recipe, videoRevision, public? (默认 true) }`。★ `videoRevision` **必须等于作品当下的 `revision`**，对不上 400 `RECIPE_REVISION_MISMATCH`（带 `details.currentRevision`）。幂等 upsert（一条作品一份）。限流 12/分钟（scope `branch:recipe`）。→ `{ ok, recipe: meta }` |
 | PATCH | `/api/branch/videos/:id/recipe` | required，仅作者 | body `{ public: boolean }` 只开 / 关。限流 30/分钟（scope `branch:recipe:toggle`）。没有配方 404 `RECIPE_NOT_FOUND` |
-| GET | `/api/branch/videos/:id/recipe` | optional | 作品本身要对这个人可读（与作品同一套 `readableBy`）。**作者本人任何状态都读得到**；别人只在 `public && !stale` 时读得到，否则 404 `RECIPE_NOT_PUBLIC`「这条作品没有公开制作过程。」（作品不存在 / 不可读是 404 `NOT_FOUND`，与作品端点同句）。→ `{ ok, recipe, meta: { video, videoRevision, public, stale, bytes, nodeCount, updatedAt, title, author: { _id, username, displayName, avatarUrl }, isOwner } }` |
+| GET | `/api/branch/videos/:id/recipe` | optional | 作品本身要对这个人可读（与作品同一套 `readableBy`）。**作者本人任何状态都读得到**；别人只在 `public && !stale` 时读得到，否则 404 `RECIPE_NOT_PUBLIC`「这条作品没有公开制作过程。」（作品不存在 / 不可读是 404 `NOT_FOUND`，与作品端点同句）。→ `{ ok, recipe, meta: { video, videoRevision, public, stale, listed, bytes, nodeCount, updatedAt, title, cover, author: { _id, username, displayName, avatarUrl }, isOwner } }` |
 | DELETE | `/api/branch/videos/:id/recipe` | required，仅作者 | → `{ ok: true }`。作品不受影响 |
 
 **`stale`**：配方描述的不是作品当下这一版 —— 回炉成功那一拍服务端只在 `BranchVideo.recipe` 上留 `{ public, revision }`
