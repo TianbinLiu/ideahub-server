@@ -100,6 +100,10 @@ const publishBody = z.object({
   pricing: pricingBody.optional(),
   // 幂等键（客户端生成，重试沿用）。z.object 默认 strip 未声明字段，不写这行就到不了 controller
   clientId: z.string().trim().min(1).max(120).optional(),
+  // 「按谁的流程做的同款」：原作品的 id（2026-10-02，公开配方）。★ 必须显式声明（理由同上面 deck / clientId）。
+  //   形状不对 / 那条作品不存在 / 这个人读不到它 → controller 里当没带，**不挡发布**（见 resolveRemixOf）。
+  //   所以这里只管上限，不用正则把它钉成 24-hex：钉死的话一个脏值会让整条发布 400，而这一格只是署名。
+  remixOf: z.string().trim().max(64).optional(),
 });
 
 // PATCH /api/branch/videos/:id —— 作品编辑（仅作者）+ **回炉重做**（唯一的内容写入通道）

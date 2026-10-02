@@ -26,6 +26,9 @@ const BranchCollect = require("../models/BranchCollect");
 // 工坊工程（画布快照）。这里只用于**级联删除**与回炉后对齐版次；
 // 读写端点在 controllers/branchProject.controller.js。
 const BranchProject = require("../models/BranchProject");
+// 公开配方（制作过程）。这里只用于**级联删除**；读写端点在 controllers/branchRecipe.controller.js，
+// 作品回包上的提示位读的是 BranchVideo.recipe（那边同拍写）。
+const BranchRecipe = require("../models/BranchRecipe");
 const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurge.service");
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
@@ -415,6 +418,19 @@ function toVideoPayload(doc, ctx = {}) {
   if (deckOut) payload.deck = deckOut;
   if (doc.pricing && doc.pricing.mode === "paid") payload.pricing = doc.pricing;
   if (ctx.comments) payload.comments = ctx.comments;
+  // ── 制作过程（公开配方）与同款 ──
+  // ★ `recipePublic` 只在「公开 + 描述的正是当下这一版」时发 —— 与 GET /videos/:id/recipe 对别人的那道闸
+  //   **同一条判据**（branchRecipe.controller 的 toMeta）：回炉之后旧配方还没换上新的那段时间，
+  //   作品页那颗「查看制作过程」不该亮着指向一份上一版的制作过程。
+  //   判有值：老作品没有 recipe 这一格 = 没留存过配方（只在为真时发这个键，老客户端读不懂也无所谓）。
+  const rcp = doc.recipe;
+  const rcpLive = !!rcp && Number(rcp.revision || 0) === Number(doc.revision || 0);
+  if (rcp && rcp.public === true && rcpLive) payload.recipePublic = true;
+  // 作者自己另看得到开关的现状（编辑页那颗开关的初值；stale = 留存的是上一版的）
+  if (ctx.isOwner && rcp) payload.recipeState = { public: rcp.public === true, stale: !rcpLive };
+  // 同款：按谁的流程做的 / 有几个人按它做了同款。只有详情（getVideo）算这两样，列表不带
+  if (ctx.remixOf) payload.remixOf = ctx.remixOf;
+  if (typeof ctx.remixCount === "number") payload.remixCount = ctx.remixCount;
   return payload;
 }
 
@@ -920,6 +936,22 @@ async function listVideos(req, res, next) {
   }
 }
 
+/**
+ * 发布体里的 `remixOf`（原作品 id）→ 落库的 `{ video, author }`；认不下来回 null。
+ *
+ * ★ 认不下来**不挡发布**：这一格只是署名。一条花了真钱的成片，不该因为原作刚好被删了 / 设成了私密
+ *   而发不出去（客户端那头也没有任何办法"修好"这一格）。
+ * ★ 只认**这个人读得到**的作品（readableBy，按 id 直取的口径）：拿一个别人的私密作品 id 来挂名，
+ *   等于借这一格去探"这个 id 上有没有东西"，还能让自己的作品页上出现一条指向私密作品的线索。
+ */
+async function resolveRemixOf(raw, user) {
+  const id = typeof raw === "string" ? raw.trim() : "";
+  if (!id || !isValidId(id)) return null;
+  const src = await BranchVideo.findById(id).select(`_id ${READABLE_FIELDS}`).lean();
+  if (!src || !readableBy(src, user)) return null;
+  return { video: src._id, author: src.author };
+}
+
 // POST /api/branch/videos
 async function createVideo(req, res, next) {
   try {
@@ -945,6 +977,8 @@ async function createVideo(req, res, next) {
 
     // 关键步骤：dataURL / 方舟 TOS 链接转存为 Cloudinary 永久地址
     const { cover, segments, branchTree, deck } = await transferDraftAssets(draft, String(req.user._id));
+    // 同款归属（按谁的流程做的）。认不下来就是 null，见 resolveRemixOf 的 ★
+    const remixOf = await resolveRemixOf(draft.remixOf, req.user);
 
     let doc;
     try {
@@ -963,6 +997,7 @@ async function createVideo(req, res, next) {
         ...(draft.linkOnly === true && draft.visibility === "private" ? { linkOnly: true } : {}),
         author: req.user._id,
         ...(clientId ? { clientId } : {}),
+        ...(remixOf ? { remixOf } : {}),
         plays: 0,
         likes: 0,
         commentCount: 0,
@@ -1033,12 +1068,32 @@ async function getVideo(req, res, next) {
     ]);
     const commentLikedIds = await loadCommentLikedSet(req.user, comments);
 
+    // ── 同款：这条是按谁的流程做的 / 有几个人按它做了同款（只有详情算，列表不带）──
+    // ★ 两样都只认**公开可见**的作品（私密 / 被下架的不算，也不带出去）：原作后来设成了私密，
+    //   别人的作品页上就不该再留着一条指向它的线索；"几个人做了同款"数的也只是别人看得到的那些。
+    // ★ 计数把**作者自己**排除掉：自己照着自己的流程又做一条，不算"有人做了同款"。
+    const authorId = doc.author?._id || doc.author;
+    const openOnly = { visibility: { $ne: "private" }, ...NOT_TAKEN_DOWN };
+    const [remixSrc, remixCount] = await Promise.all([
+      doc.remixOf?.video
+        ? BranchVideo.findOne({ _id: doc.remixOf.video, ...openOnly })
+            .select("_id title author")
+            .populate("author", AUTHOR_FIELDS)
+            .lean()
+        : Promise.resolve(null),
+      BranchVideo.countDocuments({ "remixOf.video": doc._id, author: { $ne: authorId }, ...openOnly }),
+    ]);
+
     res.json({
       ok: true,
       video: toVideoPayload(doc, {
         liked: !!liked,
         isOwner: ownedBy(doc, req.user),
         comments: comments.map((c) => toCommentPayload(c, { likedIds: commentLikedIds })),
+        ...(remixSrc
+          ? { remixOf: { id: remixSrc._id, title: remixSrc.title || "", author: toAuthorPayload(remixSrc.author) } }
+          : {}),
+        remixCount,
       }),
     });
   } catch (err) {
@@ -1659,6 +1714,9 @@ async function purgeVideo(videoId) {
     //   还占着这个人的配额。★★ 新表**必须两处都落**（这里 + branchAdmin.purgeUserCascade）——
     //   漏了哪一处都零症状，模板那次就是这么漏的。
     BranchProject.deleteMany({ video: videoId }),
+    // ★ 公开配方（制作过程）同理：作品没了，这份配方谁也读不到（GET 要先过作品的可读闸）、也再删不掉。
+    //   与上面那条一样**两处都落**（这里 + branchAdmin.purgeUserCascade）
+    BranchRecipe.deleteMany({ video: videoId }),
   ]);
 
   // ④ 库删干净了才去动云端。失败**不抛**：作品已经没了，这时候报错只会让调用方
