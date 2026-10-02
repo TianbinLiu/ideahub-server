@@ -10,13 +10,16 @@ const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const { recipeBody, recipePatchBody } = require("../schemas/branchRecipe.schemas");
-const { putRecipe, patchRecipe, getRecipe, deleteRecipe } = require("../controllers/branchRecipe.controller");
+const { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates } = require("../controllers/branchRecipe.controller");
 
 // 看制作过程。
 // @endpoint GET /api/branch/videos/:id/recipe
 //   → { ok, recipe, meta: { video, videoRevision, public, stale, title, author, isOwner, updatedAt } }
 //   别人只在「公开 + 描述的正是作品当下这一版」时读得到，否则 404 RECIPE_NOT_PUBLIC
 router.get("/videos/:id/recipe", optionalAuth, getRecipe);
+// 模板市场的「工作流」货架（上了架的公开配方）。★ 本路由文件在 app.js 里挂在 branchTemplate 之前，
+//   这条静态路径才不会被那边的 `/templates/:id` 吃掉
+router.get("/templates/workflows", optionalAuth, listWorkflowTemplates);
 
 // 留存 / 覆盖（作者）。
 // @endpoint PUT /api/branch/videos/:id/recipe   body { recipe, videoRevision, public? }

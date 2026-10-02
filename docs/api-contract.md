@@ -381,6 +381,29 @@ WorkflowRecipe {
 **级联**：删作品连带删它的配方；永久删号连带删此人全部配方（`purgeUserCascade` 的清单里）。被引用的原作删掉后，
 同款作品上的 `remixOf` 存着不动、只是不再发（读者读不到原作）。
 
+#### 工作流模板（上架的公开配方，模板体系 P2，2026-10-02）
+
+主人拍板「工作流模板必须挂在一条已发布作品上」（示例视频 = 那条作品），所以**工作流模板就是上了架的公开配方**，
+不另开一张表：`BranchRecipe.listed`（+ `listedAt`）一位布尔。
+
+- 上架的前提是**公开 + 不过期**：`PUT` 可带 `listed: true`（没勾公开时不上架、不报错 —— 从属开关）；不带 `listed` 的 PUT
+  **不动**原来的上架位（回炉重投新一版不会悄悄下架）。`PATCH { listed: true }` 对没公开 / 过期的 400 `RECIPE_NOT_LISTABLE`
+  （整句拒，不静默）；`PATCH { public: false }` 顺手下架。`PATCH` 至少要给 `public` / `listed` 一样。
+- `GET /api/branch/templates/workflows`（optionalAuth）：货架。只列「上架 + 公开 + 不过期 + 作品对这个人可读」的，
+  可读性按**凭链接可见也算**的口径（作者不想进首页流就把作品设成凭链接可见，仍能上货架）；私密、下架的不列。
+  query `limit`（默认 30，上限 60）、`before`（上一页最后一条的 `listedAt`）。→ `{ ok, items: [{ video, title, cover,
+  author, summary: { segs, totalSec, tiers, templated, cards, slots }, remixCount, listedAt, updatedAt }] }`，**不带正文**。
+  ★ 这条路由挂在 branchTemplate.routes **之前**（app.js）：不然 `/templates/:id` 会把 `workflows` 当 id 吞掉。
+- 模板页 = 作品的制作过程页（`GET /videos/:id/recipe`，meta 多一位 `listed`）；作者的作品回包 `recipeState` 多一位 `listed`。
+
+**被公开配方引用着的段模板只能「退役」**（主人拍板：只能下架，素材保留到没人引用）：`BranchTemplate.status` 多一档 `retired`。
+- 引用数现算：`BranchRecipe.refsOfTemplate(id)` = 公开配方里 `nodes[].tpl.id` 指向它的份数（关了公开的不算）。
+- `DELETE /templates/:id` 在引用数 > 0 时**不删**：status 改成 `retired`（blocked 的不动），回 `{ ok, retired: true, refs }`，
+  素材一个都不回收；引用数归零之后再删一次才真删。`PATCH /templates/:id/unpublish` 同理：有引用 → `retired`（回包带
+  `retired: true, refs`），没引用 → `pending`。
+- `retired` 对**所有人**可读（`GET /templates/:id`）、可用（ark 的 `resolveR2v` 放行）：按配方复制的人要靠它铺白模段、出片；
+  不进 `/templates/shared` 货架。与 `pending`（只有作者）/ `blocked`（谁都不能用）是三件事。
+
 ⚠ 客户端判「这台服务器有没有这个端点」看**回包形状**（`meta.video` 是否存在），不看状态码：Capacitor 对未命中路径
 回 200 + index.html。老服务端上这四条路都不存在 ⇒ App 把它说成「这台服务器还不支持公开制作过程」，不是「没有公开」。
 

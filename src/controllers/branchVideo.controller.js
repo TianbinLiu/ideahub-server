@@ -426,8 +426,8 @@ function toVideoPayload(doc, ctx = {}) {
   const rcp = doc.recipe;
   const rcpLive = !!rcp && Number(rcp.revision || 0) === Number(doc.revision || 0);
   if (rcp && rcp.public === true && rcpLive) payload.recipePublic = true;
-  // 作者自己另看得到开关的现状（编辑页那颗开关的初值；stale = 留存的是上一版的）
-  if (ctx.isOwner && rcp) payload.recipeState = { public: rcp.public === true, stale: !rcpLive };
+  // 作者自己另看得到开关的现状（编辑页那颗开关的初值；stale = 留存的是上一版的；listed = 上架到了模板市场）
+  if (ctx.isOwner && rcp) payload.recipeState = { public: rcp.public === true, stale: !rcpLive, listed: rcp.listed === true };
   // 同款：按谁的流程做的 / 有几个人按它做了同款。只有详情（getVideo）算这两样，列表不带
   if (ctx.remixOf) payload.remixOf = ctx.remixOf;
   if (typeof ctx.remixCount === "number") payload.remixCount = ctx.remixCount;

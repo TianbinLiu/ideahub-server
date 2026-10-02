@@ -148,6 +148,8 @@ const recipeBody = z
     // 这份配方描述的是作品的哪一版（必填，理由同工坊工程：对不上就是拿上一版的制作过程冒充这一版）
     videoRevision: z.coerce.number().int().min(0).max(100000),
     public: z.boolean().optional().default(true),
+    // 发布页「同时上架到模板市场」：与 public 同一拍落（listed 只在 public 为真时生效，controller 把关）
+    listed: z.boolean().optional().default(false),
   })
   .refine((v) => !NO_LOCAL.test(JSON.stringify(v.recipe)), {
     message: "配方里还有本机地址（dataURL / idb: / 方舟临时链接），不能公开",
@@ -156,8 +158,10 @@ const recipeBody = z
     message: "这份制作过程太大了",
   });
 
-/** PATCH /api/branch/videos/:id/recipe —— 只开关公开，不换正文 */
-const recipePatchBody = z.object({ public: z.boolean() });
+/** PATCH /api/branch/videos/:id/recipe —— 开关公开 / 上架到模板市场，不换正文（至少给一样） */
+const recipePatchBody = z
+  .object({ public: z.boolean().optional(), listed: z.boolean().optional() })
+  .refine((v) => v.public !== undefined || v.listed !== undefined, { message: "至少要给 public 或 listed 一样" });
 
 module.exports = {
   recipeBody,

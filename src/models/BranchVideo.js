@@ -151,6 +151,8 @@ const recipeFlagSchema = new mongoose.Schema(
   {
     public: { type: Boolean, default: false },
     revision: { type: Number, default: 0 },
+    /** 上架到了模板市场（工作流模板）。判否定：老提示位没有这一格 = 没上架 */
+    listed: { type: Boolean, default: false },
   },
   { _id: false }
 );

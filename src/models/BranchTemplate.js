@@ -326,7 +326,13 @@ const branchTemplateSchema = new mongoose.Schema(
      *   所以公开列表用等值 { status: "published" } 是安全的；「否定式判存量字段」
      *   那条仓规针对的是往老数据上后加字段的场景，别在这里误用成理由。
      */
-    status: { type: String, enum: ["pending", "published", "blocked"], default: "pending" },
+    /**
+     * retired（2026-10-02 模板体系 P2）：**被公开流程引用着**的模板，作者点「下架 / 删除」时落到这一档 ——
+     * 不进市场、素材不回收、**所有人**照样能按 id 读到并用它出片（公开配方里回指的是它，复制的人要靠它）。
+     * 引用数降到 0 之后作者再删一次才真回收（branchTemplate.routes 的 DELETE 现算引用数）。
+     * ⚠ 与 pending（没发布 / 作者下架且无人引用，只有作者能用）和 blocked（平台处置，谁都不能用）是三件事。
+     */
+    status: { type: String, enum: ["pending", "published", "blocked", "retired"], default: "pending" },
     /**
      * 试炼闸：作者本人用这个模板真实出过一次片的时刻。null = 还没证明过。
      * ★ 只由服务端的 r2v 任务追踪写入（ark.routes.js 轮询到 succeeded 且任务发起人

@@ -10,6 +10,11 @@
 //   R4 版次：回炉之后旧配方自动对别人不可见（作品页那颗键跟着熄），不需要任何人去改它。
 //   R5 级联：删作品与删号**两处都要**把配方带走。
 //   R6 同款：remixOf 认不下来不挡发布；计数只数别人的、公开可见的。
+//   L（2026-10-02 模板体系 P2）工作流模板 = 上了架的公开配方：
+//      L1 上架位随 PUT / PATCH 走，货架端点只列「上架 + 公开 + 不过期 + 作品对这个人可读」的；
+//      L2 不公开 / 过期的不许上架（400），关公开顺手下架，回炉后从货架上消失；
+//      L3 被公开配方引用着的段模板作者只能「退役」：删除 / 下架都落成 retired、素材不回收、所有人照样读得到；
+//         引用没了之后再删才真删。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -19,7 +24,9 @@ let app;
 let BranchRecipe;
 let BranchVideo;
 let BranchCard;
+let BranchTemplate;
 let User;
+let cloudinary;
 
 beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
@@ -31,7 +38,9 @@ beforeAll(async () => {
   BranchRecipe = require("../src/models/BranchRecipe");
   BranchVideo = require("../src/models/BranchVideo");
   BranchCard = require("../src/models/BranchCard");
+  BranchTemplate = require("../src/models/BranchTemplate");
   User = require("../src/models/User");
+  ({ cloudinary } = require("../src/config/cloudinary"));
 });
 
 afterAll(async () => {
@@ -167,7 +176,7 @@ describe("公开配方：写入与白名单", () => {
     expect(list.body.items.find((v) => String(v._id) === videoId).recipePublic).toBe(true);
     // 作者另看得到开关的现状
     const mine = await getVideo(author, videoId).expect(200);
-    expect(mine.body.video.recipeState).toEqual({ public: true, stale: false });
+    expect(mine.body.video.recipeState).toEqual({ public: true, stale: false, listed: false });
     expect((await getVideo(viewer, videoId).expect(200)).body.video.recipeState).toBeUndefined();
   });
 
@@ -281,7 +290,7 @@ describe("公开配方：归属、开关与可见", () => {
     const mine = await getRecipe(author, videoId).expect(200);
     expect(mine.body.meta.public).toBe(false);
     expect(mine.body.meta.isOwner).toBe(true);
-    expect((await getVideo(author, videoId).expect(200)).body.video.recipeState).toEqual({ public: false, stale: false });
+    expect((await getVideo(author, videoId).expect(200)).body.video.recipeState).toEqual({ public: false, stale: false, listed: false });
 
     await request(app).patch(`/api/branch/videos/${videoId}/recipe`).set(auth(author)).send({ public: true }).expect(200);
     await getRecipe(viewer, videoId).expect(200);
@@ -364,7 +373,7 @@ describe("公开配方：版次", () => {
     expect((await getRecipe(viewer, videoId).expect(404)).body.code).toBe("RECIPE_NOT_PUBLIC");
     const mine = await getRecipe(author, videoId).expect(200);
     expect(mine.body.meta.stale).toBe(true);
-    expect((await getVideo(author, videoId).expect(200)).body.video.recipeState).toEqual({ public: true, stale: true });
+    expect((await getVideo(author, videoId).expect(200)).body.video.recipeState).toEqual({ public: true, stale: true, listed: false });
     // 拿上一版的版次再留存 → 拒
     await putRecipe(author, videoId, { recipe: recipeOf(), videoRevision: 0 }).expect(400);
 
@@ -399,6 +408,181 @@ describe("公开配方：级联", () => {
     expect(await BranchRecipe.countDocuments({ owner: author.userId })).toBe(0);
     expect(removed.recipes).toBe(1); // 挂在作品上的那份已随 purgeVideo 走了，这里收的是孤儿
     expect(await BranchRecipe.countDocuments({ owner: keeper.userId })).toBe(1);
+  });
+});
+
+describe("工作流模板：上架与货架", () => {
+  const listWorkflows = (u) => {
+    const r = request(app).get("/api/branch/templates/workflows");
+    return u ? r.set(auth(u)) : r;
+  };
+  const patchRecipe = (u, videoId, body) => request(app).patch(`/api/branch/videos/${videoId}/recipe`).set(auth(u)).send(body);
+
+  test("L1 PUT 带 listed:true → 上架；货架端点（没登录也行）列出它，带摘要与作者；作者的作品回包 recipeState.listed", async () => {
+    const a = await registerUser();
+    const v = await publish(a, { title: "上架的那条" });
+    const put = await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: true, listed: true }).expect(200);
+    expect(put.body.recipe).toMatchObject({ public: true, listed: true, stale: false });
+    const list = await listWorkflows(null).expect(200);
+    const hit = list.body.items.find((i) => String(i.video) === v);
+    expect(hit).toBeTruthy();
+    expect(hit).toMatchObject({
+      title: "上架的那条",
+      author: { username: a.name },
+      summary: { segs: 2, totalSec: 13, tiers: ["hd", "ultra"], templated: 1, cards: 1, slots: 1 },
+      remixCount: 0,
+    });
+    // 货架不带正文
+    expect(hit.recipe).toBeUndefined();
+    const mine = await getVideo(a, v).expect(200);
+    expect(mine.body.video.recipeState).toEqual({ public: true, stale: false, listed: true });
+    // 别人的回包上没有 recipeState（那是作者的开关），recipePublic 照亮
+    const theirs = await getVideo(null, v).expect(200);
+    expect(theirs.body.video.recipeState).toBeUndefined();
+    expect(theirs.body.video.recipePublic).toBe(true);
+  });
+
+  test("L1 不带 listed 的 PUT 不动原来的上架位（回炉重投一份配方不该悄悄下架）；PATCH listed 可上可下", async () => {
+    const a = await registerUser();
+    const v = await publish(a);
+    await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: true, listed: true }).expect(200);
+    const again = await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: true }).expect(200);
+    expect(again.body.recipe.listed).toBe(true);
+    const off = await patchRecipe(a, v, { listed: false }).expect(200);
+    expect(off.body.recipe.listed).toBe(false);
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(false);
+    const on = await patchRecipe(a, v, { listed: true }).expect(200);
+    expect(on.body.recipe.listed).toBe(true);
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(true);
+    // 空 PATCH 什么都不给 → 400
+    await patchRecipe(a, v, {}).expect(400);
+  });
+
+  test("L2 没公开的不许上架（400 RECIPE_NOT_LISTABLE）；PUT 时勾了上架没勾公开 = 不上架；关公开顺手下架", async () => {
+    const a = await registerUser();
+    const v = await publish(a);
+    const put = await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: false, listed: true }).expect(200);
+    expect(put.body.recipe).toMatchObject({ public: false, listed: false });
+    const res = await patchRecipe(a, v, { listed: true }).expect(400);
+    expect(res.body.code).toBe("RECIPE_NOT_LISTABLE");
+    await patchRecipe(a, v, { public: true, listed: true }).expect(200);
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(true);
+    const closed = await patchRecipe(a, v, { public: false }).expect(200);
+    expect(closed.body.recipe).toMatchObject({ public: false, listed: false });
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(false);
+    const flag = await BranchVideo.findById(v).select("recipe").lean();
+    expect(flag.recipe).toMatchObject({ public: false, listed: false });
+  });
+
+  test("L2 回炉之后从货架上消失（配方过期），过期时不许上架；重投新一版后回来", async () => {
+    const a = await registerUser();
+    const v = await publish(a);
+    await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: true, listed: true }).expect(200);
+    await reviseOnce(a, v, 0);
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(false);
+    // 过期的那份再 PATCH listed:true（先下架再上）→ 400
+    await patchRecipe(a, v, { listed: false }).expect(200);
+    const res = await patchRecipe(a, v, { listed: true }).expect(400);
+    expect(res.body.code).toBe("RECIPE_NOT_LISTABLE");
+    await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 1, public: true, listed: true }).expect(200);
+    expect((await listWorkflows(null).expect(200)).body.items.some((i) => String(i.video) === v)).toBe(true);
+  });
+
+  test("L1 货架按作品可读性筛：私密的不列（作者自己看得到）、凭链接可见的列、被下架的不列", async () => {
+    const a = await registerUser();
+    const priv = await publish(a, { visibility: "private" });
+    const link = await publish(a, { visibility: "private", linkOnly: true });
+    const down = await publish(a);
+    for (const v of [priv, link, down]) await putRecipe(a, v, { recipe: recipeOf(), videoRevision: 0, public: true, listed: true }).expect(200);
+    await BranchVideo.updateOne({ _id: down }, { $set: { takedown: { at: new Date(), reason: "test" } } });
+    const anon = (await listWorkflows(null).expect(200)).body.items.map((i) => String(i.video));
+    expect(anon).toContain(link);
+    expect(anon).not.toContain(priv);
+    expect(anon).not.toContain(down);
+    const mine = (await listWorkflows(a).expect(200)).body.items.map((i) => String(i.video));
+    expect(mine).toContain(priv);
+  });
+});
+
+describe("工作流模板：被引用的段模板只能退役", () => {
+  const TPL_URL = (n) => `https://res.cloudinary.com/demo/video/upload/v1712000000/ideahub/template-videos/retire-${n}.mp4`;
+  async function seedTemplate(owner, n, status = "published") {
+    return BranchTemplate.create({
+      ownerId: owner.userId,
+      title: `段模板 ${n}`,
+      recipe: { beats: ["一段"], durationSec: 5 },
+      refVideo: { url: TPL_URL(n), durationSec: 5, width: 720, height: 1280, bytes: 1000, cloudinaryPublicId: `ideahub/template-videos/retire-${n}` },
+      status,
+    });
+  }
+  const getTemplate = (u, id) => {
+    const r = request(app).get(`/api/branch/templates/${id}`);
+    return u ? r.set(auth(u)) : r;
+  };
+  let destroySpy;
+  beforeEach(() => {
+    destroySpy = jest.spyOn(cloudinary.uploader, "destroy").mockResolvedValue({ result: "ok" });
+  });
+  afterEach(() => destroySpy.mockRestore());
+
+  test("L3 删除被公开配方引用的模板 → 退役（200 retired + 引用数），素材一个都不回收，没登录也读得到；引用没了再删才真删", async () => {
+    const author = await registerUser();
+    const tpl = await seedTemplate(author, 1);
+    const b = await registerUser();
+    const v = await publish(b);
+    const rec = recipeOf();
+    rec.nodes[1].tpl = { id: String(tpl._id), title: "段模板 1" };
+    await putRecipe(b, v, { recipe: rec, videoRevision: 0, public: true }).expect(200);
+
+    const del = await request(app).delete(`/api/branch/templates/${tpl._id}`).set(auth(author)).expect(200);
+    expect(del.body).toEqual({ ok: true, retired: true, refs: 1 });
+    expect(destroySpy).not.toHaveBeenCalled();
+    expect((await BranchTemplate.findById(tpl._id).lean()).status).toBe("retired");
+    // 退役的对所有人可读（复制流程的人要靠它铺白模段）；不在市场货架上
+    const anon = await getTemplate(null, tpl._id).expect(200);
+    expect(anon.body.template.status).toBe("retired");
+    const shared = await request(app).get("/api/branch/templates/shared").expect(200);
+    expect(shared.body.templates.some((t) => t.id === String(tpl._id))).toBe(false);
+
+    // 引用它的配方关了公开 → 引用数归零 → 再删一次真删、素材回收
+    await request(app).patch(`/api/branch/videos/${v}/recipe`).set(auth(b)).send({ public: false }).expect(200);
+    const del2 = await request(app).delete(`/api/branch/templates/${tpl._id}`).set(auth(author)).expect(200);
+    expect(del2.body).toEqual({ ok: true });
+    expect(destroySpy).toHaveBeenCalled();
+    expect(await BranchTemplate.findById(tpl._id).lean()).toBeNull();
+  });
+
+  test("L3 作者「下架」被引用的模板 → 退役而不是回 pending；没人引用时照旧回 pending", async () => {
+    const author = await registerUser();
+    const used = await seedTemplate(author, 2);
+    const idle = await seedTemplate(author, 3);
+    const b = await registerUser();
+    const v = await publish(b);
+    const rec = recipeOf();
+    rec.nodes[1].tpl = { id: String(used._id), title: "段模板 2" };
+    await putRecipe(b, v, { recipe: rec, videoRevision: 0, public: true }).expect(200);
+
+    const r1 = await request(app).patch(`/api/branch/templates/${used._id}/unpublish`).set(auth(author)).expect(200);
+    expect(r1.body).toMatchObject({ ok: true, retired: true, refs: 1 });
+    expect(r1.body.template.status).toBe("retired");
+    const r2 = await request(app).patch(`/api/branch/templates/${idle._id}/unpublish`).set(auth(author)).expect(200);
+    expect(r2.body.retired).toBeUndefined();
+    expect(r2.body.template.status).toBe("pending");
+    // pending 的对别人仍然 404（这条边界不变）
+    await getTemplate(null, idle._id).expect(404);
+  });
+
+  test("L3 平台已下架（blocked）的模板，删除时不会被洗成 retired", async () => {
+    const author = await registerUser();
+    const tpl = await seedTemplate(author, 4, "blocked");
+    const b = await registerUser();
+    const v = await publish(b);
+    const rec = recipeOf();
+    rec.nodes[1].tpl = { id: String(tpl._id), title: "段模板 4" };
+    await putRecipe(b, v, { recipe: rec, videoRevision: 0, public: true }).expect(200);
+    await request(app).delete(`/api/branch/templates/${tpl._id}`).set(auth(author)).expect(200);
+    expect((await BranchTemplate.findById(tpl._id).lean()).status).toBe("blocked");
+    await getTemplate(null, tpl._id).expect(404);
   });
 });
 
