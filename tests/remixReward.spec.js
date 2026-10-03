@@ -10,6 +10,8 @@
 //      而且就此定案（之后再变公开也不补）。
 //   W4 两道上限：每条原作 50 次、每位原作者 24 小时内 10 次；到了上限的不顺延。
 //   W5 通知与级联：通知带着是谁、是哪条；有拉黑时不带；删号只删"他是原作者"的行。
+//   W6 两道防刷（2026-10-03）：同款作者每人 24 小时内最多带来 3 次；全站保险丝到了就不发、一个窗口只报警一次、
+//      信没发出去下一条再试。两个数都不进规则端点（不是产品承诺）。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -56,6 +58,9 @@ afterAll(async () => {
 
 afterEach(() => {
   delete process.env.REMIX_REWARD_ENABLED;
+  delete process.env.REMIX_REWARD_GLOBAL_PER_DAY;
+  delete process.env.SUPPORT_NOTIFY_EMAIL;
+  jest.restoreAllMocks();
 });
 
 let seq = 0;
@@ -446,6 +451,103 @@ describe("同款奖励", () => {
     expect(notes[0].payload).toEqual({ tokens: 30_000, originalId: original, originalTitle: "被照着做的原作" });
     expect(JSON.stringify(notes[0])).not.toContain(remix);
     expect(JSON.stringify(notes[0])).not.toContain(remixer.userId);
+  });
+
+  test("W6 防刷一：同一位同款作者 24 小时内最多带来 3 次，第 4 次不发；窗口滑过去之后照发、被挡的不补", async () => {
+    expect(cfg.PER_REMIXER_PER_DAY).toBe(3);
+    const remixer = await registerUser();
+    const authors = [];
+    const remixes = [];
+    for (let i = 0; i < 4; i++) {
+      const a = await registerUser();
+      authors.push(a);
+      remixes.push(await publish(remixer, { remixOf: await publish(a) }));
+    }
+    const last0 = await balanceOf(authors[3]);
+    const now = due();
+    const out = await svc.sweepRemixRewards({ now });
+    expect(out).toMatchObject({ scanned: 4, paid: 3, skipped: 1 });
+    // 按发布先后：前三条发，第四条被这道挡下
+    for (const id of remixes.slice(0, 3)) expect(await RemixReward.findOne({ remix: id }).lean()).toMatchObject({ status: "paid" });
+    expect(await RemixReward.findOne({ remix: remixes[3] }).lean()).toMatchObject({ status: "skipped", reason: "remixer_cap", tokens: 0 });
+    expect(await balanceOf(authors[3])).toEqual(last0);
+
+    // 25 小时后前三次滑出窗口：这个人新发的同款照算；被挡下的那条不补
+    const fifth = await registerUser();
+    const r5 = await publish(remixer, { remixOf: await publish(fifth) });
+    const f0 = await balanceOf(fifth);
+    const later = await svc.sweepRemixRewards({ now: new Date(now.getTime() + 25 * HOUR) });
+    expect(later).toMatchObject({ scanned: 1, paid: 1 });
+    expect(await RemixReward.findOne({ remix: r5 }).lean()).toMatchObject({ status: "paid" });
+    expect((await balanceOf(fifth)).addon).toBe(f0.addon + 30_000);
+    expect(await RemixReward.findOne({ remix: remixes[3] }).lean()).toMatchObject({ status: "skipped", reason: "remixer_cap" });
+    expect(await balanceOf(authors[3])).toEqual(last0);
+  });
+
+  test("W6 防刷二：全站保险丝 —— 到了就不发并记成 budget；信没发出去下一条再试；一个窗口只发一封；额度调大之后照发", async () => {
+    expect(cfg.globalPerDay()).toBe(100); // 缺省
+    process.env.REMIX_REWARD_GLOBAL_PER_DAY = "abc";
+    expect(cfg.globalPerDay()).toBe(100); // 写坏了按缺省，不会变成 0 次或无限
+    const email = require("../src/services/email.service");
+    const send = jest.spyOn(email, "sendEmail").mockRejectedValueOnce(new Error("resend down")).mockResolvedValue({ ok: true });
+    process.env.SUPPORT_NOTIFY_EMAIL = "ops@test.local";
+
+    const pair = async () => {
+      const author = await registerUser();
+      const remix = await publish(await registerUser(), { remixOf: await publish(author) });
+      return { author, remix };
+    };
+    const now = due();
+    // 窗口是滑动的（别的用例垫的行会滑出去），所以每一轮都按「那一刻窗口里已有的」现定额度
+    const liveAt = (t) => RemixReward.countDocuments({ status: { $in: ["claimed", "paid"] }, decidedAt: { $gt: new Date(t.getTime() - 24 * HOUR) } });
+    // 第一轮：已有的 + 2 ⇒ 三条里只有前两条发得出去
+    const used = await liveAt(now);
+    process.env.REMIX_REWARD_GLOBAL_PER_DAY = String(used + 2);
+    const a = await pair();
+    const b = await pair();
+    const c = await pair();
+    const c0 = await balanceOf(c.author);
+    const out = await svc.sweepRemixRewards({ now });
+    expect(out).toMatchObject({ scanned: 3, paid: 2, skipped: 1, failed: 0 });
+    expect(await RemixReward.findOne({ remix: a.remix }).lean()).toMatchObject({ status: "paid" });
+    expect(await RemixReward.findOne({ remix: b.remix }).lean()).toMatchObject({ status: "paid" });
+    expect(await RemixReward.findOne({ remix: c.remix }).lean()).toMatchObject({ status: "skipped", reason: "budget", tokens: 0 });
+    expect(await balanceOf(c.author)).toEqual(c0);
+    expect((await BranchVideo.findById(c.remix).lean()).remixOf.pending).toBeUndefined(); // 判一次就定案
+    // 第一封信试过了（这一发被我们弄失败了）：收件人、标题里的额度、正文里的用户名
+    expect(send).toHaveBeenCalledTimes(1);
+    const mail = send.mock.calls[0][0];
+    expect(mail.to).toEqual(["ops@test.local"]);
+    expect(mail.subject).toContain(`${used + 2} 次`);
+    // 正文里列着最近 24 小时收得最多 / 带来最多的号（用户名 + id + 次数），供分清「被刷了」还是「真火了」
+    expect(mail.text).toMatch(/收到奖励最多的原作者：\n(  rr\d+_\w+  [0-9a-f]{24}  \d+ 次\n)+/);
+    expect(mail.text).toMatch(/带来奖励最多的同款作者：\n(  \S+  [0-9a-f]{24}  \d+ 次\n)+/);
+    expect(mail.text).toContain("REMIX_REWARD_GLOBAL_PER_DAY");
+
+    // 同一个窗口里又断一次：上一封没发出去 → 再试一次，这次成了
+    const d = await pair();
+    const t2 = new Date(now.getTime() + HOUR);
+    process.env.REMIX_REWARD_GLOBAL_PER_DAY = String(await liveAt(t2)); // 额度正好用完
+    await svc.sweepRemixRewards({ now: t2 });
+    expect(await RemixReward.findOne({ remix: d.remix }).lean()).toMatchObject({ status: "skipped", reason: "budget" });
+    expect(send).toHaveBeenCalledTimes(2);
+    // 再断一次：发成过了，这个窗口里不再发
+    const e = await pair();
+    const t3 = new Date(now.getTime() + 2 * HOUR);
+    process.env.REMIX_REWARD_GLOBAL_PER_DAY = String(await liveAt(t3));
+    await svc.sweepRemixRewards({ now: t3 });
+    expect(await RemixReward.findOne({ remix: e.remix }).lean()).toMatchObject({ status: "skipped", reason: "budget" });
+    expect(send).toHaveBeenCalledTimes(2);
+
+    // 把额度调大（环境变量，不用发版）：新到期的照发；被保险丝挡下的那几条不补
+    const t4 = new Date(now.getTime() + 3 * HOUR);
+    process.env.REMIX_REWARD_GLOBAL_PER_DAY = String((await liveAt(t4)) + 50);
+    const f = await pair();
+    const f0 = await balanceOf(f.author);
+    const raised = await svc.sweepRemixRewards({ now: t4 });
+    expect(raised).toMatchObject({ scanned: 1, paid: 1 });
+    expect((await balanceOf(f.author)).addon).toBe(f0.addon + 30_000);
+    expect(await balanceOf(c.author)).toEqual(c0);
   });
 
   test("W5 删号：只删「他是原作者」的判定记录；「他是同款作者」的留着（那是别人的上限计数）", async () => {

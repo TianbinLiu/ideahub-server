@@ -28,8 +28,10 @@ const SKIP_REASONS = [
   "remixer_inactive", // 同款作者注销 / 被封 / 账号不在了（封号不自动藏内容，所以要在这里挡）
   "self", // 自己按自己的流程做（发布那一拍就不该标成待判，这里是兜底）
   "repeat", // 同一个人对同一条原作已经算过一次
+  "remixer_cap", // 这位**同款作者** 24 小时内带来的奖励到上限了（防刷一，config/remixReward 的 PER_REMIXER_PER_DAY）
   "video_cap", // 这条原作到上限了
   "day_cap", // 这位原作者 24 小时内到上限了（不顺延）
+  "budget", // 全站保险丝断了（防刷二，config/remixReward 的 globalPerDay）—— 这一条本来是该发的
 ];
 
 const remixRewardSchema = new mongoose.Schema(
@@ -70,6 +72,10 @@ remixRewardSchema.index({ remix: 1 }, { unique: true });
 remixRewardSchema.index({ author: 1, status: 1, decidedAt: -1 });
 // 每条原作一共几次、同一个人算没算过（original + status [+ remixer]）
 remixRewardSchema.index({ original: 1, status: 1, remixer: 1 });
+// 防刷一：这位同款作者 24 小时内带来了几次（remixer + status + decidedAt 范围）
+remixRewardSchema.index({ remixer: 1, status: 1, decidedAt: -1 });
+// 防刷二：全站 24 小时内发了几次（status + decidedAt 范围）
+remixRewardSchema.index({ status: 1, decidedAt: -1 });
 // 清扫器「接着办」那一查。★ partialFilterExpression 写不了 `$exists:false`，所以用"在不在"而不是"为不为空"来表达没办完
 remixRewardSchema.index({ decidedAt: 1 }, { partialFilterExpression: { open: true }, name: "remix_reward_open" });
 

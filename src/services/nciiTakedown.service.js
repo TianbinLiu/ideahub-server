@@ -394,4 +394,6 @@ async function sweepDueReminders() {
   }
 }
 
-module.exports = { MEDIA_SOURCES, NOT_USER_MEDIA, findReferences, assetKey, parseTargets, notifyAdmins, notifyRequester, sweepDueReminders };
+// adminRecipients 也导出：同款奖励的保险丝报警（services/remixReward.service 的 alertFuse）要发给同一批人，
+// 不在那边抄第三份"管理员邮箱怎么取"（support.routes 里已经有一份同源的）
+module.exports = { MEDIA_SOURCES, NOT_USER_MEDIA, findReferences, assetKey, parseTargets, notifyAdmins, notifyRequester, sweepDueReminders, adminRecipients };
