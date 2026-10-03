@@ -943,13 +943,17 @@ async function listVideos(req, res, next) {
  *   而发不出去（客户端那头也没有任何办法"修好"这一格）。
  * ★ 只认**这个人读得到**的作品（readableBy，按 id 直取的口径）：拿一个别人的私密作品 id 来挂名，
  *   等于借这一格去探"这个 id 上有没有东西"，还能让自己的作品页上出现一条指向私密作品的线索。
+ * ★ `pending`（2026-10-02 模板体系 P3b）：按**别人**的流程做的同款，落一位「还欠一次奖励判定」——
+ *   满 24 小时后 services/remixReward.service 来判发不发。自己按自己的流程做的不落（不算有人做了同款，
+ *   与 remixCount 把作者自己排除掉是同一条）。开关关着也照落：发不发由判定那一拍说了算（config/remixReward 的 enabled）。
  */
 async function resolveRemixOf(raw, user) {
   const id = typeof raw === "string" ? raw.trim() : "";
   if (!id || !isValidId(id)) return null;
   const src = await BranchVideo.findById(id).select(`_id ${READABLE_FIELDS}`).lean();
   if (!src || !readableBy(src, user)) return null;
-  return { video: src._id, author: src.author };
+  const self = String(src.author) === String(user && user._id);
+  return { video: src._id, author: src.author, ...(self ? {} : { pending: true }) };
 }
 
 // POST /api/branch/videos
@@ -1640,6 +1644,9 @@ async function removeVideo(req, res, next) {
 /**
  * 硬删一条作品要连带清掉的**八样东西**（Mongo 七张表 + 云端资产）。
  * 少清一样都不报错，只是留下垃圾。
+ *
+ * 不删（刻意的）：RemixReward（同款奖励的判定记录）—— 这条作品是同款也好、是被照着做的原作也好，那几行都留着：
+ *   它们是别的原作者的上限计数与平台印钱的审计（models/RemixReward.js 的 ★★），奖励发了也不追回。
  *
  * ★ 提成函数是因为它现在有**两个**调用方：作者/管理员直接删（removeVideo），
  *   以及举报处理里的 action=delete（services/takedown.service）。

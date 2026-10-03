@@ -53,6 +53,12 @@ const TOKEN_REASONS = [
   // 老师人格（tutor）的一轮教学 / 蒸馏 / 生成没被上游受理时的退款（docs/05 §6.2）。与 minimax_refund 同一条纪律：
   // 加进 enum 的同时也要进 tokenWallet.service 的 SPEND_REASONS，否则退款抵不掉当日用量。
   "tutor_refund",
+  // 同款奖励（模板体系 P3b，2026-10-02）：别人按你的流程做了同款、公开发布满 24 小时 → **平台**印给原作者（正）。
+  // 唯一写入方 services/remixReward.service.js；memo 逐字是 `同款奖励 remix:<同款作品 id>`，清扫器靠它判断这笔发没发过。
+  // ★ 这是「我们印了钱」，不是「用户付了钱」：**不进** tokenWallet.service 的 REPAY_REASONS（印的钱不抵欠额），
+  //   也**不进** SPEND_REASONS（它不是哪次消费的退回，进了会把原作者当天的用量冲掉）。两条都钉在 tests/remixReward.spec.js。
+  // ★ 没有对手方：同款作者的钱包不动。token 不许在用户之间流转（config/remixReward.js 的 ★★）。
+  "remix_reward",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(
