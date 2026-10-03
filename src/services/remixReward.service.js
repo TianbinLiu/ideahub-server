@@ -25,6 +25,11 @@
 //
 // 【R3 判定只做一次】到期那一拍不满足的（私密、被下架、原作没了、上限到了……）就此定案，之后再变公开也不补。
 //    这是有意的：规则写成"满 24 小时那一刻还公开着"，才说得清、也才查得清（RemixReward.reason）。
+//
+// 【R4 两道防刷（2026-10-03）】同款作者每人 24 小时内最多带来 PER_REMIXER_PER_DAY 次；全站 24 小时内最多发
+//    globalPerDay() 次（保险丝）。两道都与 R2 同一个形状：数判定表、不顺延、判一次就定案。
+//    ★ 保险丝排在**最后**判：记成 budget 的那几条是"别的都合格、只是全站的额度用完了"——查的人要能一眼分出
+//      "被规则挡的"和"被保险丝挡的"，后者意味着要么被刷了、要么该把额度调大了（alertFuse 会发信）。
 const mongoose = require("mongoose");
 const BranchVideo = require("../models/BranchVideo");
 const RemixReward = require("../models/RemixReward");
@@ -85,12 +90,77 @@ async function verdictFor(remix, now) {
   if (!activeUser(remixer)) return "remixer_inactive";
   // 同一个人对同一条原作只算一次（不然一个号对着一条原作发 50 条就把它的上限吃满了）
   if (await RemixReward.exists({ original: originalId, status: { $in: LIVE }, remixer: remix.author })) return "repeat";
-  if ((await RemixReward.countDocuments({ original: originalId, status: { $in: LIVE } })) >= cfg.PER_VIDEO) return "video_cap";
   const since = new Date(now.getTime() - DAY_MS);
+  // 防刷一：这位同款作者 24 小时内已经给别人带来够多次了（R4）
+  if ((await RemixReward.countDocuments({ remixer: remix.author, status: { $in: LIVE }, decidedAt: { $gt: since } })) >= cfg.PER_REMIXER_PER_DAY) {
+    return "remixer_cap";
+  }
+  if ((await RemixReward.countDocuments({ original: originalId, status: { $in: LIVE } })) >= cfg.PER_VIDEO) return "video_cap";
   if ((await RemixReward.countDocuments({ author: authorId, status: { $in: LIVE }, decidedAt: { $gt: since } })) >= cfg.PER_AUTHOR_PER_DAY) {
     return "day_cap";
   }
+  // 防刷二：全站保险丝。★ 排在最后（R4 的 ★）
+  if ((await RemixReward.countDocuments({ status: { $in: LIVE }, decidedAt: { $gt: since } })) >= cfg.globalPerDay()) return "budget";
   return null;
+}
+
+/** 上一次保险丝报警发出去的时刻（只在内存里：进程重启后同一个窗口里最多多发一封，不值得为它落库） */
+let lastFuseAlertAt = 0;
+
+/**
+ * 保险丝断了：给管理员发一封信。**永不抛**（它是报警，不是主链路）。
+ *
+ * ★ 一个 24 小时窗口只发一封：断了之后每一条到期的同款都会走到这里，不去重就是每 10 分钟一封。
+ * ★ **发成了才记**时间：信没发出去（邮件服务挂了 / 没配收件人）的话下一条 budget 再试 —— 报警静默失败 =
+ *   奖励一直在被丢而没人知道。发不出去的每一次都在 pm2 日志里留一行 error。
+ * ★ 信里带最近 24 小时收得最多 / 带来最多的各五个号：收到信的人第一件事是分清"被刷了"还是"真火了"，
+ *   这两件事的处置相反（封号 / 把额度调大）。只写用户名与 id、不写昵称，用户名压成一行再进信 —— 纯文本邮件里
+ *   用户可控的字符串能伪造出看起来像模板自带的行（同 nciiTakedown 的 oneLine；注册只管了用户名的长度，没管字符集）。
+ */
+async function alertFuse(now) {
+  const limit = cfg.globalPerDay();
+  console.error(`[remix-reward] 全站保险丝断了：最近 24 小时已发 ${limit} 次，之后到期的同款记成 budget 不发`);
+  if (now.getTime() - lastFuseAlertAt < DAY_MS) return;
+  try {
+    const since = new Date(now.getTime() - DAY_MS);
+    const top = (field) =>
+      RemixReward.aggregate([
+        { $match: { status: { $in: LIVE }, decidedAt: { $gt: since } } },
+        { $group: { _id: `$${field}`, n: { $sum: 1 } } },
+        { $sort: { n: -1 } },
+        { $limit: 5 },
+      ]);
+    const [authors, remixers] = await Promise.all([top("author"), top("remixer")]);
+    const users = await User.find({ _id: { $in: [...authors, ...remixers].map((r) => r._id) } }).select("username").lean();
+    const nameOf = new Map(users.map((u) => [String(u._id), String(u.username || "").replace(/\s+/g, " ").slice(0, 40)]));
+    const line = (r) => `  ${nameOf.get(String(r._id)) || "（账号不在了）"}  ${String(r._id)}  ${r.n} 次`;
+    const text = [
+      `同款奖励到了全站 24 小时上限（${limit} 次 = ${(limit * cfg.TOKENS).toLocaleString("en-US")} token）。`,
+      "从现在起到窗口滑过去之前，到期的同款一律不发（记成 budget），之后也不补。",
+      "",
+      "最近 24 小时收到奖励最多的原作者：",
+      ...authors.map(line),
+      "",
+      "最近 24 小时带来奖励最多的同款作者：",
+      ...remixers.map(line),
+      "",
+      "怎么处置：",
+      "  · 像是被刷了（几个号互相做同款）：后台封号 —— 被封的号到期的同款不算；要全停就把 REMIX_REWARD_ENABLED 设成 false。",
+      "  · 是真的有这么多人在做同款：把 REMIX_REWARD_GLOBAL_PER_DAY 调大（环境变量，不用发版）。",
+      "逐条记录在 remixrewards 集合里（status / reason / author / remixer / decidedAt）。",
+    ].join("\n");
+    const { adminRecipients } = require("./nciiTakedown.service");
+    const { sendEmail } = require("./email.service");
+    const to = await adminRecipients();
+    if (!to.length) {
+      console.error("[remix-reward] 保险丝报警没有可用的管理员邮箱（TAKEDOWN_NOTIFY_EMAIL / SUPPORT_NOTIFY_EMAIL / 管理员账号的邮箱）");
+      return;
+    }
+    await sendEmail({ to, subject: `[启梦] 同款奖励到了全站 24 小时上限（${limit} 次）`, text });
+    lastFuseAlertAt = now.getTime();
+  } catch (err) {
+    console.error("[remix-reward] 保险丝报警发信失败:", (err && err.message) || err);
+  }
 }
 
 /**
@@ -178,6 +248,7 @@ async function settleOne(remix, now) {
       });
       row = doc.toObject();
       mine = true;
+      if (reason === "budget") await alertFuse(now);
     } catch (err) {
       // 唯一索引撞车 = 别的一轮刚占了这条（R1）。读回来按"不是我的"处理
       if (!err || err.code !== 11000) throw err;

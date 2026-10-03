@@ -421,6 +421,13 @@ WorkflowRecipe {
 | 每条原作一共 | 最多 50 次 | `PER_VIDEO` |
 | 要挂多久 | 24 小时 | `HOLD_MS` |
 | 开关 | 缺省开；`REMIX_REWARD_ENABLED=false` 关 | `enabled()` |
+| 防刷一：每个**同款作者** 24 小时内 | 最多带来 3 次，不顺延 | `PER_REMIXER_PER_DAY` |
+| 防刷二：**全站** 24 小时内（保险丝） | 最多 100 次（≈ 45 元 / 天），可用 `REMIX_REWARD_GLOBAL_PER_DAY` 调，不用发版 | `globalPerDay()` |
+
+上面前四个数是**产品口径**（规则端点下发、App 上屏）；两道防刷（2026-10-03 加）是内部规则，**不进规则端点、不上屏**：
+注册不要验证码，"小号互相做同款"刷得动 —— 防刷一把互刷的日产量从 10 次 / 号压到 3 次 / 号，防刷二给全站一天的总支出封顶。
+保险丝断了之后到期的同款记成 `budget` 不发、也不补；这个窗口里第一次断的时候给管理员发一封信（收件人同 NCII 那条：
+`TAKEDOWN_NOTIFY_EMAIL` / `SUPPORT_NOTIFY_EMAIL` / 管理员账号的邮箱），信里列着最近 24 小时收得最多 / 带来最多的各五个号。
 
 **规则端点**：`GET /api/branch/remix-reward`（optionalAuth）
 → `{ ok, reward: { enabled, tokens, perDay, perVideo, holdHours }, mine?: { count, tokens, last24h } }`。
@@ -434,7 +441,8 @@ App 上那句「每次 N token、每天最多 M 次…」读的是这里，**不
    - 不发的原因（`reason`）：`disabled` 开关关着 / `remix_not_public` 同款那一刻是私密、凭链接可见或被下架 /
      `original_not_public` 原作没了、私密或被下架（**凭链接可见的原作算公开**：工作流模板可以挂在那种作品上）/
      `author_inactive`、`remixer_inactive` 账号注销或被封 / `repeat` 同一个人对同一条原作已经算过 /
-     `video_cap`、`day_cap` 到了上限。
+     `remixer_cap` 这位同款作者 24 小时内带来的次数到了上限 / `video_cap`、`day_cap` 到了上限 /
+     `budget` 全站保险丝断了（排在最后判：记成它的都是"别的都合格、只是全站额度用完了"）。
    - **判一次就定案**：到期那一刻不满足的，之后再变公开也不补；发了的，之后同款被删 / 设私密 / 下架也不追回。
 3. 发：先占位（`status: claimed`，`remix` 唯一索引）→ `wallet.credit(原作者, 30000, "remix_reward", "同款奖励 remix:<id>")`
    （进 **addon**，不过期）→ `paid` → 一条 `BRANCH_REMIX_REWARD` 通知。崩在中间的由下一轮按**账本**续办
