@@ -163,6 +163,15 @@ const remixOfSchema = new mongoose.Schema(
   {
     video: { type: mongoose.Schema.Types.ObjectId, ref: "BranchVideo", required: true },
     author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    /**
+     * 「这条同款还欠一次奖励判定」（模板体系 P3b）。发布那一拍落（自己按自己的流程做的不落），
+     * 满 24 小时后由 services/remixReward.service 判一次、判完 $unset —— 不管判成发还是不发。
+     * ★ 不给 default、判**有值**：P3b 上线之前发布的同款没有这一位 = 不欠（不回头补发，那时候我们什么都没承诺）。
+     * ★ 用"在不在"而不是"判没判过"来表达，是因为 partial 索引写不了 `$exists:false`（见下面那条索引）。
+     * ★★ 必须写进 schema：strict 模式下没声明的路径 create / update 都会被无声丢掉（同 recipe 那一格的疤）——
+     *   丢了的表现是"永远没有一条同款到期"，一个错都不报。
+     */
+    pending: { type: Boolean, default: undefined },
   },
   { _id: false }
 );
@@ -283,6 +292,12 @@ branchVideoSchema.index({ visibility: 1, createdAt: -1, _id: -1 });
 branchVideoSchema.index(
   { "remixOf.video": 1 },
   { partialFilterExpression: { "remixOf.video": { $type: "objectId" } } }
+);
+// 同款奖励的清扫器「到期了还没判的同款」那一查（services/remixReward.service 的 sweepRemixRewards）。
+// ★ partial：索引里只有还带着 pending 的那几条（判完就 $unset），与作品总数无关
+branchVideoSchema.index(
+  { createdAt: 1 },
+  { partialFilterExpression: { "remixOf.pending": true }, name: "remix_reward_pending" }
 );
 // 后台「下架列表」用。★ partial 索引：全站绝大多数作品没有这个字段，
 // 建全量索引等于给一张几乎全空的列建一棵树。条件与 controller 的 TAKEN_DOWN

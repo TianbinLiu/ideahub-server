@@ -11,6 +11,8 @@ const BranchVideo = require("../models/BranchVideo");
 const BranchCard = require("../models/BranchCard");
 const { notFound, forbidden, invalidId, failWith } = require("../utils/http");
 const { isAdmin } = require("../utils/roles");
+const remixRewardConfig = require("../config/remixReward");
+const { summaryFor: remixRewardSummary } = require("../services/remixReward.service");
 
 const AUTHOR_FIELDS = "_id username displayName avatarUrl uid";
 
@@ -334,4 +336,20 @@ async function deleteRecipe(req, res, next) {
   }
 }
 
-module.exports = { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates };
+// GET /api/branch/remix-reward
+/**
+ * 同款奖励的规则 + 登录者自己（作为原作者）的小结。
+ * ★ 规则那一份是 App 上那句「每次 N token、每天最多 M 次…」的**唯一出处**：App 不另抄数（config/remixReward 的 ★）。
+ * ★ 没登录也回规则（规则与谁在问无关）；`mine` 只在登录时带。
+ */
+async function getRemixReward(req, res, next) {
+  try {
+    const reward = remixRewardConfig.publicConfig();
+    const mine = req.user ? await remixRewardSummary(req.user._id) : null;
+    res.json({ ok: true, reward, ...(mine ? { mine } : {}) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates, getRemixReward };

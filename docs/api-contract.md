@@ -407,6 +407,45 @@ WorkflowRecipe {
 ⚠ 客户端判「这台服务器有没有这个端点」看**回包形状**（`meta.video` 是否存在），不看状态码：Capacitor 对未命中路径
 回 200 + index.html。老服务端上这四条路都不存在 ⇒ App 把它说成「这台服务器还不支持公开制作过程」，不是「没有公开」。
 
+### 同款奖励（`remix_reward`，模板体系 P3b，2026-10-02）
+
+别人按你的流程做了同款、**公开发布满 24 小时还公开着** → **平台**印一笔 token 给原作者（主人 10-02 拍板四个数）。
+
+★★ **这是平台印钱，不是同款作者付给原作者**：token 只能购买、只能站内消耗，不许在用户之间流转。账本上只有原作者
+那一条 `remix_reward` 入账，同款作者的钱包不动。
+
+| 数 | 值 | 在哪儿 |
+|---|---|---|
+| 每次 | 30,000 token（≈ 0.45 元） | `config/remixReward.js` 的 `TOKENS` |
+| 每位原作者 24 小时内 | 最多 10 次，**不顺延** | `PER_AUTHOR_PER_DAY` |
+| 每条原作一共 | 最多 50 次 | `PER_VIDEO` |
+| 要挂多久 | 24 小时 | `HOLD_MS` |
+| 开关 | 缺省开；`REMIX_REWARD_ENABLED=false` 关 | `enabled()` |
+
+**规则端点**：`GET /api/branch/remix-reward`（optionalAuth）
+→ `{ ok, reward: { enabled, tokens, perDay, perVideo, holdHours }, mine?: { count, tokens, last24h } }`。
+App 上那句「每次 N token、每天最多 M 次…」读的是这里，**不在 App 里另抄一份数**。`mine` 只在带登录态时有
+（作为原作者累计发了几次 / 多少 token、最近 24 小时用掉了几次上限）。老服务端没有这条路 —— App 判回包形状（有没有 `reward` 对象）。
+
+**一条同款的一生**（唯一实现 `services/remixReward.service.js`）：
+1. 发布（`POST /videos` 认下了 `remixOf`）→ 作品上落 `remixOf.pending: true`。自己按自己的流程做的不落。
+   上线之前发布的同款没有这一位 = 不欠，不回头补发。
+2. 满 24 小时后，清扫器（`index.js`，只在 0 号实例，每 10 分钟一轮）判**一次**，写一行 `RemixReward`（每条同款恰好一行）：
+   - 不发的原因（`reason`）：`disabled` 开关关着 / `remix_not_public` 同款那一刻是私密、凭链接可见或被下架 /
+     `original_not_public` 原作没了、私密或被下架（**凭链接可见的原作算公开**：工作流模板可以挂在那种作品上）/
+     `author_inactive`、`remixer_inactive` 账号注销或被封 / `repeat` 同一个人对同一条原作已经算过 /
+     `video_cap`、`day_cap` 到了上限。
+   - **判一次就定案**：到期那一刻不满足的，之后再变公开也不补；发了的，之后同款被删 / 设私密 / 下架也不追回。
+3. 发：先占位（`status: claimed`，`remix` 唯一索引）→ `wallet.credit(原作者, 30000, "remix_reward", "同款奖励 remix:<id>")`
+   （进 **addon**，不过期）→ `paid` → 一条 `BRANCH_REMIX_REWARD` 通知。崩在中间的由下一轮按**账本**续办
+   （memo 逐字是证据：有那一条 = 发过了，只补状态）。
+
+**账本**：`TokenLedger.reason` 多一档 `remix_reward`。它**不抵欠额**（不在 `REPAY_REASONS`：印的钱不是付的钱），
+也**不冲当日用量**（不在 `SPEND_REASONS`）。
+
+**删号 / 删作品**：`RemixReward` 里「他是原作者」的行随删号一起删；「他是同款作者」的行**留着**（那是别的原作者的上限计数，
+跟着删的话刷子号做完同款就注销、上限被悄悄清零）。删作品不动这张表。
+
 ## 热度（`heat`）
 
 **只有一个公式**，实现在 server 的 `src/utils/hotScore.js`：
@@ -435,6 +474,12 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   对不认识的类型显示成通用的「系统通知」行（标题给类型名或"通知"，正文尽力取
   `payload.text`）。老包收到新类型是常态 —— 白名单过滤器只该决定**归到哪个 tab**，
   不该决定**存不存在**；把未知类型直接 filter 掉的话，用户的红点数与列表条数永远对不上。
+- `Notification.type` 另增 **`BRANCH_REMIX_REWARD`**（2026-10-02，模板体系 P3b）：**同款奖励到账**。收件人 = 原作者。
+  `payload = { tokens, originalId, originalTitle, videoId?, videoTitle? }`；`actorId` = 同款作者、`videoId` = 那条同款
+  （deeplink 到 `/video/:id`，看别人照着做出来的片子）。金额是 `payload.tokens`（数），**不拼成句子**——句子由 App 按界面语言说。
+  ★ 两人之间有拉黑、或那条同款已经不公开时**不带** `actorId` / `videoId`（App 画成「有人做了你的同款」）：币已经进账，
+  不能不说（App 没有流水页）；但也不能把被拉黑的人摆到眼前。
+  ⚠ 老 App（≤ 2.60）**收不到**这一类（请求层白名单，同 `BRANCH_REVISED`）：币照到，只是没有那条通知。
 - `Notification.type` 另增 **`BRANCH_REVISED`**（2026-09-07）：**你收藏的作品被作者回炉重做了**。
   收件人 = 这条作品的收藏者（`BranchCollect`）；`actorId` = 作者；deeplink 目标是 **`videoId`**（`/video/:id`）。
   正文走 **`payload.commentText`**（`"这条作品重新剪辑过了"`）—— 刻意复用 `ADMIN_NOTICE` 已经走通的

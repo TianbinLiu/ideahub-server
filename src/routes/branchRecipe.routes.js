@@ -10,7 +10,13 @@ const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
 const { validate } = require("../middleware/validate");
 const { recipeBody, recipePatchBody } = require("../schemas/branchRecipe.schemas");
-const { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates } = require("../controllers/branchRecipe.controller");
+const { putRecipe, patchRecipe, getRecipe, deleteRecipe, listWorkflowTemplates, getRemixReward } = require("../controllers/branchRecipe.controller");
+
+// 同款奖励的规则（每次多少、两道上限、要挂多久）与登录者自己的小结。App 上那句话读的是这里，不另抄一份数。
+// @endpoint GET /api/branch/remix-reward
+//   → { ok, reward: { enabled, tokens, perDay, perVideo, holdHours }, mine?: { count, tokens, last24h } }
+//   `mine` 只在带了登录态时有。老服务端没有这条路 —— App 判回包形状（有没有 reward 对象），不看状态码
+router.get("/remix-reward", optionalAuth, getRemixReward);
 
 // 看制作过程。
 // @endpoint GET /api/branch/videos/:id/recipe

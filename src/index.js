@@ -155,6 +155,15 @@ async function start() {
         sweepDueReminders().catch((e) => console.error("[takedown] 到期清扫失败:", (e && e.message) || e));
       }, 15 * 60 * 1000);
       takedownTimer.unref?.(); // 别因为它让进程退不出去（优雅退出时 server.close 之后还在等定时器）
+      // 同款奖励：发布满 24 小时的同款判一次发不发（services/remixReward.service，模板体系 P3b）。
+      // ★ 只在 0 号实例：两道上限是「数一下 → 占位」，两个实例同时跑会多发出一两条（同一条同款仍只发一次）。
+      // ★ 10 分钟一轮：规则是以天计的，到期之后晚几分钟到账没人在意；更密只是白查库。
+      // ★ 开关（REMIX_REWARD_ENABLED=false）关着也照跑 —— 那时它把到期的一律记成不发，不攒着（见 config/remixReward）。
+      const { sweepRemixRewards } = require("./services/remixReward.service");
+      const remixRewardTimer = setInterval(() => {
+        sweepRemixRewards().catch((e) => console.error("[remix-reward] 清扫失败:", (e && e.message) || e));
+      }, 10 * 60 * 1000);
+      remixRewardTimer.unref?.();
       // Play 的「已作废购买」每小时拉一次。★ 它是 RTDN 的**兜底**，不是替代：
       //   RTDN 可能丢、也可能我们正好在重启，而漏一条退款 = 用户白拿一整包 token。
       //   ⚠ 两条路必然重叠 ⇒ 回收本身必须幂等（revokedAt 的条件原子抢占）。
@@ -179,7 +188,7 @@ async function start() {
         playSweep.unref?.();
       }
     } else {
-      console.log(`实例 ${instanceId}：跳过 AI worker、NCII 到期清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
+      console.log(`实例 ${instanceId}：跳过 AI worker、NCII 到期清扫、同款奖励清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
     }
 
     setupGracefulShutdown(server);

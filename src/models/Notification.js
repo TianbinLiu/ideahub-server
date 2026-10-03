@@ -35,6 +35,14 @@ const NotificationSchema = new mongoose.Schema(
         //   放进查询。对未升级用户，观众知情为零 —— 这条写进了 docs/api-contract.md，
         //   不许说成「降级显示」。
         "BRANCH_REVISED",
+        // 同款奖励到账（模板体系 P3b，2026-10-02；写入只在 services/remixReward.service.js 一处）。收件人 = 原作者。
+        //   payload { tokens, originalId, originalTitle, videoId?, videoTitle? }；actorId = 同款作者、videoId = 那条同款
+        //   （deeplink 与其它 BRANCH_* 同口径，点进去看别人照着做出来的片子）。
+        // ★ 两人之间有拉黑、或那条同款已经不公开时**不带** actorId / videoId（App 画成「有人做了你的同款」）：
+        //   币已经进账了，不能不说；但也不能把一个被拉黑的人摆到眼前。
+        // ★ 金额在 payload.tokens（数），**不拼成一句话**放 commentText：句子由 App 按界面语言说。
+        // ⚠ 老 App（≤ 2.60）**收不到**这一类（请求层白名单，同 BRANCH_REVISED 那段）：币照到，只是没有那条通知。
+        "BRANCH_REMIX_REWARD",
         // 平台通知（管理员手动发给某个用户的自由文本）。payload 形状：{ text }。
         // ★ **不带 actorId**（写入点在 branchAdmin.controller 的 notifyUser，传的就是
         //   undefined）：通知以**平台口径**发出，「具体是哪个管理员发的」不透给用户 ——
