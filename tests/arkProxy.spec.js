@@ -258,6 +258,92 @@ describe("跨仓档位系数一致性（app 的报价 vs 服务端的结算）",
   });
 });
 
+describe("跨仓时长窗口一致性（app 的时长按钮 vs 服务端的结算与钉子）", () => {
+  // 抄自 app/src/data/economy.ts 的 VIDEO_TIERS[].minSec / maxSec（为什么抄不 fs 读：与上面档位系数那组同一个理由）。
+  // ★ 2026-10-03「段时长放开」：高清 2.0-mini 到 15 秒、电影级 2.5 到 30 秒（这两个模型的协议上限），1.0 两档仍 [3,10]。
+  //   两边差一格的症状是"页面按 15 秒报价、这边按 10 秒夹"（少收）或"按钮能点、请求被这边 400"（点了没反应）。
+  const APP_SEC_WINDOW = {
+    "doubao-seedance-1-0-pro-fast-251015": [3, 10],
+    "doubao-seedance-1-0-pro-250528": [3, 10],
+    "doubao-seedance-2-0-mini-260615": [4, 15],
+    "doubao-seedance-2-5-260628": [4, 30],
+  };
+
+  test("两张表完全相等，且覆盖档位系数表里的每个视频模型", () => {
+    const { VIDEO_SEC_WINDOW, VIDEO_MULT } = require("../src/config/tokens");
+    expect(VIDEO_SEC_WINDOW).toEqual(APP_SEC_WINDOW);
+    expect(Object.keys(VIDEO_SEC_WINDOW).sort()).toEqual(Object.keys(VIDEO_MULT).sort());
+  });
+
+  test("结算按窗口夹：高清 15 秒按 15 秒收、1.0 的 15 秒仍按 10 秒收（第二道保险，路由层先拒）", () => {
+    const { segTokens } = require("../src/config/tokens");
+    expect(segTokens(15, "doubao-seedance-2-0-mini-260615")).toBe(Math.round(15 * 21_600 * (23 / 15)));
+    expect(segTokens(30, "doubao-seedance-2-5-260628")).toBe(Math.round(30 * 21_600 * 4.7));
+    expect(segTokens(15, "doubao-seedance-1-0-pro-250528")).toBe(segTokens(10, "doubao-seedance-1-0-pro-250528"));
+    // 缺省 5 秒：方舟不传 duration 时的默认时长，两边要对得上
+    expect(segTokens(undefined, "doubao-seedance-2-0-mini-260615")).toBe(segTokens(5, "doubao-seedance-2-0-mini-260615"));
+  });
+
+  test("认不出的模型按改版前的 [3,10]（往窄的一侧退）", () => {
+    const { videoSecWindow } = require("../src/config/tokens");
+    expect(videoSecWindow("doubao-seedance-9-9-999999")).toEqual([3, 10]);
+    expect(videoSecWindow(undefined)).toEqual([3, 10]);
+  });
+});
+
+describe("纯视频任务的参数钉子（没有参考视频：生成参数钉在计价假设上）", () => {
+  // ★ 计价 = 请求里的 duration × 720p × 系数（segTokens）。代理原样转发，所以时长 / 帧数 / 分辨率
+  //   与计价假设不一致的请求必须在扣费之前整句拒 —— 否则改一行客户端就能「按 5 秒的价买 30 秒」。
+  const post = (body) =>
+    request(app).post("/api/ark/contents/generations/tasks").set({ Authorization: `Bearer ${paidToken}` }).send(body);
+
+  test.each([
+    ["高清 15 秒（新窗口的上界）", { model: "doubao-seedance-2-0-mini-260615", duration: 15 }],
+    ["高清 4 秒（下界）", { model: "doubao-seedance-2-0-mini-260615", duration: 4 }],
+    ["标准 10 秒", { model: "doubao-seedance-1-0-pro-250528", duration: 10 }],
+    ["不传 duration（方舟缺省 5 秒，结算也按 5 秒）", { model: "doubao-seedance-2-0-mini-260615" }],
+    ["显式 720p", { model: "doubao-seedance-2-0-mini-260615", duration: 8, resolution: "720p" }],
+  ])("合规（%s）→ 过钉子走到 forward（501 = 没配 key）", async (_n, extra) => {
+    const res = await post({ content: [], ...extra });
+    expect(res.status).toBe(501);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("电影级 30 秒过钉子（余额够不够是下一道闸的事，但不能是被钉子拒的）", async () => {
+    const res = await post({ model: "doubao-seedance-2-5-260628", duration: 30, content: [] });
+    expect(res.body.code).not.toBe("VIDEO_PARAMS_NOT_ALLOWED");
+    expect([402, 501]).toContain(res.status);
+  });
+
+  test.each([
+    ["高清 16 秒（超出 4~15）", { model: "doubao-seedance-2-0-mini-260615", duration: 16 }],
+    ["高清 3 秒（2.0-mini 不收 3 秒）", { model: "doubao-seedance-2-0-mini-260615", duration: 3 }],
+    ["标准 12 秒（1.0 仍是 3~10）", { model: "doubao-seedance-1-0-pro-250528", duration: 12 }],
+    ["电影级 31 秒", { model: "doubao-seedance-2-5-260628", duration: 31 }],
+    ["duration=-1（智能时长：方舟按上界出、这边按下界收）", { model: "doubao-seedance-2-5-260628", duration: -1 }],
+    ["duration=4.5（不是整数）", { model: "doubao-seedance-2-0-mini-260615", duration: 4.5 }],
+    ['duration="10"（字符串）', { model: "doubao-seedance-2-0-mini-260615", duration: "10" }],
+    ["带 frames（按帧数定长，与 duration 二选一）", { model: "doubao-seedance-2-0-mini-260615", frames: 361 }],
+    ["resolution=1080p（像素是 720p 的 2.25 倍）", { model: "doubao-seedance-2-0-mini-260615", duration: 5, resolution: "1080p" }],
+  ])("越出计价假设（%s）→ 400 整句拒，不出网、不扣费", async (_n, extra) => {
+    const wallet = require("../src/services/tokenWallet.service");
+    const before = await wallet.getWallet(paidUserId);
+    const res = await post({ content: [], ...extra });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VIDEO_PARAMS_NOT_ALLOWED");
+    expect(typeof res.body.message).toBe("string");
+    expect(res.body.message).toMatch(/没有扣费/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await wallet.getWallet(paidUserId);
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test("不在 Seedance 档位表里的任务（Seed3D 建模）不归这道钉子管", async () => {
+    const res = await post({ model: "doubao-seed3d-2-0-260328", content: [] });
+    expect(res.body.code).not.toBe("VIDEO_PARAMS_NOT_ALLOWED");
+  });
+});
+
 describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）", () => {
   // ★ 这一组盯的是 2026-08-11 之前真实存在的缺口：`priceOf` 拿到了请求体却不读 model，
   //   于是**顶档按最低档收费**（三档差 3 倍）。它没有任何症状 —— 用户无感、界面无错、
@@ -1051,9 +1137,9 @@ describe("跨仓 chat 定额一致性（app 的报价 vs 服务端的结算）",
 });
 
 describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 参考视频，2026-08-28）", () => {
-  // ★ 与前两条分支的差别：reference 子任务（不是 edit）、输出时长用户选（3~10）、
+  // ★ 与前两条分支的差别：reference 子任务（不是 edit）、输出时长用户选（这个模型的窗口内，2.5 是 4~30）、
   //   计价 = (登记输入 + 输出)×720p 锚×2.8（tokens.materialRefTokens）。
-  //   参数钉子是素材专属那一套（omni 必须缺省、duration 必须 3~10 有限数）。
+  //   参数钉子是素材专属那一套（omni 必须缺省、duration 必须是窗口内的整数）。
   const MaterialRefVideo = require("../src/models/MaterialRefVideo");
   let matUrl;
 
@@ -1102,6 +1188,17 @@ describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 
     // 计价公式独立断言（与 app economy.materialRefCost 跨仓逐字相等）
     const { materialRefTokens } = require("../src/config/tokens");
     expect(materialRefTokens(10, 5, "doubao-seedance-2-5-260628")).toBe(Math.round((10 + 5) * 21_600 * 2.8));
+    // 2026-10-03 起输出窗口跟模型走（2.5 到 30 秒）：30 秒的输出按 30 秒收，不再夹到 10
+    expect(materialRefTokens(10, 30, "doubao-seedance-2-5-260628")).toBe(Math.round((10 + 30) * 21_600 * 2.8));
+  });
+
+  test("输出 30 秒（2.5 窗口的上界）过素材钉子（2026-10-03 前这里会被 3~10 拒）", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set({ Authorization: `Bearer ${paidToken}` })
+      .send(matBody(matUrl, { duration: 30 }));
+    expect(res.body.code).not.toBe("R2V_NOT_ALLOWED");
+    expect([402, 501]).toContain(res.status);
   });
 
   test("别人的素材 → 400（素材私有，URL 泄了也蹭不了）", async () => {
@@ -1118,7 +1215,9 @@ describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 
   test.each([
     ["带 omni_reference_task_type（那是白模的参数）", { omni_reference_task_type: "edit" }],
     ["duration=-1（reference 会推到 30s 上界）", { duration: -1 }],
-    ["duration=30（超出 3~10）", { duration: 30 }],
+    ["duration=31（超出 2.5 的 4~30）", { duration: 31 }],
+    ["duration=3（低于 2.5 的下限 4）", { duration: 3 }],
+    ["duration=4.5（不是整数）", { duration: 4.5 }],
     ["resolution=1080p", { resolution: "1080p" }],
     ["ratio=1:1", { ratio: "1:1" }],
   ])("素材参考参数越出计价假设（%s）→ 400 不出网", async (_n, extra) => {

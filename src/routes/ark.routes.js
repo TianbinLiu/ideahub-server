@@ -35,7 +35,7 @@ const { assertPublicUrl } = require("../utils/ssrfGuard");
 const videoAsset = require("../services/videoAsset.service");
 // 转存的后台任务化（认领/去重/执行/查询）：轮询自动转存与 /transfer-video 两个入口共用
 const arkTransfer = require("../services/arkTransfer.service");
-const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT_R2V, audioSupported } = require("../config/tokens");
+const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT, VIDEO_MULT_R2V, audioSupported, videoSecWindow } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
 const arkVideoTask = require("../services/arkVideoTask.service");
@@ -315,6 +315,7 @@ async function resolveR2v(req, res, next) {
       //    多图 + 参考视频」那条路）────────────────────────────
       // ★ 与模板两条分支的本质区别：它走的是 reference 子任务（不是 edit 复刻），
       //   输出时长由用户选（3~10s），首/中/尾帧用 reference_image + 提示词点名。
+      //   （窗口按模型走 videoSecWindow，2.5 是 4~30s）。
       //   参数钉子因此是**另一套**（见下面 material 那个分支），别把 edit 的钉子
       //   套在它头上——duration:-1 在 reference 子任务上会推到 30s 上界（A7 实测），
       //   那正是"按小价买大产出"的口子。
@@ -330,7 +331,7 @@ async function resolveR2v(req, res, next) {
         // 计价输入只读服务端登记值（register 时从 Cloudinary 写入），请求体说什么不作数
         durationSec: Number(mat.durationSec),
         sourcePublicId: mat.publicId,
-        // 输出时长 = 用户点的 duration（下面素材钉子会把它钉成 3..10 的有限数）
+        // 输出时长 = 用户点的 duration（下面素材钉子会把它钉成这个模型时长窗口里的整数）
         outputSec: Number(req.body?.duration),
       };
     } else {
@@ -406,9 +407,12 @@ async function resolveR2v(req, res, next) {
       if (omni !== undefined && omni !== "reference") {
         return deny("素材参考出片只走 reference 子任务——当前请求未被受理，也没有扣费。");
       }
-      if (!Number.isFinite(Number(dur)) || Number(dur) < 3 || Number(dur) > 10) {
+      // ★ 窗口按模型走（videoSecWindow，2026-10-03 起 2.5 是 [4,30]；此前写死 3~10）。整数才收：
+      //   方舟只认整数秒，4.5 这种数发过去不是被拒就是被它自己取整，与我们按 round 结算的数可能差一秒
+      const [lo, hi] = videoSecWindow(model);
+      if (!Number.isInteger(dur) || dur < lo || dur > hi) {
         // -1（智能时长）明确拒：reference 子任务上它会推到 30s 上界（A7 实测），报价对不上实扣
-        return deny("素材参考出片要指定 3~10 秒的时长（不收 -1 智能时长）——当前请求未被受理，也没有扣费。");
+        return deny(`素材参考出片要指定 ${lo}~${hi} 秒的整数时长（不收 -1 智能时长）——当前请求未被受理，也没有扣费。`);
       }
       const resl = req.body?.resolution;
       if (resl !== undefined && resl !== "720p") {
@@ -546,6 +550,42 @@ async function noteR2vOutcome(taskId, parsed) {
   }
 }
 
+/**
+ * 纯视频任务（没有参考视频：文生 / 图生 / 参考图生视频）的参数钉子 —— 把**生成参数钉在计价假设上**，不符整句 400。
+ *
+ * ★★ 为什么要有（2026-10-03 随「段时长放开」加）：纯任务按 segTokens 结算 = 请求里的 duration × 720p × 系数，
+ *   而代理是原样转发的。此前这条路一个参数都不钉，于是改一行客户端就能：
+ *     · `duration: -1`（智能时长）→ 方舟按模型上界出（2.5 是 30 秒），我们按 `Math.round(-1)` 夹到最短收；
+ *     · `duration: 15` 发给 1.0 → 我们夹到 10 秒收，方舟收不收 15 是它的事，我们不赌；
+ *     · `frames: 361`（按帧数定长，与 duration 二选一）→ 时长由帧数决定，我们按缺省 5 秒收；
+ *     · `resolution: "1080p"` → 像素是 720p 的 2.25 倍，我们按 720p 收。
+ *   差额全进我们的方舟账单，流水与正常出片一模一样，零症状 —— 与 resolveR2v 那几行钉子同一个道理
+ *   （「不信客户端报的任何数」）。今天的 app 只发 720p、整数秒、不发 frames，所以这几道钉子对它一个字不拦。
+ * ★ 窗口按模型走（tokens.videoSecWindow，与 app 的 VideoTier.minSec / maxSec 逐条相等）。
+ * ★ 只钉 Seedance 视频模型（VIDEO_MULT 里有的）：同一个端点上的 Seed3D 建模没有这些参数，不归这里管；
+ *   不在册的模型由 billedForward 的白名单拒，也不归这里管。
+ * ★ duration 缺省放行：方舟的缺省是 5 秒，segTokens 的缺省也是 5 秒，两边对得上（老客户端也不受影响）。
+ */
+function pinPlainVideoTask(req, res, next) {
+  if (req.r2v) return next(); // 带参考视频的任务由 resolveR2v 钉过了（各钉各的计价假设）
+  const model = String(req.body?.model ?? "");
+  if (VIDEO_MULT[model] === undefined) return next();
+  const deny = (message) => res.status(400).json({ ok: false, code: "VIDEO_PARAMS_NOT_ALLOWED", message });
+  const [lo, hi] = videoSecWindow(model);
+  const dur = req.body?.duration;
+  if (dur !== undefined && (!Number.isInteger(dur) || dur < lo || dur > hi)) {
+    return deny(`这一档的时长只能是 ${lo}~${hi} 秒的整数（不收 -1 智能时长）——当前请求未被受理，也没有扣费。`);
+  }
+  if (req.body?.frames !== undefined) {
+    return deny("出片时长请用 duration 指定（不收 frames）——当前请求未被受理，也没有扣费。");
+  }
+  const resl = req.body?.resolution;
+  if (resl !== undefined && resl !== "720p") {
+    return deny("出片目前只支持 720p——当前请求未被受理，也没有扣费。");
+  }
+  return next();
+}
+
 /** Seedance 出视频 / Seed3D 建模（同一个异步任务端点）。
  *  两者单价差一个数量级（一段 720p 视频约 216k，一次建模 160k），按 body.model 分别定价 */
 router.post(
@@ -554,6 +594,7 @@ router.post(
   genLimit,
   limitUnregisteredR2v,
   resolveR2v,
+  pinPlainVideoTask,
   billedForward("task", "/contents/generations/tasks", T_CREATE),
 );
 
