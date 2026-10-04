@@ -243,6 +243,30 @@ function audioSupported(model) {
 }
 
 /**
+ * 纯任务（文生 / 图生 / 参考图生视频）每个模型收的时长窗口 [最短, 最长]（秒，整数）——**模型能力 + 产品口径**，
+ * 结算（segTokens / materialRefTokens）与路由的时长钉子（ark.routes 的 pinPlainVideoTask、素材分支）读的都是这一张。
+ *
+ * ★ 2026-10-03 主人拍板「段时长放开」：高清（2.0-mini）放到 15 秒、电影级（2.5）放到 30 秒 —— 正好是这两个模型的协议上限
+ *   （方舟「创建视频生成任务」文档：Seedance 2.0 系列 [4,15]、2.5 [4,30]；下限 4 是 2026-09-30 直连探针量出来的：3 秒同步 400）。
+ *   1.0 两档仍是 [3,10]（产品口径，没动）。此前全表一刀切 [3,10]：app 只发 10 秒以内，所以没出过事；
+ *   但这一刀同时意味着「请求里写 15 秒、方舟照出 15 秒、我们按 10 秒收」，钉子见 ark.routes 的 pinPlainVideoTask。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 `VideoTier.minSec / maxSec` **逐条相等**（跨仓契约，钉在 tests/arkProxy.spec.js
+ *   「跨仓时长窗口一致性」）：app 报 15 秒的价、这边按 10 秒夹，就是"页面报 X、扣的是另一个数"。
+ * ★ 认不出的模型按 [3,10]（改版前所有模型的口径），往窄的一侧退是安全的。
+ */
+const VIDEO_SEC_WINDOW = {
+  "doubao-seedance-1-0-pro-fast-251015": [3, 10],
+  "doubao-seedance-1-0-pro-250528": [3, 10],
+  "doubao-seedance-2-0-mini-260615": [4, 15],
+  [SEEDANCE_2_5]: [4, 30],
+};
+
+/** 这个模型一段视频能选的时长窗口 [最短, 最长]。判据只有这一处（铁律六） */
+function videoSecWindow(model) {
+  return VIDEO_SEC_WINDOW[String(model || "")] ?? [3, 10];
+}
+
+/**
  * 仅付费套餐可调用的模型。★ **"这一档对不对某个套餐开放"的判据只有 `paidOnlyDenial` 一处**，
  * 这个集合只是它的数据。
  *
@@ -352,9 +376,14 @@ function dailySoftWarn({ planId, spentToday }) {
 
 const MODEL3D_ID = "doubao-seed3d-2-0-260328";
 
-/** 一段 720p 视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数） */
+/**
+ * 一段 720p 视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数）。
+ * ★ 时长夹到这个模型的窗口（videoSecWindow；2026-10-03 之前一刀切 [3,10]）。路由层已经把窗口外的时长整句拒了
+ *   （pinPlainVideoTask），这里的夹取只是导出函数的第二道保险。缺省 5 = 方舟不传 duration 时的默认时长。
+ */
 function segTokens(durationSec, model) {
-  const d = Math.max(3, Math.min(10, Math.round(Number(durationSec) || 5)));
+  const [lo, hi] = videoSecWindow(model);
+  const d = Math.max(lo, Math.min(hi, Math.round(Number(durationSec) || 5)));
   const base = (d * 1280 * 720 * 24) / 1024;
   return Math.round(base * (VIDEO_MULT[model] ?? 1));
 }
@@ -428,12 +457,12 @@ function r2vTokens(inputDurationSec, model) {
  * 素材参考出片（reference 子任务：用户素材视频 + 多图 + 提示词点名首中尾帧）扣多少 token。
  *
  * ★ 与 r2vTokens（edit 复刻）是**两个公式**：edit 输出≈输入所以是 输入×2；
- *   reference 的输出时长由用户选（3~10s），公式是 (输入 + 输出)×720p 锚×同一系数
+ *   reference 的输出时长由用户选（这个模型的窗口内，2.5 是 4~30s），公式是 (输入 + 输出)×720p 锚×同一系数
  *   ——(输入+输出)×W×H×fps÷1024 那条账单公式的直接代入，系数同 VIDEO_MULT_R2V
  *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）。
  * ★★ 两个夹取区间必须与 app 的 economy.materialRefCost **逐字相等**（报价=实扣，
- *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹 [3,10]
- *   （resolveR2v 的素材钉子拒掉了区间外与 -1，这里的夹取只是导出函数的第二道保险）。
+ *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹到这个模型的时长窗口（videoSecWindow，
+ *   2026-10-03 之前是 [3,10]；resolveR2v 的素材钉子拒掉了窗口外与 -1，这里的夹取只是导出函数的第二道保险）。
  */
 function materialRefTokens(inputDurationSec, outputDurationSec, model) {
   const ri = Number(inputDurationSec);
@@ -442,7 +471,8 @@ function materialRefTokens(inputDurationSec, outputDurationSec, model) {
     console.error(`[tokens] 素材参考输入时长异常（${String(inputDurationSec)}），已按 ${i}s 计价 —— 登记数据可能被弄坏了`);
   }
   const ro = Number(outputDurationSec);
-  const o = Math.max(3, Math.min(10, Math.round(Number.isFinite(ro) ? ro : 0)));
+  const [lo, hi] = videoSecWindow(model);
+  const o = Math.max(lo, Math.min(hi, Math.round(Number.isFinite(ro) ? ro : 0)));
   let mult = VIDEO_MULT_R2V[model];
   if (mult === undefined) {
     console.error(`[tokens] 素材参考模型 ${String(model).slice(0, 64)} 不在 VIDEO_MULT_R2V 里，按最贵档 ${MAX_R2V_MULT} 收费`);
@@ -617,6 +647,8 @@ module.exports = {
   MODEL3D_ID,
   SEEDANCE_2_5,
   VIDEO_MULT,
+  VIDEO_SEC_WINDOW,
+  videoSecWindow,
   VIDEO_AUDIO,
   audioSupported,
   VIDEO_MULT_R2V,
