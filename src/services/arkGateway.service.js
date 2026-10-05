@@ -59,6 +59,37 @@ async function callArk({ method = "POST", path, body, timeoutMs = T_CREATE }) {
 }
 
 /**
+ * 流式转发（SSE）：2xx 时交回上游的 body 流由调用方边读边处理，其余与 callArk 同口径
+ * （非 2xx → `{ status, text }`，连不上 / 超时 → 504）。key 仍只在这个文件里出现（铁律三）。
+ *
+ * ★ 为什么组图要走流式（2026-10-05）：Node 自带的 fetch（undici）默认 **300 秒等不到响应头就断**
+ *   （headersTimeout），与我们给的 AbortSignal 无关；而非流式的组图要等**全部**画完才回响应头 ——
+ *   一组 6 张实测 249 秒，9 张就过线了。流式下响应头立刻到、每画好一张推一条事件，
+ *   两张之间的间隔（实测约 40 秒）远小于 undici 的 300 秒 body 间隔上限。
+ * ★ `timeoutMs` 管的是**整条流**：超时后读流会抛 TimeoutError，调用方按「中途断开」结算。
+ */
+async function openArkStream({ path, body, timeoutMs }) {
+  const apiKey = process.env.ARK_API_KEY;
+  if (!apiKey) return { status: 501, text: JSON.stringify({ message: "ark not configured" }) };
+  let up;
+  try {
+    up = await fetch(`${ARK_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    console.error(`[ark] upstream stream ${path} ${String((e && e.name) || e)}`);
+    return { status: 504, text: JSON.stringify({ message: `ark upstream ${String((e && e.name) || "error")}` }) };
+  }
+  if (up.status < 200 || up.status >= 300 || !up.body) {
+    return { status: up.status, text: await up.text().catch(() => "") };
+  }
+  return { status: up.status, stream: up.body, contentType: up.headers.get("content-type") || "" };
+}
+
+/**
  * 扣钱 → 转发 → 没受理就退。**代理与服务端自发的调用共用这一份**。
  *
  * @param {object} args
@@ -171,4 +202,4 @@ async function chargedArkCall({
   return { ok: true, status, text, accepted, wallet: w, cost, free };
 }
 
-module.exports = { ARK_BASE, T_CREATE, T_POLL, arkConfigured, callArk, chargedArkCall, setWalletHeaders };
+module.exports = { ARK_BASE, T_CREATE, T_POLL, arkConfigured, callArk, openArkStream, chargedArkCall, setWalletHeaders };
