@@ -46,6 +46,9 @@ const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const { cloudinary } = require("../config/cloudinary");
 // 归属与「裁剪变换 URL」的形状判据只有一处（铁律六）
 const { parseOwnClipUrl } = require("../utils/templateVideoAsset");
+// 「本人成片」的归属与形状判据只有一处：服务端合并成片认段落归属用的同一个函数（铁律六）
+const { parseOwnBranchVideoUrl } = require("../utils/videoCompose");
+const SegmentRefVideo = require("../models/SegmentRefVideo");
 const {
   templateVideoMeta,
   templateRefDurationIssue,
@@ -54,6 +57,8 @@ const {
   blockoutInputIssue,
   secText,
   TEMPLATE_REF_RULES,
+  // 分支四（本人成片）的窗口 = 方舟参考视频那一套（4~30 秒、边长、画幅、像素下限）
+  templateRefIssue,
 } = require("../middleware/upload");
 // ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
@@ -298,6 +303,41 @@ router.get("/image-groups/:id", requireAuth, pollLimit, async (req, res, next) =
  * ★ 「这个请求是不是 r2v」只在这里判一次，结论挂在 req.r2v 上 ——
  *   billedForward 的计价、memo、试炼追踪都只消费这个结论（铁律六）。
  */
+/**
+ * 分支四用：本人成片的时长与尺寸 —— 先读缓存（models/SegmentRefVideo，一天），没有再问 Cloudinary Admin API 并记下。
+ * @returns {{durationSec:number,width:number,height:number}|{issue:string}|{status:502}}
+ * ★ 窗口与白模模板视频同一把尺（middleware/upload.templateRefIssue：4~30 秒、边长、画幅、像素下限）——
+ *   那就是方舟编辑任务的输入窗口；延长的输入下限官方是 2 秒，我们的成片最短 4 秒，统一按 4 不会误伤。
+ * ★ 404 当「没有这段视频」说（还没转存完 / 已被回收）；其余读取失败回 502、不扣钱（同分支二）。
+ */
+async function ownSegmentMeta(publicId, userId) {
+  const hit = await SegmentRefVideo.findOne({ publicId }).select("durationSec width height").lean();
+  let meta = hit ? { duration: hit.durationSec, width: hit.width, height: hit.height } : null;
+  if (!meta) {
+    let resource;
+    try {
+      resource = await cloudinary.api.resource(publicId, { resource_type: "video", media_metadata: true });
+    } catch (e) {
+      const http = e?.error?.http_code ?? e?.http_code;
+      if (http === 404) return { issue: "找不到这一段成片（可能还没转存完，或已经被回收）" };
+      console.error(`[ark] 本人成片详情读取失败 public_id=${publicId}:`, e?.error?.message || e.message);
+      return { status: 502 };
+    }
+    meta = templateVideoMeta(resource);
+  }
+  const issue = templateRefIssue(meta, "这一段成片");
+  if (issue) return { issue };
+  if (!hit) {
+    // 缓存写不进去不挡这一发（时长已经拿到了），但要吼：长期写不进去 = 每一发都在烧全局的 Admin API 配额
+    await SegmentRefVideo.updateOne(
+      { publicId },
+      { $set: { userId, durationSec: meta.duration, width: meta.width, height: meta.height } },
+      { upsert: true },
+    ).catch((e) => console.error(`[ark] 本人成片时长缓存写入失败 public_id=${publicId}:`, e.message));
+  }
+  return { durationSec: meta.duration, width: meta.width, height: meta.height };
+}
+
 async function resolveR2v(req, res, next) {
   try {
     const content = req.body?.content;
@@ -341,8 +381,10 @@ async function resolveR2v(req, res, next) {
           .lean()
       : null;
 
-    /** 计价结论（下面两条分支各自填一份，参数钉子对两者一视同仁） */
+    /** 计价结论（下面几条分支各自填一份，参数钉子按 kind 各钉各的） */
     let verdict = null;
+    /** 分支四用：本人成片的 public_id（parseOwnBranchVideoUrl 的结论） */
+    let own = null;
 
     if (tpl) {
       // blocked = 平台已下架：继续可用的话「事后治理」就没有牙齿
@@ -402,6 +444,34 @@ async function resolveR2v(req, res, next) {
         sourcePublicId: mat.publicId,
         // 输出时长 = 用户点的 duration（下面素材钉子会把它钉成这个模型时长窗口里的整数）
         outputSec: Number(req.body?.duration),
+      };
+    } else if (url && (own = parseOwnBranchVideoUrl(url, String(req.user._id)))) {
+      // ── 分支四：**本人自己出的成片**（2026-10-05，App「修这一段」：返修 / 片段重拍 / 延长）──────
+      // ★★ 为什么必须有这条分支：返修（2026-09-06）发的参考视频就是本段自己的成片（出片即转存的
+      //   `ideahub/branch-videos/<userId>-<毫秒>-seg`），而上面两条只认模板与素材登记、下面那条只认带裁剪变换的模板素材 ——
+      //   于是**正式包里的返修一直被这道闸整句 400**（不扣钱），只在 dev（直连方舟）里跑得通。
+      // ★ 归属与形状用服务端合并认段落的同一个判据（目录 + 文件名以本人 id 开头）；时长由服务端向 Cloudinary 查
+      //   （ownSegmentMeta，查过缓存一天），客户端报的数一个不信。
+      // ★ 只收两种子任务，各钉各的计价假设（下面的钉子）：
+      //   · edit（返修 / 片段重拍 / 换机位）：输出跟随输入 ⇒ r2vTokens（输入 × 2），与白模复刻同一个公式；
+      //   · extend（延长）：输出时长由用户选 ⇒ (输入 + 输出)，与素材参考同一个公式（tokens.materialRefTokens）。
+      //   reference（拿自己的片当运镜参考另拍一段）这一期不开：计价形状与 extend 相同，但还没有调用方。
+      const meta = await ownSegmentMeta(own.publicId, req.user._id);
+      if (meta.status === 502) {
+        return res.status(502).json({ ok: false, message: "云端视频信息读取失败，本次请求未被受理，也没有扣费，请稍后重试。" });
+      }
+      if (meta.issue) return deny(`${meta.issue}（当前请求未被受理，也没有扣费。）`);
+      const omni = req.body?.omni_reference_task_type;
+      if (omni !== "edit" && omni !== "extend") {
+        return deny("拿自己的成片当参考视频，只能返修（edit）或延长（extend）——当前请求未被受理，也没有扣费。");
+      }
+      verdict = {
+        kind: omni === "edit" ? "ownEdit" : "ownExtend",
+        templateId: null, // 不是模板 —— 试炼追踪按空跳过（同分支二、三）
+        ownerId: String(req.user._id),
+        durationSec: meta.durationSec,
+        sourcePublicId: own.publicId,
+        ...(omni === "extend" ? { outputSec: Number(req.body?.duration) } : {}),
       };
     } else {
       // ── 分支二：本账号刚传、**尚未登记**的托管素材（白模化那一发的输入）──
@@ -491,6 +561,23 @@ async function resolveR2v(req, res, next) {
       if (ratio !== undefined && !["16:9", "9:16", "adaptive"].includes(ratio)) {
         return deny("素材参考出片的画幅只收 16:9 / 9:16 / adaptive——当前请求未被受理，也没有扣费。");
       }
+    } else if (verdict.kind === "ownExtend") {
+      // ★★ 延长（extend 子任务）的钉子：计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens），
+      //   成立的前提是输出时长就是请求里那个整数 —— -1（智能时长）会推到上界，必须拒（素材参考那条 ★ 同一个理由）。
+      const dur = req.body?.duration;
+      const [lo, hi] = videoSecWindow(model);
+      if (!Number.isInteger(dur) || dur < lo || dur > hi) {
+        return deny(`延长要指定 ${lo}~${hi} 秒的整数时长（不收 -1 智能时长）——当前请求未被受理，也没有扣费。`);
+      }
+      const resl = req.body?.resolution;
+      if (resl !== undefined && resl !== "720p") {
+        return deny("延长目前只支持 720p——当前请求未被受理，也没有扣费。");
+      }
+      // 方舟：延长任务的 ratio 必须是 adaptive（跟随待延长的那段视频）
+      const ratio = req.body?.ratio;
+      if (ratio !== undefined && ratio !== "adaptive") {
+        return deny("延长的画幅跟随原片（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
+      }
     } else {
     // ★★ 把 r2v 的**生成参数钉死在计价假设上**，不符整句 400。
     //   计价是 (登记时长×2)×720p×24fps（tokens.r2vTokens），成立的前提是
@@ -499,20 +586,22 @@ async function resolveR2v(req, res, next) {
     //   就能按 4s 模板的价买 30s/1080p 的产出（reference 子任务 duration 自由、
     //   -1 会推到 30s 上界，A7 实测），差额全进我们的方舟账单，memo 还与正常
     //   r2v 一模一样，零症状。「不信客户端报的任何数」在这条路上就是这四行。
+    // 返修（分支四的 edit）与白模复刻走同一套钉子（计价公式相同），只是拒绝语里的叫法不同
+    const what = verdict.kind === "ownEdit" ? "返修" : "白模出片";
     const dur = req.body?.duration;
     if (req.body?.omni_reference_task_type !== "edit") {
-      return deny("白模出片只支持 edit 参考子任务——当前请求未被受理，也没有扣费。");
+      return deny(`${what}只支持 edit 参考子任务——当前请求未被受理，也没有扣费。`);
     }
     if (dur !== undefined && dur !== -1) {
-      return deny("白模出片的时长跟随模板视频（duration 只能是 -1）——当前请求未被受理，也没有扣费。");
+      return deny(`${what}的时长跟随参考视频（duration 只能是 -1）——当前请求未被受理，也没有扣费。`);
     }
     const resl = req.body?.resolution;
     if (resl !== undefined && resl !== "720p") {
-      return deny("白模出片目前只支持 720p——当前请求未被受理，也没有扣费。");
+      return deny(`${what}目前只支持 720p——当前请求未被受理，也没有扣费。`);
     }
     const ratio = req.body?.ratio;
     if (ratio !== undefined && ratio !== "adaptive") {
-      return deny("白模出片的画幅跟随模板视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。");
+      return deny(`${what}的画幅跟随参考视频（ratio 只能是 adaptive）——当前请求未被受理，也没有扣费。`);
     }
     }
     // ★ generate_audio 同样要钉，但钉的是「**与该模型的支持情况一致**」，不是"必须 false"。
@@ -557,9 +646,12 @@ const unregisteredR2vLimit = aiRateLimit({ max: 6, windowMs: 60 * 1000, scope: "
 function limitUnregisteredR2v(req, res, next) {
   const content = req.body?.content;
   if (!Array.isArray(content) || !req.user?._id) return next();
-  const hit = content.some(
-    (e) => e && e.video_url?.url && parseOwnClipUrl(String(e.video_url.url).slice(0, 2000), String(req.user._id)),
-  );
+  const uid = String(req.user._id);
+  const hit = content.some((e) => {
+    const u = e && e.video_url?.url ? String(e.video_url.url).slice(0, 2000) : "";
+    // 分支四（本人成片）在缓存没命中时也要现查 Admin API —— 同一道桶（返修 / 延长每发都要等几分钟，6 次/分对真人绰绰有余）
+    return !!u && (!!parseOwnClipUrl(u, uid) || !!parseOwnBranchVideoUrl(u, uid));
+  });
   return hit ? unregisteredR2vLimit(req, res, next) : next();
 }
 

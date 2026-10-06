@@ -164,6 +164,8 @@ async function chargedArkCall({
   //  · 白模化那一发（还没有模板）→ `r2v src:<原视频 public_id>`
   let memo = `${kind} ${model}`;
   if (r2v?.templateId) memo += ` r2v tpl:${r2v.templateId}`;
+  // 本人成片（返修 / 延长）单独标子任务：对账时分得出「改自己的片」与「白模化那一发」
+  else if (r2v?.kind === "ownEdit" || r2v?.kind === "ownExtend") memo += ` r2v ${r2v.kind === "ownEdit" ? "edit" : "extend"} own:${String(r2v.sourcePublicId || "?")}`;
   else if (r2v) memo += ` r2v src:${String(r2v.sourcePublicId || "?")}`;
 
   // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端置灰是提示，不是边界）

@@ -450,6 +450,12 @@ const VIDEO_MULT_R2V = {
   //   （同一份账单里 411.3 千token × ¥0.042 = ¥17.2746，原价 = 折后价 ——
   //    说明这是刊例价而不是促销价，可以直接当长期口径用。）
   [SEEDANCE_2_5]: 2.8,
+  // 高清（2.0-mini）的「有输入视频」档：官方刊例 14 元/M ⇒ 14/15（2026-10-05 主人「合」开高清的片段重拍 + 参考视频出片）。
+  //   付费探测（app 仓 design/video-input-probe.mjs，三发全成）：mini 认 omni_reference_task_type，参考 / 编辑 / 延长都一次受理，
+  //   用量与 2.5 同一个式子（(输入 + 输出) × 21,600，输入按整秒往下取）。⚠ 账单还没逐行核过：那三个任务（2026-10-06 10:43~10:50
+  //   北京时间）每个原价 ¥3.04 = 14 元/M、¥4.99 = 23 元/M；核出来不是 14 就两仓一起改（app economy 的 HD_R2V_MULT 同一个数）。
+  //   促销（4 折）不入表，理由见上。延长不开：mini 延长的第一帧接不上原片（app 的 VideoTier.extendOk 挡着），服务端只管价钱。
+  "doubao-seedance-2-0-mini-260615": 14 / 15,
 };
 
 /** 表里最贵的 r2v 系数。兜底方向与 imageTokensOf 同理：多收会被投诉、少收永远没人发现 */
@@ -637,8 +643,9 @@ function priceOf(kind, body, r2v = null) {
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
     if (r2v) {
-      // 素材参考（reference）与白模复刻（edit）各自的公式——kind 由 resolveR2v 定
-      if (r2v.kind === "material") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
+      // 两个公式，kind 由 resolveR2v 定：素材参考（reference）与延长（extend）的输出时长由用户选 ⇒ (输入 + 输出)；
+      // 白模复刻与返修（edit）输出跟随输入 ⇒ 输入 × 2
+      if (r2v.kind === "material" || r2v.kind === "ownExtend") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
       return r2vTokens(r2v.durationSec, model);
     }
     return segTokens(body?.duration, model);

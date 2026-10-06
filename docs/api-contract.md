@@ -2151,7 +2151,7 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
   **绝不静默退回首尾帧**（那是偷换商品）。服务端侧对应的白名单是
   `VIDEO_MULT_R2V`（模型不在表里 → r2v 任务 400 拒单）。
 
-### r2v（白模出片）的服务端规则 —— `reference_video` 只有两条合法来源
+### r2v（带参考视频的出片）的服务端规则 —— `reference_video` 只有四条合法来源
 
 任务体 `content[]` 里带 **`video_url` 形状条目**（`type:"video_url"` 或带 `video_url`
 键——按**形状**判不按 `role` 判：`role` 是客户端可控字符串，只认 `role` 会被"去掉
@@ -2164,9 +2164,14 @@ role 的 video_url"绕过、按纯任务价放行）的请求，代理在计费�
 2. `model` 必须在 `VIDEO_MULT_R2V` 价目表里（首发只有 Seedance 2.5 = 2.8），不在 →
    400。**绝不静默按纯任务系数（4.7）结算** —— 那是不含视频输入的价，
    等于输入时长一分不收、账目全瞎。
-3. **生成参数钉死在计价假设上**：`omni_reference_task_type` 必须是 `"edit"`、
-   `duration` 只能缺省或 `-1`、`resolution` 只能缺省或 `"720p"`、`ratio` 只能缺省或
-   `"adaptive"`，越出任一条 → 400。计费是 (输入时长×2)×720p×24fps，而代理原样转发
+3. **生成参数钉死在计价假设上**（按子任务各钉各的，2026-10-05 起三套）：
+   - **edit**（白模复刻 / 白模化 / 返修）：`omni_reference_task_type` 必须是 `"edit"`、`duration` 只能缺省或 `-1`、
+     `resolution` 只能缺省或 `"720p"`、`ratio` 只能缺省或 `"adaptive"`；计价 `r2vTokens` = (输入时长 × 2)×720p×24fps×系数；
+   - **reference**（素材参考，分支三）：不许带 `omni_reference_task_type`（或显式 `"reference"`）、`duration` 是这个模型窗口内的整数（不收 -1）；
+     计价 `materialRefTokens` = (输入 + 输出)×…；
+   - **extend**（延长，分支四）：`omni_reference_task_type` 必须是 `"extend"`、`duration` 是窗口内的整数（不收 -1）、
+     `ratio` 只能缺省或 `"adaptive"`（方舟对延长的要求）、`resolution` 只能缺省或 `"720p"`；计价同 reference（输入 + 输出）。
+   越出任一条 → 400。以 edit 为例：计费是 (输入时长×2)×720p×24fps，而代理原样转发
    请求体——不钉的话改一行客户端就能按 4s 模板的价买 30s/1080p 的产出（reference
    子任务 duration 自由、-1 上探 30s，A7 实测），差额全进我们的方舟账单且零症状。
    `generate_audio` 钉的是「**与该模型的支持情况一致**」（`config/tokens.VIDEO_AUDIO`
@@ -2204,10 +2209,29 @@ Cloudinary `secure_url` 规范形态——塞一段 transformation 也绕不开�
   Cloudinary Admin API，而免费档 Admin API 是**全局** 500 次/小时，不限的话一个账号能把
   全 App 的建模板能力一起刷停摆。
 
-两条都不中 → **400 `R2V_NOT_ALLOWED` 整句拒**，方舟不会被调用、不扣费。
+**分支三：已登记的用户素材参考视频**（工作流「自定义 = 多图 + 参考视频」，2026-08-28）
 
-为什么要收窄到这两条：r2v 的输入视频时长计进 token，「输入多长」只能有可信来源
-（服务端登记值 / 服务端自己拼的 `du_`）。代价是封死了"拿任意视频二创"这类非模板 r2v ——
+按 URL 等值反查 `MaterialRefVideo`（登记时服务端从 Cloudinary 写入时长）；素材**私有**，只有登记者本人能用。
+走 reference 子任务（输出时长由用户选），计价 `materialRefTokens`（输入 + 输出）。
+
+**分支四：本人自己出的成片**（App「修这一段」：返修 / 片段重拍 / 延长，2026-10-05）
+
+- URL 是出片即转存的成片地址（`ideahub/branch-videos/<userId>-<毫秒>-<后缀>`，不带变换），归属用服务端合并认段落的
+  同一个判据（`utils/videoCompose.parseOwnBranchVideoUrl`：目录 + 文件名以本人 id 开头）。别人的成片不认（落到下面「都不中」）。
+- **计价输入时长由服务端向 Cloudinary 查**（Admin API，`media_metadata`），查过记进 `SegmentRefVideo`（TTL 一天：成片会被回收，
+  缓存活得比文件久的话方舟拿不到视频是受理之后的失败）；客户端报的数一个不信。成片要过方舟参考视频窗口（`templateRefIssue`：4~30 秒等）。
+  查不到（404）→ 400「找不到这一段成片」；别的读取失败 → 502；都不扣费。缓存没命中时同样走 `ark-r2v-source` 那道 6 次/分的桶。
+- 只收两种子任务：`edit`（返修 / 片段重拍，计价 `r2vTokens` 输入 × 2）与 `extend`（延长，计价 `materialRefTokens` 输入 + 输出）；
+  别的（含不带任务类型）→ 400。流水 memo 追加 ` r2v edit own:<publicId>` / ` r2v extend own:<publicId>`。
+- ⚠ 2026-10-05 之前没有这一条：App 的「返修」发的就是本段成片，**在正式包里一直被这道闸 400**（不扣钱），只在 dev 直连方舟时跑得通。
+- 高清档（2.0 mini）2026-10-05 起在 `VIDEO_MULT_R2V` 里（含视频输入的刊例 14 元/M ⇒ 14/15，主人「合」）：四条分支对它一样放行、按同一个式子结算。
+  付费探测（app 仓 `design/video-input-probe.mjs`）：mini 认 `omni_reference_task_type`，参考 / 编辑 / 延长都一次受理；**延长的第一帧接不上原片**，
+  所以 App 不给高清开延长（`VideoTier.extendOk`）—— 服务端只管价钱，真有高清延长的请求照价结算、不会少收。
+
+四条都不中 → **400 `R2V_NOT_ALLOWED` 整句拒**，方舟不会被调用、不扣费。
+
+为什么要收窄到这几条：r2v 的输入视频时长计进 token，「输入多长」只能有可信来源
+（服务端登记值 / 服务端自己拼的 `du_` / 服务端向 Cloudinary 查到的时长）。代价是封死了"拿任意视频二创"这类 r2v ——
 有意的范围取舍，放开前必须先解决输入时长的可信来源。
 
 ### 白模链路的两笔钱（报价 = 实收，两仓逐条相等）
@@ -2351,9 +2375,9 @@ App `src/data/economy.ts` 是**报价**口径。不一致的后果是"报价 216
   （**② 号窗口 [4,30]s**，服务端 `r2vTokens` 对输入时长夹到同一区间并在异常时吼）。
   ⚠ 这个夹取区间与 ② 号窗口**必须同时改**：夹到 15 而窗口放到 30 的话，一段 20s 的模板
   会按 15s 计价 = **报价 < 实收**，本仓头号事故形状。
-- 2.0-mini 含视频输入档刊例 14 元/M（⇒ 备选系数 0.93）**未入表**：A6（mini 对
-  `omni_reference_task_type` 的行为）与账单都没核过，没核过的价不进表；促销价（4 折）
-  一律不写，价目只记刊例。
+- 2.0-mini 含视频输入档刊例 14 元/M ⇒ 系数 14/15，2026-10-05 **入表**：A6（mini 对 `omni_reference_task_type` 的行为）
+  付费探测答了（认，三种子任务都一次受理，用量与 2.5 同式、输入按整秒往下取）；账单还待逐行核对（那三个任务每个原价 ¥3.04 = 14 元/M）。
+  促销价（4 折）一律不写，价目只记刊例。
 
 ### 视频任务登记与找回（`GET /api/ark/video-tasks`，2026-09-06）
 
