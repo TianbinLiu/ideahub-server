@@ -2321,7 +2321,9 @@ V2 这条链路**花两次真钱**，报价页必须**两笔都写明**，不许
 
 | 端点 | 计费 |
 |---|---|
-| `POST /images/generations` | **按 `body.model` 查表**：13,333 / 16,667 / 40,000（见上「出图档位与计价」）。认不出的按最贵档 |
+| `POST /images/generations` | **按 `body.model` 查表**：13,333 / 16,667 / 40,000（见上「出图档位与计价」）。认不出的按最贵档。**只出一张**：组图 / 图层拆分 / 流式 / `n≠1` / `tools` 一律 400（见下「组图」） |
+| `POST /image-groups`（组图） | 受理时预扣 `单价 × max_images`，结束按**拿到手的张数**结算、多退（见下「组图」） |
+| `GET /image-groups[/:id]` | **0** |
 | `POST /chat/completions` | 400（一次豆包往返） |
 | `POST /contents/generations/tasks`（Seedance） | `时长×1280×720×24/1024 × 档位系数`（极速 0.3 / 标准 1 / 高清 1.6 / 电影级 4.7） |
 | `POST /contents/generations/tasks`（**r2v 白模出片**，带 `reference_video`） | `输入时长 × 2 × 21,600 × r2v 系数`（2.5 = **2.8** = 42 元/M ÷ 15）。输入时长有且只有两个可信来源：**模板登记的 `refVideo.durationSec`**（分支一）或**服务端拼的变换 URL 里那个 `du_`**（分支二，白模化）。见上「r2v 的服务端规则」 |
@@ -2389,6 +2391,40 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
   也没取回过的任务补成「待取回」凭据，再走同一条「取回」（`GET tasks/:id`，不计费）。
 - 服务端不知道客户端取没取回：去重由客户端做（取回 / 正常收到结果 / 「知道了」都记进本机的已处理名单）。
 - 与 `BranchTemplateTrial` 不是一回事：那条是试炼闸，任务一出结果就删。
+
+### 组图（`POST /api/ark/image-groups`，2026-10-05）
+
+一次请求让 Seedream 出一组内容关联的图（方舟 `sequential_image_generation: "auto"`）。App 的「跟着做 C · 九宫格分镜」用它一次画出 4~9 个镜头的开头画面。
+
+- **为什么不走单张出图那条路**：① 方舟按**实际画出的张数**计费（官方：「仅对成功生成图片按张数进行计费」），那条路按调用收一张；
+  ② 一组 6 张实测 249 秒、9 张约 6 分钟，同步等必撞 Cloudflare 的 125 秒读超时；③ 非流式要等全部画完才回响应头，Node 自带 fetch 300 秒等不到就断。
+  所以：受理 → 服务端后台对方舟走流式（SSE）→ 客户端短轮询，画好一张就多一张。
+- **受理** `POST /api/ark/image-groups`（requireAuth + 生成限流桶）请求体 `{ model, prompt, image?, size?, max_images }`：
+  `model` 只收 `doubao-seedream-4-0-250828` / `doubao-seedream-4-5-251128`（5.0 pro 不支持组图；老客户端那一档按老价亏 10%，不放进来乘十几张）；
+  `image` 是 https 地址或图片 dataURL（单个或数组，≤14 张）；`max_images` 是 1~15 的整数（真数字，`"6"` 也拒），**参考图 + 张数 ≤ 15**（官方上限）；
+  `size` 是 `WxH` 或 `1K/2K/4K`，缺省 `2K`。发给方舟的请求体由服务端按白名单重拼（`watermark:false`、`response_format:"url"`、`stream:true`），
+  客户端多带的键一个都不出去。参数不对 → 400 `IMAGE_GROUP_PARAMS`；同一个人已经有一组在画 → 409 `IMAGE_GROUP_BUSY`（带那一组的 `id`）；
+  余额 / 套餐 / 冻结 / 每日上限 → 与出图同一套 402 / 403 / 429；没配 key → 501。都不扣钱。
+  成功 → **202** `{ ok, id, maxImages, unitCost, prepaid }`（`prepaid = unitCost × maxImages`，管理员免单为 0），带余额头。
+- **查询** `GET /api/ark/image-groups/:id`（轮询限流桶，不计费，只给本人，别人的 / 乱写的 id 一律 404）→ `{ ok, group }`，
+  `group = { id, status: "running"|"done"|"failed", model, maxImages, unitCost, prepaid, charged, generated, images: [{ index, url, size }],
+  failures: [{ index, code, message }], interrupted, code, message, createdAt, finishedAt }`。
+  `images[].index` = 方舟的 `image_index`（从 0 起）= 提示词里第几个镜头；**被审核拦下的那一张不在 images 里、序号会跳**（它在 failures 里，
+  `code` 是方舟原样，审核不过是 `OutputImageSensitiveContentDetected`）。`url` 是方舟临时链接（**24 小时有效**），客户端拿到就转存。
+  `running` 时 images 是已经画好的那几张；结束（done = 至少一张 / failed = 一张没有）后带余额头。
+  `GET /api/ark/image-groups` 回这个人最近 24 小时的 5 组（新的在前），App 丢了任务号时据此接回来。
+- **钱**：受理时预扣 `unitCost × maxImages`；结束时按**拿到手的张数**结算（不按方舟 `usage.generated_images`，两者不等时只记日志对账 ——
+  流中途断开时方舟可能还画了几张，那几张用户拿不到，差价我们吃）。一张没拿到 → 预扣**全退进 addon**（同「上游没受理」）；
+  拿到 k 张 → 多扣的 `(maxImages − k) × unitCost` **冲正回 plan**（`settleOverCharge`；不进 addon —— 否则「要 15 张、只画 1 张」
+  就是把当月额度洗成永久余额的路）。`charged` 是最终实收。
+- **中途断开 / 进程没了**：流断了（超时 15 分钟 / 连接重置）→ 画到哪张算哪张，`interrupted: true`、`code: "INTERRUPTED"`。
+  画到一半服务重启（部署）的那一组会挂在 running：这个人下次查询 / 开新的一组时，超过 20 分钟还在 running 的按已经写进库的张数结掉（懒回收）。
+  先原子地把这一组改成终态、改成功的才结钱 —— 后台那一路与懒回收撞上也只结一次。
+- **能力位**：`GET /api/ark/health` 回 `imageGroups: true`。老服务端没有这一位 —— App 判能力只看它（Capacitor 的 SPA 回退会把
+  不存在的路径答成 200 + HTML，状态码不可信）。
+- **单张出图那条路从此只出一张**（`POST /api/ark/images/generations`）：`sequential_image_generation` 不是 `disabled`、`layer_decomposition`
+  不是 false、`stream` 不是 false、`n` 不是 1、`tools` 非空 —— 一律 400 `IMAGE_PARAMS_NOT_ALLOWED`，不扣钱。此前请求体原样转发、按一张收，
+  带上组图开关就能用一张的钱换十五张，零症状。App 从来只发 model / prompt / image / size / response_format / watermark，不受影响。
 
 ## 真人肖像授权（方舟可信素材）
 

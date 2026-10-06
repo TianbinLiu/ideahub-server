@@ -39,6 +39,8 @@ const { SEEDANCE_2_5, IMAGE_MODELS, VIDEO_MULT, VIDEO_MULT_R2V, audioSupported, 
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
 const arkVideoTask = require("../services/arkVideoTask.service");
+// 组图（一次出一组关联的图）：按上限预扣、后台画、按拿到手的张数结算（见那个文件头的 ★★）
+const imageGroups = require("../services/arkImageGroup.service");
 const MaterialRefVideo = require("../models/MaterialRefVideo");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const { cloudinary } = require("../config/cloudinary");
@@ -61,6 +63,7 @@ const {
 // ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
 const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_POLL } = require("../services/arkGateway.service");
+const wallet = require("../services/tokenWallet.service");
 
 const router = express.Router();
 
@@ -106,7 +109,9 @@ const ASSET_HOST_RE = /(^|\.)(volces|volccdn)\.com$|^public-cdn-video-data[\w-]*
  * 不必去翻日志猜。
  */
 router.get("/health", (_req, res) => {
-  res.json({ ok: true, ark: arkConfigured() });
+  // imageGroups：这台服务器有没有 /image-groups（组图任务）。App 据此决定「九宫格分镜」能不能用 ——
+  // 判断「有没有这个能力」只看能力位，不看状态码（Capacitor 的 SPA 回退见文件头）
+  res.json({ ok: true, ark: arkConfigured(), imageGroups: true });
 });
 
 // setWalletHeaders 2026-08-24 迁到 arkGateway.service（minimax 路由也要写同一对头，
@@ -212,9 +217,73 @@ function billedForward(kind, path, timeoutMs) {
 const genLimit = aiRateLimit({ max: 30, scope: "ark-gen" });
 const pollLimit = aiRateLimit({ max: 90, scope: "ark-poll" });
 
+/**
+ * 单张出图这条路**只出一张**：一次出多张的参数整句拒（2026-10-05）。
+ *
+ * ★★ 为什么：方舟同一个出图端点上有两种「一次出好几张」的开关，都按**实际画出的张数**计费 ——
+ *   `sequential_image_generation: "auto"`（组图，缺省最多 15 张）与 `layer_decomposition: true`（5.0 pro，1 张底图 + 最多 16 个图层）；
+ *   而这条代理是**按调用**收一张的钱、请求体原样转发。在这道闸之前，带上那个开关就能用一张的钱换十几张，
+ *   零症状，只有火山账单知道。组图走 POST /image-groups（按上限预扣、按实际张数结算）。
+ * ★ `stream` 也拒：流式回的是 SSE，billedForward 只认一次性的 JSON；`tools`（联网搜索）另有用量、App 从没发过。
+ * ★ 判「不是缺省值就拒」，不判「等于某个值才拒」：`"auto "` / `1` 这类写法方舟认不认没人测过，宁可整句拒。
+ *   App 从来只发 model / prompt / image / size / response_format / watermark（git 史核过），一个字都不拦它。
+ */
+function pinSingleImage(req, res, next) {
+  const b = req.body || {};
+  const many =
+    (b.sequential_image_generation !== undefined && b.sequential_image_generation !== "disabled") ||
+    (b.layer_decomposition !== undefined && b.layer_decomposition !== false) ||
+    (b.stream !== undefined && b.stream !== false) ||
+    (b.n !== undefined && b.n !== 1) ||
+    (b.tools !== undefined && !(Array.isArray(b.tools) && b.tools.length === 0));
+  if (many) {
+    return res.status(400).json({
+      ok: false,
+      code: "IMAGE_PARAMS_NOT_ALLOWED",
+      message: "这条路一次只出一张图（组图请走 /api/ark/image-groups）——当前请求未被受理，也没有扣费。",
+    });
+  }
+  return next();
+}
+
 /** Seedream 出图。★ **按 body.model 计价**（三档差 3 倍：13,333 / 16,667 / 40,000），
  *  不是一口价——写成常量就是"顶档按最低档收费"，零症状白送。见 config/tokens.imageTokensOf */
-router.post("/images/generations", requireAuth, genLimit, billedForward("image", "/images/generations", T_CREATE));
+router.post("/images/generations", requireAuth, genLimit, pinSingleImage, billedForward("image", "/images/generations", T_CREATE));
+
+/**
+ * 组图：POST 受理（202 + 任务号，按「单价 × max_images」预扣）→ 后台画 → GET 短轮询（每画好一张就多一张）。
+ * 结束时按**拿到手的张数**结算，多扣的退回（services/arkImageGroup）。契约见 docs/api-contract.md「组图」。
+ * ★ 受理走 genLimit（会花钱），查询走 pollLimit（不花钱、高频）—— 与视频任务的分法一样。
+ */
+router.post("/image-groups", requireAuth, genLimit, async (req, res, next) => {
+  try {
+    const out = await imageGroups.startImageGroup({ user: req.user, body: req.body });
+    setWalletHeaders(res, out.wallet);
+    return res.status(out.status).json(out.body);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/image-groups", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    return res.json({ ok: true, groups: await imageGroups.listImageGroups({ user: req.user }) });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/image-groups/:id", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    const group = await imageGroups.getImageGroup({ user: req.user, id: req.params.id });
+    if (!group) return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "没有这一组（或已过期）" });
+    // 结束了才带余额头：退款发生在后台，App 的钱包镜像要靠这一趟同步（running 时余额没变，省一次读）
+    if (group.status !== "running") setWalletHeaders(res, await wallet.getWallet(req.user._id));
+    return res.json({ ok: true, group });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 /**
  * 参考视频生视频（r2v，白模模板）的解析闸门 —— **只准已登记模板的 URL**。

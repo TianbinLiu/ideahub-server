@@ -62,6 +62,8 @@ const MEDIA_SOURCES = [
   { model: "VideoCompose", label: "合成任务产物", fields: ["url"] },
   { model: "BlockoutJob", label: "白模任务产物", fields: ["coverUrl"] },
   { model: "ArkVideoTransfer", label: "资产转存记录", fields: ["url", "sourceUrl"] },
+  // 组图的产物：方舟临时链接（24 小时有效），记录 48 小时 TTL —— 与上面转存记录里的方舟源地址同一类
+  { model: "ArkImageGroup", label: "组图产物（方舟临时链接）", fields: ["images.url"] },
 ];
 
 /**

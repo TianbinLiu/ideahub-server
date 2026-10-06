@@ -447,7 +447,8 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
 describe("健康端点", () => {
   test("不需要登录，且只说配没配、不泄露 key", async () => {
     const res = await request(app).get("/api/ark/health").expect(200);
-    expect(res.body).toEqual({ ok: true, ark: false });
+    // imageGroups：这台服务器有没有组图任务（App 据此决定九宫格分镜能不能用），能力位、不是秘密
+    expect(res.body).toEqual({ ok: true, ark: false, imageGroups: true });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });
 });

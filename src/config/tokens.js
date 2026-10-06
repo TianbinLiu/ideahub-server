@@ -136,6 +136,42 @@ function imageTokensOf(model) {
   return MAX_IMAGE_TOKENS;
 }
 
+// ── 组图（一次请求出一组内容关联的图，2026-10-05）─────────────────────
+//
+// ★★ 为什么单列：方舟的出图端点**不止一张**的出法有两种，都按**实际画出的张数**计费
+//   （官方：「仅对成功生成图片按张数进行计费」）——
+//     · `sequential_image_generation: "auto"`：组图，`max_images` 1~15（缺省 **15**）；
+//     · `layer_decomposition: true`（5.0 pro）：1 张底图 + 最多 16 个图层。
+//   而单张出图那条路（POST /api/ark/images/generations）是**按调用**收一张的钱。
+//   在 2026-10-05 之前，往那条路上带 `sequential_image_generation: "auto"` 就能用一张的钱换十五张 ——
+//   请求体原样转发、零症状，只有火山账单知道。现在那条路把这几个参数整句拒掉（routes/ark.routes 的
+//   pinSingleImage），组图只走 POST /api/ark/image-groups（按上限预扣、按实际张数结算，services/arkImageGroup）。
+
+/**
+ * 能出组图的在册模型（官方：Seedream 5.0 lite / 4.5 / 4.0 支持组图，5.0 pro / flash 不支持）。
+ * ★ 老客户端那一档（`doubao-seedream-5-0-260128`，账单名 5.0 lite）**刻意不放进来**：它按老包的 13,300 收、
+ *   真价 14,667（见 LEGACY_IMAGE_TOKENS），单张时每张亏 10% 是为了不坑老用户；组图是新功能，没有老用户要迁就，
+ *   放进来只是把那 10% 乘上十几张。
+ */
+const GROUP_IMAGE_MODELS = new Set(["doubao-seedream-4-0-250828", "doubao-seedream-4-5-251128"]);
+/** 一组最多几张（协议上限）；参考图 + 出图 ≤ 15 */
+const GROUP_MAX_IMAGES = 15;
+/** 组图最多带几张参考图（协议上限 14） */
+const GROUP_MAX_REFS = 14;
+
+/**
+ * 这一发出图**最多**会画几张 —— 报价按这个上界收（宁高不低）。
+ * ★ 单张出图那条路已经把组图 / 图层拆分整句拒了，这里是第二道保险：哪条路漏了闸，也只会按上界多收、
+ *   不会按一张的钱放走十几张。组图服务（arkImageGroup）的预扣也读它 —— 「一组值多少」只算这一处。
+ */
+function imageCountCap(body) {
+  if (body?.layer_decomposition !== undefined && body.layer_decomposition !== false) return 17;
+  if (body?.sequential_image_generation !== "auto") return 1;
+  const n = Number(body?.sequential_image_generation_options?.max_images);
+  // 缺省 15 是官方的默认值；不是整数 / 越界都按上限算
+  return Number.isInteger(n) && n >= 1 && n <= GROUP_MAX_IMAGES ? n : GROUP_MAX_IMAGES;
+}
+
 /** 一次豆包对话往返（含人设与历史的保守值） */
 const CHAT_TURN_TOKENS = 400;
 /** 老师人格三个单价（docs/08 #4：tutor_turn 钉在 CHAT_TURN_TOKENS；其余按「相对一次教学轮花多少 token」按比例，建议值） */
@@ -566,7 +602,8 @@ function minimaxFlatCost(model, duration) {
 
 function priceOf(kind, body, r2v = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
-  if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
+  // ★ 乘上「最多几张」：组图 / 图层拆分按实际张数计费，按一张收就是白送（见 imageCountCap 的 ★★）
+  if (kind === "image") return imageTokensOf(String(body?.model ?? "")) * imageCountCap(body);
   if (kind === "chat") return CHAT_TURN_TOKENS;
   // 老师人格（tutor，docs/08 #4）：一轮教学 / 试教 = 一次 chat 的量纲；蒸馏与生成 / 扫描的每一块另有价。
   //   ★ 三个数都是**建议值**（tutor 仓 docs/10：`npm run dogfood` 用真模型量过 p95 再改这里 + tutor 仓 pricing.js 两处同改）。
@@ -648,6 +685,10 @@ module.exports = {
   LEGACY_IMAGE_TOKENS,
   IMAGE_MODELS,
   imageTokensOf,
+  GROUP_IMAGE_MODELS,
+  GROUP_MAX_IMAGES,
+  GROUP_MAX_REFS,
+  imageCountCap,
   CHAT_TURN_TOKENS,
   TUTOR_PRICES,
   MODEL3D_TOKENS,
