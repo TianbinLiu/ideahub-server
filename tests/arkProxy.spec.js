@@ -1230,3 +1230,180 @@ describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
+
+describe("r2v 第四条分支：本人自己出的成片（返修 / 片段重拍 / 延长，2026-10-05）", () => {
+  // ★ 为什么开这条分支：返修（App「✎ 返修这一段」，2026-09-06）发的参考视频就是本段自己的成片
+  //   （出片即转存的 ideahub/branch-videos/<userId>-<毫秒>-seg），此前三条分支一条都不认它 ——
+  //   正式包里的返修一直被整句 400（不扣钱），只在 dev 直连方舟时跑得通。延长（extend）同样要靠它。
+  // ★★ 这一组盯死的是两件零症状的事：① 计价的输入时长只认服务端向 Cloudinary 查到的数（客户端报的不信）；
+  //   ② edit 与 extend 各走各的公式（编辑 = 输入 × 2，延长 = 输入 + 输出）—— 混用的话延长 25 秒按 5 秒的价收。
+  const { SEEDANCE_2_5, r2vTokens, materialRefTokens } = require("../src/config/tokens");
+  const walletSvc = require("../src/services/tokenWallet.service");
+  const TokenLedger = require("../src/models/TokenLedger");
+  const SegmentRefVideo = require("../src/models/SegmentRefVideo");
+  const { cloudinary } = require("../src/config/cloudinary");
+
+  const CLOUD = "https://res.cloudinary.com/demo/video/upload";
+  let resourceSpy;
+  /** 出片即转存的成片地址（形状手写、不调 videoCompose：要钉的正是「转存写出的形状」与「闸门认的形状」是同一种） */
+  const segUrl = (uid, ts) => `${CLOUD}/v1789000000/ideahub/branch-videos/${uid}-${ts}-seg.mp4`;
+  const segId = (uid, ts) => `ideahub/branch-videos/${uid}-${ts}-seg`;
+  const asPaid = () => ({ Authorization: `Bearer ${paidToken}` });
+
+  function ownBody(url, extra = {}) {
+    return {
+      model: SEEDANCE_2_5,
+      content: [
+        { type: "text", text: "编辑视频1：把背景换成雨夜" },
+        { type: "video_url", role: "reference_video", video_url: { url } },
+      ],
+      omni_reference_task_type: "edit",
+      duration: -1,
+      ratio: "adaptive",
+      ...extra,
+    };
+  }
+  const extendBody = (url, extra = {}) =>
+    ownBody(url, { omni_reference_task_type: "extend", duration: 8, ...extra, content: [{ type: "text", text: "向后延长视频1：她推门走进雨里" }, { type: "video_url", role: "reference_video", video_url: { url } }] });
+
+  /** 成片的「云端真相」：5.04 秒、704×1248（竖屏 720p 的实际尺寸） */
+  let cloudMeta = { duration: 5.041667, width: 704, height: 1248 };
+
+  beforeAll(async () => {
+    await walletSvc.credit(paidUserId, 50_000_000, "recharge", "测试预置额度");
+  });
+
+  beforeEach(async () => {
+    // 每条先清当天流水（付费档有每日 token 上限，r2v 一发就是几十万 —— 同第二条分支那组的 ★）
+    await TokenLedger.deleteMany({ user: paidUserId });
+    await SegmentRefVideo.deleteMany({});
+    cloudMeta = { duration: 5.041667, width: 704, height: 1248 };
+    resourceSpy = jest.spyOn(cloudinary.api, "resource").mockImplementation(async (publicId) => ({
+      public_id: publicId,
+      secure_url: `${CLOUD}/${publicId}.mp4`,
+      ...cloudMeta,
+      bytes: 6_000_000,
+      version: 1789000000,
+    }));
+  });
+
+  afterEach(() => {
+    resourceSpy.mockRestore();
+  });
+
+  test("返修（edit）→ 按 r2vTokens（输入 × 2）扣；输入时长取云端查到的数；流水标 edit own", async () => {
+    const before = await walletSvc.getWallet(paidUserId);
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9001)));
+    expect(res.status).toBe(501); // 没配 key：闸门与扣费都过了才到 forward
+    const expected = r2vTokens(5.041667, SEEDANCE_2_5);
+    expect(expected).toBe(604_800); // 5 × 2 × 21600 × 2.8：改公式必须先改这一行
+    const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: new RegExp(`r2v edit own:${segId(paidUserId, 9001)}`) }).lean();
+    expect(spend).toBeTruthy();
+    expect(spend.delta).toBe(-expected);
+    const after = await walletSvc.getWallet(paidUserId);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon); // 501 后原路退回
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("延长（extend）→ 按 (输入 + 输出) 扣，不是 edit 的输入 × 2；流水标 extend own", async () => {
+    await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(extendBody(segUrl(paidUserId, 9002), { duration: 8 })).expect(501);
+    const expected = materialRefTokens(5.041667, 8, SEEDANCE_2_5);
+    expect(expected).toBe(786_240); // (5 + 8) × 21600 × 2.8
+    expect(expected).not.toBe(r2vTokens(5.041667, SEEDANCE_2_5));
+    const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: new RegExp(`r2v extend own:${segId(paidUserId, 9002)}`) }).lean();
+    expect(spend.delta).toBe(-expected);
+  });
+
+  test("同一段第二次用 → 读缓存，不再问 Cloudinary Admin API（全局配额）", async () => {
+    const url = segUrl(paidUserId, 9003);
+    await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(url)).expect(501);
+    await TokenLedger.deleteMany({ user: paidUserId });
+    await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(extendBody(url)).expect(501);
+    expect(resourceSpy).toHaveBeenCalledTimes(1);
+    const cached = await SegmentRefVideo.findOne({ publicId: segId(paidUserId, 9003) }).lean();
+    expect(cached.durationSec).toBeCloseTo(5.041667, 5);
+  });
+
+  test("别人的成片 → 400（归属钉在文件名的 user id 上），不出网不扣费", async () => {
+    const before = await walletSvc.getWallet(paidUserId);
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(freeUserId, 9004)));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(resourceSpy).not.toHaveBeenCalled();
+    const after = await walletSvc.getWallet(paidUserId);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+  });
+
+  test("云端查不到这段（404）→ 400 说清楚；别的读失败 → 502；都不扣钱", async () => {
+    resourceSpy.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("not found"), { error: { http_code: 404, message: "Resource not found" } });
+    });
+    const r404 = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9005)));
+    expect(r404.status).toBe(400);
+    expect(r404.body.message).toMatch(/找不到这一段成片/);
+    const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+    resourceSpy.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("boom"), { error: { http_code: 500, message: "boom" } });
+    });
+    const r502 = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9006)));
+    spy.mockRestore();
+    expect(r502.status).toBe(502);
+    expect(await TokenLedger.countDocuments({ user: paidUserId, reason: "ark_spend" })).toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("成片越出方舟参考视频窗口（3.5 秒 / 31 秒）→ 400，不出网", async () => {
+    for (const duration of [3.5, 31]) {
+      await SegmentRefVideo.deleteMany({});
+      cloudMeta = { duration, width: 704, height: 1248 };
+      const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9100 + Math.round(duration))));
+      expect({ duration, status: res.status }).toEqual({ duration, status: 400 });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["不带任务类型", { omni_reference_task_type: undefined }],
+    ["reference 子任务（这一期不开）", { omni_reference_task_type: "reference", duration: 5 }],
+    ["edit 却指定时长 5（输出跟随输入，只收 -1）", { duration: 5 }],
+    ["edit 1080p", { resolution: "1080p" }],
+    ["edit 比例 16:9", { ratio: "16:9" }],
+  ])("返修参数越出计价假设（%s）→ 400 不出网", async (_n, extra) => {
+    const body = ownBody(segUrl(paidUserId, 9200), extra);
+    if (extra.omni_reference_task_type === undefined) delete body.omni_reference_task_type;
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(body);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["duration=-1（智能时长会推到上界）", { duration: -1 }],
+    ["duration=31（超出 2.5 的 4~30）", { duration: 31 }],
+    ["duration=3（低于下限 4）", { duration: 3 }],
+    ["duration=4.5（不是整数）", { duration: 4.5 }],
+    ["resolution=1080p", { resolution: "1080p" }],
+    ["ratio=9:16（延长只收 adaptive）", { ratio: "9:16" }],
+  ])("延长参数越出计价假设（%s）→ 400 不出网", async (_n, extra) => {
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(extendBody(segUrl(paidUserId, 9300), extra));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("高清档（2.0 mini）不在 r2v 价目表 → 400：付费探测与账单核过之前不开", async () => {
+    const res = await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(asPaid())
+      .send(ownBody(segUrl(paidUserId, 9400), { model: "doubao-seedance-2-0-mini-260615" }));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("R2V_NOT_ALLOWED");
+    expect(resourceSpy).not.toHaveBeenCalled();
+  });
+
+  test("返修开着出声（2.5 支持音频）→ 放行；计价不变（开音频零额外成本）", async () => {
+    await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9500), { generate_audio: true })).expect(501);
+    const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: /r2v edit own:/ }).lean();
+    expect(spend.delta).toBe(-r2vTokens(5.041667, SEEDANCE_2_5));
+  });
+});
