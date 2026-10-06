@@ -600,8 +600,9 @@ function priceOf(kind, body, r2v = null) {
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
     if (r2v) {
-      // 素材参考（reference）与白模复刻（edit）各自的公式——kind 由 resolveR2v 定
-      if (r2v.kind === "material") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
+      // 两个公式，kind 由 resolveR2v 定：素材参考（reference）与延长（extend）的输出时长由用户选 ⇒ (输入 + 输出)；
+      // 白模复刻与返修（edit）输出跟随输入 ⇒ 输入 × 2
+      if (r2v.kind === "material" || r2v.kind === "ownExtend") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
       return r2vTokens(r2v.durationSec, model);
     }
     return segTokens(body?.duration, model);
