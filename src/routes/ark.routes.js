@@ -131,11 +131,11 @@ router.get("/health", (_req, res) => {
   //   · res480：纯任务收 480p（「草稿」档）。老服务端对 480p 整句 400「出片目前只支持 720p」；
   //   · draftMode：电影级「样片」两步（draft:true 的第一步 + content 里只有一条 draft_task 的第二步）；
   //   · failRefund：受理之后**方舟**报 failed / cancelled / expired 的任务会退钱（无条件，没有开关）；
-  //   · freeVideo：免费档门禁开着时，免费版能出普通片的档（停用的自动出局）。判据在服务端（config/tokens.videoPlanDenial）；
-  //     ⚠ 2026-10-07 这一版的 App 不读它（档位能不能用照自己的 VideoTier.freeOk 判），它是给以后的 App 与人工核对用的。
+  //   · freeVideo：免费档门禁开着时，免费版能出普通片的档（停用的自动出局）。App 置灰照它（读不到 = 老服务端，按自己档位表的 freeOk），
+  //     判据仍在服务端（config/tokens.videoPlanDenial）—— 客户端置灰只是提示。
   // 2026-10-07 评审补的两个**运维开关的现状**（老服务端没有 = 当成开着）：
   //   · freeVideoGate：FREE_VIDEO_GATE 开没开。false = 服务端不按 freeVideo 拦，退回改版前只挡电影级的口径；
-  //     App 要读这一位才会跟着放开置灰 —— 不读的 App（含 2026-10-07 这一版）关闸后仍按自己的 freeOk 置灰，开关对它们只放开服务端这道门。
+  //     App 读到 false 要跟着放开置灰 —— 不报这一位的话，关闸只放开了服务端，App 照旧把标准 / 高清画成会员档，开关形同虚设。
   //   · minimaxFailRefund：MINIMAX_FAIL_REFUND 开没开。false = 真人档（MiniMax）受理之后的失败**不退**（账留着，开关打开后接着退），
   //     App 对真人档说「会自动退回」之前要看这一位，不能只看 failRefund（那一位只说方舟）。
   res.json({
