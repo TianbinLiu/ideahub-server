@@ -2097,7 +2097,7 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 
 | 方法 | 路径 | 鉴权 | 限流 | 说明 |
 |---|---|---|---|---|
-| GET | `/api/ark/health` | 无 | — | `{ ok, ark: boolean }`，只说配没配 key |
+| GET | `/api/ark/health` | 无 | — | `{ ok, ark, imageGroups, res480, draftMode, failRefund, freeVideo: [{label, model, resolution}] }`：配没配 key + 能力位（老服务端没有的位 = 没有这个能力，App 据此藏起对应的东西；判能力只看能力位，不看状态码） |
 | POST | `/api/ark/images/generations` | required | 30/min | Seedream 出图（卡面 / 首尾帧） |
 | POST | `/api/ark/contents/generations/tasks` | required | 30/min | Seedance 出视频 / Seed3D 建模（同一个异步任务端点） |
 | GET | `/api/ark/contents/generations/tasks/:id` | required | 90/min | 轮询任务状态（每 5s 一次，一段视频最多 120 次，所以单独一个桶） |
@@ -2120,12 +2120,16 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 
 ### 视频档位与模型能力（写死在两边的表里，不靠运行时探测）
 
-| 档位 id | label | 模型 | 系数 mult | 首尾帧 | 参考图 | 最短时长 | 套餐门槛 |
-|---|---|---|---|---|---|---|---|
-| `fast` | 极速 | `doubao-seedance-1-0-pro-fast-251015` | 0.3 | ✗ | ✗ | 3s | — |
-| `std` | 标准 | `doubao-seedance-1-0-pro-250528` | 1 | ✓ | ✗ | 3s | — |
-| `hd` | 高清 | `doubao-seedance-2-0-mini-260615` | 1.6 | ✓ | ✓ | 3s | — |
-| `ultra` | 电影级 | `doubao-seedance-2-5-260628` | 4.7 | ✓ | ✓ | **4s** | **仅付费套餐** |
+| 档位 id | label | 模型 | 分辨率 | 系数 mult | 首尾帧 | 参考图 | 时长窗口 | 谁能用 | 停用 |
+|---|---|---|---|---|---|---|---|---|---|
+| `fast` | 极速 | `doubao-seedance-1-0-pro-fast-251015` | 720p | 4.2/15 | ✗ | ✗ | 3~10s | **免费版可用** | 2026-11-24 13:00（北京时间） |
+| `draft` | 草稿 | `doubao-seedance-2-0-mini-260615` | **480p** | 23/15 | ✓ | ✓ | 4~15s | **免费版可用** | — |
+| `std` | 标准 | `doubao-seedance-1-0-pro-250528` | 720p | 1 | ✓ | ✗ | 3~10s | 付过钱 | 2026-11-24 13:00（北京时间） |
+| `hd` | 高清 | `doubao-seedance-2-0-mini-260615` | 720p | 23/15 | ✓ | ✓ | 4~15s | 付过钱 | — |
+| `ultra` | 电影级 | `doubao-seedance-2-5-260628` | 720p（样片 480p → 1080p） | 4.7（样片第二步 77/15） | ✓ | ✓ | 4~30s | 付过钱 | — |
+
+★ **「草稿」与「高清」是同一个模型**，只差分辨率 —— 服务端的免费档清单、分辨率清单、跨仓测试都按 **(模型, 分辨率)** 认，
+只按模型认就会把高清一起放给免费版（或者把草稿一起挡掉）。
 
 - **参考图（全模态参考生视频）只有 2.5 与 2.0 系列有**；1.0/1.5 完全不支持。没人验证过
   1.0 收到 `reference_image` 是 400 还是**静默忽略** —— 若是忽略，用户就"加了图、多付了钱、
@@ -2140,16 +2144,56 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
   见下）。显式传则在提交时同步 400，一分钱不花。
 - **2.5 的时长区间是 [4,30]**，给 3 秒同步 400。App 的时长下限写在 `VideoTier.minSec`，
   报价（`segTokens`）与出片（`composeSegments`）用同一个 `clampDuration`。
-- **`ultra` 仅付费套餐可用**：App 侧免费版**看得见但点不动，并写出原因**（藏起来用户
-  不知道有这回事），判断只有 `app/src/data/account.ts` 的 `tierBlockReason` 一处。
-  ⚠ 客户端禁用只是提示，**不是安全边界** —— 服务端必须按当前用户的套餐再挡一次，
-  免费版调 2.5 直接拒并给出可读原因。
+- **免费版（没付过钱）只能用「极速」「草稿」出普通片**（2026-10-07 主人拍板）：标准 / 高清 / 电影级（含样片两步）/
+  真人档（MiniMax、Runway）/ 一切带参考视频的出片（白模、返修、延长、素材参考）都要**付过钱** ——
+  有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买；钱包上的 `paidEver`）。
+  判据只有服务端 `config/tokens.videoPlanDenial` 一处（「付过钱」是 `isPaidUser`）；它只管出视频，出图 / 对话 / 语音 / Seed3D 照常开放。
+  拒绝回 **403** `{ code: "PLAN_REQUIRED", message, planId, allowed: ["极速","草稿"] }`：`message` 是能直接显示的整句中文
+  （不含模型 id、不含 ASCII 双引号），`allowed` 是此刻免费版能用的档名（英文界面不显示服务端的中文句子，靠它自己说）。
+  停用时刻一过，`allowed` 只剩「草稿」。App 侧免费版**看得见但点不动，并写出原因**（`tierBlockReason`）；
+  ⚠ 客户端禁用只是提示，**不是安全边界**。运维总开关 `FREE_VIDEO_GATE=off`（缺省开）关掉之后退回改版前的口径：只挡电影级。
 - **白模（r2v）能不能卖看 `VideoTier.refVid`**（App 档位表，四档全显式写值）：
   2026-08-14 起 **ultra=true 已开闸**（前置 A2 保真度 / A3 计费公式 / A4 门槛探底
   三发实测全过），其余三档 `false`（hd 的开闸前置见 r2vMult 注释：A6 + 画质实拍 +
   14元/M 账单核对）。未开档位界面按 `r2vPriceIssue` 整句「看得见但点不动 + 说原因」，
   **绝不静默退回首尾帧**（那是偷换商品）。服务端侧对应的白名单是
   `VIDEO_MULT_R2V`（模型不在表里 → r2v 任务 400 拒单）。
+
+### 纯任务的参数钉子、样片两步、停用（2026-10-07）
+
+**纯任务**（没有参考视频：文生 / 图生 / 参考图生视频 / 样片第一步）过 `pinPlainVideoTask`（server `ark.routes.js`），
+不符 → 400 `VIDEO_PARAMS_NOT_ALLOWED`（整句中文，「没有扣费」）：
+
+- **缺省补齐，不再放行**：不传 `duration` 补成 **5**、不传 `resolution` 补成 **720p**。方舟的缺省是 2.5 `-1`（最长 30 秒）、
+  1.0 `1080p` —— 原来「缺省放行」就是两个少收的口子。补齐之后计价与门禁读的都是补好的那一份。
+- `duration` 是这个模型窗口内的整数（不收 -1、字符串、小数）；不收 `frames`。
+- **分辨率按模型放**（`tokens.VIDEO_RESOLUTIONS`）：1.0 两档只有 720p；2.0 mini 480p / 720p；2.5 只有 720p。
+- **`draft: true`（电影级样片第一步）**：只给 2.5，且必须**显式** `resolution: "480p"` 与整数 `duration`；`draft` 只认布尔，
+  `false` 与缺省同义（转发前剥掉）。带参考视频的出片不收 `draft`（`R2V_NOT_ALLOWED`）。
+- `content[]` 只认 `text` / `image_url` / `audio_url`（`video_url` 由 r2v 那道闸接走，`draft_task` 由样片第二步那道闸接走）。
+- **停用**：`doubao-seedance-1-0-pro-250528` 与 `doubao-seedance-1-0-pro-fast-251015` 自 **2026-11-24 13:00（北京时间）**起
+  新任务一律 400 `{ code: "MODEL_RETIRED" }`（方舟 14:00 停服，我们提前一小时；`tokens.RETIRED_MODELS_AT`）。
+
+**每一发 Seedance 任务**（纯任务、r2v、样片两步、白模化）转发前由服务端钉死：`execution_expires_after: 86400`
+（客户端的值覆盖 —— 排队 / 运行超过 24 小时方舟标 `expired`，失败退款按它退）；剥掉 `callback_url`（拿我们的 key
+往任意地址 POST）与 `service_tier`（flex 半价但排队以天计，我们按在线价收）。唯一实现 `arkGateway.withServerTaskFields`。
+
+**电影级样片第二步**（480p 样片 → 1080p 成片）：`POST /api/ark/contents/generations/tasks`，请求体只许
+
+```json
+{ "model": "doubao-seedance-2-5-260628", "content": [{ "type": "draft_task", "draft_task": { "id": "<样片任务 id>" } }] }
+```
+
+另外只容忍 `resolution`（只能是 `"1080p"`）、`watermark`、`draft`（只能 false）、`execution_expires_after` / `callback_url` / `service_tier`
+（这几样都会被重写或剥掉）。时长、画幅、提示词、图、视频、音频、种子、音频开关、任务类型**一个都不许带**（方舟规定沿用样片、重传即报错）
+→ 400 `DRAFT_FINAL_NOT_ALLOWED`。服务端（`resolveDraftFinal`）：
+- 只认**本人、经我们这里出的样片**（`ArkVideoTask` 里 `draft: true` 的那一条）—— 所有人的任务挂在同一把方舟 key 下；
+- 有效期 **7 天差 1 小时**（方舟 7 天），按我们的登记与方舟 `created_at` 里更早的那个算；
+- 向方舟 GET 一次（不计费）确认 `succeeded`（`running` 等 → 400；404 → 400；查不通 → 502，都不扣费；没配 key → 501）；
+- 请求体重写成 `{ model, content:[draft_task], resolution:"1080p", watermark:false }` 再转发；
+- **计价** = `round(样片时长 × 2.5 的 1080p 每秒 × 77/15)`：时长取**样片登记的** `durationSec`（不信请求体、也不信方舟回的数，
+  登记没有才退方舟的整数秒），画幅取方舟回的实际画幅（认不出按 1080p 最大一格）。免费版一律 403（与其它出片同一道门）。
+- 成片那一发在 `ArkVideoTask` 里记 `draftOf: <样片 id>`；`GET /api/ark/video-tasks` 的每一条多带 `draft` / `draftOf` / `costTokens`。
 
 ### r2v（带参考视频的出片）的服务端规则 —— `reference_video` 只有四条合法来源
 
@@ -2325,7 +2369,8 @@ V2 这条链路**花两次真钱**，报价页必须**两笔都写明**，不许
 | `POST /image-groups`（组图） | 受理时预扣 `单价 × max_images`，结束按**拿到手的张数**结算、多退（见下「组图」） |
 | `GET /image-groups[/:id]` | **0** |
 | `POST /chat/completions` | 400（一次豆包往返） |
-| `POST /contents/generations/tasks`（Seedance） | `时长×1280×720×24/1024 × 档位系数`（极速 0.3 / 标准 1 / 高清 1.6 / 电影级 4.7） |
+| `POST /contents/generations/tasks`（Seedance） | `round(时长 × 每秒 raw token × 档位系数)`：每秒 raw token = 宽×高×24/1024 —— **720p 一刀切 21,600**（所有模型、所有画幅，改版前的口径）；480p / 1080p 按官方像素表逐格查（画幅缺省 / `adaptive` / 认不出按那一行最大一格）。系数：极速 4.2/15 / 标准 1 / 高清与草稿 23/15 / 电影级（含样片第一步）4.7。例：草稿 4 秒 9:16 = 61,603、5 秒 = 77,004；样片第一步 4 秒 9:16 = 180,621 |
+| `POST /contents/generations/tasks`（**样片第二步**，`draft_task`） | `round(样片时长 × 2.5 的 1080p 每秒 × 77/15)`（刊例 77 元/M：输出 1080p、第一步无输入视频）。例：4 秒 9:16 = 997,920、5 秒 = 1,247,400。时长 / 画幅只取服务端登记与方舟查询（见上「样片两步」） |
 | `POST /contents/generations/tasks`（**r2v 白模出片**，带 `reference_video`） | `输入时长 × 2 × 21,600 × r2v 系数`（2.5 = **2.8** = 42 元/M ÷ 15）。输入时长有且只有两个可信来源：**模板登记的 `refVideo.durationSec`**（分支一）或**服务端拼的变换 URL 里那个 `du_`**（分支二，白模化）。见上「r2v 的服务端规则」 |
 | `POST /contents/generations/tasks`（Seed3D） | 160,000 |
 | `GET /contents/generations/tasks/:id` | **0**（轮询高频，按次收会把一段片的价格翻几倍） |
@@ -2346,7 +2391,11 @@ App `src/data/economy.ts` 是**报价**口径。不一致的后果是"报价 216
 
 | 内容 | app（报价） | server（结算） | 钉住它的测试 |
 |---|---|---|---|
-| 视频档位系数 | `VIDEO_TIERS[].mult` | `VIDEO_MULT` | `arkProxy.spec.js`「跨仓档位系数一致性」 |
+| 视频档位系数 | `VIDEO_TIERS[].mult` | `VIDEO_MULT` | `arkProxy.spec.js`「跨仓档位表一致性」（按 **(模型, 分辨率)** 认，草稿与高清不许塌成一行） |
+| 每档分辨率 | `VIDEO_TIERS[].resolution` | `VIDEO_RESOLUTIONS` | 同上 |
+| 免费档 | `VIDEO_TIERS[].freeOk` | `FREE_VIDEO_ALLOW` | 同上 |
+| 停用时刻 | `VIDEO_TIERS[].retireAt` | `RETIRED_MODELS_AT` | 同上 |
+| 像素表（480p / 1080p） | 像素表 | `VIDEO_PIXELS` | `arkProxy.spec.js`「跨仓像素表与 480p / 1080p 价目」（含草稿 / 样片两步的价目钉子） |
 | **r2v 档位系数** | `VIDEO_TIERS[].r2vMult`（非 null 的那些档） | `VIDEO_MULT_R2V` | `arkProxy.spec.js`（r2vMult ↔ VIDEO_MULT_R2V 双向相等） |
 | 出图单价 | `IMAGE_TOKENS_BY_MODEL` | `IMAGE_TOKENS_BY_MODEL` | `arkProxy.spec.js`「跨仓出图价目一致性」 |
 | 套餐 / 直充包 | `PLANS` / `RECHARGE_PACKS` | `PLANS` / `order.service.RECHARGE_PACKS` | `payOrder.spec.js`「跨仓价目一致性」 |
