@@ -25,7 +25,7 @@ const wallet = require("./tokenWallet.service");
 // 「谁是管理员」只有 utils/roles 一处判据（铁律六）：角色名散着写，
 // 哪天多出一个 moderator 就会漏改，而漏改的表现是某条链路悄悄变成免费
 const { isAdmin } = require("../utils/roles");
-const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
+const { dailyCapDenial, dailySoftWarn, isPaidUser } = require("../config/tokens");
 
 /**
  * 跑一次要花钱的上游调用。
@@ -98,7 +98,9 @@ async function preAuthorize({ user, cost, memo, denyReason = "", denyExtra = nul
     //   而「一天之内烧光」正是被盗号与脚本滥用的形状，账单要到月底才看得见。
     //   超限只拒当天、不封号，返回的是能直接显示给用户的整句话。
     const spent = await wallet.spentToday(user._id);
-    const capped = dailyCapDenial({ planId: before?.planId, spentToday: spent, cost, accountAgeDays: accountAgeDays(user) });
+    // ★ 付费与否按 isPaidUser（付费套餐或付过钱）分档 —— 与免费档门禁同一个口径（见 dailyCapDenial 的 ★★）
+    const paid = isPaidUser(before);
+    const capped = dailyCapDenial({ planId: before?.planId, paid, spentToday: spent, cost, accountAgeDays: accountAgeDays(user) });
     if (capped) {
       return {
         ok: false,
@@ -109,7 +111,7 @@ async function preAuthorize({ user, cost, memo, denyReason = "", denyExtra = nul
         free,
       };
     }
-    if (dailySoftWarn({ planId: before?.planId, spentToday: spent })) {
+    if (dailySoftWarn({ planId: before?.planId, paid, spentToday: spent })) {
       console.warn(`[billing] 付费账号 ${user._id} 今日已用 ${spent} token（软告警线）`);
     }
 

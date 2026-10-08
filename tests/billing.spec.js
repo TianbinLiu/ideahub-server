@@ -281,6 +281,18 @@ describe('每日上限（§14.10）', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('★ 充过钱、套餐还是免费版：日上限按付费档算（与免费档门禁同一个「付费用户」口径，isPaidUser）', async () => {
+    // 否则门禁放他用电影级，日上限却在第一段之后就把他挡在当天门外（样片第二步一发就是上百万）
+    const { user, token } = await makeUser();
+    await wallet.credit(user._id, 5_000_000, 'recharge', '订单');
+    await TokenLedger.create({ user: user._id, delta: -tokens.DAILY_LIMITS.freeDaily, reason: 'ark_spend', balanceAfter: 0 });
+    fetchSpy.mockResolvedValueOnce(ttsOk());
+    const res = await request(app).post('/api/tts').set('Authorization', `Bearer ${token}`).send({ text: '你好' });
+    expect(res.status).not.toBe(429);
+    expect(tokens.dailyCapDenial({ planId: 'free', paid: true, spentToday: tokens.DAILY_LIMITS.freeDaily })).toBeNull();
+    expect(tokens.dailyCapDenial({ planId: 'free', paid: false, spentToday: tokens.DAILY_LIMITS.freeDaily })).toMatch(/上限/);
+  });
+
   it('退款要抵掉当天用量：扣了又退的失败调用不该吃掉额度', async () => {
     const { user } = await makeUser();
     await TokenLedger.create({ user: user._id, delta: -50000, reason: 'ark_spend', balanceAfter: 0 });

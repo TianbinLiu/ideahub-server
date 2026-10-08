@@ -587,12 +587,16 @@ const DAILY_LIMITS = Object.freeze({
 
 /**
  * 今天还能不能再花 `cost`。**判据只有这一处**（与 videoPlanDenial 同在 billing.preAuthorize 那一格起作用）。
+ * @param {boolean} [o.paid] isPaidUser(钱包) 的结论。★★ 2026-10-07 起「付费用户」= 付费套餐**或者付过任何一笔钱**
+ *   （config/tokens.isPaidUser）。日上限按同一个口径分档：只看套餐的话，一个充了 450 万 token 的免费版用户每天只能花 15 万 ——
+ *   一段 5 秒的电影级样片第二步（124 万）他一天里根本点不出来，而门禁刚刚才放他用这一档。不传时退回只看套餐（老调用点）。
  * @returns {string|null} 整句拒绝理由；null = 放行
  */
-function dailyCapDenial({ planId, spentToday, cost, accountAgeDays }) {
+function dailyCapDenial({ planId, paid, spentToday, cost, accountAgeDays }) {
   const spent = Math.max(0, Number(spentToday) || 0);
   void cost; // 见下面 ★★：判据刻意**不含**本次报价
-  if (isFreePlan(planId)) {
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  if (!isPaid) {
     const newcomer = Number(accountAgeDays) >= 0 && Number(accountAgeDays) < DAILY_LIMITS.newcomerDays;
     const cap = newcomer ? DAILY_LIMITS.newcomerDaily : DAILY_LIMITS.freeDaily;
     if (spent < cap) return null;
@@ -602,9 +606,10 @@ function dailyCapDenial({ planId, spentToday, cost, accountAgeDays }) {
   return `今天的用量已达单日上限（${DAILY_LIMITS.paidHardDaily} token，已用 ${spent}）。这是防滥用的保护线，明天 0 点（UTC）重置；确有大批量需求请联系我们。`;
 }
 
-/** 到没到该提醒一声的线（只记日志/告警，不拒） */
-function dailySoftWarn({ planId, spentToday }) {
-  return !isFreePlan(planId) && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
+/** 到没到该提醒一声的线（只记日志/告警，不拒）。paid 的口径同 dailyCapDenial */
+function dailySoftWarn({ planId, paid, spentToday }) {
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  return isPaid && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
 }
 
 const MODEL3D_ID = "doubao-seed3d-2-0-260328";
