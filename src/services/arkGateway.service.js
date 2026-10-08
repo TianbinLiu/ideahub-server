@@ -38,13 +38,20 @@ const T_POLL = 30_000;
  * ★ callback_url 剥掉：方舟会把任务状态 POST 到那个地址 —— 等于拿我们的 key 替任何人往任意地址发请求。
  * ★ service_tier 剥掉：`flex`（离线推理）只对 1.0 有、价格是在线的一半、排队以天计 —— 我们按在线价收，
  *   放它过去就是多收用户、还让出片慢到看不见。
+ * ★ tools 剥掉（2026-10-07 评审）：2.x 的 `tools: [{ type: "web_search" }]` 让模型出片前联网搜索，搜索次数**另外计费**
+ *   （查询任务回包的 usage.tool_usage.web_search）—— 我们没给它定价，放过去就是让方舟替任何人白搜、账记在我们名下。
+ *   App 从没发过它（出图那条路的 pinSingleImage 也拒它）。
+ * ★ priority 剥掉（同上）：取值 0~9，数大的插到**同一个接入点**上所有低优先级任务的前面 —— 所有人的任务挂在同一把 key、
+ *   同一个接入点下，放它过去就是让一个人把别人的任务往 24 小时过期线上挤。缺省 0 = 先来先到。
+ * ⚠ 剥而不是拒：都是可选参数，剥掉上游按缺省办，不会让一发正常的请求失败；`safety_identifier`（给方舟的用户标识）
+ *   不花钱也不影响别人，不剥。
  */
 const SERVER_TASK_FIELDS = Object.freeze({ execution_expires_after: 86_400 });
-const STRIPPED_TASK_FIELDS = Object.freeze(["callback_url", "service_tier"]);
+const STRIPPED_TASK_FIELDS = Object.freeze(["callback_url", "service_tier", "tools", "priority"]);
 
 /**
  * 给一发异步任务套上服务端钉死的字段（返回新对象，不改调用方的 body）。不是任务端点（出图 / 对话）原样返回。
- * ★ 剥 callback_url / service_tier 对**每一发**任务都做（含 Seed3D）：回调地址那个口子与模型无关 —— 同一个端点上
+ * ★ 剥 STRIPPED_TASK_FIELDS 对**每一发**任务都做（含 Seed3D）：回调地址那个口子与模型无关 —— 同一个端点上
  *   拿 Seed3D 也一样能让方舟替任何人往任意地址 POST；剥掉一个可选参数只会让上游用缺省值，不会让请求失败。
  * ★ execution_expires_after 只套在 Seedance 上：Seed3D 收不收这个参数我们没核实过，硬塞一个它不认的参数可能整发 400
  *   （它按方舟缺省 48 小时过期，过期同样会被失败退款按 expired 退回）。

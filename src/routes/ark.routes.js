@@ -48,6 +48,7 @@ const {
   videoSecWindow,
   retiredDenial,
   freeVideoTiers,
+  freeVideoGateOn,
 } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
@@ -129,8 +130,14 @@ router.get("/health", (_req, res) => {
   // 2026-10-07 的四个能力位（老服务端一个都没有 —— App 见不到就把对应的东西藏起来）：
   //   · res480：纯任务收 480p（「草稿」档）。老服务端对 480p 整句 400「出片目前只支持 720p」；
   //   · draftMode：电影级「样片」两步（draft:true 的第一步 + content 里只有一条 draft_task 的第二步）；
-  //   · failRefund：受理之后方舟报 failed / cancelled / expired 的任务会退钱（App 据此决定那句话怎么说）；
-  //   · freeVideo：此刻免费版能出普通片的档（停用的自动出局）。App 置灰用它，判据仍在服务端（config/tokens.videoPlanDenial）。
+  //   · failRefund：受理之后**方舟**报 failed / cancelled / expired 的任务会退钱（无条件，没有开关）；
+  //   · freeVideo：免费档门禁开着时，免费版能出普通片的档（停用的自动出局）。判据在服务端（config/tokens.videoPlanDenial）；
+  //     ⚠ 2026-10-07 这一版的 App 不读它（档位能不能用照自己的 VideoTier.freeOk 判），它是给以后的 App 与人工核对用的。
+  // 2026-10-07 评审补的两个**运维开关的现状**（老服务端没有 = 当成开着）：
+  //   · freeVideoGate：FREE_VIDEO_GATE 开没开。false = 服务端不按 freeVideo 拦，退回改版前只挡电影级的口径；
+  //     App 要读这一位才会跟着放开置灰 —— 不读的 App（含 2026-10-07 这一版）关闸后仍按自己的 freeOk 置灰，开关对它们只放开服务端这道门。
+  //   · minimaxFailRefund：MINIMAX_FAIL_REFUND 开没开。false = 真人档（MiniMax）受理之后的失败**不退**（账留着，开关打开后接着退），
+  //     App 对真人档说「会自动退回」之前要看这一位，不能只看 failRefund（那一位只说方舟）。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -139,6 +146,8 @@ router.get("/health", (_req, res) => {
     draftMode: true,
     failRefund: true,
     freeVideo: freeVideoTiers().map(({ label, model, resolution }) => ({ label, model, resolution })),
+    freeVideoGate: freeVideoGateOn(),
+    minimaxFailRefund: taskRefund.minimaxRefundOn(),
   });
 });
 
@@ -783,6 +792,35 @@ async function noteR2vOutcome(taskId, parsed) {
 const PLAIN_CONTENT_TYPES = new Set(["text", "image_url", "audio_url"]);
 
 /**
+ * 提示词里「弱校验」写法的生成参数（`小猫 --rs 1080p --dur 30`）。
+ *
+ * ★★ 为什么要拦（2026-10-07 评审）：方舟「创建视频生成任务」写明 resolution / ratio / duration / frames / seed /
+ *   camera_fixed / watermark 七个参数**也可以**追加在文本提示词后面传（`--rs` `--rt` `--dur` `--frames` `--seed` `--cf` `--wm`，
+ *   「所有模型均兼容」），而且没说请求体与提示词冲突时听谁的。下面那几行钉子只看请求体 ——
+ *   于是请求体写 480p / 4 秒（按「草稿」放行、按 4 秒收钱），提示词里写 `--rs 720p --dur 15`，方舟要是听提示词的，
+ *   就是免费版拿到 15 秒高清、我们收 4 秒草稿的钱；样片第一步同理（第二步按第一步登记的时长收 1080p 的钱）。
+ *   门禁与计价的假设都钉在请求体上，所以提示词里**一个都不许出现**（整句 400，不扣钱）。
+ * ★ 拒而不是悄悄删：删掉用户提示词里的字是在改他的创作；App 从来不拼这种写法（git 史核过），
+ *   撞上的只会是手搓的请求，或者用户自己在提示词里打了这几个字 —— 后者那句话能看懂怎么改。
+ * ★ 七个参数的长短两种写法都认（--rs/--resolution、--rt/--ratio、--dur/--duration、--cf/--camerafixed、--wm/--watermark），
+ *   外加旧版文档里的帧率 --fps / --framespersecond。参数名后面紧跟字母的不算（`--seedling` 不是 --seed），紧跟数字的算（`--dur30`）。
+ *   前面不能是字母数字（`a--dur` 不是一个参数）；中文紧挨着的算（`小猫--dur 30`，宁可多拦）。
+ * ★ 只管 Seedance 视频任务：同一个端点上的 Seed3D 正是用 `--subdivisionlevel` 这类写法传参的，别把它一起拦了。
+ */
+const WEAK_PARAM_RE = /(?<![A-Za-z0-9_])--(?:rs|resolution|rt|ratio|dur|duration|frames|fps|framespersecond|seed|cf|camerafixed|wm|watermark)(?![A-Za-z])/i;
+
+/** content 里哪一条文字带了弱校验参数 —— 回参数原样（给拒绝那句话用），没有回 null */
+function weakParamIn(content) {
+  if (!Array.isArray(content)) return null;
+  for (const e of content) {
+    if (!e || e.type !== "text" || typeof e.text !== "string") continue;
+    const m = WEAK_PARAM_RE.exec(e.text);
+    if (m) return m[0].trim();
+  }
+  return null;
+}
+
+/**
  * 纯视频任务（没有参考视频：文生 / 图生 / 参考图生视频 / 样片第一步）的参数钉子 —— 把**生成参数钉在计价假设上**，
  * 缺省的补齐、不符的整句 400。
  *
@@ -803,6 +841,8 @@ const PLAIN_CONTENT_TYPES = new Set(["text", "image_url", "audio_url"]);
  *   （第二步的价钱按第一步登记的时长算，见 resolveDraftFinal）。
  * ★ content 条目只认 text / image_url / audio_url：`draft_task`（样片第二步）只许从 resolveDraftFinal 那条路进来 ——
  *   从这里漏过去的话，它按 5 秒 720p 收、方舟却按样片的时长出 1080p。
+ * ★ 文字条目里不许出现 `--rs` / `--dur` 这类「弱校验」参数（WEAK_PARAM_RE 的 ★★）：只钉请求体等于没钉。
+ *   这一道对带参考视频的任务（req.r2v）同样生效。
  * ★ 停用的模型（tokens.RETIRED_MODELS_AT）在这里拒新任务：码是 MODEL_RETIRED，不是参数错。
  * ★ execution_expires_after / callback_url / service_tier 不在这里钉：它们对**每一发** Seedance 任务都一样
  *   （r2v、样片第二步、白模化也要），唯一实现在 services/arkGateway 的 withServerTaskFields。
@@ -811,11 +851,21 @@ const PLAIN_CONTENT_TYPES = new Set(["text", "image_url", "audio_url"]);
  *   不在册的模型由 billedForward 的白名单拒，也不归这里管。
  */
 function pinPlainVideoTask(req, res, next) {
-  // 带参考视频的任务由 resolveR2v 钉过了、样片第二步由 resolveDraftFinal 钉过了（各钉各的计价假设）
-  if (req.r2v || req.draftFinal) return next();
+  // 样片第二步由 resolveDraftFinal 钉过了（请求体整体重写成只有一条 draft_task，没有文字）
+  if (req.draftFinal) return next();
   const model = String(req.body?.model ?? "");
-  if (!Object.hasOwn(VIDEO_MULT, model)) return next();
+  // 带参考视频的任务（req.r2v）也要过下面那道「提示词里的弱校验参数」：resolveR2v 钉的同样只是请求体
+  if (!req.r2v && !Object.hasOwn(VIDEO_MULT, model)) return next();
   const deny = (message) => res.status(400).json({ ok: false, code: "VIDEO_PARAMS_NOT_ALLOWED", message });
+
+  const weak = weakParamIn(req.body?.content);
+  if (weak) {
+    return deny(
+      `提示词里不能用 ${weak.slice(0, 20)} 这种写法指定分辨率、画幅、时长等参数（这些由档位与时长设置决定），请删掉后再出片——当前请求未被受理，也没有扣费。`,
+    );
+  }
+  // 带参考视频的任务的其余参数由 resolveR2v 钉过了（各钉各的计价假设）
+  if (req.r2v) return next();
 
   const retired = retiredDenial(model);
   if (retired) return res.status(400).json({ ok: false, code: "MODEL_RETIRED", message: retired });
@@ -983,12 +1033,26 @@ async function resolveDraftFinal(req, res, next) {
       return deny("这条样片已经超过 7 天有效期，不能再转成片了——当前请求未被受理，也没有扣费。");
     }
 
-    // 时长：优先我们登记的那份（样片第一步被钉子要求显式写整数时长）；没有再退方舟回的整数秒。都没有就不转 ——
-    // 时长是价钱的一半，猜一个就是"报价与实扣分家"。
+    // 时长：我们登记的那份（样片第一步被钉子要求显式写整数时长）与方舟回的整数秒**两份都认得出时必须相等**；
+    // 只认得出一份就用那一份；都认不出就不转 —— 时长是价钱的一半，猜一个就是"报价与实扣分家"。
+    // ★★ 为什么不再「登记优先、方舟的不看」（2026-10-07 评审）：登记的是**请求体**里的数，而第一步的提示词里
+    //   要是夹着 `--dur 30`、方舟又听了它的，样片其实是 30 秒 —— 按登记的 4 秒收 1080p 的钱就少收了七倍多。
+    //   钉子现在拦了提示词里的这种写法（WEAK_PARAM_RE），这里是第二道：两份对不上就不转（不扣钱、吼一声），
+    //   不取大的那个 —— 取大的会让 App 的报价（照登记时长算）与实扣分家；对不上本来就不该发生，要人看。
+    // ★ 方舟只回 duration 与 frames 里的一个（查询任务文档）：只回了 frames 说明这一发是按帧数定长的（钉子不放 frames），同样不转。
     const [lo, hi] = videoSecWindow(SEEDANCE_2_5);
     const okSec = (n) => Number.isInteger(n) && n >= lo && n <= hi;
-    const arkSec = Number(parsed.duration);
-    const durationSec = okSec(rec.durationSec) ? rec.durationSec : okSec(arkSec) ? arkSec : null;
+    if ((parsed.duration === undefined || parsed.duration === null) && parsed.frames !== undefined && parsed.frames !== null) {
+      console.error(`[ark] 样片 ${id} 是按帧数（${String(parsed.frames).slice(0, 12)}）出的，不转成片`);
+      return deny("这条样片是按帧数定长的，没法按时长报价，不能转成片——当前请求未被受理，也没有扣费。");
+    }
+    const regSec = okSec(rec.durationSec) ? rec.durationSec : null;
+    const arkSec = okSec(Number(parsed.duration)) ? Number(parsed.duration) : null;
+    if (regSec !== null && arkSec !== null && regSec !== arkSec) {
+      console.error(`[ark] 样片 ${id} 的时长对不上（登记 ${regSec} 秒，方舟 ${arkSec} 秒），不转成片 user=${req.user._id}`);
+      return deny(`这条样片的时长对不上（提交时是 ${regSec} 秒，生成出来是 ${arkSec} 秒），没法按报价转成片——当前请求未被受理，也没有扣费。`);
+    }
+    const durationSec = regSec ?? arkSec;
     if (durationSec === null) {
       console.error(`[ark] 样片 ${id} 认不出时长（登记 ${String(rec.durationSec)}，方舟 ${String(parsed.duration)}）`);
       return deny("认不出这条样片的时长，没法报价——当前请求未被受理，也没有扣费。");

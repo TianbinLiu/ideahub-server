@@ -456,7 +456,9 @@ function isRetired(model, now = Date.now()) {
  */
 function retiredDenial(model, now = Date.now()) {
   if (!isRetired(model, now)) return null;
-  return "这一档用的 Seedance 1.0 已于 2026-11-24 停止服务（火山方舟下线了这一代模型），请换一档再出片——当前请求未被受理，也没有扣费。";
+  // ★ 末尾那半句给旧版 App（2.61 及更早）：它们没有「草稿」，免费版用户在那些包里停用之后一档都没得用 ——
+  //   原样显示这句话的包里，这是他唯一能读到的出路。新版 App 看得到草稿，这半句对它也不算错话。
+  return "这一档用的 Seedance 1.0 已于 2026-11-24 停止服务（火山方舟下线了这一代模型），请换一档再出片（档位里没有「草稿」的话，请先更新 App）——当前请求未被受理，也没有扣费。";
 }
 
 /** 此刻免费版还能用的档（停用的那几档自动出局：11-24 之后只剩「草稿」） */
@@ -530,8 +532,12 @@ function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = fa
   const plain = kind === "task" && !r2v && !draft && !draftFinal;
   if (plain && open.some((t) => t.model === m && t.resolution === resolution)) return null;
   const allowed = open.map((t) => t.label);
+  // ★ 旧版 App（2.61 及更早）原样显示这句话，而它们的档位表里**没有「草稿」**（只有「极速」可用；11-24 之后连它都停了）——
+  //   只说「只能用草稿」，那些包里的人找不到这一档。所以点到草稿时补半句「看不到就更新 App」：新版 App 看得到，这半句对它不算错话。
+  //   请求里没有版本号可以分辨新旧包，只能一句话两边都成立。
+  const updateHint = allowed.includes("草稿") ? "（档位里看不到「草稿」的话，请先更新 App）" : "";
   const head = allowed.length
-    ? `免费版只能用${allowed.map((l) => `「${l}」`).join("")}出普通片（参考视频、返修、延长、样片、真人档都不在内）`
+    ? `免费版只能用${allowed.map((l) => `「${l}」`).join("")}出普通片${updateHint}，参考视频、返修、延长、样片、真人档都不在内`
     : "免费版暂时没有可用的出片档位";
   return { message: `${head}；这一项需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。`, allowed };
 }

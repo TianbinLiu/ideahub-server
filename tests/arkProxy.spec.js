@@ -196,6 +196,8 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     // 停用之前是「极速」「草稿」，之后只剩「草稿」（freeLabels 的 ★）
     expect(res.body.message).toContain(freeLabels().map((l) => `「${l}」`).join(""));
     expect(res.body.message).toMatch(/「草稿」/);
+    // ★ 旧版 App（≤ 2.61）原样显示这句话、却没有「草稿」这一档：句子里要给它一条出路（2026-10-07 评审）
+    expect(res.body.message).toMatch(/看不到「草稿」的话，请先更新 App/);
     // ★ 不许把模型 id 甩给用户；也不许有 ASCII 双引号（老 App 用 "message":"([^"]+)" 抠这句话，带引号会被拦腰截断）
     expect(res.body.message).not.toMatch(/seedance|doubao|"/i);
     // 英文界面不显示服务端的中文句子：能用哪几档要有结构化的一份
@@ -600,6 +602,51 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     expect(res.body.code).not.toBe("VIDEO_PARAMS_NOT_ALLOWED");
   });
 
+  // ★★ 2026-10-07 评审：方舟「弱校验」传参 —— 分辨率 / 画幅 / 时长 / 帧数 / 种子 / 固定镜头 / 水印也能写在提示词末尾（`--rs 720p --dur 15`），
+  //   而且文档没说与请求体冲突时听谁的。门禁与计价都按请求体判：请求体写草稿 480p / 4 秒、提示词里写 720p / 15 秒，
+  //   方舟要是听提示词的，就是免费版拿到 15 秒高清、我们收 4 秒草稿的钱。所以提示词里一个都不许有。
+  test.each([
+    ["--rs 720p（草稿的请求体 + 提示词里要 720p）", { model: MINI, duration: 4, resolution: "480p" }, "cat --rs 720p"],
+    ["--dur 15", { model: MINI, duration: 4, resolution: "480p" }, "cat --dur 15"],
+    ["长写法 --resolution", { model: MINI, duration: 5 }, "cat --resolution 1080p"],
+    ["长写法 --duration", { model: MINI, duration: 5 }, "cat --duration 15"],
+    ["--rt 21:9", { model: MINI, duration: 5 }, "cat --rt 21:9"],
+    ["--frames", { model: MINI, duration: 5 }, "cat --frames 361"],
+    ["--fps", { model: MINI, duration: 5 }, "cat --fps 24"],
+    ["--seed / --cf / --wm", { model: MINI, duration: 5 }, "cat --seed 11 --cf false --wm true"],
+    ["大写也认", { model: MINI, duration: 5 }, "cat --RS 1080P"],
+    ["紧跟数字也认（--dur30）", { model: MINI, duration: 5 }, "cat --dur30"],
+    ["中文紧挨着也认（宁可多拦）", { model: MINI, duration: 5 }, "小猫--dur 30"],
+    ["开头就是参数", { model: MINI, duration: 5 }, "--rs 1080p cat"],
+    ["样片第一步也拦（第二步按第一步登记的时长收 1080p 的钱）", { model: ULTRA, duration: 4, resolution: "480p", draft: true }, "cat --dur 30"],
+  ])("提示词里的弱校验参数（%s）→ 400 整句拒，不出网、不扣费", async (_n, extra, text) => {
+    const wallet = require("../src/services/tokenWallet.service");
+    const before = await wallet.getWallet(paidUserId);
+    const res = await post({ ...extra, content: [{ type: "image_url", image_url: { url: "https://x/y.jpg" } }, { type: "text", text }] });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VIDEO_PARAMS_NOT_ALLOWED");
+    expect(res.body.message).toMatch(/提示词里不能用/);
+    expect(res.body.message).toMatch(/没有扣费/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await wallet.getWallet(paidUserId);
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
+  });
+
+  test.each([
+    ["参数名后面紧跟字母的不算（--seedling 不是 --seed）", "a --seedling grows"],
+    ["前面是字母数字的不算（a--dur 不是一个参数）", "a--dur 5"],
+    ["普通的破折号", "他停了一下 -- 然后跑开"],
+    ["别的双横线写法", "--style anime"],
+  ])("提示词里不是弱校验参数的（%s）照常放行", async (_n, text) => {
+    const res = await post({ model: MINI, duration: 5, content: [{ type: "text", text }] });
+    expect(res.status).toBe(501); // 没配 key：过了钉子走到 forward
+  });
+
+  test("Seed3D 的提示词照用它自己的 --参数 写法（不归这道钉子管）", async () => {
+    const res = await post({ model: "doubao-seed3d-2-0-260328", content: [{ type: "text", text: "--subdivisionlevel medium --fileformat glb --seed 3" }] });
+    expect(res.body.code).not.toBe("VIDEO_PARAMS_NOT_ALLOWED");
+  });
+
   test("★ 缺省补齐 + 服务端钉死的字段：转发出去的是补好的那一份（不是原样转发客户端的）", async () => {
     // ★★ 不传 duration / resolution 在方舟那边是 2.5 的 -1（最长 30 秒）与 1.0 的 1080p —— 两个少收的口子。
     //   这条从「真正发出去的请求体」上验：补齐、超时 24 小时、回调地址与服务等级被剥掉。
@@ -614,6 +661,9 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
         callback_url: "https://evil.example.com/hook",
         service_tier: "flex",
         execution_expires_after: 259200,
+        // 2026-10-07 评审：联网搜索另外计费、priority 让一个人插到所有人前面 —— 都剥掉
+        tools: [{ type: "web_search" }],
+        priority: 9,
       });
       expect(res.status).toBe(200);
       expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -685,6 +735,8 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
         const res = await send({ model, duration: 5, content: [] });
         expect({ model, status: res.status, code: res.body.code }).toEqual({ model, status: 400, code: "MODEL_RETIRED" });
         expect(res.body.message).toMatch(/停止服务/);
+        // 旧版 App 的免费版用户停用之后一档都没得用（它们没有「草稿」）：句子里给一条出路
+        expect(res.body.message).toMatch(/更新 App/);
         expect(res.body.message).toMatch(/没有扣费/);
       }
       expect((await send({ model: MINI, duration: 4, resolution: "480p", content: [] })).status).toBe(501);
@@ -777,9 +829,22 @@ describe("电影级样片第二步（480p 样片 → 1080p 成片，resolveDraft
     expect(finalRow).toMatchObject({ durationSec: 4, ratio: "9:16", resolution: "1080p", draft: false, costTokens: expected });
   });
 
-  test("时长只认我们登记的那一份：方舟回的 duration 再大也不作数；登记没有才退方舟的整数秒", async () => {
+  test("时长：登记与方舟回的对不上 → 400 不转、不扣费（不取大的，也不只信登记）；对得上照扣；登记没有才退方舟的整数秒", async () => {
+    // ★★ 2026-10-07 评审：第一步的提示词里夹着 `--dur 30`、方舟又听了它的话，样片其实是 30 秒 ——
+    //   只信登记的 5 秒就是按 5 秒收 30 秒 1080p 的钱。钉子现在拦提示词里的这种写法，这里是第二道。
     await seedDraft("cgt-draft-dur-1", paidUserId, { durationSec: 5 });
     draftView.body.duration = 30;
+    const before = await walletSvc.getWallet(paidUserId);
+    const bad = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(finalBody("cgt-draft-dur-1"));
+    expect(bad.status).toBe(400);
+    expect(bad.body.code).toBe("DRAFT_FINAL_NOT_ALLOWED");
+    expect(bad.body.message).toMatch(/对不上/);
+    expect(bad.body.message).toMatch(/没有扣费/);
+    expect(createCalls).toHaveLength(0);
+    const after = await walletSvc.getWallet(paidUserId);
+    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+
+    draftView.body.duration = 5;
     await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(finalBody("cgt-draft-dur-1")).expect(200);
     let spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend" }).sort({ _id: -1 }).lean();
     expect(spend.delta).toBe(-draftFinalTokens(5, "9:16"));
@@ -790,6 +855,17 @@ describe("电影级样片第二步（480p 样片 → 1080p 成片，resolveDraft
     await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(finalBody("cgt-draft-dur-2")).expect(200);
     spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend" }).sort({ _id: -1 }).lean();
     expect(spend.delta).toBe(-draftFinalTokens(6, undefined));
+  });
+
+  test("方舟只回 frames 不回 duration（按帧数定长的样片）→ 400 不转、不扣费", async () => {
+    await seedDraft("cgt-draft-frames-1", paidUserId);
+    delete draftView.body.duration;
+    draftView.body.frames = 721;
+    const res = await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(finalBody("cgt-draft-frames-1"));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("DRAFT_FINAL_NOT_ALLOWED");
+    expect(res.body.message).toMatch(/帧数/);
+    expect(createCalls).toHaveLength(0);
   });
 
   test.each([
@@ -1015,8 +1091,24 @@ describe("健康端点", () => {
         { label: "极速", model: "doubao-seedance-1-0-pro-fast-251015", resolution: "720p" },
         { label: "草稿", model: "doubao-seedance-2-0-mini-260615", resolution: "480p" },
       ].filter((t) => !require("../src/config/tokens").isRetired(t.model)),
+      // 两个运维开关的现状（2026-10-07 评审）：缺省都开着
+      freeVideoGate: true,
+      minimaxFailRefund: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
+  });
+
+  test("运维开关如实报：FREE_VIDEO_GATE=off → freeVideoGate:false；MINIMAX_FAIL_REFUND=off → minimaxFailRefund:false（failRefund 只说方舟，不跟着变）", async () => {
+    // ★ 不报的话：关了闸 App 照旧按免费档置灰（开关形同虚设）；关了 MiniMax 退款 App 照旧对真人档说「会自动退回」（说的是假话）
+    process.env.FREE_VIDEO_GATE = "off";
+    process.env.MINIMAX_FAIL_REFUND = "off";
+    try {
+      const res = await request(app).get("/api/ark/health").expect(200);
+      expect(res.body).toMatchObject({ freeVideoGate: false, minimaxFailRefund: false, failRefund: true });
+    } finally {
+      delete process.env.FREE_VIDEO_GATE;
+      delete process.env.MINIMAX_FAIL_REFUND;
+    }
   });
 });
 
@@ -1141,6 +1233,24 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("R2V_NOT_ALLOWED");
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("r2v 的提示词里写 --rs 1080p / --dur 30 → 400 VIDEO_PARAMS_NOT_ALLOWED（resolveR2v 钉的也只是请求体），不出网不扣费", async () => {
+    // ★ 2026-10-07 评审：弱校验参数（提示词末尾的 --rs / --dur …）同样够得着 r2v —— 计价钉在 720p × 登记时长上
+    for (const tail of [" --rs 1080p", " --dur 30"]) {
+      const body = r2vBody(publishedTpl.refVideo.url);
+      body.content[0].text += tail;
+      const before = await walletSvc.getWallet(paidUserId);
+      const res = await request(app)
+        .post("/api/ark/contents/generations/tasks")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("VIDEO_PARAMS_NOT_ALLOWED");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const after = await walletSvc.getWallet(paidUserId);
+      expect(after.plan + after.addon).toBe(before.plan + before.addon);
+    }
   });
 
   test("不带 role 的 video_url 条目 → 400（role 是客户端可控字段，去掉它不能绕过注册表按纯任务价放行）", async () => {
