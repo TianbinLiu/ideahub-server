@@ -601,7 +601,8 @@ async function resolveR2v(req, res, next) {
       //   计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens）。
       const dur = req.body?.duration;
       // 收 undefined 或显式 "reference"：app 对 2.5 显式发 reference（auto 判错是**异步**
-      // 失败且不退费，显式判错是提交时同步 400 —— arkClient 那行 ★ 的同一条理由）。
+      // 失败（钱先扣、几十秒后才 failed —— 2026-10-07 起会自动退回，但人白等一趟），显式判错是提交时同步 400 ——
+      // arkClient 那行 ★ 的同一条理由）。
       // edit 一律拒：那是白模复刻的计价形状（输出跟随输入），揣着素材票走 edit 就是错价。
       const omni = req.body?.omni_reference_task_type;
       if (omni !== undefined && omni !== "reference") {

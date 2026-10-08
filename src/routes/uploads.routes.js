@@ -91,7 +91,7 @@ async function templateVideoInUse(publicId) {
     // ★★ 白模 V2 拆成两阶段之后多出的第三种引用：**还没取回结果**的那一发。
     //   从受理到取回之间世上还没有模板，上面两条 exists 都落空 —— 而方舟那边可能
     //   还要去拉这段素材的变换地址（懒生成），此刻删掉它，用户那一发就会莫名其妙失败，
-    //   **而钱已经花了**（受理后失败不退），且没有任何一层会说这是他自己删的。
+    //   **而钱已经扣了**（方舟明说失败时出片那一笔会自动退回，但看帧那一笔不退、人也白等一趟），且没有任何一层会说这是他自己删的。
     const jobUsed = await BlockoutJob.exists({
       "source.publicId": publicId,
       status: { $in: ["pending", "claimed"] },
