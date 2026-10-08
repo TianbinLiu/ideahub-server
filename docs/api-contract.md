@@ -2114,7 +2114,7 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 | GET | `/api/ark/contents/generations/tasks/:id` | required | 90/min | 轮询任务状态（每 5s 一次，一段视频最多 120 次，所以单独一个桶） |
 | POST | `/api/ark/chat/completions` | required | 30/min | 豆包对话 / 看图说话 |
 | GET | `/api/ark/asset?url=…` | required | 90/min | 取方舟产物（图片 / 视频 / 3D zip），域名限 `*.volces.com`、`*.volccdn.com` |
-| POST | `/api/ark/transfer-video` | required | 30/min | body=`{url}`（限方舟视频域名）→ 服务端拉取并传 Cloudinary → `{url}` 永久地址。**出片一成客户端就调它**（2026-08-20 起）：TOS 直链跨境下载速度低于成片码率，预览黑屏、合并超时；转存失败客户端退回方舟直链（24h 内有效，发布时的转存老路会再兜一次）。不计费（不产生算力消耗）。实现与发布时的转存共用 `services/videoAsset.service` 一份 |
+| POST | `/api/ark/transfer-video` | required | 30/min | body=`{url}`（限方舟视频域名）→ 服务端拉取并传 Cloudinary → `{url}` 永久地址。**出片一成客户端就调它**（2026-08-20 起）：TOS 直链跨境下载速度低于成片码率，预览黑屏、合并超时；转存失败客户端退回方舟直链（24h 内有效，发布时的转存老路会再兜一次）。不计费（不产生算力消耗）。实现与发布时的转存共用 `services/videoAsset.service` 一份；H.265 的成片存成 8 bit H.264（见「样片两步」） |
 
 请求体与响应**原样透传**方舟 v3（含错误码：`400` 敏感词、`429` 限流——客户端对这两者的
 处置完全不同，聚合成 502 会把区分抹掉）。`POST /api/ark` 的 body 上限放宽到 50MB
@@ -2222,6 +2222,12 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
   样片其实是 30 秒）；只认得出一份就用那一份；方舟只回 `frames` 不回 `duration`（按帧数定长的样片）→ 400。
   画幅取方舟回的实际画幅（认不出按 1080p 最大一格）。免费版一律 403（与其它出片同一道门）。
 - 成片那一发在 `ArkVideoTask` 里记 `draftOf: <样片 id>`；`GET /api/ark/video-tasks` 的每一条多带 `draft` / `draftOf` / `costTokens`。
+- **1080p 成片是 HEVC Main 10**（2026-10-07 付费实测：1080×1920、`yuv420p10le`、约 12 Mbit/s、AAC；样片第一步的 480p 是 8 bit H.264）——
+  App 的 WebView 解不出这种画面（模拟器实测：只有声音、`videoWidth` 0，`canPlayType` 对 Main 10 回空），截帧与合并读的是同一种解码能力。
+  所以**转存进图床时转成 8 bit H.264**：`videoAsset.uploadVideoBuffer` 认 `stsd` 里的 `hvc1` / `hev1`，带入站变换 `vc_h264,q_auto:good` 上传
+  （与合并同一种做法，存下来的就是转好的常规 MP4）；转码那一发失败就**按原样再存一次**，转存不丢。转存之前那几分钟里的方舟直链仍是 H.265。
+- **方舟按实际帧数计用量**（同一次实测，五发全对上）：4 秒出 97 帧（= 4 秒 + 1 帧），`completion_tokens` = 97 × 宽 × 高 ÷ 1024 ——
+  比我们按「秒 × 24 帧」算的 raw token 多 1/96（约 1%）。报价与扣费照旧按秒算，这 1% 在档位系数的余量里，不另收。
 
 ### r2v（带参考视频的出片）的服务端规则 —— `reference_video` 只有四条合法来源
 

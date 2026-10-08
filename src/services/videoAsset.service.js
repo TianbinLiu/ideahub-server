@@ -49,7 +49,35 @@ function isArkVideoUrl(value) {
   }
 }
 
-async function uploadVideoBuffer(buffer, key, opts) {
+/**
+ * 这份 mp4 / mov 的视频轨是不是 H.265（样本描述是 `hvc1` / `hev1`）。
+ * ★ 只看 `stsd` 盒子里第一条样本描述的 fourcc（`stsd` 类型之后：版本+标志 4、条目数 4、条目大小 4，再 4 字节就是它），
+ *   不在整份文件里搜 "hvc1" —— mdat 里的随机字节会撞上。认错的代价只是多转一次码（或少转一次 = 与改之前一样）。
+ */
+function isHevcMp4(buf) {
+  if (!Buffer.isBuffer(buf)) return false;
+  for (let at = 0; ; ) {
+    const i = buf.indexOf("stsd", at, "latin1");
+    if (i === -1) return false;
+    if (i + 20 <= buf.length) {
+      const fourcc = buf.toString("latin1", i + 16, i + 20);
+      if (fourcc === "hvc1" || fourcc === "hev1") return true;
+    }
+    at = i + 4;
+  }
+}
+
+/**
+ * H.265 成片存进图床时转成 H.264 的入站变换（与 videoCompose 的合并同一种做法：随签名的上传请求发出，
+ * 存下来的就是转好的常规 MP4，不产生派生资源）。
+ * ★★ 为什么要转（2026-10-07 付费实测）：电影级「样片」定稿出来的 1080p 是 **HEVC Main 10**（10 bit，方舟官方：2.5 的 1080p 一律 10 bit），
+ *   App 的 WebView（模拟器 Chrome 133）上 `canPlayType('hvc1.2.4…')` 为空、放起来**只有声音、一帧画面都解不出**（videoWidth 0）；
+ *   而 App 的截帧、合并（Media3 走系统解码器）读的都是同一种解码能力。没有 10 bit 解码器的手机上，这一段付了最贵的钱、是黑的。
+ * ★ 质量取 `q_auto:good`（与合并的 good 档同一个旋钮）。Cloudinary 出的 H.264 是 8 bit。
+ */
+const H264_TRANSCODE = "vc_h264,q_auto:good";
+
+function uploadOnce(buffer, key, opts, rawTransformation) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       {
@@ -59,14 +87,40 @@ async function uploadVideoBuffer(buffer, key, opts) {
         // 后台转存（arkTransfer.service）传 timeoutMs=300s：ECS → Cloudinary 跨境传
         // 20MB 级成片可能过分钟，SDK 默认 60s 会掐死在半途。发布老路不传 = 行为不变。
         ...(opts && opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+        ...(rawTransformation ? { raw_transformation: rawTransformation } : {}),
       },
       (error, result) => {
         if (error) reject(error);
-        else resolve(result?.secure_url || "");
+        else resolve(result || {});
       }
     );
     stream.end(buffer);
   });
+}
+
+/**
+ * 成片 → 图床，回永久地址。H.265 的先试着转成 H.264 存（见 H264_TRANSCODE）；转码那一发失败就**按原样再存一次**并吼一声 ——
+ * 退回的就是改之前的行为（存原片），不会因为多了这一步把转存弄丢（转存不成 = 24 小时后方舟链接过期、这一段就没了）。
+ */
+async function uploadVideoBuffer(buffer, key, opts) {
+  if (isHevcMp4(buffer)) {
+    try {
+      const r = await uploadOnce(buffer, key, opts, H264_TRANSCODE);
+      const codec = r?.video?.codec;
+      const pix = r?.video?.pix_format;
+      // 转出来的不是 8 bit H.264（Cloudinary 哪天改了缺省）只吼不拦：存下来的至少是一份能用的永久地址
+      if (codec && (!/^h264/i.test(codec) || /10/.test(String(pix || "")))) {
+        console.warn(`[video-asset] ${key} 转码结果是 ${codec} / ${pix}，不是 8 bit H.264`);
+      } else {
+        console.log(`[video-asset] ${key} H.265 → ${codec || "?"} / ${pix || "?"}`);
+      }
+      return r?.secure_url || "";
+    } catch (e) {
+      console.warn(`[video-asset] ${key} H.265 转 H.264 没成，按原样存：`, (e && e.message) || e);
+    }
+  }
+  const r = await uploadOnce(buffer, key, opts, null);
+  return r?.secure_url || "";
 }
 
 async function downloadToBuffer(url, opts) {
@@ -100,6 +154,8 @@ module.exports = {
   ARK_HOST_PATTERNS,
   isHttpUrl,
   isArkVideoUrl,
+  isHevcMp4,
+  H264_TRANSCODE,
   uploadVideoBuffer,
   downloadToBuffer,
 };
