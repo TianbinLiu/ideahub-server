@@ -2072,8 +2072,8 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/api/tts/health` | 无 | `{ ok, tts: boolean }` —— 这台服务器配没配 `TTS_API_KEY`。不回密钥本身 |
-| POST | `/api/tts` | **必须** | 合成一句台词，回 `audio/mpeg`。按用户限流 30 次/分钟 |
-| GET | `/api/tts/voices` | 无 | 音色目录 `{ ok, voices, mixable, defaultVoiceId, maxMixVoices: 3 }`：`voices` = 2.0 单音色（每条 `generation:"2.0"`、`mixable:false`），`mixable` = 23 个验证过的 1.0 音色（`{ id, name, gender, generation:"1.0", mixable:true }`），混音配方**只能**从 `mixable` 里选。声音市场 `/api/voice-templates` 的契约见 server 仓 `PROJECT_STRUCTURE.md` 路由章节 |
+| POST | `/api/tts` | **必须** | 合成一句台词，回 `audio/mpeg`。按用户限流 30 次/分钟。**按字计费**（`priceOf("tts")` = 截断后的字数 × `TTS_TOKENS_PER_CHAR`，2026-09-25 起），剪辑页旁白（`purpose:"cut-narration"`）除外，见下 |
+| GET | `/api/tts/voices` | 无 | 音色目录 `{ ok, voices, mixable, defaultVoiceId, maxMixVoices: 3 }`：`voices` = 2.0 单音色（每条 `generation:"2.0"`、`mixable:false`），`mixable` = 23 个验证过的 1.0 音色（`{ id, name, gender, generation:"1.0", mixable:true }`），混音配方**只能**从 `mixable` 里选。另带能力位 `narrationFree: { dailyChars }`（2026-10-08：剪辑页旁白免费、每个账号每天几个字；老服务端没有这一位 = 那里旁白照样按字扣钱）。声音市场 `/api/voice-templates` 的契约见 server 仓 `PROJECT_STRUCTURE.md` 路由章节 |
 
 请求体（除 `text` 外都可省）：
 
@@ -2085,7 +2085,8 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
   "emotion": "happy", "instruct": "用更冷静的语气",
   "rate": 0,        // [-50,100]，0 = 1.0 倍
   "pitch": -1,      // [-12,12]
-  "expressive": true // 2.0 ICL 音色专属；<cot> 标签生效的前提
+  "expressive": true, // 2.0 ICL 音色专属；<cot> 标签生效的前提
+  "purpose": "cut-narration" // 可省。目前只认这一个值（剪辑页旁白，走免费额度）；别的值整句 400 TTS_PURPOSE
 }
 ```
 
@@ -2093,7 +2094,21 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 
 - `501` 服务端没配密钥、`404` 没挂路由、`401/403` 掉登录 → **本会话永久关掉云端合成**，退回浏览器内置合成器
 - `502/504` 上游偶发失败 → 只是这一句没出声，不关云端（下一句照常重试）
-- `400` 空文本
+- `400` 空文本；`TTS_PURPOSE` 认不出的 purpose；`NARRATION_SHAPE` 旁白带了混音 / 表现力 / 语调指令 / 情绪
+- `402 INSUFFICIENT_TOKENS` / `403 WALLET_FROZEN|PLAN_REQUIRED` / `429 DAILY_LIMIT`：按字计费的那条路上，钱包门禁原样回（billing 的形状）
+- `429 NARRATION_DAILY_LIMIT`：今天的免费旁白用完了，回包带 `{ limit, used, need }`（都是字数），不调上游、不扣钱
+
+★ **剪辑页旁白免费 + 限量**（2026-10-08；主人 2026-09-30 定「配音免费 + 限量」，而这条链路 2026-09-25 起已经按字扣钱 ——
+App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。带 `purpose:"cut-narration"` 的一句：
+- **不扣钱**、不占每日用量上限；每个账号每个 UTC 日最多 `NARRATION_FREE_DAILY_CHARS` 个字（`config/tokens`，数字只在那一处，
+  App 从 `GET /voices` 的 `narrationFree.dailyChars` 读）。字数与计价同一把尺：截断后的 `text.length`，英文字母也算一个；
+- 先占额度、再合成、没出声（502 / 504 / 中途断开）就还回去（`services/narrationFree`，计数器 `models/NarrationFreeUsage`，
+  `(userId, day)` 唯一索引上的条件 upsert，并发冲不破）；出了声照样落一笔 `TokenLedger` `narration_free`（delta 0、`costTokens` 照价），
+  月底与 tts 的 `ark_spend` 加在一起才是语音合成的账单；
+- 用完是 `429 NARRATION_DAILY_LIMIT`，**不转成扣钱**；
+- 只收「只念字」：带混音 / 表现力 / 语调指令 / 情绪的整句 400（客服、看板娘那几种嗓子照旧按字扣）。
+  这个标记谁都能带，它不是凭证 —— 兜住敞口的是每天那个上限。
+- ⚠ 老 App（≤ 2.62）不带这个标记，在新服务端上**照旧按字扣**，界面上仍写着「现在免费」，要更新 App 才免费。
 
 ★ **这个端点必须在服务端，不能只留在 app 仓 `vite.config.ts` 的 dev 中间件里**：
 打成 APK 后 vite 不存在，`/api/tts` 无人应答，工坊 NPC 全程哑巴（安卓 WebView 的
