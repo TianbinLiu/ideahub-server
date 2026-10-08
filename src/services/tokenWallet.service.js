@@ -35,6 +35,7 @@
 const mongoose = require("mongoose");
 const User = require("../models/User");
 const TokenLedger = require("../models/TokenLedger");
+const TokenOrder = require("../models/TokenOrder");
 const { planOf, DEFAULT_PLAN_ID, isFreePlan } = require("../config/tokens");
 
 /** 当前计费周期标识（UTC 年月）。用字符串而不是时间戳：可直接做等值条件更新 */
@@ -60,8 +61,55 @@ function daysBetween(a, b) {
  * 「付过钱」的入账类别：只有这两类会把 `paidEver` 置真（也只有它们抵欠额，见 REPAY_REASONS）。
  * ★ 支付入账全部走 credit("recharge") 或 buyPlan —— order.service（充值 / 套餐 / 模拟渠道）、play.service（Play 购买与补发）
  *   一个不落地都在这两个函数里，所以置真只写在这两处，调用方不用记得。
+ * ★ 例外是 Play 的**测试购买**（许可测试员，一分钱没付）：它照常发币、照常抵欠额，但不算付过钱 —— credit 的 `test` 选项。
  */
 const PAYMENT_REASONS = ["recharge", "plan_buy"];
+
+/**
+ * 「这个人现在有没有一笔**还作数的**真实付款」—— paidEver 的唯一事实来源（铁律六）。
+ *
+ * ★★ 为什么不按账本数（2026-10-07 评审）：账本只记「到过账」，记不了「后来被退款了」。按账本数的话，
+ *   买一个最小的 Play 充值包、48 小时内找 Google 退款 —— token 被收回（花掉了就转欠额），
+ *   可「付过钱」永远是真的：电影级、样片、真人档、参考视频全部对他打开，日上限也从 15 万跳到 300 万。
+ *   老的模拟充值（下单系统之前「调一下就到账」的 /recharge）也会在账本里留一条 recharge，那不是钱。
+ * ⇒ 改按**订单**数：kind 不限（充值 / 套餐），渠道不限（含模拟渠道 —— 它在生产被启动自检拒掉），
+ *   状态是 paid（抢到结算、正在发币）或 settled（发完了），**没有被回收**（revokedAt 为空 —— 退款 / 拒付回收时写），
+ *   而且**不是测试购买**（isTest：许可测试员一分钱没付）。
+ * ★ Play 的**部分退款**（一次买了 3 份、退了 1 份）也算：回收把整张订单标成 refunded、写上 revokedAt（回收的幂等锚只抢一次），
+ *   可剩下那 2 份是真付了钱的 —— 认 voidedQuantity 小于 quantity 的那种（全额退款时 voidedQuantity 是 0 或等于 quantity）。
+ */
+function hasLivePayment(userId) {
+  return TokenOrder.exists({
+    user: userId,
+    isTest: { $ne: true },
+    $or: [
+      { status: { $in: ["paid", "settled"] }, revokedAt: null },
+      { status: "refunded", $expr: { $and: [{ $gt: ["$voidedQuantity", 0] }, { $lt: ["$voidedQuantity", { $ifNull: ["$quantity", 1] }] }] } },
+    ],
+  }).then(Boolean);
+}
+
+/**
+ * 按订单重算一次 `paidEver`。**退款 / 拒付回收之后**由回收的那一方调（play.service.revokeByToken）——
+ * 那一笔不作数了，他还有没有别的真实付款决定了他还算不算付费用户。
+ *
+ * ★ 写 false 有一个窗口：重算的查询跑在一笔新付款的订单落库之前、写回却落在那笔付款的 credit 置真之后，就会把真改回假。
+ *   所以写完 false 之后**再问一次**：付款的顺序永远是「订单先落库（paid）→ 再 credit 置真」，
+ *   只要 credit 的置真落在我们的 false 之前，那张订单在我们第二次查询时一定已经在了 —— 再置回真即可；
+ *   落在之后的话它自己就把真写上了。
+ * @returns {Promise<boolean|null>} 重算后的值；钱包不存在 null
+ */
+async function refreshPaidEver(userId) {
+  const paid = await hasLivePayment(userId);
+  const r = await User.updateOne({ _id: userId, tokenWallet: { $exists: true } }, { $set: { "tokenWallet.paidEver": paid } });
+  if (!r.matchedCount) return null;
+  if (paid) return true;
+  if (await hasLivePayment(userId)) {
+    await User.updateOne({ _id: userId }, { $set: { "tokenWallet.paidEver": true } });
+    return true;
+  }
+  return false;
+}
 
 /** 归一化成非负整数。小数会让流水与余额慢慢对不上（同 points 的 toPoints） */
 function toTokens(input) {
@@ -146,8 +194,9 @@ async function ensureWallet(userId, now = new Date()) {
 
   // ② 老钱包回填 paidEver（只跑一次：写成 true / false 之后这个分支就再也进不来）。
   //   ★ 条件带 $exists:false：回填与一笔并发的充值（credit 会把它 $set 成 true）撞车时，回填那一发落空，不会把 true 改回 false。
+  //   ★ 按订单判（hasLivePayment 的 ★★），不按账本：退过款的、测试购买、老的模拟充值都不算付过钱。
   if (cur.tokenWallet.paidEver === undefined) {
-    const paid = !!(await TokenLedger.exists({ user: userId, reason: { $in: PAYMENT_REASONS } }));
+    const paid = await hasLivePayment(userId);
     await User.updateOne({ _id: userId, "tokenWallet.paidEver": { $exists: false } }, { $set: { "tokenWallet.paidEver": paid } });
     cur = (await User.findById(userId).select(SELECT).lean()) || cur;
   }
@@ -349,13 +398,16 @@ async function refundSplit(userId, took, reason, memo = "", now = new Date()) {
  * ★ 知道两桶的退款一律走 refundSplit（按原桶退回，见文件头 W2 的 ★★）—— 全进 addon 会把会过期的 plan 洗成永久余额。
  * ★ 付过钱的入账（PAYMENT_REASONS：recharge / plan_buy）在**同一次原子更新**里把 `paidEver` 置真 ——
  *   免费档门禁（config/tokens.isPaidUser）认的就是它。分两步写的话，钱到了、身份没到的那一拍他点高清仍会被拒。
+ *   这笔付款之后被退款 / 拒付回收时，由回收方按订单重算（refreshPaidEver）。
+ * @param {object} [opts]
+ * @param {boolean} [opts.test] Play 的测试购买：照常入账、照常抵欠额，但**不置 paidEver**（一分钱没付，见 hasLivePayment）
  */
-async function credit(userId, amount, reason, memo = "", now = new Date()) {
+async function credit(userId, amount, reason, memo = "", now = new Date(), opts = {}) {
   const n = toTokens(amount);
   if (n === null || n === 0) return getWallet(userId, now);
   await ensureWallet(userId, now);
   const update = { $inc: { "tokenWallet.addon": n } };
-  if (PAYMENT_REASONS.includes(reason)) update.$set = { "tokenWallet.paidEver": true };
+  if (PAYMENT_REASONS.includes(reason) && !opts?.test) update.$set = { "tokenWallet.paidEver": true };
   const updated = await User.findOneAndUpdate({ _id: userId }, update, { returnDocument: "after" })
     .select(SELECT)
     .lean();
@@ -665,6 +717,8 @@ module.exports = {
   debitSplit,
   refundSplit,
   PAYMENT_REASONS,
+  hasLivePayment,
+  refreshPaidEver,
   debtOf,
   creditReversal,
   SPEND_REASONS,

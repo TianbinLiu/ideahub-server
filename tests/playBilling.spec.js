@@ -282,6 +282,16 @@ describe('测试购买（许可测试员）', () => {
     expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-test' }).lean()).isTest).toBe(true);
   });
 
+  it('★ 测试购买不算「付过钱」：照常发币，但付费档不对他开（许可测试员一分钱没付）', async () => {
+    const { isPaidUser } = require('../src/config/tokens');
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
+    await redeem(token, 'ptok-test-paid');
+    const w = await wallet.getWallet(user._id);
+    expect(w.paidEver).toBe(false);
+    expect(isPaidUser(w)).toBe(false);
+  });
+
   it('★ 测试购买被退款 → 回收照做，但**不产生欠额**（否则测试员会把自己冻住）', async () => {
     const { user, token, acct } = await makeUser();
     upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
@@ -325,6 +335,33 @@ describe('退款回收', () => {
     const before = await balance(user._id);
     await play.revokeByToken({ purchaseToken: 'ptok-partial', voidedQuantity: 1 });
     expect(await balance(user._id)).toBe(before - 150_000); // 450k 的 1/3
+  });
+
+  it('★★ 退款之后不再算「付过钱」（否则买一包、退款，付费档就永远对他开着）；另有一笔没退的照样算', async () => {
+    const { isPaidUser } = require('../src/config/tokens');
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct });
+    await redeem(token, 'ptok-paid-refund');
+    expect(isPaidUser(await wallet.getWallet(user._id))).toBe(true);
+    await play.revokeByToken({ purchaseToken: 'ptok-paid-refund' });
+    const w = await wallet.getWallet(user._id);
+    expect(w.paidEver).toBe(false);
+    expect(isPaidUser(w)).toBe(false);
+
+    const two = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: two.acct, orderId: 'GPA.keep' });
+    await redeem(two.token, 'ptok-keep');
+    upstream.purchase = purchaseBody({ accountId: two.acct, orderId: 'GPA.drop' });
+    await redeem(two.token, 'ptok-drop');
+    await play.revokeByToken({ purchaseToken: 'ptok-drop' });
+    expect(isPaidUser(await wallet.getWallet(two.user._id))).toBe(true);
+
+    // 部分退款：3 份退 1 份，剩下 2 份是真付了钱的
+    const part = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: part.acct, quantity: 3, orderId: 'GPA.part' });
+    await redeem(part.token, 'ptok-part-paid');
+    await play.revokeByToken({ purchaseToken: 'ptok-part-paid', voidedQuantity: 1 });
+    expect(isPaidUser(await wallet.getWallet(part.user._id))).toBe(true);
   });
 
   it('★ RTDN 与每小时轮询同时命中 → 只回收一次', async () => {

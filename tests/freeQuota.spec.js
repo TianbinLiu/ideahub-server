@@ -6,7 +6,8 @@
 //   ① 新人额度只能发一次（并发首次触达、老钱包都不能再发）；
 //   ② 每日补发按 UTC 日抢占，只补不削（老账号剩下的月度额度不能被一把削没）；
 //   ③ 付费套餐不吃每日补发、免费版不吃月度刷新（否则攒了几天的额度跨月一把清零）；
-//   ④ 付过钱的标记由支付入账置真、老账号按账本回填一次，GET /api/me/wallet 回 `paid` 与 `free`。
+//   ④ 付过钱的标记由支付入账置真、老账号按**订单**回填一次（退过款的、测试购买、老的模拟充值都不算），
+//      回收之后按订单重算（tokenWallet.refreshPaidEver）；GET /api/me/wallet 回 `paid` 与 `free`。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -15,6 +16,7 @@ let mongod;
 let app;
 let User;
 let TokenLedger;
+let TokenOrder;
 let wallet;
 let tokens;
 
@@ -31,6 +33,7 @@ beforeAll(async () => {
   app = require("../src/app");
   User = require("../src/models/User");
   TokenLedger = require("../src/models/TokenLedger");
+  TokenOrder = require("../src/models/TokenOrder");
   wallet = require("../src/services/tokenWallet.service");
   tokens = require("../src/config/tokens");
 });
@@ -205,18 +208,66 @@ describe("付没付过钱（paidEver）", () => {
     expect(tokens.isPaidUser(w)).toBe(false);
   });
 
-  test("老钱包（没有 paidEver）按账本回填一次：付过钱的回填成 true，没付过的写成 false", async () => {
+  /** 一张订单（只填 hasLivePayment 看的那几格） */
+  let orderSeq = 0;
+  const seedOrder = (userId, extra = {}) => {
+    orderSeq += 1;
+    return TokenOrder.create({ orderNo: `FQ${Date.now().toString(36)}${orderSeq}`, user: userId, kind: "recharge", packTokens: 200_000, amountFen: 600, status: "settled", settledAt: new Date(), ...extra });
+  };
+
+  test("老钱包（没有 paidEver）按**订单**回填一次：有还作数的付款 → true；没付过 / 退过款 / 测试购买 / 只有老模拟充值的账本 → false", async () => {
+    // ★★ 2026-10-07 评审：原来按账本（recharge / plan_buy 流水）回填 —— 账本记不了「后来被退款了」，
+    //   买一包、退款，付费档就永远对他开着；下单系统之前「调一下就到账」的模拟充值也在账本里留了 recharge。
     const paid = await makeUser();
     const never = await makeUser();
-    for (const u of [paid, never]) {
+    const refunded = await makeUser();
+    const tester = await makeUser();
+    const legacyMock = await makeUser();
+    for (const u of [paid, never, refunded, tester, legacyMock]) {
       await User.updateOne({ _id: u.id }, { $set: { tokenWallet: { plan: 1_000, addon: 0, planId: "free", cycle: "2026-10", day: "2026-10-07", debt: 0, debtSince: null } } });
     }
-    await TokenLedger.create({ user: paid.id, delta: 200_000, reason: "recharge", balanceAfter: 201_000, memo: "老订单" });
+    await seedOrder(paid.id);
+    await seedOrder(refunded.id, { channel: "play", status: "refunded", revokedAt: new Date() });
+    await seedOrder(tester.id, { channel: "play", isTest: true });
+    await TokenLedger.create({ user: legacyMock.id, delta: 200_000, reason: "recharge", balanceAfter: 201_000, memo: "老的模拟充值（没有订单）" });
     expect((await wallet.getWallet(paid.id, dayAt("2026-10-07"))).paidEver).toBe(true);
-    expect((await wallet.getWallet(never.id, dayAt("2026-10-07"))).paidEver).toBe(false);
-    // 写下来了：之后不再查账本
+    for (const u of [never, refunded, tester, legacyMock]) expect((await wallet.getWallet(u.id, dayAt("2026-10-07"))).paidEver).toBe(false);
+    // 写下来了：之后不再查订单
     const raw = await User.findById(never.id).select("tokenWallet").lean();
     expect(raw.tokenWallet.paidEver).toBe(false);
+  });
+
+  test("Play 测试购买（许可测试员，一分钱没付）照常入账，但不置「付过钱」", async () => {
+    const u = await makeUser();
+    await wallet.getWallet(u.id);
+    const w = await wallet.credit(u.id, 150_000, "recharge", "Play 订单 T（测试购买）", new Date(), { test: true });
+    expect(w.addon).toBe(WELCOME + 150_000);
+    expect(w.paidEver).toBe(false);
+    expect(tokens.isPaidUser(w)).toBe(false);
+  });
+
+  test("refreshPaidEver 按订单重算：唯一一笔被回收 → false；还有别的付款 → 仍是 true；部分退款（还剩没退的份）→ 仍是 true", async () => {
+    const solo = await makeUser();
+    await wallet.getWallet(solo.id);
+    const o1 = await seedOrder(solo.id, { channel: "play" });
+    await wallet.credit(solo.id, 200_000, "recharge", `Play 订单 ${o1.orderNo}`);
+    expect((await wallet.getWallet(solo.id)).paidEver).toBe(true);
+    await TokenOrder.updateOne({ _id: o1._id }, { $set: { revokedAt: new Date(), status: "refunded" } });
+    expect(await wallet.refreshPaidEver(solo.id)).toBe(false);
+    expect(tokens.isPaidUser(await wallet.getWallet(solo.id))).toBe(false);
+
+    const two = await makeUser();
+    await wallet.getWallet(two.id);
+    await seedOrder(two.id, { channel: "play", status: "refunded", revokedAt: new Date() });
+    await seedOrder(two.id, { kind: "plan", planId: "std", packTokens: 0 });
+    expect(await wallet.refreshPaidEver(two.id)).toBe(true);
+
+    const partial = await makeUser();
+    await wallet.getWallet(partial.id);
+    await seedOrder(partial.id, { channel: "play", status: "refunded", revokedAt: new Date(), quantity: 3, voidedQuantity: 1 });
+    expect(await wallet.refreshPaidEver(partial.id)).toBe(true);
+    await TokenOrder.updateMany({ user: partial.id }, { $set: { voidedQuantity: 3 } });
+    expect(await wallet.refreshPaidEver(partial.id)).toBe(false);
   });
 
   test("回填与并发充值撞车：充值置的 true 不会被回填的 false 盖掉", async () => {
