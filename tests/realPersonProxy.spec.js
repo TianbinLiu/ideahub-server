@@ -185,7 +185,8 @@ describe("白名单转发（配假 key + 假上游，看真正发出去的是什
         .send({ model: "MiniMax-Hailuo-2.3-Fast", prompt: "p", duration: 6, first_frame_image: "data:image/png;base64,QQ==" });
       expect(mm.status).toBe(403);
       expect(mm.body.code).toBe("PLAN_REQUIRED");
-      expect(mm.body.allowed).toEqual(["极速", "草稿"]);
+      // 按「此刻」断言：极速 2026-11-24 13:00 停用之后清单只剩「草稿」（写死的话这条会在那一天变红）
+      expect(mm.body.allowed).toEqual(require("../src/config/tokens").freeVideoTiers().map((t) => t.label));
       const rw = await request(app)
         .post("/api/runway/video")
         .set({ Authorization: `Bearer ${freeToken}` })

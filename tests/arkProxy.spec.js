@@ -174,6 +174,11 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
   const MINI = "doubao-seedance-2-0-mini-260615";
   const FAST = "doubao-seedance-1-0-pro-fast-251015";
   const STD = "doubao-seedance-1-0-pro-250528";
+  // ★ 1.0 两档 2026-11-24 13:00（北京时间）起停用（tokens.RETIRED_MODELS_AT）：过了那一刻免费档只剩「草稿」、
+  //   1.0 的新任务一律 400 MODEL_RETIRED。凡是碰到 1.0 或免费档清单的断言都按「此刻」说话 —— 写死「极速」的话，
+  //   这些用例会在那一天集体变红，而代码一个字没动。停用之后的行为另有专门的用例（拨钟验，见参数钉子那一组末尾）。
+  const { isRetired, freeVideoTiers } = require("../src/config/tokens");
+  const freeLabels = () => freeVideoTiers().map((t) => t.label);
   const taskBody = { model: SEEDANCE_2_5, duration: 5, content: [] };
   const post = (body, t = token) =>
     request(app).post("/api/ark/contents/generations/tasks").set({ Authorization: `Bearer ${t}` }).send(body);
@@ -188,11 +193,14 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     expect(typeof res.body.message).toBe("string");
     expect(res.body.message).toMatch(/付费套餐/);
     expect(res.body.message).toMatch(/免费版/);
-    expect(res.body.message).toMatch(/「极速」「草稿」/);
+    // 停用之前是「极速」「草稿」，之后只剩「草稿」（freeLabels 的 ★）
+    expect(res.body.message).toContain(freeLabels().map((l) => `「${l}」`).join(""));
+    expect(res.body.message).toMatch(/「草稿」/);
     // ★ 不许把模型 id 甩给用户；也不许有 ASCII 双引号（老 App 用 "message":"([^"]+)" 抠这句话，带引号会被拦腰截断）
     expect(res.body.message).not.toMatch(/seedance|doubao|"/i);
     // 英文界面不显示服务端的中文句子：能用哪几档要有结构化的一份
-    expect(res.body.allowed).toEqual(["极速", "草稿"]);
+    expect(res.body.allowed).toEqual(freeLabels());
+    if (!isRetired(FAST)) expect(res.body.allowed).toEqual(["极速", "草稿"]);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -216,10 +224,11 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     ["极速 720p（不写分辨率 = 钉子补成 720p）", { model: FAST, duration: 5, content: [] }],
     ["极速 显式 720p", { model: FAST, duration: 5, resolution: "720p", content: [] }],
     ["草稿（2.0 mini · 480p）", { model: MINI, duration: 4, resolution: "480p", ratio: "9:16", content: [] }],
-  ])("免费版用免费档（%s）→ 过门禁（501 = 走到 forward）", async (_n, body) => {
+  ])("免费版用免费档（%s）→ 过门禁（501 = 走到 forward；1.0 停用之后是 400 MODEL_RETIRED）", async (_n, body) => {
     const res = await post(body);
     expect(res.body.code).not.toBe("PLAN_REQUIRED");
-    expect(res.status).toBe(501);
+    if (isRetired(body.model)) expect({ status: res.status, code: res.body.code }).toEqual({ status: 400, code: "MODEL_RETIRED" });
+    else expect(res.status).toBe(501);
   });
 
   test.each([
@@ -231,9 +240,14 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     const walletSvc = require("../src/services/tokenWallet.service");
     const before = await walletSvc.getWallet(freeUserId);
     const res = await post(body);
-    expect(res.status).toBe(403);
-    expect(res.body.code).toBe("PLAN_REQUIRED");
-    expect(res.body.allowed).toEqual(["极速", "草稿"]);
+    if (isRetired(body.model)) {
+      // 停用之后 1.0 在钉子那一关就被拒了（排在门禁前面），同样不出网、不扣费
+      expect({ status: res.status, code: res.body.code }).toEqual({ status: 400, code: "MODEL_RETIRED" });
+    } else {
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("PLAN_REQUIRED");
+      expect(res.body.allowed).toEqual(freeLabels());
+    }
     expect(fetchSpy).not.toHaveBeenCalled();
     const after = await walletSvc.getWallet(freeUserId);
     expect(after.plan + after.addon).toBe(before.plan + before.addon);
@@ -253,7 +267,7 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     process.env.FREE_VIDEO_GATE = "off";
     try {
       expect((await post({ model: MINI, duration: 5, resolution: "720p", content: [] })).status).toBe(501);
-      expect((await post({ model: STD, duration: 5, content: [] })).status).toBe(501);
+      expect((await post({ model: STD, duration: 5, content: [] })).status).toBe(isRetired(STD) ? 400 : 501); // 停用与门禁开关无关
       const ultra = await post(taskBody);
       expect(ultra.status).toBe(403);
       expect(ultra.body.code).toBe("PLAN_REQUIRED");
@@ -267,10 +281,12 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     const free = (o) => videoPlanDenial({ paid: false, ...o });
 
     test("免费档只认 (模型, 分辨率) 两个都对上、且是普通片", () => {
+      // 极速那两条钉在停用前一刻（纯函数收 now）：停用之后极速本来就出局，见下面「停用时刻一到」那条
+      const beforeRetire = Date.parse(RETIRED_MODELS_AT[FAST]) - 1;
       expect(free({ kind: "task", model: MINI, resolution: "480p" })).toBeNull();
-      expect(free({ kind: "task", model: FAST, resolution: "720p" })).toBeNull();
+      expect(free({ kind: "task", model: FAST, resolution: "720p", now: beforeRetire })).toBeNull();
       expect(free({ kind: "task", model: MINI, resolution: "720p" })).not.toBeNull();
-      expect(free({ kind: "task", model: FAST, resolution: "1080p" })).not.toBeNull();
+      expect(free({ kind: "task", model: FAST, resolution: "1080p", now: beforeRetire })).not.toBeNull();
       expect(free({ kind: "task", model: MINI, resolution: undefined })).not.toBeNull();
       // 同样的 (模型, 分辨率)，只要带参考视频 / 是样片 / 样片转成片，就不是「普通片」
       expect(free({ kind: "task", model: MINI, resolution: "480p", r2v: { kind: "material" } })).not.toBeNull();
@@ -370,12 +386,15 @@ describe("跨仓档位表一致性（app 的报价 vs 服务端的结算，按 (
   test("在册模型与档位表一一对应（新增档位不许漏掉 ALLOWED_MODELS）", async () => {
     // 白名单是私有常量，所以从行为上验：每个档位的 (模型, 分辨率) 都得能过"在册 + 钉子"这两关。
     // 漏掉一行的症状是 400 —— 用户那边表现为"这一档永远失败"。
+    // ★ 停用之后的 1.0 两行回 400 MODEL_RETIRED（码不是 VIDEO_PARAMS_NOT_ALLOWED / 不在册）：仍在册，只是不收新任务了
+    const { isRetired } = require("../src/config/tokens");
     for (const t of APP_VIDEO_TIERS) {
       const res = await request(app)
         .post("/api/ark/contents/generations/tasks")
         .set({ Authorization: `Bearer ${paidToken}` })
         .send({ model: t.model, duration: 5, resolution: t.resolution, content: [] });
-      expect({ id: t.id, status: res.status }).toEqual({ id: t.id, status: 501 });
+      const want = isRetired(t.model) ? { status: 400, code: "MODEL_RETIRED" } : { status: 501, code: res.body.code };
+      expect({ id: t.id, status: res.status, code: res.body.code }).toEqual({ id: t.id, ...want });
     }
   });
 
@@ -514,6 +533,9 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     request(app).post("/api/ark/contents/generations/tasks").set({ Authorization: `Bearer ${paidToken}` }).send(body);
   const MINI = "doubao-seedance-2-0-mini-260615";
   const ULTRA = "doubao-seedance-2-5-260628";
+  // ★ 1.0 两档 2026-11-24 13:00 起停用：那之后碰到 1.0 的几行先撞「停用」（400 MODEL_RETIRED），不再走到窗口 / 分辨率那几道钉子。
+  //   按「此刻」断言，别让这一组在那一天无缘无故变红（停用本身的用例在本组末尾，拨钟验）。
+  const { isRetired } = require("../src/config/tokens");
 
   test.each([
     ["高清 15 秒（新窗口的上界）", { model: MINI, duration: 15 }],
@@ -527,7 +549,8 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     ["三种合法条目（文字 / 图 / 音频）", { model: MINI, duration: 5, content: [{ type: "text", text: "t" }, { type: "image_url", image_url: { url: "https://x/y.jpg" } }, { type: "audio_url", audio_url: { url: "https://x/a.mp3" } }] }],
   ])("合规（%s）→ 过钉子走到 forward（501 = 没配 key）", async (_n, extra) => {
     const res = await post({ content: [], ...extra });
-    expect(res.status).toBe(501);
+    if (isRetired(extra.model)) expect({ status: res.status, code: res.body.code }).toEqual({ status: 400, code: "MODEL_RETIRED" });
+    else expect(res.status).toBe(501);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -564,7 +587,7 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     const before = await wallet.getWallet(paidUserId);
     const res = await post({ content: [], ...extra });
     expect(res.status).toBe(400);
-    expect(res.body.code).toBe("VIDEO_PARAMS_NOT_ALLOWED");
+    expect(res.body.code).toBe(isRetired(extra.model) ? "MODEL_RETIRED" : "VIDEO_PARAMS_NOT_ALLOWED");
     expect(typeof res.body.message).toBe("string");
     expect(res.body.message).toMatch(/没有扣费/);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -580,11 +603,13 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
   test("★ 缺省补齐 + 服务端钉死的字段：转发出去的是补好的那一份（不是原样转发客户端的）", async () => {
     // ★★ 不传 duration / resolution 在方舟那边是 2.5 的 -1（最长 30 秒）与 1.0 的 1080p —— 两个少收的口子。
     //   这条从「真正发出去的请求体」上验：补齐、超时 24 小时、回调地址与服务等级被剥掉。
+    // 用极速（1.0：不传 resolution 的缺省是 1080p，正是要堵的那个口子）；1.0 停用之后换高清（2.0 mini）验同一件事
+    const model = isRetired("doubao-seedance-1-0-pro-fast-251015") ? MINI : "doubao-seedance-1-0-pro-fast-251015";
     process.env.ARK_API_KEY = "test-key";
     try {
       fetchSpy.mockImplementation(async () => ({ status: 200, text: async () => JSON.stringify({ id: "cgt-pin-fill-1" }) }));
       const res = await post({
-        model: "doubao-seedance-1-0-pro-fast-251015",
+        model,
         content: [{ type: "text", text: "t" }],
         callback_url: "https://evil.example.com/hook",
         service_tier: "flex",
@@ -594,17 +619,17 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const sent = JSON.parse(fetchSpy.mock.calls[0][1].body);
       expect(sent).toEqual({
-        model: "doubao-seedance-1-0-pro-fast-251015",
+        model,
         content: [{ type: "text", text: "t" }],
         duration: 5,
         resolution: "720p",
         execution_expires_after: 86400,
       });
-      // 记账也是按补好的那一份：5 秒 720p 极速
+      // 记账也是按补好的那一份：5 秒 720p
       const TokenLedger = require("../src/models/TokenLedger");
       const { segTokens } = require("../src/config/tokens");
       const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend" }).sort({ _id: -1 }).lean();
-      expect(spend.delta).toBe(-segTokens(5, "doubao-seedance-1-0-pro-fast-251015"));
+      expect(spend.delta).toBe(-segTokens(5, model, "720p"));
     } finally {
       delete process.env.ARK_API_KEY;
     }
@@ -970,10 +995,11 @@ describe("健康端点", () => {
       res480: true,
       draftMode: true,
       failRefund: true,
+      // 停用的档自动出局（1.0 极速 2026-11-24 13:00 起就不在这里了）：按「此刻」断言，别让这条在那一天变红
       freeVideo: [
         { label: "极速", model: "doubao-seedance-1-0-pro-fast-251015", resolution: "720p" },
         { label: "草稿", model: "doubao-seedance-2-0-mini-260615", resolution: "480p" },
-      ],
+      ].filter((t) => !require("../src/config/tokens").isRetired(t.model)),
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });
@@ -1162,9 +1188,9 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
     expect(res.status).toBe(501); // 无 key：扣费发生在 forward 之前，501 后 W2 原路退回
 
     const after = await walletSvc.getWallet(paidUserId);
-    // 扣的是 r2v 价（先扣 plan），退回进 addon —— 总额不变、构成移动，两头都对得上
-    expect(after.plan).toBe(before.plan - Math.min(before.plan, expected));
-    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+    // 扣的是 r2v 价（先扣 plan 再扣 addon），501 = 没受理 ⇒ 按扣的那两桶原样退回（2026-10-07 起 tokenWallet.refundSplit）——
+    //   两桶各自复原。★ 原来这里断言「退回进 addon、构成移动」：那是改版前的口径，只因为这个账号此刻 plan 恰好是 0 才一直绿着
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
 
     // 流水必须带 r2v 标记（对账时把白模的钱从纯任务里分出来靠它）。
     // 按 memo 里的模板 id 查而不是按时间排序：金额相同的两笔（试炼那发也是 1,209,600）
@@ -1353,10 +1379,11 @@ describe("r2v（白模模板）：只准已登记模板 URL，按 2.8 系数计�
   });
 
   test("不带 reference_video 的任务不受影响（别把正常出片一起拦了）", async () => {
+    // 免费版用「草稿」（2.0 mini · 480p）：免费档里不会停用的那一档（极速 2026-11-24 停用，用它的话这条会在那一天变红）
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth())
-      .send({ model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [{ type: "text", text: "t" }] });
+      .send({ model: "doubao-seedance-2-0-mini-260615", duration: 5, resolution: "480p", content: [{ type: "text", text: "t" }] });
     expect(res.status).toBe(501); // 没配 key 时到 501 = 门都过了、走到 forward
   });
 });
@@ -1434,9 +1461,9 @@ describe("r2v 第二条分支：本账号刚传、尚未登记的素材（白模
     expect(res.status).toBe(501); // 没配 key：闸门与扣费都过了才到 forward
 
     const after = await walletSvc.getWallet(paidUserId);
-    // 扣的是 r2v 价（先扣 plan），501 后 W2 退回 addon —— 总额不变、构成移动
-    expect(after.plan).toBe(before.plan - Math.min(before.plan, expected));
-    expect(after.plan + after.addon).toBe(before.plan + before.addon);
+    // 扣的是 r2v 价（先扣 plan 再扣 addon），501 后 W2 按扣的那两桶原样退回（2026-10-07 起）—— 两桶各自复原
+    //   （原来断言「退回 addon、构成移动」，只因为 plan 恰好是 0 才一直绿着）
+    expect({ plan: after.plan, addon: after.addon }).toEqual({ plan: before.plan, addon: before.addon });
 
     // 流水必须带来源标记：不带的话月底对账分不出白模化那一发花的钱
     const spend = await TokenLedger.findOne({

@@ -205,21 +205,32 @@ describe("/api/ark 的扣费闸门", () => {
     }
   });
 
-  test("视频按时长与档位定价：极速档比标准档便宜", async () => {
+  test("视频按时长、档位与分辨率定价：同一个模型，草稿（480p）比高清（720p）便宜", async () => {
+    // ★ 实扣走一遍 HTTP 用的是**不会停用**的两档（2.0 mini 的高清 / 草稿）：原来这条用标准 vs 极速，
+    //   而 1.0 两档 2026-11-24 13:00 起停用（tokens.RETIRED_MODELS_AT）—— 那之后两发都是 400，这条会在那一天无缘无故变红。
+    //   1.0 两档的系数改成下面的纯函数断言照样钉着（它们跟账单走，停用之前仍在收钱）。
     const { token: t1, userId: u1 } = await registerUser();
     const { token: t2, userId: u2 } = await registerUser();
-    await makePaying(u1); // 标准档只对付过钱的人开放；极速档免费版也能用（u2 留着免费版）
+    await makePaying(u1); // 高清只对付过钱的人开放；草稿免费版也能用（u2 留着免费版）
     mockArk(200, { id: "task_1" });
-    const body = (model) => ({ model, content: [], duration: 5 });
-    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t1)).send(body("doubao-seedance-1-0-pro-250528")).expect(200);
-    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t2)).send(body("doubao-seedance-1-0-pro-fast-251015")).expect(200);
-    const spentStd = FREE - (await balanceOf(u1));
-    const spentFast = FREE - (await balanceOf(u2));
-    expect(spentStd).toBe(108_000); // 5×1280×720×24/1024
+    const MINI = "doubao-seedance-2-0-mini-260615";
+    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t1)).send({ model: MINI, content: [], duration: 5, resolution: "720p" }).expect(200);
+    await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth(t2))
+      .send({ model: MINI, content: [], duration: 5, resolution: "480p", ratio: "9:16" })
+      .expect(200);
+    const spentHd = FREE - (await balanceOf(u1));
+    const spentDraft = FREE - (await balanceOf(u2));
+    expect(spentHd).toBe(165_600); // 5×21,600（720p 一刀切）×23/15
+    expect(spentDraft).toBe(77_004); // 5×10,044（480p 9:16 = 496×864×24/1024）×23/15
+
+    const { segTokens } = require("../src/config/tokens");
+    expect(segTokens(5, "doubao-seedance-1-0-pro-250528")).toBe(108_000); // 5×1280×720×24/1024
     // ⚠ 2026-08-16 按 8 月账单把极速档从 0.3 改成 4.2/15（账单 ¥0.0042/千token）：
     //   30,240 而不是 32,400。**这个数字要跟着账单走**，别看到红就改回 0.3 ——
     //   0.3 比真实成本高 7%，方向是多收用户。系数的出处写在 config/tokens.js 的 VIDEO_MULT。
-    expect(spentFast).toBe(Math.round(108_000 * (4.2 / 15)));
+    expect(segTokens(5, "doubao-seedance-1-0-pro-fast-251015")).toBe(Math.round(108_000 * (4.2 / 15)));
   });
 
   test("W2 上游 400（敏感词）→ 原路退回，余额不变，流水一扣一退", async () => {
@@ -273,7 +284,7 @@ describe("/api/ark 的扣费闸门", () => {
 
   test("余额不足 → 402 + INSUFFICIENT_TOKENS，且【根本不打方舟】", async () => {
     const { token, userId } = await registerUser();
-    await makePaying(userId); // 标准档只对付过钱的人开放（这条测的是余额闸，不是免费档门禁）
+    await makePaying(userId); // 高清只对付过钱的人开放（这条测的是余额闸，不是免费档门禁）
     const spy = mockArk(200, {});
     await walletSvc.getWallet(userId);
     await walletSvc.debit(userId, FREE, "掏空");
@@ -283,10 +294,11 @@ describe("/api/ark 的扣费闸门", () => {
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth(token))
-      .send({ model: "doubao-seedance-1-0-pro-250528", content: [], duration: 10 })
+      // 高清 10 秒（不会停用的一档：原来用标准，1.0 2026-11-24 停用之后这里会先撞 400 MODEL_RETIRED）
+      .send({ model: "doubao-seedance-2-0-mini-260615", content: [], duration: 10, resolution: "720p" })
       .expect(402);
     expect(res.body.code).toBe("INSUFFICIENT_TOKENS");
-    expect(res.body.need).toBe(216_000);
+    expect(res.body.need).toBe(331_200); // 10×21,600×23/15
     expect(spy).not.toHaveBeenCalled(); // ★ 这条才是"钱包搬到服务端"的意义
   });
 
