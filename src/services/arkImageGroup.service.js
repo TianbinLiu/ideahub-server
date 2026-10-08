@@ -19,14 +19,12 @@
 //   扫描要做实例判断），改成**懒回收**：这个人下次查询 / 开新的一组时，把超过 STALE_MS 还没结束的按「画到哪张算哪张」结掉。
 const mongoose = require("mongoose");
 const ArkImageGroup = require("../models/ArkImageGroup");
-const wallet = require("./tokenWallet.service");
 const billing = require("./billing.service");
 const { ADMIN_ROLE } = require("../utils/roles");
 const { arkConfigured, openArkStream } = require("./arkGateway.service");
 const {
   imageTokensOf,
   priceOf,
-  paidOnlyDenial,
   GROUP_IMAGE_MODELS,
   GROUP_MAX_IMAGES,
   GROUP_MAX_REFS,
@@ -367,9 +365,10 @@ async function startImageGroup({ user, body }) {
 
   let pre;
   try {
-    // 套餐门禁的判据只有 paidOnlyDenial 一处（与 chargedArkCall 同一个读法）
-    const before = await wallet.getWallet(user._id);
-    pre = await billing.preAuthorize({ user, cost, memo, denyReason: paidOnlyDenial(before?.planId, req.model) || "" });
+    // ★ 组图**不过**免费档门禁（2026-10-07 起门禁只管出视频，config/tokens.videoPlanDenial）：
+    //   免费额度本来就该能出图。原来这里调过一次「仅付费模型」的判据，而它对出图模型恒为放行 ——
+    //   留着一个永远不拒的调用，只会诱导下一个人往里加条件、误伤免费用户，所以连调用一起删了。
+    pre = await billing.preAuthorize({ user, cost, memo });
   } catch (e) {
     await ArkImageGroup.deleteOne({ _id: job._id }).catch(() => {});
     throw e;

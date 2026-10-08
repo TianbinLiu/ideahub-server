@@ -34,6 +34,8 @@ const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
  * @param {Function} o.forward   async () => ({ accepted: boolean, ... })，返回值原样带回
  * @param {string}   [o.refundTag="ark_refund"] 退款流水的类别（分得出哪家上游退的）
  * @param {string}   [o.denyReason] 额外的门禁（套餐不足等）：给了就直接 403，不扣费
+ * @param {object}   [o.denyExtra]  拒绝时并进 403 回包的结构化字段（免费档门禁的 `allowed`：此刻免费版能用的档名。
+ *                                  英文界面不显示服务端的中文句子，客户端靠它自己说「哪几档能用」）
  * @returns {Promise<{ok:boolean, status?:number, body?:object, wallet:object|null, cost:number, free:boolean, result?:object}>}
  *   `ok:false` 时 status/body 是**可以直接回给客户端**的完整响应。
  */
@@ -46,7 +48,7 @@ const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
  *   序列本身仍然只有这一份实现。
  * @returns {{ok:false,status,body,wallet}|{ok:true,wallet,free,cost}}
  */
-async function preAuthorize({ user, cost, memo, denyReason = "" }) {
+async function preAuthorize({ user, cost, memo, denyReason = "", denyExtra = null }) {
   const free = isAdmin(user);
   // 一趟读，三个用途：冻结判据、402 时报给用户的余额、顺带完成钱包初始化与跨月刷新
   const before = await wallet.getWallet(user._id);
@@ -79,7 +81,8 @@ async function preAuthorize({ user, cost, memo, denyReason = "" }) {
       return {
         ok: false,
         status: 403,
-        body: { ok: false, code: "PLAN_REQUIRED", message: denyReason, planId: before?.planId ?? null },
+        // ★ denyExtra 先摊、四个固定字段后写：附加字段只能**加**东西，盖不掉 code / message
+        body: { ...(denyExtra || {}), ok: false, code: "PLAN_REQUIRED", message: denyReason, planId: before?.planId ?? null },
         wallet: before,
         cost,
         free,
@@ -147,8 +150,8 @@ async function noteFreeCall({ user, cost, memo, snapshot = null }) {
  * 跑一次要花钱的上游调用（非流式链路用这一条：门禁 → 预扣 → 转发 → 没受理退 → 免单记账）。
  * @param {Function} o.forward async () => ({ accepted: boolean, ... })，返回值原样带回
  */
-async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund", denyReason = "" }) {
-  const pre = await preAuthorize({ user, cost, memo, denyReason });
+async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund", denyReason = "", denyExtra = null }) {
+  const pre = await preAuthorize({ user, cost, memo, denyReason, denyExtra });
   if (!pre.ok) return pre;
   let { wallet: w } = pre;
   const { free, before } = pre;

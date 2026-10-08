@@ -16,6 +16,7 @@ const request = require("supertest");
 let mongod;
 let app;
 let token;
+let freeToken;
 let fetchSpy;
 
 beforeAll(async () => {
@@ -40,7 +41,21 @@ beforeAll(async () => {
     .send({ username: name, email: `${name}@test.local`, password: "secret123" })
     .expect(201);
   token = res.body.token;
+  freeToken = await registerFree("realfree");
+  // ★ 2026-10-07 起真人档只对付过钱的人开放（config/tokens.videoPlanDenial）：这一套测的是转发与计费，
+  //   所以主账号先发一个付费套餐（绕开支付渠道）；「免费版被挡住」单独一组用 freeToken 测。
+  await require("../src/services/tokenWallet.service").buyPlan(res.body.user._id, "std");
 });
+
+/** 注册一个保持免费版的账号，返回 token */
+async function registerFree(tag) {
+  const name = `${tag}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const r = await request(app)
+    .post("/api/auth/register")
+    .send({ username: name, email: `${name}@test.local`, password: "secret123" })
+    .expect(201);
+  return r.body.token;
+}
 
 afterAll(async () => {
   await mongoose.disconnect();
@@ -160,6 +175,32 @@ describe("白名单转发（配假 key + 假上游，看真正发出去的是什
     }
   });
 
+  test("免费版（没付过钱）调真人档 → 403 PLAN_REQUIRED，带 allowed；不出网、不扣钱（MiniMax 与 Runway 同一道门）", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    process.env.RUNWAY_API_KEY = "test-key";
+    try {
+      const mm = await request(app)
+        .post("/api/minimax/video")
+        .set({ Authorization: `Bearer ${freeToken}` })
+        .send({ model: "MiniMax-Hailuo-2.3-Fast", prompt: "p", duration: 6, first_frame_image: "data:image/png;base64,QQ==" });
+      expect(mm.status).toBe(403);
+      expect(mm.body.code).toBe("PLAN_REQUIRED");
+      expect(mm.body.allowed).toEqual(["极速", "草稿"]);
+      const rw = await request(app)
+        .post("/api/runway/video")
+        .set({ Authorization: `Bearer ${freeToken}` })
+        .send({ model: "gen4_turbo", promptImage: "data:image/png;base64,QQ==", duration: 5 });
+      expect(rw.status).toBe(403);
+      expect(rw.body.code).toBe("PLAN_REQUIRED");
+      expect(rw.body.message).toMatch(/免费版/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await require("../src/models/TokenLedger").countDocuments({ reason: "ark_spend" })).toBe(0);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+      delete process.env.RUNWAY_API_KEY;
+    }
+  });
+
   test("任务 id 只收安全字符集（不许把路径拼进上游 URL）", async () => {
     process.env.MINIMAX_API_KEY = "test-key";
     process.env.RUNWAY_API_KEY = "test-key";
@@ -192,6 +233,8 @@ describe("真人档计费", () => {
       .expect(201);
     billToken = r.body.token;
     billUserId = r.body.user?.id || r.body.user?._id || null;
+    // 真人档只对付过钱的人开放（2026-10-07）：这一组测计费，先发套餐（余额在 beforeEach 里另行摆好）
+    if (billUserId) await require("../src/services/tokenWallet.service").buyPlan(billUserId, "std");
   });
   const bauth = () => ({ Authorization: `Bearer ${billToken}` });
   // ★ 每条用例前把余额摆回一个够花的数：这一组里有好几发真扣钱的用例，

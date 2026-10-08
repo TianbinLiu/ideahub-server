@@ -55,7 +55,7 @@ const {
 } = require("../utils/templateVideoAsset");
 const { callArk, chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
 const blockout = require("../services/blockoutize.service");
-const { SEEDANCE_2_5, VIDEO_MULT_R2V, paidOnlyDenial } = require("../config/tokens");
+const { SEEDANCE_2_5, VIDEO_MULT_R2V, videoPlanDenial, isPaidUser } = require("../config/tokens");
 const wallet = require("../services/tokenWallet.service");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
 const { isAdmin } = require("../utils/roles");
@@ -616,10 +616,14 @@ router.post(
       //   与 services/arkGateway 里那一段逐字同理：那道门守的是"钱"，
       //   对一个根本不花钱的人守它没有意义。不跳的话，挂在免费档上的管理员账号
       //   在这里被 403，而同一发走 /api/ark 却是通的（两处行为分家）。
-      const denied = isAdmin(req.user) ? null : paidOnlyDenial(w0?.planId, BLOCKOUT_MODEL);
+      // ★ 判据与 /api/ark 同一处（config/tokens.videoPlanDenial）：白模化那一发是 r2v，免费版一律不开。
+      //   这里只是**提前**问一次（排在看帧那笔钱之前）；r2v 那一发走 chargedArkCall 时还会再过同一道门。
+      const denied = isAdmin(req.user)
+        ? null
+        : videoPlanDenial({ paid: isPaidUser(w0), kind: "task", model: BLOCKOUT_MODEL, resolution: "720p", r2v: { kind: "blockout" } });
       if (denied) {
-        // 403 而不是 402：充值解决不了，得换套餐（与 /api/ark 同一条口径）
-        return fail(res, 403, denied, { code: "PLAN_REQUIRED", planId: w0?.planId ?? null, billed: false });
+        // 403 而不是 402：没付过钱之前怎么都过不去（与 /api/ark 同一条口径）
+        return fail(res, 403, denied.message, { code: "PLAN_REQUIRED", planId: w0?.planId ?? null, billed: false, ...(denied.allowed ? { allowed: denied.allowed } : {}) });
       }
 
       // ── ④ 前置：现查原片元数据（四组数要靠它校）──────────────────────

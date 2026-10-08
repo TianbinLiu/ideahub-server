@@ -57,6 +57,16 @@ async function registerUser() {
 
 const auth = (t) => ({ Authorization: `Bearer ${t}` });
 
+/**
+ * 把一个账号标成「付过钱」而**不动余额**（2026-10-07 起没付过钱只能用极速 / 草稿出片，见 config/tokens.videoPlanDenial）。
+ * ★ 只改 planId、不走 buyPlan：buyPlan 会把 plan 余额顶到套餐额度，下面那些「FREE - 余额 = 花了多少」的断言就全歪了。
+ *   这里测的是扣费与价目，不是门禁（门禁的用例在 arkProxy.spec.js）。
+ */
+async function makePaying(userId) {
+  await walletSvc.getWallet(userId);
+  await User.updateOne({ _id: userId }, { $set: { "tokenWallet.planId": "std" } });
+}
+
 /** 让上游"方舟"按剧本回应，测试里不真的出网 */
 function mockArk(status, body = { ok: true }) {
   process.env.ARK_API_KEY = "test-key";
@@ -188,6 +198,7 @@ describe("/api/ark 的扣费闸门", () => {
   test("视频按时长与档位定价：极速档比标准档便宜", async () => {
     const { token: t1, userId: u1 } = await registerUser();
     const { token: t2, userId: u2 } = await registerUser();
+    await makePaying(u1); // 标准档只对付过钱的人开放；极速档免费版也能用（u2 留着免费版）
     mockArk(200, { id: "task_1" });
     const body = (model) => ({ model, content: [], duration: 5 });
     await request(app).post("/api/ark/contents/generations/tasks").set(auth(t1)).send(body("doubao-seedance-1-0-pro-250528")).expect(200);
@@ -240,6 +251,7 @@ describe("/api/ark 的扣费闸门", () => {
 
   test("余额不足 → 402 + INSUFFICIENT_TOKENS，且【根本不打方舟】", async () => {
     const { token, userId } = await registerUser();
+    await makePaying(userId); // 标准档只对付过钱的人开放（这条测的是余额闸，不是免费档门禁）
     const spy = mockArk(200, {});
     await walletSvc.getWallet(userId);
     await walletSvc.debit(userId, FREE, "掏空");

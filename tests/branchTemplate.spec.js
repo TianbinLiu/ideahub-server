@@ -1849,6 +1849,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(res.status).toBe(403);
     expect(res.body.code).toBe("PLAN_REQUIRED");
     expect(res.body.billed).toBe(false);
+    // 判据与 /api/ark 同一处（config/tokens.videoPlanDenial）：白模化是 r2v，免费版能用的只有极速 / 草稿的普通片
+    expect(res.body.allowed).toEqual(["极速", "草稿"]);
+    expect(res.body.message).toMatch(/免费版/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

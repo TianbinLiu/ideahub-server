@@ -284,7 +284,14 @@ describe('每日上限（§14.10）', () => {
 
   it('免费档的日上限不能低到「一段视频都出不来」（死配置自检）', () => {
     // 方案 §14.10 自己点名的形状：日上限 < 最短一段的价钱 ⇒ 那条闸门永远触发不到
-    const cheapestVideo = 67200; // H3-Max 480P 最短一段（方案 §18.2）
+    // ★ 2026-10-07 起免费版只能用 FREE_VIDEO_ALLOW 里的档出片（极速 / 草稿），而极速 11-24 停用 ——
+    //   所以按「停用之后还开着的免费档」里最便宜的一段算（4 秒草稿 = 61,603）。
+    //   别拿已停用的极速 3 秒（18,144）蒙混过关：那一天之后它根本点不了，自检就成了假的。
+    const afterRetire = Math.max(...Object.values(tokens.RETIRED_MODELS_AT).map((s) => Date.parse(s)));
+    const open = tokens.freeVideoTiers(afterRetire);
+    expect(open.length).toBeGreaterThan(0);
+    const cheapestVideo = Math.min(...open.map((t) => tokens.segTokens(tokens.videoSecWindow(t.model)[0], t.model, t.resolution)));
+    expect(cheapestVideo).toBe(61603);
     expect(tokens.DAILY_LIMITS.freeDaily).toBeGreaterThanOrEqual(cheapestVideo);
   });
 });
