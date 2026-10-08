@@ -29,8 +29,8 @@ const T_CREATE = 150_000;
 const T_POLL = 30_000;
 
 /**
- * 每一发 Seedance 出片任务都由服务端钉死的字段（客户端传什么都不作数）。**只有这一处**（铁律六）——
- * /api/ark 代理（纯任务、r2v、样片两步）与白模化自己发的那一发都经 chargedArkCall 转发，在那里套上。
+ * 每一发异步生成任务都由服务端钉死的字段（客户端传什么都不作数）。**只有这一处**（铁律六）——
+ * /api/ark 代理（纯任务、r2v、样片两步、Seed3D）与白模化自己发的那一发都经 chargedArkCall 转发，在那里套上。
  *
  * ★ execution_expires_after = 24 小时（方舟缺省 48 小时）：排队 / 运行超过这个时长方舟会把任务标成 `expired` ——
  *   失败退款按这个终态退钱；而 App 能取回成片的窗口本来就只有 24 小时（产物地址 24 小时过期），
@@ -42,11 +42,18 @@ const T_POLL = 30_000;
 const SERVER_TASK_FIELDS = Object.freeze({ execution_expires_after: 86_400 });
 const STRIPPED_TASK_FIELDS = Object.freeze(["callback_url", "service_tier"]);
 
-/** 给一发 Seedance 任务套上服务端钉死的字段（返回新对象，不改调用方的 body）。不是 Seedance 任务原样返回 */
+/**
+ * 给一发异步任务套上服务端钉死的字段（返回新对象，不改调用方的 body）。不是任务端点（出图 / 对话）原样返回。
+ * ★ 剥 callback_url / service_tier 对**每一发**任务都做（含 Seed3D）：回调地址那个口子与模型无关 —— 同一个端点上
+ *   拿 Seed3D 也一样能让方舟替任何人往任意地址 POST；剥掉一个可选参数只会让上游用缺省值，不会让请求失败。
+ * ★ execution_expires_after 只套在 Seedance 上：Seed3D 收不收这个参数我们没核实过，硬塞一个它不认的参数可能整发 400
+ *   （它按方舟缺省 48 小时过期，过期同样会被失败退款按 expired 退回）。
+ */
 function withServerTaskFields(kind, body) {
-  if (kind !== "task" || !Object.hasOwn(VIDEO_MULT, String(body?.model ?? ""))) return body;
+  if (kind !== "task" || !body || typeof body !== "object") return body;
   const out = { ...body };
   for (const k of STRIPPED_TASK_FIELDS) delete out[k];
+  if (!Object.hasOwn(VIDEO_MULT, String(body.model ?? ""))) return out;
   return { ...out, ...SERVER_TASK_FIELDS };
 }
 

@@ -176,6 +176,19 @@ describe("受理时记账", () => {
     expect(row).toMatchObject({ state: "skipped", note: "free", charged: 0, free: true });
     expect(row.purgeAt).toBeTruthy();
   });
+
+  test("记账永不抛：同一个任务号重放、回读那一下也出错 → 回 null 并吼（不把受理了的那一发打成 5xx）", async () => {
+    const u = await makeUser();
+    const id = await createTask(u);
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    jest.spyOn(GenTaskCharge, "findOne").mockReturnValueOnce({ lean: () => Promise.reject(new Error("db blip")) });
+    await expect(
+      svc.recordCharge({ provider: "ark", taskId: id, kind: "video", user: u.id, model: MINI, cost: DRAFT_4S, took: { plan: 0, addon: DRAFT_4S } }),
+    ).resolves.toBeNull();
+    expect(err).toHaveBeenCalled();
+    // 原来那一行账原样还在（重放不改它）
+    expect((await GenTaskCharge.countDocuments({ provider: "ark", taskId: id }))).toBe(1);
+  });
 });
 
 describe("轮询看见失败 → 按原桶退回，恰好一次", () => {

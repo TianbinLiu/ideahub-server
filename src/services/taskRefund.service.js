@@ -141,8 +141,14 @@ async function recordCharge({ provider, taskId, kind, user, model = "", cost, fr
     return doc.toObject();
   } catch (e) {
     if (e && e.code === 11000) {
-      // 同一个上游任务号记第二次（重放）：既有那一行就是账，不算事
-      return GenTaskCharge.findOne({ provider, taskId: id }).lean();
+      // 同一个上游任务号记第二次（重放）：既有那一行就是账，不算事。
+      // ★ 回读也不许抛：这一拍钱已扣、任务已受理，抛出去调用方就回 5xx（客户端以为没受理、去重试 = 再花一次钱）
+      return GenTaskCharge.findOne({ provider, taskId: id })
+        .lean()
+        .catch((err) => {
+          console.error(`[task-refund] 重复落账后回读失败 ${provider} task=${id}:`, (err && err.message) || err);
+          return null;
+        });
     }
     console.error(`[task-refund] 落账失败 ${provider} task=${id} user=${user} cost=${charged}（这一发失败时退不了钱）:`, (e && e.message) || e);
     return null;

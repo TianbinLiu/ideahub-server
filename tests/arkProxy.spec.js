@@ -656,6 +656,21 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     }
   });
 
+  test("Seed3D 任务也剥 callback_url / service_tier（同一个端点、同一个口子），但不套 execution_expires_after", async () => {
+    // ★ 回调地址那个口子与模型无关：不剥的话，拿 Seed3D 也能让方舟替任何人往任意地址 POST（arkGateway.withServerTaskFields）
+    process.env.ARK_API_KEY = "test-key";
+    try {
+      fetchSpy.mockImplementation(async () => ({ status: 200, text: async () => JSON.stringify({ id: "cgt-3d-strip-1" }) }));
+      const content = [{ type: "image_url", image_url: { url: "https://x/y.png" } }];
+      const res = await post({ model: "doubao-seed3d-2-0-260328", content, callback_url: "https://evil.example.com/hook", service_tier: "flex" });
+      expect(res.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(fetchSpy.mock.calls[0][1].body)).toEqual({ model: "doubao-seed3d-2-0-260328", content });
+    } finally {
+      delete process.env.ARK_API_KEY;
+    }
+  });
+
   test("停用时刻一到：标准 / 极速新任务 400 MODEL_RETIRED（不扣费）；别的档照常", async () => {
     const { RETIRED_MODELS_AT } = require("../src/config/tokens");
     const { signToken } = require("../src/utils/jwt");

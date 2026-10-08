@@ -2186,7 +2186,8 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 
 **每一发 Seedance 任务**（纯任务、r2v、样片两步、白模化）转发前由服务端钉死：`execution_expires_after: 86400`
 （客户端的值覆盖 —— 排队 / 运行超过 24 小时方舟标 `expired`，失败退款按它退）；剥掉 `callback_url`（拿我们的 key
-往任意地址 POST）与 `service_tier`（flex 半价但排队以天计，我们按在线价收）。唯一实现 `arkGateway.withServerTaskFields`。
+往任意地址 POST）与 `service_tier`（flex 半价但排队以天计，我们按在线价收）。这两个字段在 Seed3D 任务上也剥
+（同一个端点、同一个口子）；Seed3D 不套 `execution_expires_after`（没核实它收不收）。唯一实现 `arkGateway.withServerTaskFields`。
 
 **电影级样片第二步**（480p 样片 → 1080p 成片）：`POST /api/ark/contents/generations/tasks`，请求体只许
 
