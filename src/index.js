@@ -144,6 +144,11 @@ async function start() {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === undefined || instanceId === "0") {
       startAiWorker();
+      // ArkVideoTask 的 TTL 从 createdAt 搬到每行自带的 expireAt（2026-10-07，样片要活 8 天）：删老索引 + 回填老行。
+      // ★ 一次性、幂等；只在 0 号实例跑（两个实例同时删同一条索引只会让其中一个白报一句）。失败只记日志，不挡启动。
+      require("./services/arkVideoTask.service")
+        .migrateExpiry()
+        .catch((e) => console.error("[ark] ArkVideoTask 迁移失败:", (e && e.message) || e));
       // 老师人格的长活（生成作业 + 30 分钟无动作蒸馏）：与模块同一个开关 TUTOR_ENABLED，只在 0 号实例（同上面的理由）
       if (process.env.TUTOR_ENABLED === "true") require("./workers/tutor.worker").startTutorWorker();
       // NCII 移除请求的到期提醒（TAKE IT DOWN Act §3 的 48 小时是**法定上限**）。
@@ -188,7 +193,7 @@ async function start() {
         playSweep.unref?.();
       }
     } else {
-      console.log(`实例 ${instanceId}：跳过 AI worker、NCII 到期清扫、同款奖励清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
+      console.log(`实例 ${instanceId}：跳过 AI worker、ArkVideoTask 迁移、NCII 到期清扫、同款奖励清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
     }
 
     setupGracefulShutdown(server);
