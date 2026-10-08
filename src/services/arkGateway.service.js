@@ -127,7 +127,8 @@ async function openArkStream({ path, body, timeoutMs }) {
  *        resolveDraftFinal 解析出的样片第二步结论。有它 = 按 draftFinalTokens 计价、免费版一律拒。
  * @param {number} [args.timeoutMs]
  * @returns {Promise<
- *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean }
+ *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean,
+ *       took:{plan:number, addon:number}, memo:string }
  *   | { ok:false, reason:"model"|"plan"|"funds", status:number, body:object, wallet:object|null }
  * >}
  */
@@ -237,10 +238,11 @@ async function chargedArkCall({
   }
 
   const { status, text } = upstream;
-  const { accepted, wallet: w, free } = r;
+  const { accepted, wallet: w, free, took } = r;
   if (!accepted && !free) console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
 
-  return { ok: true, status, text, accepted, wallet: w, cost, free };
+  // took / memo：受理了的异步任务由调用方记进 GenTaskCharge（受理后失败按原桶退回，services/taskRefund）
+  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo };
 }
 
 module.exports = {

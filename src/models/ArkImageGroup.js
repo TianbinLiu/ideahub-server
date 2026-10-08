@@ -45,6 +45,15 @@ const arkImageGroupSchema = new mongoose.Schema(
     prepaid: { type: Number, default: 0 },
     /** 管理员免单：不动余额，结束时按实际张数记一笔 admin_free */
     free: { type: Boolean, default: false },
+    /**
+     * 预扣时从哪两桶各扣了多少（billing.preAuthorize 的 took）。一张没拿到时**按它原样退回**（plan 回 plan、addon 回 addon）。
+     * ★ 2026-10-07 加：之前全退进 addon，「要 15 张、一张不给」就成了把当月额度洗成永久余额的路。
+     *   老的那几组没有这一位（undefined）→ 退款兜底进 addon（改版前的行为）。
+     */
+    took: {
+      type: new mongoose.Schema({ plan: { type: Number, min: 0 }, addon: { type: Number, min: 0 } }, { _id: false }),
+      default: undefined,
+    },
     images: { type: [imageSchema], default: [] },
     failures: { type: [failureSchema], default: [] },
     /** 结算按的张数 = 拿到手的张数（≤ maxImages） */

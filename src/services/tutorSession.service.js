@@ -2,7 +2,7 @@
 // 老师人格的学习会话（tutor 仓 docs/05 §5.1 / §5.6；参考实现 devServer.mjs 的 buildMessages / handleTurn / handleQuiz 逐段搬来，数据从课程工作区换成 CourseCtx）。
 //   · 一轮 = SSE：token {t} / sentence {index,text} / done / error，与 companion 同形（openSse 同一份响应头）；
 //   · 钱（docs/05 §6.2）：tutor_turn 在开流**之前** billing.preAuthorize 原子扣（余额 / 套餐 / 冻结的拒绝还能按 JSON 回 402 / 403），
-//     第一个 delta 之前上游抛 ⇒ refundUnaccepted 退回 addon；之后断流不退（W2 同口径）；管理员免单照 noteFreeCall 记账。试教同价；
+//     第一个 delta 之前上游抛 ⇒ refundUnaccepted 按扣的那两桶退回；之后断流不退（W2 同口径）；管理员免单照 noteFreeCall 记账。试教同价；
 //   · 状态只由 core/session/progress.js 的 advance() 翻（ctx.applyAdvance 是唯一调用口）；政策闸 policyGate 在拼提示词之前判；
 //   · 「没懂」「加入必背」两条不过模型、不计费，直接成 typed op（source: reader）落修订记录。
 // ★ 演示模式（没配 AI key）：老师是 core/session/demoTeacher 的确定性回复，不扣钱；生产是否允许由 tutorAi.demoAllowed() 决定。
@@ -135,7 +135,7 @@ async function handleTurn(ctx, req, res, body, { preview = false } = {}) {
             if (ev.done) { tokens = (ev.done.usage && ev.done.usage.total_tokens) || 0; if (sentence.trim()) send("sentence", { index: index++, text: sentence.trim() }); }
           }
         } catch (e) {
-          if (!accepted) { await billing.refundUnaccepted({ user: req.user, cost, memo: `tutor_turn ${ctx.id}`, refundTag: "tutor_refund" }); throw new Error(`${e.message}（这一轮的 token 已退回）`); }
+          if (!accepted) { await billing.refundUnaccepted({ user: req.user, cost, memo: `tutor_turn ${ctx.id}`, refundTag: "tutor_refund", took: pre && pre.took }); throw new Error(`${e.message}（这一轮的 token 已退回）`); }
           throw e; // 第一个 token 之后断流：已扣、半截如实说
         }
       } else {

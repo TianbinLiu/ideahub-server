@@ -232,7 +232,8 @@ describe('consume 失败之后（2026-09-25 评审逮到的 critical）', () => 
   it('★ 崩在「抢到发币权」与「币真的进账」之间 → 清扫器按账本判断并补发', async () => {
     const { user } = await makeUser();
     await wallet.ensureWallet(user._id);
-    const before = (await wallet.getWallet(user._id)).plan;
+    const w0 = await wallet.getWallet(user._id);
+    const before = w0.plan + w0.addon; // 免费版新人额度在 addon、当天那一份在 plan（2026-10-07）
     // 造出那个中间态：grantedAt 有值、status 还是 paid、账本里没有这笔
     await TokenOrder.create({
       orderNo: 'PLAYMID1',
@@ -285,8 +286,8 @@ describe('测试购买（许可测试员）', () => {
     const { user, token, acct } = await makeUser();
     upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
     await redeem(token, 'ptok-test-refund');
-    // 先把余额花掉一部分，让回收收不回全额
-    await wallet.debit(user._id, 400_000, '测试消耗');
+    // 先把余额花掉一部分，让回收收不回全额（新钱包 172k + 这一包 150k = 322k，花掉 250k 只剩 72k < 150k）
+    expect(await wallet.debit(user._id, 250_000, '测试消耗')).not.toBeNull();
     const r = await play.revokeByToken({ purchaseToken: 'ptok-test-refund' });
     expect(r.code).toBe('revoked');
     expect(r.shortfall).toBeGreaterThan(0);

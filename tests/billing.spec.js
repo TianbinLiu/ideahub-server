@@ -55,6 +55,12 @@ async function makeUser(role = 'user') {
   return { user: u, token: signToken(u) };
 }
 
+/** 新钱包的总额：免费版新人一次（addon）+ 当天那一份（plan）（2026-10-07 起不再按月发） */
+function freshTotal() {
+  const p = tokens.planOf('free');
+  return p.welcomeTokens + p.dailyTokens;
+}
+
 async function balance(userId) {
   const u = await User.findById(userId).select('tokenWallet').lean();
   return u.tokenWallet.plan + u.tokenWallet.addon;
@@ -91,7 +97,7 @@ describe('TTS 进钱包（33 token/字符）', () => {
     const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
     expect(refund.delta).toBe(-spend.delta);
     // 一来一回，余额回到发放值
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('余额不足 → 402，且**不调上游**（白嫖不了）', async () => {
@@ -167,7 +173,7 @@ describe('ASR 进钱包（5,000 token/分钟，预扣多退）', () => {
     const res = await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(Buffer.alloc(96000, 1));
     expect(res.status).toBe(200);
     expect(res.body.silent).toBe(true);
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('余额不足 → 402 且不调上游', async () => {
@@ -195,7 +201,7 @@ describe('冲正与异常路径（2026-09-25 评审补）', () => {
     const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
     const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
     expect(refund.delta).toBe(-spend.delta);
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('★ 预扣的冲正回 plan，不进 addon —— 否则就是一条「把当月额度洗成永久余额」的路', async () => {
@@ -293,6 +299,8 @@ describe('每日上限（§14.10）', () => {
     const cheapestVideo = Math.min(...open.map((t) => tokens.segTokens(tokens.videoSecWindow(t.model)[0], t.model, t.resolution)));
     expect(cheapestVideo).toBe(61603);
     expect(tokens.DAILY_LIMITS.freeDaily).toBeGreaterThanOrEqual(cheapestVideo);
+    // 同一个形状的另一半：新人额度要够出**几段**（主人 2026-10-07：「而不是连一个视频都生成不了」）
+    expect(tokens.planOf('free').welcomeTokens).toBeGreaterThanOrEqual(2 * cheapestVideo);
   });
 });
 

@@ -15,16 +15,28 @@ const { aiRateLimit } = require("../middleware/rateLimit");
 const wallet = require("../services/tokenWallet.service");
 const orders = require("../services/payment/order.service");
 const { availableChannels } = require("../services/payment/channels");
-const { PLANS } = require("../config/tokens");
+const { PLANS, DEFAULT_PLAN_ID, planOf, isPaidUser } = require("../config/tokens");
 
 const router = express.Router();
 
-/** GET /api/me/wallet —— 余额快照。顺带完成初始化与跨月刷新 */
+/**
+ * GET /api/me/wallet —— 余额快照。顺带完成初始化、跨月刷新与免费版的每日补发。
+ * ★ `paid`：这个人算不算付费用户（有付费套餐或付过任何一笔钱）—— 判据只有 config/tokens.isPaidUser 一处，
+ *   App 拿它决定档位置不置灰；**不给**的话 App 只能自己按 planId 猜，充过钱、套餐还是免费的那批人就被猜错（门在服务端，猜错只是提示错）。
+ * ★ `free`：免费额度的规则（新人一次 / 每天 / 最多攒多少）—— App 的说明文字照这三个数说，不抄数。
+ */
 router.get("/", requireAuth, async (req, res, next) => {
   try {
     const w = await wallet.getWallet(req.user._id);
     if (!w) return res.status(404).json({ ok: false, message: "wallet not found" });
-    res.json({ ok: true, wallet: w, plans: PLANS });
+    const fp = planOf(DEFAULT_PLAN_ID);
+    res.json({
+      ok: true,
+      wallet: w,
+      plans: PLANS,
+      paid: isPaidUser(w),
+      free: { welcomeTokens: fp.welcomeTokens || 0, dailyTokens: fp.dailyTokens || 0, dailyCapTokens: fp.dailyCapTokens || 0 },
+    });
   } catch (err) {
     next(err);
   }

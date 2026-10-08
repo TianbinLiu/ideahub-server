@@ -379,11 +379,12 @@ describe("跨仓档位表一致性（app 的报价 vs 服务端的结算，按 (
     }
   });
 
-  test("2.5 的一段片确实超过免费版整月额度（「电影级不对免费版开」的一个理由）", () => {
+  test("2.5 的一段片确实超过免费版的整份新人额度（「电影级不对免费版开」的一个理由）", () => {
     const { segTokens, planOf } = require("../src/config/tokens");
-    // 取**最短**的一段（窗口下限 4 秒）：连最便宜的一段都超月额，说明"免费版怎么都用不了这一档"
-    // 是事实陈述，不是营销话术。
-    expect(segTokens(3, "doubao-seedance-2-5-260628")).toBeGreaterThan(planOf("free").monthlyTokens);
+    // 取**最短**的一段（窗口下限 4 秒）：连最便宜的一段都超过新人那一次额度 + 攒满的每日额度，
+    // 说明"免费版怎么都用不了这一档"是事实陈述，不是营销话术（2026-10-07 起免费版不按月发了）。
+    const free = planOf("free");
+    expect(segTokens(4, "doubao-seedance-2-5-260628")).toBeGreaterThan(free.welcomeTokens + free.dailyCapTokens);
   });
 });
 

@@ -13,12 +13,13 @@
 //   多扣一笔和少退一笔在事后完全无法区分。
 const mongoose = require("mongoose");
 
-// grant       注册/首次触达发的免费额度
+// grant       注册/首次触达发的免费额度（2026-10-07 起免费版 = 新人一次 170,000 进 addon + 当天的 2,000 进 plan，一行记）
+// daily_grant 免费版每过一个 UTC 日往 plan 里补的那一份（补到上限为止，见 tokenWallet.ensureWallet 的 ③）
 // recharge    直充进 addon（模拟支付）
 // plan_buy    购/续套餐发放 plan 额度（模拟支付）
 // cycle_reset 月度刷新（plan 归位到当月额度，未用完的作废）—— delta 可正可负
 // ark_spend   花在方舟上（负）
-// ark_refund  方舟没受理，把 ark_spend 退回来（正）
+// ark_refund  方舟没受理，把 ark_spend 退回来（正）。2026-10-07 起按扣的那两桶原样退回（tokenWallet.refundSplit）
 // admin_free  管理员免单的方舟调用：**余额不动（delta=0），但这笔钱真花出去了**，
 //             实际金额记在 costTokens 里。见下面 costTokens 的说明与
 //             services/tokenWallet.service.js 的 noteAdminFree。
@@ -26,7 +27,8 @@ const mongoose = require("mongoose");
 // debt_incurred  收回时余额不够，差额转成欠额：**余额不动（delta=0）**，差额记在 costTokens
 // debt_repaid    下次充值抵扣欠额（负）
 // debt_forgiven  管理员免除欠额（delta=0，金额记 costTokens）
-// provider_failed 上游受理后才失败、按政策退回的那一类（与 ark_refund 分开，便于对账）
+// provider_failed 上游**受理之后**才失败（方舟 failed / cancelled / expired、MiniMax Fail）、按原桶退回的那一笔（正）。
+//                 与 ark_refund 分开，便于对账：ark_refund 是「我们没让它出门」，这一类是「方舟受理了、又明说没成」。
 // ★★ 这是 **mongoose enum**：没注册的 reason 会写入失败，而 writeEntry 把异常吞进
 //    console.error —— 表现是「回收做了、账本静默缺条」。加新 reason 必须先加这里。
 const TOKEN_REASONS = [
@@ -47,8 +49,9 @@ const TOKEN_REASONS = [
   //   ★ 加进 enum **只修了一半**：`spentToday` 的 $in 里也要有它，否则退款抵不掉当日用量，
   //   免费档被敏感词拒两次就被日上限锁到次日，而余额栏还显示满格。
   "minimax_refund",
-  // ⚠ 目前**没有任何写入方**：受理之后才失败的那一类我们**不退**（见 billing.service 的 W2），
-  //   留着这个取值是为了将来真要区分时有地方落。别照它的字面意思去实现「失败就退」。
+  // 受理之后才失败的退款（2026-10-07 主人拍板「做生成失败返回 token」）。唯一写入方 services/taskRefund.service.js；
+  // memo 逐字是 `provider_failed <ark|minimax> task:<任务号>`，搁浅续办时靠它判断「这一笔进没进过账」（别改形状）。
+  // ★ 在 tokenWallet.SPEND_REASONS 里（退款抵掉当日用量），**不在** REPAY_REASONS 里（退的是我们的钱，不抵欠额）。
   "provider_failed",
   // 老师人格（tutor）的一轮教学 / 蒸馏 / 生成没被上游受理时的退款（docs/05 §6.2）。与 minimax_refund 同一条纪律：
   // 加进 enum 的同时也要进 tokenWallet.service 的 SPEND_REASONS，否则退款抵不掉当日用量。
@@ -59,6 +62,8 @@ const TOKEN_REASONS = [
   //   也**不进** SPEND_REASONS（它不是哪次消费的退回，进了会把原作者当天的用量冲掉）。两条都钉在 tests/remixReward.spec.js。
   // ★ 没有对手方：同款作者的钱包不动。token 不许在用户之间流转（config/remixReward.js 的 ★★）。
   "remix_reward",
+  // 免费版的每日额度（2026-10-07，见上面 daily_grant 那行）。★ 「我们印了钱」：不进 REPAY_REASONS、不进 SPEND_REASONS
+  "daily_grant",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(

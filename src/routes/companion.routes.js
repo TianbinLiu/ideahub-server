@@ -259,7 +259,7 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
         },
       });
       // 一个字都没出来 = 上游没受理（敏感词 / 限流 / 挂了）⇒ 退款，与方舟那条口径逐字相同
-      if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+      if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion", took: pre.took });
       else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
       return;
     }
@@ -328,7 +328,7 @@ router.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "companion" }), 
         return chatMemory.finishTurn({ thread, displayText: text, modelText: rawText.replace(/\s*\[[^\]]*$/, ""), usage, estPrompt, aborted });
       },
     });
-    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion" });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat companion", took: pre.took });
     else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat companion", snapshot: pre.before });
     // 用量到阈值 → 回复发完之后再提纯（不让用户等），失败只记日志
     chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[companion] compact failed:", (e && e.message) || e));
