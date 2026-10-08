@@ -178,6 +178,18 @@ describe("付费套餐不吃每日补发，照旧按月刷新", () => {
     expect(next.plan).toBe(1_660_000);
     expect(await TokenLedger.countDocuments({ user: u.id, reason: "cycle_reset" })).toBe(1);
   });
+
+  test("拿一个旧的 now 来问（清扫器开轮那一拍）：不往回刷到上个月", async () => {
+    const u = await makeUser();
+    await wallet.getWallet(u.id, dayAt("2026-10-07"));
+    await wallet.buyPlan(u.id, "std", dayAt("2026-10-07"));
+    await wallet.getWallet(u.id, dayAt("2026-11-01"));
+    await wallet.debit(u.id, 500_000, "新月里花掉", dayAt("2026-11-01"));
+    const stale = await wallet.getWallet(u.id, new Date("2026-10-31T23:59:50Z"));
+    expect(stale.cycle).toBe("2026-11");
+    expect(stale.plan).toBe(1_660_000 - 500_000);
+    expect(await TokenLedger.countDocuments({ user: u.id, reason: "cycle_reset" })).toBe(1);
+  });
 });
 
 describe("付没付过钱（paidEver）", () => {

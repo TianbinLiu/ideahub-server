@@ -205,7 +205,11 @@ async function ensureWallet(userId, now = new Date()) {
   if (isFreePlan(cur.tokenWallet.planId)) return accrueDaily(userId, cur, { day, cycle });
 
   // ③b 付费套餐：跨月刷新。条件带上旧 cycle，抢到的那一次才重置。
-  if (cur.tokenWallet.cycle === cycle) return shape(cur);
+  // ★★ 只许往前刷，不许往回拨（2026-10-07 评审）：调用方给的 `now` 可能是**旧的** —— 退款清扫器一轮最长十几分钟，
+  //   原来整轮共用开轮那一拍的时间。跨月那一夜开轮、半夜之后才退到某个已经刷到新月的人头上，按 `===` 判的话
+  //   钱包会被「刷回」上个月（plan 归位到月额度 = 新月里花掉的全吐回来），他下一次请求再刷一次新月（退回去的那一笔被归位抹掉），
+  //   账本里还多一条倒填日期的 cycle_reset。YYYY-MM 补零定长，字符串比较就是时间先后；没有 cycle 的老钱包照旧刷。
+  if (cur.tokenWallet.cycle && cur.tokenWallet.cycle >= cycle) return shape(cur);
 
   const grant = planOf(cur.tokenWallet.planId).monthlyTokens;
   const rolled = await User.findOneAndUpdate(

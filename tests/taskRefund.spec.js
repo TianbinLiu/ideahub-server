@@ -437,6 +437,45 @@ describe("清扫器", () => {
     expect(await Notification.countDocuments({ userId: u.id, type: "GEN_TASK_REFUND" })).toBe(1);
     expect((await GenTaskCharge.findOne({ taskId: id }).lean()).notified).toBe(true);
   });
+
+  test("清扫跨过月初：开轮那一拍是上个月、钱包已经刷到新月 —— 退款照原桶加回去，不把钱包刷回上个月", async () => {
+    // 2026-10-07 评审复现：开轮的 now 一路传进 ensureWallet，付费钱包被刷回上个月（新月里花掉的全吐回来），
+    // 下一次请求又刷一次新月（退回去的那一笔被归位抹掉），账本多一条倒填日期的 cycle_reset。
+    // ★ 日期都按「真实此刻的下一个月初」算：用例哪天跑都成立（真实此刻永远早于那个月初）
+    const real = new Date();
+    const boundary = new Date(Date.UTC(real.getUTCFullYear(), real.getUTCMonth() + 1, 1));
+    const lastSecond = new Date(boundary.getTime() - 10_000); // 开轮那一拍：上个月的最后几秒
+    const afterMidnight = new Date(boundary.getTime() + 30_000);
+    const newCycle = `${boundary.getUTCFullYear()}-${String(boundary.getUTCMonth() + 1).padStart(2, "0")}`;
+    const oldCycle = `${lastSecond.getUTCFullYear()}-${String(lastSecond.getUTCMonth() + 1).padStart(2, "0")}`;
+
+    const u = await makeUser();
+    await wallet.buyPlan(u.id, "std");
+    const id = await createTask(u);
+    const row0 = await GenTaskCharge.findOne({ taskId: id }).lean();
+    // 半夜之后他来过一次：钱包刷到新月，又花掉 50 万
+    await wallet.getWallet(u.id, afterMidnight);
+    await wallet.debit(u.id, 500_000, "新月里花掉", afterMidnight);
+    const w1 = await wallet.getWallet(u.id, afterMidnight);
+    expect(w1.cycle).toBe(newCycle);
+    // 这一行受理在开轮前 20 分钟（不然按开轮的 now 算会「老过 8 天」被记成 lost），到点该问了
+    await GenTaskCharge.collection.updateOne({ taskId: id }, { $set: { createdAt: new Date(lastSecond.getTime() - 20 * 60_000), nextCheckAt: new Date(Date.now() - 1000) } });
+
+    const refundSpy = jest.spyOn(wallet, "refundSplit");
+    await svc.reconcile({ now: lastSecond, query: async () => ({ status: "failed" }) });
+    // 动钱用的是这一行办的那一刻，不是开轮那一拍
+    expect(refundSpy).toHaveBeenCalledTimes(1);
+    expect(refundSpy.mock.calls[0][4].getTime()).not.toBe(lastSecond.getTime());
+    expect(refundSpy.mock.calls[0][4].getTime()).toBeLessThanOrEqual(Date.now());
+
+    const w2 = await wallet.getWallet(u.id, afterMidnight);
+    expect(w2.cycle).toBe(newCycle);
+    expect({ plan: w2.plan, addon: w2.addon }).toEqual({ plan: w1.plan + row0.took.plan, addon: w1.addon + row0.took.addon });
+    // 新月那一条归位之外，没有倒填回上个月的 cycle_reset
+    expect(await TokenLedger.countDocuments({ user: u.id, reason: "cycle_reset", memo: `${oldCycle} 月度刷新` })).toBe(0);
+    expect(await TokenLedger.countDocuments({ user: u.id, reason: "cycle_reset", memo: `${newCycle} 月度刷新` })).toBe(1);
+    expect((await GenTaskCharge.findOne({ taskId: id }).lean()).state).toBe("refunded");
+  });
 });
 
 describe("账与上限", () => {

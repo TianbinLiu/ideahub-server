@@ -372,7 +372,8 @@ async function queryUpstream(row) {
 
 /**
  * 搁浅的 claimed 接着办（进程在「抢到」与「标 refunded」之间死掉的那些）。
- * ★ 续办之前先把它**再抢一次**（claimedAt 从旧值换成 now 的条件更新）：两个续办方同时过账本检查的话会退两次。
+ * ★ 续办之前先把它**再抢一次**（claimedAt 从旧值换成此刻的条件更新）：两个续办方同时过账本检查的话会退两次。
+ * ★★ `now` 只管「挑哪几行」；动钱与写时间戳一律用**这一行办的那一刻**（`at`，见 reconcile 的同一条 ★★）。
  */
 async function resumeClaimed({ now = new Date(), limit = SWEEP_LIMIT } = {}) {
   const stale = new Date(now.getTime() - CLAIM_STALE_MS);
@@ -380,13 +381,14 @@ async function resumeClaimed({ now = new Date(), limit = SWEEP_LIMIT } = {}) {
   let resumed = 0;
   for (const row of rows) {
     try {
+      const at = new Date();
       const mine = await GenTaskCharge.findOneAndUpdate(
         { _id: row._id, state: "claimed", claimedAt: row.claimedAt },
-        { $set: { claimedAt: now } },
+        { $set: { claimedAt: at } },
         { returnDocument: "after" },
       ).lean();
       if (!mine) continue;
-      await payRefund(mine, { resume: true, now });
+      await payRefund(mine, { resume: true, now: at });
       resumed += 1;
     } catch (e) {
       console.error(`[task-refund] 续办失败 ${row.provider} task=${row.taskId}:`, (e && e.message) || e);
@@ -397,6 +399,11 @@ async function resumeClaimed({ now = new Date(), limit = SWEEP_LIMIT } = {}) {
 
 /**
  * 没人再来问的那些（App 被杀 / 卸载 / 用户再也没打开）：到点了替他问一次上游。
+ *
+ * ★★ `now` 是开轮那一拍的时间，**只拿来挑行**（到没到点、老没老）。结账（动钱、claimedAt / settledAt）一律用这一行
+ *   真正办的那一刻：一轮最多 30 次上游查询、每次最长 30 秒，开轮的时间到最后一行可能已经旧了十几分钟。
+ *   2026-10-07 评审复现过：跨月那一夜开轮、半夜之后才退到某个付费用户头上，旧的 now 一路传进 ensureWallet，
+ *   把他已经刷到新月的钱包又刷回上个月 —— 新月里花掉的全吐回来、退回去的那一笔被下一次归位抹掉（钱包那边另有一道「不许往回拨」）。
  * @param {object} [o]
  * @param {Function} [o.query] 问上游的函数（测试替换用；缺省 queryUpstream）
  * @returns {Promise<{checked:number, settled:number, lost:number}>}
@@ -424,7 +431,7 @@ async function reconcile({ now = new Date(), limit = SWEEP_LIMIT, query = queryU
       const r = await query(row);
       if (r && verdictOf(row.provider, r.status)) {
         // region：queryUpstream 只回建这一行的那个站问出来的结论（不是那个站就回 null），所以这里照行上的报
-        await settleTask({ provider: row.provider, taskId: row.taskId, status: r.status, code: r.code, detail: r.detail, viewerId: null, region: row.region, now });
+        await settleTask({ provider: row.provider, taskId: row.taskId, status: r.status, code: r.code, detail: r.detail, viewerId: null, region: row.region, now: new Date() });
         const after = await GenTaskCharge.findById(row._id).select("state").lean();
         if (after && after.state !== "open") {
           out.settled += 1;
