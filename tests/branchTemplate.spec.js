@@ -1637,6 +1637,25 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(await Notification.countDocuments({ userId: owner.id, type: "GEN_TASK_REFUND", "payload.taskId": started.body.taskId })).toBe(0);
   });
 
+  test("App 的真实顺序：先经 /api/ark 轮询看见 failed（退款落在这一拍），再调 finish —— 方舟的失败原因照样说出来", async () => {
+    // ★ App 的 waitBlockoutTask 先轮询任务、看见 failed 才调 finish（data/templates.ts）。轮询那一拍结账时不带方舟的原话，
+    //   取件单的 failMessage 就没有原因，finish 照它回话 ⇒「内容审核未通过」永远到不了用户眼前（2026-10-07 评审）。
+    //   上面那条直接调 finish，测不出这条路。
+    net.taskStatus = "failed";
+    const started = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8010` }));
+    expect(started.status).toBe(202);
+    const polled = await request(app).get(`/api/ark/contents/generations/tasks/${started.body.taskId}`).set(asOwner());
+    expect(polled.status).toBe(200);
+    expect(polled.body.refund).toMatchObject({ state: "refunded" });
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.status).toBe("failed");
+    expect(job.failMessage).toMatch(/内容审核未通过/);
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(502);
+    expect(res.body.message).toMatch(/内容审核未通过/);
+    expect(res.body.message).toMatch(/退回/);
+  });
+
   test("★ 方舟失败、没人来取回：清扫器退了钱，取件单跟着钉成 failed（列表不再说「无法挽回」），并发一条通知", async () => {
     const taskRefund = require("../src/services/taskRefund.service");
     const GenTaskCharge = require("../src/models/GenTaskCharge");

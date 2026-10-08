@@ -1122,6 +1122,10 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
             status: parsed.status,
             code: parsed?.error?.code,
             viewerId: req.user._id,
+            // ★ 方舟的原话要带上（与白模化取回、清扫器的 queryUpstream 同一个截法）：白模化那一发在 App 里是**先在这里轮询、
+            //   再调 finish** 的，退款就落在这一拍 —— 不带的话取件单的 failMessage 里没有失败原因，finish 之后照它回话，
+            //   「内容审核未通过」这类原因用户永远看不到（2026-10-07 评审）
+            detail: String(parsed?.error?.message || "").slice(0, 300),
           });
           if (verdict === "failed" && row && String(row.user) === String(req.user._id)) {
             parsed.refund = taskRefund.refundView(row);
