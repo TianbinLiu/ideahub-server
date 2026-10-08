@@ -272,6 +272,26 @@ describe("组图：受理 → 后台画 → 按拿到手的张数结算", () => 
     expect(await balanceSettles(u.id, before)).toBe(before);
   });
 
+  test("一张没拿到的全退**按原桶**：预扣从 plan 扣的回 plan（不把当月额度洗进 addon）", async () => {
+    const u = await registerUser("bucket");
+    await wallet.getWallet(u.id);
+    const User = require("../src/models/User");
+    // plan 够付整组的预扣（6 × 13,333 = 79,998）：全退之后 plan 回到原数、addon 一分没多
+    await User.updateOne({ _id: u.id }, { $set: { "tokenWallet.plan": 100_000, "tokenWallet.addon": 5_000 } });
+    fetchSpy.mockImplementation(async () =>
+      new Response(JSON.stringify({ error: { code: "InputTextSensitiveContentDetected", message: "sensitive" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const res = await request(app).post("/api/ark/image-groups").set(u.auth).send(groupBody()).expect(202);
+    expect((await ArkImageGroup.findById(res.body.id).lean()).took).toEqual({ plan: 6 * UNIT, addon: 0 });
+    await waitGroup(u, res.body.id, (x) => x.status !== "running");
+    await balanceSettles(u.id, 105_000);
+    const w = await wallet.getWallet(u.id);
+    expect({ plan: w.plan, addon: w.addon }).toEqual({ plan: 100_000, addon: 5_000 });
+  });
+
   test("流里只有顶层 error 事件、一张没有 → failed，钱全退", async () => {
     const u = await registerUser("errev");
     const before = await balance(u.id);
