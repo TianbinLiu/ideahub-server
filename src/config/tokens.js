@@ -310,10 +310,10 @@ function videoSecWindow(model) {
 //
 // ★★ 为什么价钱要跟着像素走：方舟的用量公式是 (输入时长 + 输出时长) × 宽 × 高 × 24 ÷ 1024（官方「创建视频生成任务」
 //   像素表 + 价目页的用量公式），而 2026-10-07 之前 segTokens 写死了 1280×720 —— 那时代理只放 720p，没出过事。
-//   一放开 480p 就是"按 720p 收 480p 的钱"（2.0 mini 480p 9:16 是 496×864，约 720p 的 46%，多收两倍多）；
-//   反过来 1080p 按 720p 收是少收 2.25 倍。所以：720p 维持改版前一刀切的 21,600（价目一个字不变），
+//   一放开 480p 就是"按 720p 收 480p 的钱"（2.0 mini 480p 9:16 是 496×864，约 720p 的 46%，按 720p 收就是收了 2.15 倍的钱）；
+//   反过来 1080p 的像素是 720p 的 2.25 倍，按 720p 收就只收了不到一半。所以：720p 维持改版前一刀切的 21,600（价目一个字不变），
 //   其余分辨率一律**按官方像素表逐格查**。
-// ★ 与 app 仓 `src/data/economy.ts` 的像素表**逐格相等**（跨仓契约，钉在 tests/arkProxy.spec.js「跨仓像素表一致性」）。
+// ★ 与 app 仓 `src/data/economy.ts` 的像素表**逐格相等**（跨仓契约，钉在 tests/arkProxy.spec.js「跨仓像素表与 480p / 1080p 价目」）。
 
 /** 720p 一秒的 raw token（1280×720×24/1024）。720p 全档、全画幅都按它收（改版前的口径，一个字不变） */
 const SEC_720P_TOKENS = 21_600;
@@ -364,7 +364,7 @@ const MAX_SEC_TOKENS = (4398 * 1886 * 24) / 1024;
  *   · 1.0 两档：只放 720p（方舟对 1.0 不传 resolution 的缺省是 **1080p**，所以钉子会把缺省补成 720p）；
  *   · 2.0 mini：480p（「草稿」）与 720p（「高清」）；
  *   · 2.5：只放 720p —— 480p 只在 `draft: true`（样片第一步）时放，1080p 只给样片第二步（resolveDraftFinal 另钉）。
- * ★ 与 app 的 `VideoTier.resolution` 对得上（跨仓钉在 arkProxy.spec「跨仓分辨率一致性」）。
+ * ★ 与 app 的 `VideoTier.resolution` 对得上（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
  */
 const VIDEO_RESOLUTIONS = Object.freeze({
   [SEEDANCE_FAST]: Object.freeze(["720p"]),
@@ -412,7 +412,7 @@ function perSecTokens(model, resolution = "720p", ratio) {
 //   同时把更好的档位留给付费的人，给升级一个理由。
 // ★ 「付过钱」= 有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买都算）—— 判据只有 isPaidUser 一处。
 // ★ 草稿与高清**是同一个模型**，只差分辨率 ⇒ 这张表必须按 (model, resolution) 认，只按 model 认就会把高清一起放给免费版。
-// ★ 与 app 仓 `VideoTier.freeOk` 一一对应（跨仓钉在 arkProxy.spec「跨仓免费档一致性」）。客户端置灰只是提示，门在这里。
+// ★ 与 app 仓 `VideoTier.freeOk` 一一对应（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。客户端置灰只是提示，门在这里。
 
 /** 免费版能出普通片的 (模型, 分辨率)。label 是给人看的档名（拒绝那句话与 /health 里用，不出现模型 id） */
 const FREE_VIDEO_ALLOW = Object.freeze([
@@ -423,7 +423,7 @@ const FREE_VIDEO_ALLOW = Object.freeze([
 /**
  * 我们自己停用的模型与停用时刻。★ 方舟第十批下线公告：Seedance 1.0 pro / pro fast **2026-11-24 14:00（北京时间）**停服；
  * 我们提前一小时（13:00）自己停 —— 停服那一刻还在排队的任务结局不可知，提前停掉就不会有人在最后几分钟付钱下单。
- * ★ 与 app 仓 `VideoTier.retireAt` 逐条相等（跨仓钉在 arkProxy.spec「跨仓停用时刻一致性」）。
+ * ★ 与 app 仓 `VideoTier.retireAt` 逐条相等（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
  */
 const RETIRED_MODELS_AT = Object.freeze({
   [SEEDANCE_STD]: "2026-11-24T13:00:00+08:00",
