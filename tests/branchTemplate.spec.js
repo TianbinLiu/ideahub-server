@@ -1592,29 +1592,77 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
   });
 
   // ── ⑥ 受理后失败 / 转存失败 ──────────────────────────────────────────
-  test("方舟受理后 failed（F11 真人脸）→ 取回时整句说明**不退费**，不落库", async () => {
+  test("方舟受理后 failed（F11 真人脸）→ 取回时 r2v 那一笔按原桶退回、看帧那一笔不退，两笔分开说；再取不再退", async () => {
+    // ★★ 2026-10-07 起（主人「做生成失败返回 token」）：方舟明说失败 → r2v 那一笔退回（services/taskRefund，恰好一次）。
+    //   看帧那一笔是受理了的 chat，照旧不退 —— 两笔结论相反，话要分开说（VISION_BILLED_NOTE 那条规矩）。
+    const TokenLedger = require("../src/models/TokenLedger");
     net.taskStatus = "failed";
     const pid = `ideahub/template-videos/${owner.id}-8009`;
+    const w0 = await walletSvc.getWallet(owner.id);
     const started = await post(baseBody({ publicId: pid }));
     expect(started.status).toBe(202); // 受理是真的：钱就是在这一步花掉的
+    const r2v = r2vTokens(8, SEEDANCE_2_5);
     const res = await finish(started.body.jobId);
     expect(res.status).toBe(502);
-    // ★★ 两阶段之后 billed 分两件事说：**这一次调用**没花钱（false），
-    //   但开炼那一笔**什么都没剩**（lost:true）。合成一位的话必然有一半是假话。
+    // ★★ 两阶段之后 billed 分两件事说：**这一次调用**没花钱（false）；开炼那一笔退了，所以 lost:false
     expect(res.body.billed).toBe(false);
-    expect(res.body.lost).toBe(true);
+    expect(res.body.lost).toBe(false);
     expect(res.body.state).toBe("failed");
-    // ★ 这句话必须说出口：方舟受理后失败不退费，含糊其辞等于骗人
-    expect(res.body.message).toMatch(/不退/);
+    expect(res.body.refund).toEqual({ state: "refunded", tokens: r2v });
+    expect(res.body.message).toMatch(/退回/);
+    expect(res.body.message).toMatch(/看画面那一步的费用不退/);
     expect(res.body.message).toMatch(/真人/);
+    expect(res.body.message).toMatch(/内容审核未通过/); // 方舟的原话带进来
+    // 余额头随响应回来（App 的钱包镜像据此同步）
+    expect(Number(res.headers["x-wallet-plan"]) + Number(res.headers["x-wallet-addon"])).toBe(w0.plan + w0.addon - CHAT_TURN_TOKENS);
+    // 钱：只剩看帧那一笔；退款流水恰好一行，memo 带任务号
+    const w1 = await walletSvc.getWallet(owner.id);
+    expect(w0.plan + w0.addon - (w1.plan + w1.addon)).toBe(CHAT_TURN_TOKENS);
+    const refunds = await TokenLedger.find({ user: owner.id, reason: "provider_failed", memo: `provider_failed ark task:${started.body.taskId}` }).lean();
+    expect(refunds).toHaveLength(1);
+    expect(refunds[0].delta).toBe(r2v);
     expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
-    // 凭据钉成终局：再点一次不会又去问方舟，而是原样把那句话再说一遍
+    // 凭据钉成终局：再点一次不会又去问方舟，原样把那句话再说一遍 —— 也**不会再退一次**
     const job = await BlockoutJob().findById(started.body.jobId).lean();
     expect(job.status).toBe("failed");
-    expect(job.failMessage).toMatch(/不退/);
+    expect(job.failMessage).toMatch(/退回/);
     const again = await finish(started.body.jobId);
     expect(again.status).toBe(502);
-    expect(again.body.message).toMatch(/不退/);
+    expect(again.body.message).toMatch(/退回/);
+    expect(again.body.lost).toBe(false);
+    expect(again.body.refund).toEqual({ state: "refunded", tokens: r2v });
+    expect(await TokenLedger.countDocuments({ user: owner.id, reason: "provider_failed", memo: `provider_failed ark task:${started.body.taskId}` })).toBe(1);
+    // 本人这次的响应里已经说了退款 —— 不再另发一条通知
+    const Notification = require("../src/models/Notification");
+    expect(await Notification.countDocuments({ userId: owner.id, type: "GEN_TASK_REFUND", "payload.taskId": started.body.taskId })).toBe(0);
+  });
+
+  test("★ 方舟失败、没人来取回：清扫器退了钱，取件单跟着钉成 failed（列表不再说「无法挽回」），并发一条通知", async () => {
+    const taskRefund = require("../src/services/taskRefund.service");
+    const GenTaskCharge = require("../src/models/GenTaskCharge");
+    const Notification = require("../src/models/Notification");
+    net.taskStatus = "failed";
+    const started = await post(baseBody());
+    expect(started.status).toBe(202);
+    // 让这一笔账到点（清扫器只问受理 10 分钟之后的）
+    await GenTaskCharge.updateOne({ provider: "ark", taskId: started.body.taskId }, { $set: { nextCheckAt: new Date(Date.now() - 1000) } });
+    const out = await taskRefund.sweepTaskRefunds();
+    expect(out.settled).toBeGreaterThanOrEqual(1);
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.status).toBe("failed");
+    expect(job.failMessage).toMatch(/已经自动退回/);
+    // 列表（pending 那条路读的是同一个 stateOf）
+    const st = BlockoutJob().stateOf(job);
+    expect(st.state).toBe("failed");
+    expect(st.message).not.toMatch(/无法挽回/);
+    const notes = await Notification.find({ userId: owner.id, type: "GEN_TASK_REFUND", "payload.taskId": started.body.taskId }).lean();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].payload).toMatchObject({ kind: "blockout", provider: "ark", tokens: r2vTokens(8, SEEDANCE_2_5) });
+    // 用户这时再来取回：照实说已经退了，不再退第二次
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(502);
+    expect(res.body.refund).toMatchObject({ state: "refunded" });
+    expect(res.body.lost).toBe(false);
   });
 
   test("方舟受理**前** 400（敏感词/输入不合格）→ 出片那笔退回、看帧那笔不退，两笔分开说", async () => {

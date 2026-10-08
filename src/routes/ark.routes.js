@@ -52,6 +52,8 @@ const {
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
 const arkVideoTask = require("../services/arkVideoTask.service");
+// 受理之后失败的退款（2026-10-07）：受理时记账（billedForward）、轮询看见终态时结账 —— 唯一实现在那个文件里
+const taskRefund = require("../services/taskRefund.service");
 // 组图（一次出一组关联的图）：按上限预扣、后台画、按拿到手的张数结算（见那个文件头的 ★★）
 const imageGroups = require("../services/arkImageGroup.service");
 const MaterialRefVideo = require("../models/MaterialRefVideo");
@@ -214,6 +216,28 @@ function billedForward(kind, path, timeoutMs) {
           r2v: req.r2v ?? null,
           draftFinal: req.draftFinal ?? null,
           costTokens: out.free ? 0 : out.cost,
+        });
+        // ★★ 记账（services/taskRefund）：这一发扣了多少、从哪两桶扣的、是不是免单 —— 方舟之后明说失败 / 取消 / 过期时
+        //   按它原样退回。每一发受理了的任务都记（Seedance 普通出片、r2v、样片两步、Seed3D）；记账只吼不抛
+        //   （此刻钱已扣、任务已受理，5xx 会让客户端以为没受理去重试 = 再花一次钱）。
+        //   样片两步各记各的：两笔独立的钱，第二步失败只退第二步。
+        let taskId = "";
+        try {
+          taskId = String(JSON.parse(out.text || "{}")?.id || "");
+        } catch {
+          /* 回包读不出任务号：recordCharge 自己会吼 */
+        }
+        const model = String(req.body?.model ?? "");
+        await taskRefund.recordCharge({
+          provider: "ark",
+          taskId,
+          kind: req.draftFinal ? "draftFinal" : req.body?.draft === true ? "draft" : Object.hasOwn(VIDEO_MULT, model) ? "video" : "3d",
+          user: req.user._id,
+          model,
+          cost: out.cost,
+          free: out.free,
+          took: out.took,
+          memo: out.memo,
         });
       }
       if (out.accepted && req.r2v?.templateId) {
@@ -1019,6 +1043,30 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
       } catch {
         /* 上游给的不是 JSON —— 原样透传，这里不掺和 */
       }
+      // ★★ 失败退款的挂点（2026-10-07，services/taskRefund）：方舟**明说**这一发失败 / 取消 / 过期 → 按原桶退给账的主人
+      //   （恰好一次：别人、清扫器、白模化取回同时看见也只退一次）。只在终态上查库 —— 排队 / 运行中的高频轮询零额外开销。
+      // ★ 退给**账的主人**，不是来问的人：这条路不查归属，任何登录用户都能问任何任务号。`refund` 字段与余额头也只给主人。
+      // ★ 失败只吼不挡：查库 / 退款出了错，这一拍照样把方舟的原话回出去（不回 5xx —— 客户端连查失败几次就当成
+      //   「还在跑、盯不住了」，一发已经退了钱的任务反而被说成还在跑）。没退成的那一笔账还是 open，清扫器会接着退。
+      const verdict = taskRefund.verdictOf("ark", parsed?.status);
+      if (verdict) {
+        try {
+          const row = await taskRefund.settleTask({
+            provider: "ark",
+            taskId: req.params.id,
+            status: parsed.status,
+            code: parsed?.error?.code,
+            viewerId: req.user._id,
+          });
+          if (verdict === "failed" && row && String(row.user) === String(req.user._id)) {
+            parsed.refund = taskRefund.refundView(row);
+            setWalletHeaders(res, await wallet.getWallet(req.user._id));
+            out = JSON.stringify(parsed);
+          }
+        } catch (e) {
+          console.error(`[ark] 失败退款的结账没办成 task=${req.params.id}（清扫器会接着办）:`, e.message);
+        }
+      }
       if (parsed?.status === "succeeded") {
         // 白模模板的试炼闸：succeeded 的 r2v 任务在这里被看见（running/queued 的高频
         // 轮询零额外开销）。失败只吼不打断轮询。
@@ -1054,6 +1102,24 @@ router.get("/contents/generations/tasks/:id", requireAuth, pollLimit, async (req
       }
     }
     return res.status(status).type("application/json").send(out);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * GET /api/ark/task-charges/:taskId —— 我的某一发任务的钱怎么样了（2026-10-07，失败退款）：
+ *   `{ ok, taskId, provider, kind, state, tokens }`，state ∈ pending（还不知道结局）/ refunding / refunded / settled（出成了，钱照收）/
+ *   skipped（没有要退的：管理员免单）/ lost（一直问不出结局，交人工）。查不到（不是你的 / 自动退款上线之前的任务）→ 404。
+ * App 在对一发过期没取回的任务说「已经花掉的钱无法挽回」之前先问它（那一发可能早被清扫器退了钱）。
+ * ★ 只给本人（按账的 user 查）；不计费、走轮询那个限流桶；不替你去问上游（那是清扫器的事，这里只读账）。
+ */
+router.get("/task-charges/:taskId", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    if (!TASK_ID_RE.test(req.params.taskId)) return res.status(400).json({ ok: false, message: "bad task id" });
+    const row = await taskRefund.chargeOf(req.params.taskId, req.user._id);
+    if (!row) return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "没有这一发任务的扣费记录" });
+    return res.json({ ok: true, taskId: row.taskId, provider: row.provider, kind: row.kind, ...taskRefund.refundView(row) });
   } catch (err) {
     return next(err);
   }

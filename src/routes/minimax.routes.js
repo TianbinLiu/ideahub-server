@@ -26,7 +26,10 @@ const { chargedArkCall, setWalletHeaders } = require("../services/arkGateway.ser
 const { MINIMAX_FLAT_COST, MINIMAX_REAL_MODELS, minimaxFlatCost, MINIMAX_REAL_RESOLUTION } = require("../config/tokens");
 // ★★ 往哪个站打、用哪把 key **只有这一处判据**（config/minimax）：中国站与国际站是
 //   两套账号两个域名，把国际站的 key 配到中国站地址上只会一路鉴权失败，而那时钱已经扣过。
-const { minimaxBase, minimaxKey, minimaxConfigured } = require("../config/minimax");
+const { minimaxBase, minimaxKey, minimaxConfigured, minimaxRegion } = require("../config/minimax");
+const wallet = require("../services/tokenWallet.service");
+// 受理之后失败的退款（2026-10-07）：受理时记账（带区域）、轮询看见 Fail 时结账 —— 唯一实现在那个文件里
+const taskRefund = require("../services/taskRefund.service");
 
 const router = express.Router();
 
@@ -158,6 +161,28 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
       setWalletHeaders(res, out.wallet);
       return res.status(out.status).json(out.body);
     }
+    if (out.accepted) {
+      // ★★ 记账（services/taskRefund）：MiniMax 之后报 Fail 时按扣的那两桶退回。**带上区域** ——
+      //   MiniMax 的任务绑站（config/minimax 的 ★★），清扫器只能回同一个站去问。记账只吼不抛。
+      let taskId = "";
+      try {
+        taskId = String(JSON.parse(out.text || "{}")?.task_id || "");
+      } catch {
+        /* acceptedOf 已经确认过有 task_id；读不出来 recordCharge 自己会吼 */
+      }
+      await taskRefund.recordCharge({
+        provider: "minimax",
+        taskId,
+        kind: "minimax",
+        user: req.user._id,
+        model,
+        cost: out.cost,
+        free: out.free,
+        took: out.took,
+        memo: out.memo,
+        region: minimaxRegion(),
+      });
+    }
     setWalletHeaders(res, out.wallet);
     // 上游状态码与 JSON 原样透传（业务码在 base_resp 里，App 的 minimaxVideo 会读）
     return res.status(out.status).type("application/json").send(out.text || "{}");
@@ -195,7 +220,29 @@ router.get("/video/:taskId", requireAuth, pollLimit, async (req, res) => {
     console.error(`[minimax] upstream query ${String((e && e.name) || e)}`);
     return res.status(504).json({ message: `minimax upstream ${String((e && e.name) || "error")}` });
   }
-  return res.status(up.status).type("application/json").send((await up.text()) || "{}");
+  let out = (await up.text()) || "{}";
+  // ★★ 失败退款的挂点（2026-10-07，services/taskRefund）：MiniMax **明说** Fail → 按原桶退给账的主人（恰好一次）。
+  //   只认 200 + base_resp 成功 + status 字段；别的（非 200、读不懂、查无此任务）一律不是结局。
+  //   开关 MINIMAX_FAIL_REFUND=off 时 settleTask 一分不动（MiniMax 对按量付费的失败任务计不计费没有书面说法，见 .env.example）。
+  // ★ 同 /api/ark 的轮询：退给账的主人、refund 字段与余额头只给主人；失败只吼不挡，原话照回。
+  if (up.status === 200) {
+    try {
+      const j = JSON.parse(out);
+      const okResp = !j?.base_resp || j.base_resp.status_code === 0;
+      const verdict = okResp ? taskRefund.verdictOf("minimax", j?.status) : null;
+      if (verdict) {
+        const row = await taskRefund.settleTask({ provider: "minimax", taskId: req.params.taskId, status: j.status, viewerId: req.user._id });
+        if (verdict === "failed" && row && String(row.user) === String(req.user._id)) {
+          j.refund = taskRefund.refundView(row);
+          setWalletHeaders(res, await wallet.getWallet(req.user._id));
+          out = JSON.stringify(j);
+        }
+      }
+    } catch (e) {
+      if (!(e instanceof SyntaxError)) console.error(`[minimax] 失败退款的结账没办成 task=${req.params.taskId}（清扫器会接着办）:`, e.message);
+    }
+  }
+  return res.status(up.status).type("application/json").send(out);
 });
 
 /**

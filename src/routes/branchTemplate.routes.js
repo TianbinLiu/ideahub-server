@@ -53,7 +53,9 @@ const {
   buildOutFrameUrl,
   OUT_FRAME_W_ROSTER,
 } = require("../utils/templateVideoAsset");
-const { callArk, chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
+const { callArk, chargedArkCall, T_CREATE, setWalletHeaders } = require("../services/arkGateway.service");
+// 受理之后失败的退款：唯一实现（白模化 r2v 受理时记账、取回时看见 failed 就结账，见 ⑥ 与 finish）
+const taskRefund = require("../services/taskRefund.service");
 const blockout = require("../services/blockoutize.service");
 const { SEEDANCE_2_5, VIDEO_MULT_R2V, videoPlanDenial, isPaidUser } = require("../config/tokens");
 const wallet = require("../services/tokenWallet.service");
@@ -243,7 +245,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     //   不是上传口那套 —— V2 起两者不同：上传口收的是"任意原始素材"（(0,600]s、不校比例），
     //   而这条 V1 登记路把**整段原片直接当参考视频**用，它必须满足方舟 edit 的硬约束。
     //   拿上传口那套松窗口复核的话，一段 300s 的素材会被登记成模板，然后每个套用它的人
-    //   在付费出片那一步撞 400 —— 而方舟受理后失败是不退费的。
+    //   在付费出片那一步撞 400（同步 400 会退款，但他白等一趟、前面推演 / 画帧的钱也花了）。
     const meta = templateVideoMeta(resource);
     // ★★ 重复登记的门要在**任何一次付费/转存调用之前**（2026-08-17 加；2026-08-20 又
     //   挪到窗口检查之前）：一段已经分段登记过的长视频再来一次，先撞窗口会得到
@@ -470,7 +472,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 //
 // ══ 为什么要拆（2026-08-16，拆之前是一条同步长请求）══════════════════
 // 拆之前这九步在**同一条 HTTP 请求**里跑完，中间含最长 5 分钟的服务端轮询。而这条链路的
-// 钱是在**中途**花掉的（看帧一笔 + r2v 受理一笔，受理后失败不退，F11）—— 于是手机切后台、
+// 钱是在**中途**花掉的（看帧一笔 + r2v 受理一笔，F11）—— 于是手机切后台、
 // 弱网断线、App 进程被系统回收、nginx 超时掐断，任何一条都会让用户**丢掉这一发的结果，
 // 而钱已经花了**，我们这边的日志里却是一次成功。一条要等五分钟的请求本身就是脆的：
 // 它把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接的命上。
@@ -482,8 +484,10 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 //
 // ★★ 这条路**花两次真钱**：⑤ 一次 chat（看帧）+ ⑥ 一次 r2v 出片。两笔都走
 //   services/arkGateway 的同一条计费序列（与 /api/ark 代理**同一份实现**）。
-//   ⑥ 一旦被方舟受理，**失败也不退费**（F11：含真人人脸的视频创建时不拒、
-//   跑到一半才 failed）—— 所以 App 必须在开炼前就把这句话整句写给用户看。
+//   ⑥ 一旦被方舟受理，钱就扣了（F11：含真人人脸的视频创建时不拒、跑到一半才 failed）。
+//   2026-10-07 起方舟明说失败（failed / cancelled / expired）时 **r2v 那一笔自动退回**（services/taskRefund，
+//   按扣的那两桶、恰好一次）；看帧那一笔照旧不退；方舟出成了但产物我们用不了（太短、元数据缺失）也不退 ——
+//   那几种方舟收了钱。所以 App 开炼前仍要把「看帧不退、真人面孔容易失败」写给用户看。
 const BLOCKOUT_MODEL = SEEDANCE_2_5;
 /** 看帧用的对话模型。与 app 的 MODELS.chat 同一个 id（看图说话走同一个模型） */
 const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
@@ -542,13 +546,13 @@ const blockoutPendingLimit = userRateLimit({ max: 30, windowMs: 60 * 1000, scope
 /** 整句失败 —— 全 app 没有任何地方监听 emitApiError，只回错误码等于让用户对着转圈干等（铁律八）。
  *
  * ★★ `billed` 的语义在两阶段里必须**分得开**，别把两件事混成一位：
- *   · 阶段一（开炼）：r2v 一旦被方舟受理就是 `billed:true` —— 受理后失败不退（F11）；
+ *   · 阶段一（开炼）：r2v 一旦被方舟受理就是 `billed:true` —— 钱这一刻就扣了（方舟明说失败时 r2v 那一笔会自动退回）；
  *   · 阶段二（取回结果）：**它自己一分钱都不花**（核实任务、转存、建模板都不计费），
  *     所以它的失败一律 `billed:false` —— 那是「这次没取到」，不是「又花了一笔」。
  *     写成 true 的话，用户会以为每点一次「取回结果」就再扣一笔钱，于是不敢重试 ——
  *     而重试恰恰是我们拆两阶段给他的那条活路。
- *   · 钱确实没了的那两种终局（产物过期、方舟受理后 failed）另有 `lost:true` 一位，
- *     并且**话要说满**（见 BlockoutJob.stateOf 的整句）。
+ *   · 钱确实没了的终局（产物过期没取回、产物不合格）另有 `lost:true` 一位，并且**话要说满**（见 BlockoutJob.stateOf 的整句）；
+ *     方舟受理后 failed 那一种 2026-10-07 起 r2v 那一笔会退回 —— 退了（或正在退）就 `lost:false` 并带 `refund:{state,tokens}`。
  */
 function fail(res, status, message, extra = {}) {
   return res.status(status).json({ ok: false, message, ...extra });
@@ -820,14 +824,28 @@ router.post(
         /* 见下：拿不到任务 id 与"任务没受理"是两件事 */
       }
       if (!taskId) {
-        // 已受理却读不到任务 id：钱已经花出去了，只能照实说（不退是事实，不许粉饰）
+        // 已受理却读不到任务 id：钱已经花出去了，只能照实说（没有任务号就没法记账、也没法在失败时退 —— 不许粉饰）
         console.error("[blockoutize] r2v 任务受理但响应里没有任务 id");
         return fail(res, 502, "AI 已经开始生成，但我们没能拿到任务编号，无法跟进这一发的结果。这一发的费用已经产生、无法退回。", { billed: true, visionFrames });
       }
 
+      // ★★ 先记账再落取件单（services/taskRefund）：这一发的钱（多少、从哪两桶扣的、是不是免单）要在
+      //   方舟明说失败时原样退回 —— 记账只吼不抛；排在取件单前面，取件单落不下去的那条路上失败了也照样能退。
+      await taskRefund.recordCharge({
+        provider: "ark",
+        taskId,
+        kind: "blockout",
+        user: req.user._id,
+        model: BLOCKOUT_MODEL,
+        cost: taskOut.cost,
+        free: taskOut.free,
+        took: taskOut.took,
+        memo: taskOut.memo,
+      });
+
       // ── ⑦ 落取件凭据：**两阶段的分界线就在这里** ──────────────────────
       //
-      // ★★ 到这一行为止钱已经全花掉了（看帧一笔 + r2v 受理一笔，受理后失败不退）。
+      // ★★ 到这一行为止钱已经全花掉了（看帧一笔 + r2v 受理一笔；r2v 那一笔方舟明说失败时会自动退回）。
       //   凭据落不下去 = 用户付了钱却拿不到任何能取回结果的句柄 —— 所以它必须在返回
       //   之前落库成功，落不下要**响亮到能人工兜底**（把 taskId 交给用户），
       //   绝不能只在日志里叹口气然后回 500（那就是把一笔钱静默扔了，铁律八）。
@@ -881,7 +899,7 @@ router.post(
         return fail(
           res,
           500,
-          `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生、无法退回。请把这个任务编号发给我们：${taskId}`,
+          `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生（AI 中途失败的话出片那一笔会自动退回）。请把这个任务编号发给我们：${taskId}`,
           { billed: true, taskId, visionFrames },
         );
       }
@@ -897,7 +915,7 @@ router.post(
 );
 
 /** 阶段一的受理回执 —— **一处实现**（首次受理与"撞上既有凭据"两条路共用）。
- *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经花了、失败也不退（F11）。
+ *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经扣了（方舟明说失败时 r2v 那一笔自动退回，F11）。
  *    这一位在阶段一是"钱花了没有"，在阶段二是"这一次调用花钱了没有"（恒 false），
  *    两边的措辞都要写满，别让 App 自己去猜。
  *
@@ -923,7 +941,7 @@ function startedPayload(job) {
     billed: true,
     ...(Number.isFinite(frames) && frames > 0 ? { visionFrames: frames } : {}),
     message:
-      "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 受理之后失败也不退费）。" +
+      "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 中途失败的话，出片那一笔会自动退回；看画面那一步不退）。" +
       `出片之后回来点「取回结果」才会建成模板；产物只保 ${BlockoutJob.TTL_HOURS} 小时，过期这一发就没法挽回了。`,
   };
 }
@@ -953,12 +971,25 @@ async function releaseJob(jobId) {
 }
 
 /** 判定这一发**终局失败**（方舟明说没成 / 产物不合格）。整句理由存下来：
- *  用户可能几小时后才回来看列表，那时再去问方舟已经问不到了，而"为什么没了"必须还说得出口。 */
+ *  用户可能几小时后才回来看列表，那时再去问方舟已经问不到了，而"为什么没了"必须还说得出口。
+ *  @returns {Promise<boolean>} 这一次是不是真的把它改成了 failed（false = 别人先改了：失败退款那条路
+ *    会顺手把它钉成 failed、写上退款那句话 —— 这时要回**库里那句**，别拿自己这句盖过去） */
 async function failJob(jobId, message) {
-  await BlockoutJob.updateOne(
+  const r = await BlockoutJob.updateOne(
     { _id: jobId, status: { $in: ["pending", "claimed"] } },
     { $set: { status: "failed", failMessage: message, claimedAt: null } },
   );
+  return r.modifiedCount > 0;
+}
+
+/** 这一发的 r2v 那一笔退了没有（取回结果时说话用）。查不到账 = null（上线之前的老凭据）；查账本身出错 = undefined（不知道） */
+async function refundOfJob(job) {
+  try {
+    return taskRefund.refundView(await taskRefund.chargeByTask("ark", job.taskId));
+  } catch (e) {
+    console.error(`[blockoutize] 查退款失败 task=${job.taskId}:`, e.message);
+    return undefined;
+  }
 }
 
 /** 「这一发已经取回过了」的回法 —— 幂等路径与首次成功共用同一个形状。
@@ -993,8 +1024,12 @@ async function respondNonFinishable(req, res, job, st) {
   }
   if (st.state === "failed") {
     // ★ lost:true = 钱确实没了且拿不回任何东西。与 billed 分开两位：
-    //   billed 说的是"这一次调用花钱没有"（没有），lost 说的是"开炼那笔还剩什么"（什么都没剩）。
-    fail(res, 502, st.message, { billed: false, lost: true, state: "failed" });
+    //   billed 说的是"这一次调用花钱没有"（没有），lost 说的是"开炼那笔还剩什么"。
+    // ★ 2026-10-07 起方舟明说失败的那一种 r2v 那一笔会退回：退了 / 正在退就 lost:false 并带 refund
+    //   （产物不合格那几种没有退款 ⇒ lost 照旧为真）
+    const refund = await refundOfJob(job);
+    const back = !!refund && (refund.state === "refunded" || refund.state === "refunding");
+    fail(res, 502, st.message, { billed: false, lost: !back, state: "failed", ...(refund ? { refund } : {}) });
     return true;
   }
   if (st.state === "expired") {
@@ -1092,9 +1127,33 @@ router.post(
         });
       }
       if (verdict.state === "failed") {
-        // 终局：方舟明说这一发没成（含 F11 真人脸）。钱不退，照实说，凭据钉成 failed
-        await failJob(claimed._id, verdict.message);
-        return fail(res, 502, verdict.message, { billed: false, lost: true, state: "failed" });
+        // 终局：方舟明说这一发没成（含 F11 真人脸）。
+        // ★ r2v 那一笔按扣的那两桶退回（services/taskRefund，唯一实现、恰好一次 —— 清扫器 / 别人的轮询可能已经退过了，
+        //   它会照实回「已经退了」）。退款没办成（查库抖了）不挡这一步：账还是 open，清扫器会接着退，这里说「会退」。
+        let refund;
+        try {
+          refund = taskRefund.refundView(
+            await taskRefund.settleTask({
+              provider: "ark",
+              taskId: claimed.taskId,
+              status: verdict.upstreamStatus,
+              code: verdict.code,
+              detail: verdict.detail,
+              viewerId: req.user._id,
+            }),
+          );
+        } catch (e) {
+          console.error(`[blockoutize] 失败退款没办成 task=${claimed.taskId}（清扫器会接着办）:`, e.message);
+          refund = undefined;
+        }
+        // 凭据钉成 failed。★ 退款那条路会顺手把它钉成 failed、写上同一句话（BlockoutJob.failedMessage 一处措辞）——
+        //   这里改不动的话就回库里那句（别拿自己这句盖过去）
+        const msg = BlockoutJob.failedMessage({ detail: verdict.detail, refund });
+        const moved = await failJob(claimed._id, msg);
+        const finalMsg = moved ? msg : (await BlockoutJob.findById(claimed._id).select("failMessage").lean())?.failMessage || msg;
+        const back = !!refund && (refund.state === "refunded" || refund.state === "refunding");
+        if (back) setWalletHeaders(res, await wallet.getWallet(req.user._id));
+        return fail(res, 502, finalMsg, { billed: false, lost: !back, state: "failed", ...(refund ? { refund } : {}) });
       }
       if (verdict.state !== "succeeded") {
         // unknown：我们**没问清楚**（上游抖动/回包读不懂）。不替方舟宣判 ——
@@ -1179,9 +1238,9 @@ router.post(
           : `${outIssue}（这一发的费用已经产生、无法挽回，请换一段素材重做。）`;
         // ★★ 结构化告警：修完之后这条分支**只可能在"方舟改了裁短行为"时触发** ——
         //   它是一个需要人工补偿并重新校准 BLOCKOUT_MIN_INPUT_SEC 的信号，不是日常事件。
-        //   （钱维持"不退"，与 blockoutize.service 里 F11 真人脸那条同一口径：方舟受理并
-        //   交付了算力，成本真实发生。要不要改成自动退费是产品决策，wallet.credit 是现成的、
-        //   幂等靠 failJob 那个条件原子更新抢占 —— 工程上这里就是那个挂点。）
+        //   （钱维持"不退"：方舟算它**出成了**，成本真实发生 —— 2026-10-07 的失败退款只退方舟明说失败的那一种
+        //   （services/taskRefund），这里不是。要不要也退是另一个产品决策；真要退，按原桶退走 taskRefund 那一份实现，
+        //   别在这里另写一套。）
         console.error(
           `[blockoutize:bad-output] job=${claimed._id} task=${claimed.taskId} inputSec=${inSec} ` +
             `outSec=${outMeta.duration} trimmed=${Number.isFinite(trimmed) ? trimmed.toFixed(3) : "?"} reason=${outIssue}`,
@@ -1527,8 +1586,8 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
     }
     // ★★ 试炼闸：provenAt 由服务端在「作者本人的 r2v 任务真实出片成功」时写入
     //   （ark.routes.js 的轮询追踪），这里只认它非空。为什么必须有这道门：
-    //   方舟任务**受理后**才失败（含真人人脸、内容审核）是不退费的 ——
-    //   没这道门，一个坏模板会让每个套用的人各赔一次；有这道门，坏在作者自己那一次。
+    //   方舟任务**受理后**才失败（含真人人脸、内容审核）—— 2026-10-07 起出片那一笔会自动退回，但每个套用的人
+    //   都要白等一趟、白花前面推演 / 画帧的钱；有这道门，坏在作者自己那一次。
     if (!doc.provenAt) {
       badRequest("发布前请先用这个模板成功出一段片（在自己的工程里套用它跑通一次）——这一步能确保套用你模板的人不会白花钱。");
     }

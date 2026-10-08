@@ -1,6 +1,6 @@
 // 视频任务登记与找回（模型见 models/ArkVideoTask 的 ★★）。调用方：
 //   · ark.routes.billedForward 受理之后 recordVideoTask（落库失败只吼不打断响应：任务已受理、钱已扣）
-//   · GET /api/ark/video-tasks → listVideoTasks（最近 24 小时，方舟产物的寿命）
+//   · GET /api/ark/video-tasks → listVideoTasks（最近 24 小时，方舟产物的寿命；已退款的不列）
 //   · ark.routes.resolveDraftFinal → findOwnDraft（样片第二步：归属 + 样片的时长）
 //   · src/index.js 启动时（0 号实例）→ migrateExpiry（TTL 从 createdAt 搬到每行自带的 expireAt）
 const ArkVideoTask = require("../models/ArkVideoTask");
@@ -72,10 +72,21 @@ async function recordVideoTask({ userId, body, responseText, r2v, draftFinal = n
   }
 }
 
-/** 这个账号最近 24 小时提交过的视频任务（新的在前，最多 50 条） */
+/**
+ * 这个账号最近 24 小时提交过的视频任务（新的在前，最多 50 条）。
+ * ★ 已经因为失败退了钱的那些不列（2026-10-07，services/taskRefund）：它们没有成片可取了，
+ *   App 冷启动拿这张表补「待取回」凭据 —— 列出来就是一张永远取不回、还说着「钱已经花了」的卡。
+ *   老 App 也靠这一条不去捞它们（它们不认 refund 字段）。查账失败不挡列表：退一步照旧全列。
+ */
 async function listVideoTasks(userId) {
   const since = new Date(Date.now() - LIST_WINDOW_MS);
-  const rows = await ArkVideoTask.find({ userId, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(50).lean();
+  let rows = await ArkVideoTask.find({ userId, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(50).lean();
+  try {
+    const refunded = await require("./taskRefund.service").refundedTaskIds("ark", rows.map((r) => r.taskId));
+    if (refunded.size) rows = rows.filter((r) => !refunded.has(r.taskId));
+  } catch (e) {
+    console.error("[ark] 视频任务列表查退款失败（照旧全列）:", e.message);
+  }
   return rows.map((r) => ({
     taskId: r.taskId,
     createdAt: r.createdAt,

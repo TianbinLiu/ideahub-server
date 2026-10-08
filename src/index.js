@@ -169,6 +169,15 @@ async function start() {
         sweepRemixRewards().catch((e) => console.error("[remix-reward] 清扫失败:", (e && e.message) || e));
       }, 10 * 60 * 1000);
       remixRewardTimer.unref?.();
+      // 受理之后失败的生成任务：替没人再来问的那些（App 被杀 / 卸载）向上游问一次结局，失败的按原桶退钱（services/taskRefund）。
+      // ★ 只在 0 号实例：两个实例各扫一遍不会多退（open → claimed 是条件原子抢占），但会把上游查询翻倍（方舟查询的 QPS 上限没有公开数）。
+      // ★ 5 分钟一轮、一轮最多问 30 次、问不出结局就退避（10 → 60 分钟）；同实例不重入（一轮可能跨过下一个 5 分钟）。
+      // ★ 失败只记日志：它是兜底，主链路是轮询端点与白模化取回那两处（看见失败当场退）。
+      const { sweepTaskRefunds } = require("./services/taskRefund.service");
+      const taskRefundTimer = setInterval(() => {
+        sweepTaskRefunds().catch((e) => console.error("[task-refund] 清扫失败:", (e && e.message) || e));
+      }, 5 * 60 * 1000);
+      taskRefundTimer.unref?.();
       // Play 的「已作废购买」每小时拉一次。★ 它是 RTDN 的**兜底**，不是替代：
       //   RTDN 可能丢、也可能我们正好在重启，而漏一条退款 = 用户白拿一整包 token。
       //   ⚠ 两条路必然重叠 ⇒ 回收本身必须幂等（revokedAt 的条件原子抢占）。
@@ -193,7 +202,7 @@ async function start() {
         playSweep.unref?.();
       }
     } else {
-      console.log(`实例 ${instanceId}：跳过 AI worker、ArkVideoTask 迁移、NCII 到期清扫、同款奖励清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
+      console.log(`实例 ${instanceId}：跳过 AI worker、ArkVideoTask 迁移、NCII 到期清扫、同款奖励清扫、失败退款清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
     }
 
     setupGracefulShutdown(server);

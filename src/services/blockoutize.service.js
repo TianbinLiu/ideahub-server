@@ -26,7 +26,7 @@ const { buildOutFrameUrl, OUT_FRAME_W_ROSTER } = require("../utils/templateVideo
 //
 // ★★ 2026-08-15 实测：Cloudinary 的变换是**懒生成**的 —— 第一次请求可能拿到一份
 //   **不完整**的资产（连发两次，字节数不一样）。不预热就把这条 URL 交给方舟，
-//   方舟拉到半截视频，产出是一段莫名其妙的片子，而**钱照扣**（受理后失败不退）。
+//   方舟拉到半截视频，产出是一段莫名其妙的片子，而**钱照扣**（方舟算它出成了 —— 失败退款退不到它头上）。
 //   所以：连发到"两次读到的字节数一样且非零"才算生成完，否则整句拒。
 const PREWARM_TRIES = 6;
 // ★ 测试环境把**等待**去掉（判断逻辑一个字不动：仍要"连续两次读到相同且非零的字节数"）。
@@ -938,7 +938,7 @@ function blockoutPrompt(roles) {
  * 这个文件之前有一个 `pollTask`：在**建模板那一条 HTTP 请求里**每 5 秒问一次、最长等
  * 5 分钟。它把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接的命上 —— 手机切后台、
  * 弱网断线、App 进程被回收、nginx `proxy_read_timeout` 掐断，任何一条都会让用户
- * **丢掉这一发的结果，而钱已经花了**（方舟受理后失败不退，F11），我们这边的日志里
+ * **丢掉这一发的结果，而钱已经花了**（出成了的那一发方舟照收，F11），我们这边的日志里
  * 却还是一次成功。所以轮询整段搬回客户端（走既有的
  * `GET /api/ark/contents/generations/tasks/:id` —— 不计费、已有限流桶），
  * 服务端只在**取回结果**那一步问这一次。
@@ -951,9 +951,10 @@ function blockoutPrompt(roles) {
  * @returns {Promise<
  *   | { state:"succeeded", videoUrl:string }
  *   | { state:"running" }
- *   | { state:"failed", message:string }
+ *   | { state:"failed", message:string, upstreamStatus:string, code:string, detail:string }
  *   | { state:"unknown", message:string }>}
- *   · failed  = 方舟明说这一发没成 —— 终局，**不退费**，调用方要照实说；
+ *   · failed  = 方舟明说这一发没成（failed / cancelled / expired）—— 终局。r2v 那一笔由调用方交给
+ *     services/taskRefund 退回（2026-10-07 起），upstreamStatus / code / detail 就是给它的；话由 BlockoutJob.failedMessage 说；
  *   · unknown = 我们**没问清楚**（上游抖动/回包不是 JSON/说成功却没给地址）——
  *     不是终局：凭据要留着让用户过一会儿再取。把它当失败处理等于替方舟宣判，
  *     而那一句"这一发没了"是收不回来的。
@@ -986,14 +987,18 @@ async function fetchTaskState(taskId) {
     }
     return { state: "succeeded", videoUrl };
   }
-  if (parsed?.status === "failed" || parsed?.status === "cancelled") {
+  // ★ expired 也是终局失败（2026-10-07）：每一发都钉了 execution_expires_after = 24 小时（arkGateway.withServerTaskFields），
+  //   排队 / 运行超时方舟标 expired、不出片也不计费。原来它落进下面的「还在跑」，凭据会一直说"还没出片"直到 24 小时过期。
+  //   ⚠ 与 BlockoutJob 的 status:"expired"（**我们的**产物地址过期，方舟已经收了钱）是两回事，别混。
+  if (parsed?.status === "failed" || parsed?.status === "cancelled" || parsed?.status === "expired") {
     const why = String(parsed?.error?.message || "").slice(0, 300);
     return {
       state: "failed",
-      message:
-        `AI 中途拒绝了这段视频${why ? `（${why}）` : ""}。` +
-        "视频里出现真人面孔时最容易发生这种情况——任务已经被受理并消耗了算力，**这一发的费用不退**。" +
-        "建议换一段没有真人面孔的素材再试。",
+      upstreamStatus: String(parsed.status),
+      code: String(parsed?.error?.code || "").slice(0, 80),
+      detail: why,
+      // 没交给 taskRefund 时的兜底说法（不说退没退：那要看账）
+      message: `AI 中途没能出完这一发${why ? `（${why}）` : ""}。视频里出现真人面孔时最容易发生这种情况，建议换一段没有真人面孔的素材再试。`,
     };
   }
   // queued / running / 其它进行中的状态
