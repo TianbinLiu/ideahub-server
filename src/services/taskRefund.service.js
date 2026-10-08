@@ -204,7 +204,10 @@ async function followUp(row, { viewerIsOwner = false, detail = "" } = {}) {
     mine = await GenTaskCharge.findOneAndUpdate({ _id: row._id, state: "refunded", notified: false }, { $set: { notified: true } }, { returnDocument: "after" }).lean();
     if (!mine) return;
     if (mine.kind === "blockout") await syncBlockoutJob(mine, detail);
-    if (!viewerIsOwner) {
+    // ★ 3D（Seed3D 建模）**本人轮询退的也发**（2026-10-07 评审）：App 的建模那条路把失败吞成一行 console.warn（随卡组出模型时
+    //   不打断整件事），轮询响应里的 refund 字段没有人读 —— 不发通知的话，这一笔退款到账时一个字都没有，
+    //   而「一笔说不出来历的余额变动比一条通知糟」。出片那几种的本人轮询由 App 当场说「已退回」，不重复发。
+    if (!viewerIsOwner || mine.kind === "3d") {
       // 正文由 App 按界面语言说（金额是数，不拼成句子 —— 与 BRANCH_REMIX_REWARD 同一条理由）；不带 actorId：平台口径
       await createNotification({
         userId: mine.user,
@@ -261,33 +264,45 @@ async function payRefund(row, { resume = false, now = new Date(), viewerIsOwner 
  * @param {string} [o.code]  上游的错误码（对账用）
  * @param {*}      [o.viewerId] 谁在问（是账的主人 ⇒ 他这次的响应里就带着 refund，不再另发通知）
  * @param {string} [o.detail]   上游的错误原话（只给白模化那句话用，不落库）
+ * @param {string} [o.region]   **MiniMax 必填**：回答这个状态的是哪个站（minimaxRegion()）。只结那个站建的账 ——
+ *   MiniMax 的任务号绑站，切过 MINIMAX_REGION 之后，另一个站上同号的任务不是这一发（它报 Fail 不该退这一笔、报 Success 也不该把它结掉）。
+ *   方舟只有一个站，不看它。
  * @returns {Promise<object|null>} 这一笔账现在的样子（lean）；null = 不是结局 / 没有这笔账 / 成功（成功不回读，省一次查询）
  */
-async function settleTask({ provider, taskId, status, code = "", viewerId = null, detail = "", now = new Date() }) {
+async function settleTask({ provider, taskId, status, code = "", viewerId = null, detail = "", region, now = new Date() }) {
   const verdict = verdictOf(provider, status);
   if (!verdict) return null;
   const id = String(taskId ?? "");
   const upstreamStatus = String(status).slice(0, 32);
+  // ★★ MiniMax 的账只认建它的那个站回的话（2026-10-07 评审）：清扫器的 queryUpstream 早就按区域问，
+  //   而轮询端点问的是**此刻**配的那个站 —— 切站之后两边的结论会打架。判据放在这里（所有入口都走 settleTask），
+  //   调用方不说是哪个站回的就不结（宁可留给清扫器，也不按一个说不清来历的结论动钱）。
+  let scope = { provider, taskId: id };
+  if (provider === "minimax") {
+    const r = String(region ?? "");
+    if (!r) {
+      console.error(`[task-refund] minimax task=${id} 结账没说是哪个站回的，不结（留给清扫器）`);
+      return null;
+    }
+    scope = { ...scope, region: r };
+  }
   if (verdict === "succeeded") {
     // ★ 成功那一拍只写一次库：出成之后客户端还会带着 ?transfer=1 轮询好几次（等转存），这里不能每次多两次读写
-    await GenTaskCharge.updateOne(
-      { provider, taskId: id, state: "open" },
-      { $set: { state: "settled", upstreamStatus, settledAt: now, purgeAt: purgeAtOf(now) } },
-    );
+    await GenTaskCharge.updateOne({ ...scope, state: "open" }, { $set: { state: "settled", upstreamStatus, settledAt: now, purgeAt: purgeAtOf(now) } });
     return null;
   }
   if (provider === "minimax" && !minimaxRefundOn()) {
     // 开关关着：一分不动，行留 open（清扫器也不去问），8 天后静悄悄记成 lost。为什么不直接 skipped：开关打开之后还能接着退
-    return GenTaskCharge.findOne({ provider, taskId: id }).lean();
+    return GenTaskCharge.findOne(scope).lean();
   }
   const claimed = await GenTaskCharge.findOneAndUpdate(
-    { provider, taskId: id, state: "open" },
+    { ...scope, state: "open" },
     { $set: { state: "claimed", claimedAt: now, upstreamStatus, upstreamCode: String(code || "").slice(0, 80) } },
     { returnDocument: "after" },
   ).lean();
   if (!claimed) {
-    // 没抢到：别人刚退过 / 正在退 / 没有这笔账。照实回现在的样子，别猜
-    return GenTaskCharge.findOne({ provider, taskId: id }).lean();
+    // 没抢到：别人刚退过 / 正在退 / 没有这笔账（或是另一个站的）。照实回现在的样子，别猜
+    return GenTaskCharge.findOne(scope).lean();
   }
   const viewerIsOwner = viewerId != null && String(viewerId) === String(claimed.user);
   return payRefund(claimed, { resume: false, now, viewerIsOwner, detail });
@@ -408,7 +423,8 @@ async function reconcile({ now = new Date(), limit = SWEEP_LIMIT, query = queryU
       out.checked += 1;
       const r = await query(row);
       if (r && verdictOf(row.provider, r.status)) {
-        await settleTask({ provider: row.provider, taskId: row.taskId, status: r.status, code: r.code, detail: r.detail, viewerId: null, now });
+        // region：queryUpstream 只回建这一行的那个站问出来的结论（不是那个站就回 null），所以这里照行上的报
+        await settleTask({ provider: row.provider, taskId: row.taskId, status: r.status, code: r.code, detail: r.detail, viewerId: null, region: row.region, now });
         const after = await GenTaskCharge.findById(row._id).select("state").lean();
         if (after && after.state !== "open") {
           out.settled += 1;

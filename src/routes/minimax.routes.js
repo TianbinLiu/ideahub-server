@@ -231,7 +231,14 @@ router.get("/video/:taskId", requireAuth, pollLimit, async (req, res) => {
       const okResp = !j?.base_resp || j.base_resp.status_code === 0;
       const verdict = okResp ? taskRefund.verdictOf("minimax", j?.status) : null;
       if (verdict) {
-        const row = await taskRefund.settleTask({ provider: "minimax", taskId: req.params.taskId, status: j.status, viewerId: req.user._id });
+        // region：回答这句话的是**此刻配的那个站**（上面 fetch 的 base）—— settleTask 只结那个站建的账（切过站的不动）
+        const row = await taskRefund.settleTask({
+          provider: "minimax",
+          taskId: req.params.taskId,
+          status: j.status,
+          viewerId: req.user._id,
+          region: minimaxRegion(),
+        });
         if (verdict === "failed" && row && String(row.user) === String(req.user._id)) {
           j.refund = taskRefund.refundView(row);
           setWalletHeaders(res, await wallet.getWallet(req.user._id));

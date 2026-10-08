@@ -262,6 +262,20 @@ describe("轮询看见失败 → 按原桶退回，恰好一次", () => {
     expect(await Notification.countDocuments({ userId: owner.id, type: "GEN_TASK_REFUND" })).toBe(1);
   });
 
+  test("Seed3D（3D 建模）本人轮询退的也发一条通知（App 的建模那条路把失败吞了，refund 字段没人读）", async () => {
+    // ★ 2026-10-07 评审：出片那几种由 App 当场说「已退回」，3D 没有 —— 不发通知的话这一笔退款到账时一个字都没有
+    const u = await makeUser({ paid: true });
+    const id = await createTask(u, { model: "doubao-seed3d-2-0-260328", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] });
+    up.tasks[id] = { status: "failed" };
+    const res = await poll(u, id).expect(200);
+    expect(res.body.refund).toMatchObject({ state: "refunded" });
+    const notes = await Notification.find({ userId: u.id, type: "GEN_TASK_REFUND" }).lean();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].payload).toMatchObject({ kind: "3d", taskId: id, provider: "ark" });
+    await poll(u, id).expect(200);
+    expect(await Notification.countDocuments({ userId: u.id, type: "GEN_TASK_REFUND" })).toBe(1);
+  });
+
   test("管理员免单的任务失败：不退（没扣钱），refund 说 skipped", async () => {
     const a = await makeUser({ admin: true });
     const id = await createTask(a);
@@ -532,6 +546,32 @@ describe("MiniMax（真人档）", () => {
     delete process.env.MINIMAX_FAIL_REFUND;
     await mmPoll(u, id).expect(200);
     expect(await TokenLedger.countDocuments({ user: u.id, reason: "provider_failed" })).toBe(1);
+  });
+
+  test("轮询端点也只结建这笔账的那个站回的话：切过站之后另一个站报 Fail 不退、报 Success 也不结", async () => {
+    // ★ 2026-10-07 评审：轮询问的是**此刻**配的站，而 MiniMax 的任务号绑站 —— 另一个站上同号的任务不是这一发
+    process.env.MINIMAX_API_KEY = "test-key";
+    const u = await makeUser({ paid: true });
+    const a = await mmCreate(u);
+    const b = await mmCreate(u);
+    await GenTaskCharge.updateMany({ provider: "minimax", taskId: { $in: [a, b] } }, { $set: { region: "intl" } }); // 这两笔是在国际站建的
+    up.mm[a] = "Fail";
+    up.mm[b] = "Success";
+    const ra = await mmPoll(u, a).expect(200);
+    expect(ra.body.status).toBe("Fail"); // 上游原话照回
+    expect(ra.body.refund).toBeUndefined();
+    await mmPoll(u, b).expect(200);
+    expect((await GenTaskCharge.findOne({ provider: "minimax", taskId: a }).lean()).state).toBe("open");
+    expect((await GenTaskCharge.findOne({ provider: "minimax", taskId: b }).lean()).state).toBe("open");
+    expect(await TokenLedger.countDocuments({ user: u.id, reason: "provider_failed" })).toBe(0);
+    // settleTask 本身：MiniMax 不说是哪个站回的就不结
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await svc.settleTask({ provider: "minimax", taskId: a, status: "Fail", viewerId: u.id })).toBeNull();
+    } finally {
+      err.mockRestore();
+    }
+    expect((await GenTaskCharge.findOne({ provider: "minimax", taskId: a }).lean()).state).toBe("open");
   });
 
   test("清扫器只回同一个站去问：区域被切走了就不问（拿另一把 key 去问只会查无此任务，那不是结局）", async () => {
