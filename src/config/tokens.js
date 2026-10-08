@@ -385,6 +385,25 @@ const VIDEO_RESOLUTIONS = Object.freeze({
   [SEEDANCE_MINI]: Object.freeze(["480p", "720p"]),
   [SEEDANCE_2_5]: Object.freeze(["720p"]),
 });
+/**
+ * 纯任务出 720p 时放哪几种画幅（判据在 ark.routes 的 pinPlainVideoTask；2026-10-07 评审）。
+ *
+ * ★★ 为什么要管：720p 一刀切按 1280×720 收（SEC_720P_TOKENS），而官方像素表里 720p 有几格**比它大**——
+ *   1.0 系列 21:9 = 1504×640（贵 4.4%）、4:3 = 1120×832（贵 1.1%）；2.0 / 2.5 的 4:3 / 3:4 = 1112×834（0.6%）、21:9 = 1470×630（0.5%）。
+ *   方舟按真实像素结算，手搓一个 21:9 的请求就能让我们倒贴（免费版的「极速」也够得着）。App 只发 16:9 / 9:16（2.5 的首帧任务发 adaptive），
+ *   所以只放不比 1280×720 大的几格：16:9 / 9:16 / 1:1（1.0 的 16:9 / 9:16 是 1248×704，更小）。
+ * ★ 2.0 / 2.5 另放 `adaptive`：2.5 的首帧 / 首尾帧任务**只收** adaptive（官方注意事项，App 的 arkClient.ratioFor），不放就出不了片。
+ *   代价写明：adaptive 落到 4:3 那一格时少收 ≤0.63%（1112×834 对 1280×720）—— 一个画幅的差，不值得为它把 720p 改成按表收
+ *   （720p 一刀切是两仓共用的口径，App 的报价逐条对着它）。1.0 不放 adaptive：它落到 21:9 那一格要少收 4.4%。
+ * ★ 1.0 不写画幅时方舟的缺省：文生视频 16:9（在名单里）、图生视频 adaptive（不在）—— 钉子对后一种整句拒，不替人猜一个画幅
+ *   （猜错了是一刀裁切）。
+ */
+const VIDEO_720P_RATIOS = Object.freeze({
+  [SEEDANCE_FAST]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_STD]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_MINI]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+  [SEEDANCE_2_5]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+});
 /** 样片第一步只能出 480p、第二步只能出 1080p（官方 Seedance 2.5「样片模式」两条注意事项） */
 const DRAFT_RESOLUTION = "480p";
 const DRAFT_FINAL_RESOLUTION = "1080p";
@@ -954,6 +973,7 @@ module.exports = {
   VIDEO_PIXELS,
   MAX_SEC_TOKENS,
   VIDEO_RESOLUTIONS,
+  VIDEO_720P_RATIOS,
   DRAFT_RESOLUTION,
   DRAFT_FINAL_RESOLUTION,
   perSecTokens,

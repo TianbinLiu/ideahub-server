@@ -41,6 +41,7 @@ const {
   VIDEO_MULT,
   VIDEO_MULT_R2V,
   VIDEO_RESOLUTIONS,
+  VIDEO_720P_RATIOS,
   VIDEO_PIXELS,
   DRAFT_RESOLUTION,
   DRAFT_FINAL_RESOLUTION,
@@ -804,10 +805,12 @@ const PLAIN_CONTENT_TYPES = new Set(["text", "image_url", "audio_url"]);
  *   撞上的只会是手搓的请求，或者用户自己在提示词里打了这几个字 —— 后者那句话能看懂怎么改。
  * ★ 七个参数的长短两种写法都认（--rs/--resolution、--rt/--ratio、--dur/--duration、--cf/--camerafixed、--wm/--watermark），
  *   外加旧版文档里的帧率 --fps / --framespersecond。参数名后面紧跟字母的不算（`--seedling` 不是 --seed），紧跟数字的算（`--dur30`）。
- *   前面不能是字母数字（`a--dur` 不是一个参数）；中文紧挨着的算（`小猫--dur 30`，宁可多拦）。
+ *   **前面是什么都算**（`cat--rs 720p`、`720p--dur 15`、`小猫--dur 30`）：方舟没说它怎么切词，粘在前一个词上的写法它认不认
+ *   我们没探过 —— 认的话，前面那一版「前面不能是字母数字」的后看就是一个整的口子（2026-10-07 第二轮评审）。宁可多拦：
+ *   App 从来不拼这种串，用户自己打出「词--rs」的机会几乎为零，撞上了那句话也看得懂怎么改。
  * ★ 只管 Seedance 视频任务：同一个端点上的 Seed3D 正是用 `--subdivisionlevel` 这类写法传参的，别把它一起拦了。
  */
-const WEAK_PARAM_RE = /(?<![A-Za-z0-9_])--(?:rs|resolution|rt|ratio|dur|duration|frames|fps|framespersecond|seed|cf|camerafixed|wm|watermark)(?![A-Za-z])/i;
+const WEAK_PARAM_RE = /--(?:rs|resolution|rt|ratio|dur|duration|frames|fps|framespersecond|seed|cf|camerafixed|wm|watermark)(?![A-Za-z])/i;
 
 /** content 里哪一条文字带了弱校验参数 —— 回参数原样（给拒绝那句话用），没有回 null */
 function weakParamIn(content) {
@@ -915,6 +918,19 @@ function pinPlainVideoTask(req, res, next) {
   const allowed = VIDEO_RESOLUTIONS[model] || ["720p"];
   if (!allowed.includes(b.resolution)) {
     return deny(`这一档只能出 ${allowed.join(" / ")}——当前请求未被受理，也没有扣费。`);
+  }
+  // 720p 一刀切按 1280×720 收：比它大的画幅格不放（理由与名单在 tokens.VIDEO_720P_RATIOS）
+  if (b.resolution === "720p" && Object.hasOwn(VIDEO_720P_RATIOS, model)) {
+    const ratios = VIDEO_720P_RATIOS[model];
+    if (b.ratio === undefined) {
+      // 不写画幅：2.x 的缺省是 adaptive（在名单里）；1.0 文生视频缺省 16:9（在名单里）、图生视频缺省 adaptive（不在）
+      const hasImage = (b.content || []).some((e) => e && e.type === "image_url");
+      if (!ratios.includes("adaptive") && hasImage) {
+        return deny(`这一档带图出片要写明画幅（${ratios.join(" / ")}）——当前请求未被受理，也没有扣费。`);
+      }
+    } else if (!ratios.includes(b.ratio)) {
+      return deny(`这一档 720p 的画幅只能是 ${ratios.join(" / ")}——当前请求未被受理，也没有扣费。`);
+    }
   }
   return next();
 }

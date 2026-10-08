@@ -548,6 +548,10 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     ["草稿：2.0 mini 480p", { model: MINI, duration: 4, resolution: "480p", ratio: "9:16" }],
     ["电影级样片第一步：2.5 · 480p · draft · 整数时长", { model: ULTRA, duration: 4, resolution: "480p", draft: true }],
     ["draft:false 与缺省同义", { model: MINI, duration: 5, draft: false }],
+    ["极速 720p 1:1（960×960，不比 1280×720 大）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, ratio: "1:1" }],
+    ["极速文生视频不写画幅（方舟缺省 16:9）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5 }],
+    ["电影级首帧任务 adaptive（2.5 的首帧任务只收它）", { model: ULTRA, duration: 5, ratio: "adaptive", content: [{ type: "image_url", image_url: { url: "https://x/y.jpg" } }] }],
+    ["草稿 21:9（480p 按表收，最大一格也收得到）", { model: MINI, duration: 4, resolution: "480p", ratio: "21:9" }],
     ["三种合法条目（文字 / 图 / 音频）", { model: MINI, duration: 5, content: [{ type: "text", text: "t" }, { type: "image_url", image_url: { url: "https://x/y.jpg" } }, { type: "audio_url", audio_url: { url: "https://x/a.mp3" } }] }],
   ])("合规（%s）→ 过钉子走到 forward（501 = 没配 key）", async (_n, extra) => {
     const res = await post({ content: [], ...extra });
@@ -573,6 +577,13 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     ["带 frames（按帧数定长，与 duration 二选一）", { model: MINI, frames: 361 }],
     ["resolution=1080p（像素是 720p 的 2.25 倍）", { model: MINI, duration: 5, resolution: "1080p" }],
     ["极速 480p（1.0 只放 720p）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, resolution: "480p" }],
+    // ★ 720p 一刀切按 1280×720 收，比它大的画幅格不放（tokens.VIDEO_720P_RATIOS；第二轮评审：极速 21:9 = 1504×640，贵 4.4%）
+    ["极速 720p 21:9（1504×640）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, ratio: "21:9" }],
+    ["标准 720p 4:3（1120×832）", { model: "doubao-seedance-1-0-pro-250528", duration: 5, ratio: "4:3" }],
+    ["极速 adaptive（1.0 会落到 21:9 那一格）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, ratio: "adaptive" }],
+    ["极速图生视频不写画幅（方舟对图生视频的缺省是 adaptive）", { model: "doubao-seedance-1-0-pro-fast-251015", duration: 5, content: [{ type: "image_url", image_url: { url: "https://x/y.jpg" } }] }],
+    ["高清 720p 4:3（1112×834）", { model: MINI, duration: 5, ratio: "4:3" }],
+    ["电影级 720p 21:9（1470×630）", { model: ULTRA, duration: 5, ratio: "21:9" }],
     ["标准 480p（1.0 只放 720p）", { model: "doubao-seedance-1-0-pro-250528", duration: 5, resolution: "480p" }],
     ["电影级 480p 却不是样片", { model: ULTRA, duration: 5, resolution: "480p" }],
     ["电影级 1080p（只有样片第二步出 1080p）", { model: ULTRA, duration: 5, resolution: "1080p" }],
@@ -617,6 +628,10 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
     ["大写也认", { model: MINI, duration: 5 }, "cat --RS 1080P"],
     ["紧跟数字也认（--dur30）", { model: MINI, duration: 5 }, "cat --dur30"],
     ["中文紧挨着也认（宁可多拦）", { model: MINI, duration: 5 }, "小猫--dur 30"],
+    // ★ 第二轮评审：原来「前面是字母数字的不算」—— 粘在前一个英文词 / 数字上的写法方舟认不认没探过，认的话就是整的口子
+    ["粘在英文词后面也认（cat--rs 720p）", { model: MINI, duration: 4, resolution: "480p" }, "cat--rs 720p"],
+    ["粘在数字后面也认（720p--dur 15）", { model: MINI, duration: 4, resolution: "480p" }, "720p--dur 15"],
+    ["连着两个都粘着", { model: MINI, duration: 4, resolution: "480p" }, "cat--rs 720p--dur 15"],
     ["开头就是参数", { model: MINI, duration: 5 }, "--rs 1080p cat"],
     ["样片第一步也拦（第二步按第一步登记的时长收 1080p 的钱）", { model: ULTRA, duration: 4, resolution: "480p", draft: true }, "cat --dur 30"],
   ])("提示词里的弱校验参数（%s）→ 400 整句拒，不出网、不扣费", async (_n, extra, text) => {
@@ -634,7 +649,6 @@ describe("纯视频任务的参数钉子（没有参考视频：生成参数钉�
 
   test.each([
     ["参数名后面紧跟字母的不算（--seedling 不是 --seed）", "a --seedling grows"],
-    ["前面是字母数字的不算（a--dur 不是一个参数）", "a--dur 5"],
     ["普通的破折号", "他停了一下 -- 然后跑开"],
     ["别的双横线写法", "--style anime"],
   ])("提示词里不是弱校验参数的（%s）照常放行", async (_n, text) => {

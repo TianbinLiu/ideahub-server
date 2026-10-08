@@ -2182,13 +2182,18 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
   1.0 `1080p` —— 原来「缺省放行」就是两个少收的口子。补齐之后计价与门禁读的都是补好的那一份。
 - `duration` 是这个模型窗口内的整数（不收 -1、字符串、小数）；不收 `frames`。
 - **分辨率按模型放**（`tokens.VIDEO_RESOLUTIONS`）：1.0 两档只有 720p；2.0 mini 480p / 720p；2.5 只有 720p。
+- **720p 的画幅按模型放**（`tokens.VIDEO_720P_RATIOS`，2026-10-07 第二轮评审补）：720p 一刀切按 1280×720 收，官方像素表里比它大的几格不放 ——
+  1.0 两档只收 `16:9` / `9:16` / `1:1`（21:9 是 1504×640、贵 4.4%；adaptive 会落到那一格；不写画幅的**图生视频**方舟缺省 adaptive，也拒，
+  文生视频缺省 16:9 照放）；2.0 mini / 2.5 收 `16:9` / `9:16` / `1:1` / `adaptive`（2.5 的首帧 / 首尾帧任务只收 adaptive；
+  adaptive 落到 4:3 那一格时少收 ≤0.63%，接受）。480p / 1080p 按表逐格收，不受这一条管。App 只发 16:9 / 9:16（2.5 首帧任务发 adaptive）。
 - **`draft: true`（电影级样片第一步）**：只给 2.5，且必须**显式** `resolution: "480p"` 与整数 `duration`；`draft` 只认布尔，
   `false` 与缺省同义（转发前剥掉）。带参考视频的出片不收 `draft`（`R2V_NOT_ALLOWED`）。
 - `content[]` 只认 `text` / `image_url` / `audio_url`（`video_url` 由 r2v 那道闸接走，`draft_task` 由样片第二步那道闸接走）。
 - **提示词里不许写参数**（2026-10-07 评审补）：方舟允许把 `resolution` / `ratio` / `duration` / `frames` / `seed` / `camera_fixed` / `watermark`
   用「弱校验」写法追加在提示词后面（`--rs 720p --rt 16:9 --dur 5 --seed 11 --cf false --wm true`，长写法 `--resolution` 等同理），
   而且没说与请求体冲突时听谁的。门禁与计价都按请求体判，所以文字条目里出现这些（外加旧文档的 `--fps` / `--framespersecond`）一律
-  400 `VIDEO_PARAMS_NOT_ALLOWED`，句子以「提示词里不能用 …」开头。**带参考视频的任务（r2v）同样过这一道**；Seed3D 不归它管
+  400 `VIDEO_PARAMS_NOT_ALLOWED`，句子以「提示词里不能用 …」开头。**粘在前一个词上也算**（`cat--rs 720p`、`720p--dur 15`；
+  方舟怎么切词没说，宁可多拦）；参数名后面紧跟字母的不算（`--seedling`）。**带参考视频的任务（r2v）同样过这一道**；Seed3D 不归它管
   （它就是用 `--subdivisionlevel` 这种写法传参的）。App 从来不拼这种写法；撞上的多半是用户自己在提示词里打了这几个字。
 - **停用**：`doubao-seedance-1-0-pro-250528` 与 `doubao-seedance-1-0-pro-fast-251015` 自 **2026-11-24 13:00（北京时间）**起
   新任务一律 400 `{ code: "MODEL_RETIRED" }`（方舟 14:00 停服，我们提前一小时；`tokens.RETIRED_MODELS_AT`）。
@@ -2392,7 +2397,7 @@ V2 这条链路**花两次真钱**，报价页必须**两笔都写明**，不许
 | `POST /image-groups`（组图） | 受理时预扣 `单价 × max_images`，结束按**拿到手的张数**结算、多退（见下「组图」） |
 | `GET /image-groups[/:id]` | **0** |
 | `POST /chat/completions` | 400（一次豆包往返） |
-| `POST /contents/generations/tasks`（Seedance） | `round(时长 × 每秒 raw token × 档位系数)`：每秒 raw token = 宽×高×24/1024 —— **720p 一刀切 21,600**（所有模型、所有画幅，改版前的口径）；480p / 1080p 按官方像素表逐格查（画幅缺省 / `adaptive` / 认不出按那一行最大一格）。系数：极速 4.2/15 / 标准 1 / 高清与草稿 23/15 / 电影级（含样片第一步）4.7。例：草稿 4 秒 9:16 = 61,603、5 秒 = 77,004；样片第一步 4 秒 9:16 = 180,621 |
+| `POST /contents/generations/tasks`（Seedance） | `round(时长 × 每秒 raw token × 档位系数)`：每秒 raw token = 宽×高×24/1024 —— **720p 一刀切 21,600**（所有模型、所有放行的画幅，改版前的口径；比 1280×720 大的画幅格钉子不放，见「纯任务的参数钉子」）；480p / 1080p 按官方像素表逐格查（画幅缺省 / `adaptive` / 认不出按那一行最大一格）。系数：极速 4.2/15 / 标准 1 / 高清与草稿 23/15 / 电影级（含样片第一步）4.7。例：草稿 4 秒 9:16 = 61,603、5 秒 = 77,004；样片第一步 4 秒 9:16 = 180,621 |
 | `POST /contents/generations/tasks`（**样片第二步**，`draft_task`） | `round(样片时长 × 2.5 的 1080p 每秒 × 77/15)`（刊例 77 元/M：输出 1080p、第一步无输入视频）。例：4 秒 9:16 = 997,920、5 秒 = 1,247,400。时长 / 画幅只取服务端登记与方舟查询（见上「样片两步」） |
 | `POST /contents/generations/tasks`（**r2v 白模出片**，带 `reference_video`） | `输入时长 × 2 × 21,600 × r2v 系数`（2.5 = **2.8** = 42 元/M ÷ 15）。输入时长有且只有两个可信来源：**模板登记的 `refVideo.durationSec`**（分支一）或**服务端拼的变换 URL 里那个 `du_`**（分支二，白模化）。见上「r2v 的服务端规则」 |
 | `POST /contents/generations/tasks`（Seed3D） | 160,000 |
