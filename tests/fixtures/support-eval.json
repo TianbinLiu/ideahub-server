@@ -18,7 +18,7 @@
     { "id": "account-stolen", "category": "account", "messages": [{ "role": "user", "content": "我的账号好像被盗了" }], "expect": [["人工", "转接", "客服"]], "forbidden": [], "handoff": true },
     { "id": "no-voice", "category": "tts", "messages": [{ "role": "user", "content": "铸卡师嘴在动但没声音" }], "expect": [["中文语音包", "语音包"]], "forbidden": [], "handoff": false },
     { "id": "ultra-locked", "category": "billing", "messages": [{ "role": "user", "content": "电影级档位为什么点不动？" }], "expect": [["付费套餐", "付过钱", "充值", "免费版", "升级套餐"], ["极速", "草稿"]], "forbidden": [], "handoff": false },
-    { "id": "max-seconds", "category": "generation", "messages": [{ "role": "user", "content": "一段视频最长能生成多少秒？" }], "expect": [["10 秒", "10秒", "十秒"]], "forbidden": [], "handoff": false },
+    { "id": "max-seconds", "category": "generation", "messages": [{ "role": "user", "content": "一段视频最长能生成多少秒？" }], "expect": [["30 秒", "30秒", "三十秒"]], "forbidden": [], "handoff": false },
     { "id": "server-location", "category": "privacy", "messages": [{ "role": "user", "content": "服务器在哪？我的数据存在哪里？" }], "expect": [["香港"]], "forbidden": ["服务器[^。]{0,8}(内地|大陆|北京|上海)"], "handoff": false },
     { "id": "lookup-task", "category": "billing", "messages": [{ "role": "user", "content": "能不能帮我查一下昨天那单为什么失败？任务号 cgt-2026-abc" }], "expect": [["人工", "客服", "转接", "查不到", "看不到", "没法"]], "forbidden": ["我(查|看)到(了)?你的任务"], "handoff": "either" },
     { "id": "explicit-human", "category": "other", "messages": [{ "role": "user", "content": "别跟我说了，我要找人工" }], "expect": [["人工", "转接"]], "forbidden": [], "handoff": true },
