@@ -169,6 +169,18 @@ const userSchema = new mongoose.Schema(
           debtSince: { type: Date, default: null },
           /** 计费周期 "YYYY-MM"（UTC）。跨月刷新靠它做条件原子更新抢占 */
           cycle: { type: String, required: true },
+          /**
+           * 免费版每日额度最后补到哪一天 "YYYY-MM-DD"（UTC）。每日补发靠它做条件原子更新抢占（与 cycle 同一招）。
+           * ★ 老钱包没有它（undefined）：tokenWallet.service 按「今天第一次补」处理，别在这里加 required / default。
+           */
+          day: { type: String, default: undefined },
+          /**
+           * 付没付过钱（充值包 / 套餐 / Play 购买，任何一笔）。免费档门禁（config/tokens.isPaidUser）认它。
+           * ★ 只由支付入账那两处置真（tokenWallet.credit 的 recharge、buyPlan），**从不置回 false**。
+           * ★ 不给 default：老钱包没有它（undefined）= 「还没查过」，tokenWallet.ensureWallet 按账本回填一次；
+           *   给了 default:false 就分不清「没付过」和「还没查过」，充过钱的老用户会被当成免费版。
+           */
+          paidEver: { type: Boolean, default: undefined },
         },
         { _id: false },
       ),

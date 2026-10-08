@@ -175,7 +175,9 @@ describe("同款奖励", () => {
     const a1 = await balanceOf(author);
     const r1 = await balanceOf(remixer);
     expect(a1.addon).toBe(a0.addon + 30_000); // 进 addon（不过期），不进 plan
-    expect(a1.plan).toBe(a0.plan);
+    // ★ 清扫拨到了第二天：那一拍免费版的每日额度会补进 plan（tokenWallet.ensureWallet 的 ③）—— 奖励本身一分都不进 plan
+    const daily = (await TokenLedger.find({ user: author.userId, reason: "daily_grant" }).lean()).reduce((n, r) => n + r.delta, 0);
+    expect(a1.plan).toBe(a0.plan + daily);
     expect(r1).toEqual(r0); // ★ 同款作者一个 token 都没动
 
     const ledger = await TokenLedger.find({ reason: "remix_reward", user: author.userId }).lean();

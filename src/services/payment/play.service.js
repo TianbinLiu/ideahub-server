@@ -271,7 +271,8 @@ async function redeem({ user, purchaseToken, now = new Date() }) {
 
   // ★ memo 带上 orderNo：它是「这笔币到底发没发」的**唯一可查证据**，清扫器靠它判断
   //   崩在 credit 前后（见 sweepUnconsumed 的 ★★）。也方便人工对账。
-  await wallet.credit(user._id, amount, "recharge", `Play ${p.productId} 订单 ${order.orderNo}${p.isTest ? "（测试购买）" : ""}`, now);
+  // ★ 测试购买（许可测试员，一分钱没付）照常发币，但不算「付过钱」（不开付费档，见 tokenWallet.hasLivePayment）
+  await wallet.credit(user._id, amount, "recharge", `Play ${p.productId} 订单 ${order.orderNo}${p.isTest ? "（测试购买）" : ""}`, now, { test: p.isTest });
   await TokenOrder.updateOne({ _id: order._id }, { $set: { status: "settled", grantedTokens: amount } });
   // 记下这个账号的 Play 身份，退款通知只带 token 时靠它找人
   await User.updateOne({ _id: user._id, playAccountId: { $ne: expect } }, { $set: { playAccountId: expect } });
@@ -282,6 +283,20 @@ async function redeem({ user, purchaseToken, now = new Date() }) {
   await consumeAndMark(await TokenOrder.findById(order._id));
 
   return { ok: true, code: "settled", granted: amount, order: await TokenOrder.findById(order._id) };
+}
+
+/**
+ * 这一笔被回收了，他还算不算「付过钱」—— 按剩下的、还作数的订单重算（tokenWallet.refreshPaidEver）。
+ * ★★ 不重算的话（2026-10-07 评审）：买一个最小的充值包、找 Google 退款 —— token 收回了，可「付过钱」永远是真的，
+ *   付费档（电影级、样片、真人、参考视频）全部对他打开，日上限也跳到付费档。
+ * ★ 失败只吼不抛：回收（钱的那一半）已经办完，这里抛出去会让 RTDN / 轮询以为没办成、重来一遍（回收本身是幂等的，但没必要）。
+ */
+async function recomputePaid(order) {
+  try {
+    await wallet.refreshPaidEver(order.user);
+  } catch (e) {
+    console.error(`[play] 回收后重算「付过钱」失败 订单 ${order.orderNo}（这个人可能仍按付费用户放行）:`, (e && e.message) || e);
+  }
 }
 
 /**
@@ -343,6 +358,7 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
 
   if (!order.user || clawback <= 0) {
     await TokenOrder.updateOne({ _id: order._id }, { $set: { status: "refunded", clawbackTokens: 0, shortfall: 0 } });
+    if (order.user) await recomputePaid(order);
     return { ok: true, code: "nothing_to_claw" };
   }
 
@@ -367,6 +383,7 @@ async function revokeByToken({ purchaseToken, voidedQuantity = 0, refundType = "
     },
   );
   await User.updateOne({ _id: order.user }, { $inc: { playRefundCount: 1 } });
+  await recomputePaid(order);
   if (!r) {
     // 钱包不存在（账号已注销）——一分没收回。要响，别当成功：轮询会把它计进 handled。
     console.error(`[play] 回收时找不到钱包（账号已注销？）订单 ${order.orderNo}`);
@@ -414,7 +431,7 @@ async function sweepUnconsumed({ now = new Date(), limit = 50 } = {}) {
       if (!already) {
         const amount = Number(order.packTokens) || 0;
         if (amount > 0) {
-          await wallet.credit(order.user, amount, "recharge", `Play 补发 订单 ${order.orderNo}`, now);
+          await wallet.credit(order.user, amount, "recharge", `Play 补发 订单 ${order.orderNo}`, now, { test: Boolean(order.isTest) });
           granted += amount;
           console.warn(`[play] 补发 ${amount} token（崩在发币中间）订单 ${order.orderNo}`);
         }

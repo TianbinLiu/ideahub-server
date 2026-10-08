@@ -416,7 +416,7 @@ async function previewChat(req, res, next) {
         return {};
       },
     });
-    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat persona-preview" });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat persona-preview", took: pre.took });
     else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat persona-preview", snapshot: pre.before });
   } catch (err) {
     next(err);

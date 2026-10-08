@@ -17,7 +17,13 @@ let User;
 let TokenLedger;
 let walletSvc;
 
-const FREE = 300_000;
+/**
+ * 新钱包的余额（2026-10-07 起免费版 = 新人一次 170,000 进 addon + 当天的 2,000 进 plan）。
+ * ★ 两桶分开记：「先扣 plan 再扣 addon」那几条要的是桶，不只是总数。规则本身的用例在 tests/freeQuota.spec.js。
+ */
+const WELCOME = 170_000;
+const DAILY = 2_000;
+const FREE = WELCOME + DAILY;
 /** 默认档（Seedream 4.0，0.20 元/张 ÷ 15 元/M）单图。
  *  ★ 出图**按 model 计价**，所以这个常量只对下面那条用 4.0 的用例成立，不是"一张图的价"。 */
 const IMAGE = 13_333;
@@ -57,6 +63,16 @@ async function registerUser() {
 
 const auth = (t) => ({ Authorization: `Bearer ${t}` });
 
+/**
+ * 把一个账号标成「付过钱」而**不动余额**（2026-10-07 起没付过钱只能用极速 / 草稿出片，见 config/tokens.videoPlanDenial）。
+ * ★ 只改 planId、不走 buyPlan：buyPlan 会把 plan 余额顶到套餐额度，下面那些「FREE - 余额 = 花了多少」的断言就全歪了。
+ *   这里测的是扣费与价目，不是门禁（门禁的用例在 arkProxy.spec.js）。
+ */
+async function makePaying(userId) {
+  await walletSvc.getWallet(userId);
+  await User.updateOne({ _id: userId }, { $set: { "tokenWallet.planId": "std" } });
+}
+
 /** 让上游"方舟"按剧本回应，测试里不真的出网 */
 function mockArk(status, body = { ok: true }) {
   process.env.ARK_API_KEY = "test-key";
@@ -85,7 +101,7 @@ describe("钱包初始化与月度刷新（W3）", () => {
     expect(await balanceOf(userId)).toBeNull();
 
     const res = await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
-    expect(res.body.wallet).toMatchObject({ plan: FREE, addon: 0, planId: "free" });
+    expect(res.body.wallet).toMatchObject({ plan: DAILY, addon: WELCOME, planId: "free", paidEver: false });
 
     const rows = await TokenLedger.find({ user: userId }).lean();
     expect(rows).toHaveLength(1);
@@ -99,20 +115,23 @@ describe("钱包初始化与月度刷新（W3）", () => {
     expect(await TokenLedger.countDocuments({ user: userId, reason: "grant" })).toBe(1);
   });
 
-  test("跨月：plan 归位到当月额度、addon 不动；同一个月内不重复刷新", async () => {
+  test("跨月（付费套餐）：plan 归位到当月额度、addon 不动；同一个月内不重复刷新", async () => {
+    // ★ 2026-10-07 起只有付费套餐按月刷新（免费版按天补，用例在 tests/freeQuota.spec.js）
+    const STD = require("../src/config/tokens").planOf("std").monthlyTokens;
     const { token, userId } = await registerUser();
     await request(app).get("/api/me/wallet").set(auth(token)).expect(200);
+    await User.updateOne({ _id: userId }, { $set: { "tokenWallet.planId": "std" } });
     await walletSvc.credit(userId, 50_000, "recharge", "测试直充");
-    await walletSvc.debit(userId, 100_000, "测试消耗");
+    await walletSvc.debit(userId, 100_000, "测试消耗"); // plan 2,000 先扣光，其余 98,000 从 addon 扣
     // 手动把周期拨回上个月，模拟"上次使用是上个月"
     await User.updateOne({ _id: userId }, { $set: { "tokenWallet.cycle": "2000-01" } });
 
     const w = await walletSvc.getWallet(userId);
-    expect(w.plan).toBe(FREE); // 归位，未用完的作废
-    expect(w.addon).toBe(50_000); // addon 不受月度刷新影响
+    expect(w.plan).toBe(STD); // 归位，未用完的作废
+    expect(w.addon).toBe(WELCOME + 50_000 - 98_000); // addon 不受月度刷新影响
 
     const again = await walletSvc.getWallet(userId);
-    expect(again.plan).toBe(FREE);
+    expect(again.plan).toBe(STD);
     // 同月内再读不会再记一条 cycle_reset
     expect(await TokenLedger.countDocuments({ user: userId, reason: "cycle_reset" })).toBe(1);
   });
@@ -124,7 +143,7 @@ describe("扣费口径：先扣 plan 再扣 addon（W1）", () => {
     await walletSvc.getWallet(userId);
     await walletSvc.credit(userId, 10_000, "recharge");
     const w = await walletSvc.debit(userId, 1_000, "测试");
-    expect(w).toMatchObject({ plan: FREE - 1_000, addon: 10_000 });
+    expect(w).toMatchObject({ plan: DAILY - 1_000, addon: WELCOME + 10_000 });
   });
 
   test("plan 不够时先掏空 plan 再动 addon", async () => {
@@ -142,13 +161,13 @@ describe("扣费口径：先扣 plan 再扣 addon（W1）", () => {
     expect(await balanceOf(userId)).toBe(FREE);
   });
 
-  test("并发扣费不超付：10 路各扣 40k，总额度只够 7 笔", async () => {
+  test("并发扣费不超付：10 路各扣 20k，总额度只够 8 笔", async () => {
     const { userId } = await registerUser();
-    await walletSvc.getWallet(userId); // 300k
-    const results = await Promise.all(Array.from({ length: 10 }, () => walletSvc.debit(userId, 40_000, "并发")));
+    await walletSvc.getWallet(userId); // 172k
+    const results = await Promise.all(Array.from({ length: 10 }, () => walletSvc.debit(userId, 20_000, "并发")));
     const ok = results.filter(Boolean).length;
-    expect(ok).toBe(7); // 300k / 40k = 7 笔
-    expect(await balanceOf(userId)).toBe(FREE - ok * 40_000);
+    expect(ok).toBe(8); // 172k / 20k = 8 笔
+    expect(await balanceOf(userId)).toBe(FREE - ok * 20_000);
     // ★ 关键断言：余额不能是负数。读-改-写的实现会在这里挂
     expect(await balanceOf(userId)).toBeGreaterThanOrEqual(0);
   });
@@ -164,8 +183,9 @@ describe("/api/ark 的扣费闸门", () => {
       .send({ model: "doubao-seedream-4-0-250828", prompt: "x" })
       .expect(200);
     expect(await balanceOf(userId)).toBe(FREE - IMAGE);
-    expect(Number(res.headers["x-wallet-plan"])).toBe(FREE - IMAGE);
-    expect(Number(res.headers["x-wallet-addon"])).toBe(0);
+    // 先扣 plan（2,000 扣光）再扣 addon
+    expect(Number(res.headers["x-wallet-plan"])).toBe(0);
+    expect(Number(res.headers["x-wallet-addon"])).toBe(WELCOME - (IMAGE - DAILY));
   });
 
   test("出图按档位定价：精绘档确实比速写档贵（写成一口价这条会红）", async () => {
@@ -185,20 +205,32 @@ describe("/api/ark 的扣费闸门", () => {
     }
   });
 
-  test("视频按时长与档位定价：极速档比标准档便宜", async () => {
+  test("视频按时长、档位与分辨率定价：同一个模型，草稿（480p）比高清（720p）便宜", async () => {
+    // ★ 实扣走一遍 HTTP 用的是**不会停用**的两档（2.0 mini 的高清 / 草稿）：原来这条用标准 vs 极速，
+    //   而 1.0 两档 2026-11-24 13:00 起停用（tokens.RETIRED_MODELS_AT）—— 那之后两发都是 400，这条会在那一天无缘无故变红。
+    //   1.0 两档的系数改成下面的纯函数断言照样钉着（它们跟账单走，停用之前仍在收钱）。
     const { token: t1, userId: u1 } = await registerUser();
     const { token: t2, userId: u2 } = await registerUser();
+    await makePaying(u1); // 高清只对付过钱的人开放；草稿免费版也能用（u2 留着免费版）
     mockArk(200, { id: "task_1" });
-    const body = (model) => ({ model, content: [], duration: 5 });
-    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t1)).send(body("doubao-seedance-1-0-pro-250528")).expect(200);
-    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t2)).send(body("doubao-seedance-1-0-pro-fast-251015")).expect(200);
-    const spentStd = FREE - (await balanceOf(u1));
-    const spentFast = FREE - (await balanceOf(u2));
-    expect(spentStd).toBe(108_000); // 5×1280×720×24/1024
+    const MINI = "doubao-seedance-2-0-mini-260615";
+    await request(app).post("/api/ark/contents/generations/tasks").set(auth(t1)).send({ model: MINI, content: [], duration: 5, resolution: "720p" }).expect(200);
+    await request(app)
+      .post("/api/ark/contents/generations/tasks")
+      .set(auth(t2))
+      .send({ model: MINI, content: [], duration: 5, resolution: "480p", ratio: "9:16" })
+      .expect(200);
+    const spentHd = FREE - (await balanceOf(u1));
+    const spentDraft = FREE - (await balanceOf(u2));
+    expect(spentHd).toBe(165_600); // 5×21,600（720p 一刀切）×23/15
+    expect(spentDraft).toBe(77_004); // 5×10,044（480p 9:16 = 496×864×24/1024）×23/15
+
+    const { segTokens } = require("../src/config/tokens");
+    expect(segTokens(5, "doubao-seedance-1-0-pro-250528")).toBe(108_000); // 5×1280×720×24/1024
     // ⚠ 2026-08-16 按 8 月账单把极速档从 0.3 改成 4.2/15（账单 ¥0.0042/千token）：
     //   30,240 而不是 32,400。**这个数字要跟着账单走**，别看到红就改回 0.3 ——
     //   0.3 比真实成本高 7%，方向是多收用户。系数的出处写在 config/tokens.js 的 VIDEO_MULT。
-    expect(spentFast).toBe(Math.round(108_000 * (4.2 / 15)));
+    expect(segTokens(5, "doubao-seedance-1-0-pro-fast-251015")).toBe(Math.round(108_000 * (4.2 / 15)));
   });
 
   test("W2 上游 400（敏感词）→ 原路退回，余额不变，流水一扣一退", async () => {
@@ -214,6 +246,18 @@ describe("/api/ark 的扣费闸门", () => {
     expect(rows.map((r) => r.reason)).toEqual(["grant", "ark_spend", "ark_refund"]);
     expect(rows[1].delta).toBe(-CHAT);
     expect(rows[2].delta).toBe(CHAT);
+    // ★ 按扣的那两桶原样退回（2026-10-07）：那 400 是从 plan 扣的，就回 plan —— 不许进 addon（洗额度）
+    expect(await walletSvc.getWallet(userId)).toMatchObject({ plan: DAILY, addon: WELCOME });
+  });
+
+  test("W2 退款按原桶退回：一笔跨两桶的扣费，退回之后两桶各自复原（不把当月额度洗进 addon）", async () => {
+    const { token, userId } = await registerUser();
+    await walletSvc.getWallet(userId);
+    await User.updateOne({ _id: userId }, { $set: { "tokenWallet.plan": 5_000, "tokenWallet.addon": 20_000 } });
+    mockArk(400, { error: { message: "InputTextSensitiveContentDetected" } });
+    // 13,333 的图：plan 那 5,000 扣光，剩下 8,333 从 addon 扣；400 没受理 → 原样退回
+    await request(app).post("/api/ark/images/generations").set(auth(token)).send({ model: "doubao-seedream-4-0-250828", prompt: "x" }).expect(400);
+    expect(await walletSvc.getWallet(userId)).toMatchObject({ plan: 5_000, addon: 20_000 });
   });
 
   test("W2 上游 429（限流）同样退回", async () => {
@@ -240,6 +284,7 @@ describe("/api/ark 的扣费闸门", () => {
 
   test("余额不足 → 402 + INSUFFICIENT_TOKENS，且【根本不打方舟】", async () => {
     const { token, userId } = await registerUser();
+    await makePaying(userId); // 高清只对付过钱的人开放（这条测的是余额闸，不是免费档门禁）
     const spy = mockArk(200, {});
     await walletSvc.getWallet(userId);
     await walletSvc.debit(userId, FREE, "掏空");
@@ -249,10 +294,11 @@ describe("/api/ark 的扣费闸门", () => {
     const res = await request(app)
       .post("/api/ark/contents/generations/tasks")
       .set(auth(token))
-      .send({ model: "doubao-seedance-1-0-pro-250528", content: [], duration: 10 })
+      // 高清 10 秒（不会停用的一档：原来用标准，1.0 2026-11-24 停用之后这里会先撞 400 MODEL_RETIRED）
+      .send({ model: "doubao-seedance-2-0-mini-260615", content: [], duration: 10, resolution: "720p" })
       .expect(402);
     expect(res.body.code).toBe("INSUFFICIENT_TOKENS");
-    expect(res.body.need).toBe(216_000);
+    expect(res.body.need).toBe(331_200); // 10×21,600×23/15
     expect(spy).not.toHaveBeenCalled(); // ★ 这条才是"钱包搬到服务端"的意义
   });
 

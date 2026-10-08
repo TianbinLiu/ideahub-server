@@ -232,7 +232,8 @@ describe('consume 失败之后（2026-09-25 评审逮到的 critical）', () => 
   it('★ 崩在「抢到发币权」与「币真的进账」之间 → 清扫器按账本判断并补发', async () => {
     const { user } = await makeUser();
     await wallet.ensureWallet(user._id);
-    const before = (await wallet.getWallet(user._id)).plan;
+    const w0 = await wallet.getWallet(user._id);
+    const before = w0.plan + w0.addon; // 免费版新人额度在 addon、当天那一份在 plan（2026-10-07）
     // 造出那个中间态：grantedAt 有值、status 还是 paid、账本里没有这笔
     await TokenOrder.create({
       orderNo: 'PLAYMID1',
@@ -281,12 +282,22 @@ describe('测试购买（许可测试员）', () => {
     expect((await TokenOrder.findOne({ playPurchaseToken: 'ptok-test' }).lean()).isTest).toBe(true);
   });
 
+  it('★ 测试购买不算「付过钱」：照常发币，但付费档不对他开（许可测试员一分钱没付）', async () => {
+    const { isPaidUser } = require('../src/config/tokens');
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
+    await redeem(token, 'ptok-test-paid');
+    const w = await wallet.getWallet(user._id);
+    expect(w.paidEver).toBe(false);
+    expect(isPaidUser(w)).toBe(false);
+  });
+
   it('★ 测试购买被退款 → 回收照做，但**不产生欠额**（否则测试员会把自己冻住）', async () => {
     const { user, token, acct } = await makeUser();
     upstream.purchase = purchaseBody({ accountId: acct, isTest: true });
     await redeem(token, 'ptok-test-refund');
-    // 先把余额花掉一部分，让回收收不回全额
-    await wallet.debit(user._id, 400_000, '测试消耗');
+    // 先把余额花掉一部分，让回收收不回全额（新钱包 172k + 这一包 150k = 322k，花掉 250k 只剩 72k < 150k）
+    expect(await wallet.debit(user._id, 250_000, '测试消耗')).not.toBeNull();
     const r = await play.revokeByToken({ purchaseToken: 'ptok-test-refund' });
     expect(r.code).toBe('revoked');
     expect(r.shortfall).toBeGreaterThan(0);
@@ -324,6 +335,33 @@ describe('退款回收', () => {
     const before = await balance(user._id);
     await play.revokeByToken({ purchaseToken: 'ptok-partial', voidedQuantity: 1 });
     expect(await balance(user._id)).toBe(before - 150_000); // 450k 的 1/3
+  });
+
+  it('★★ 退款之后不再算「付过钱」（否则买一包、退款，付费档就永远对他开着）；另有一笔没退的照样算', async () => {
+    const { isPaidUser } = require('../src/config/tokens');
+    const { user, token, acct } = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: acct });
+    await redeem(token, 'ptok-paid-refund');
+    expect(isPaidUser(await wallet.getWallet(user._id))).toBe(true);
+    await play.revokeByToken({ purchaseToken: 'ptok-paid-refund' });
+    const w = await wallet.getWallet(user._id);
+    expect(w.paidEver).toBe(false);
+    expect(isPaidUser(w)).toBe(false);
+
+    const two = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: two.acct, orderId: 'GPA.keep' });
+    await redeem(two.token, 'ptok-keep');
+    upstream.purchase = purchaseBody({ accountId: two.acct, orderId: 'GPA.drop' });
+    await redeem(two.token, 'ptok-drop');
+    await play.revokeByToken({ purchaseToken: 'ptok-drop' });
+    expect(isPaidUser(await wallet.getWallet(two.user._id))).toBe(true);
+
+    // 部分退款：3 份退 1 份，剩下 2 份是真付了钱的
+    const part = await makeUser();
+    upstream.purchase = purchaseBody({ accountId: part.acct, quantity: 3, orderId: 'GPA.part' });
+    await redeem(part.token, 'ptok-part-paid');
+    await play.revokeByToken({ purchaseToken: 'ptok-part-paid', voidedQuantity: 1 });
+    expect(isPaidUser(await wallet.getWallet(part.user._id))).toBe(true);
   });
 
   it('★ RTDN 与每小时轮询同时命中 → 只回收一次', async () => {

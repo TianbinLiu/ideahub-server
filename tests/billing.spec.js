@@ -55,6 +55,12 @@ async function makeUser(role = 'user') {
   return { user: u, token: signToken(u) };
 }
 
+/** 新钱包的总额：免费版新人一次（addon）+ 当天那一份（plan）（2026-10-07 起不再按月发） */
+function freshTotal() {
+  const p = tokens.planOf('free');
+  return p.welcomeTokens + p.dailyTokens;
+}
+
 async function balance(userId) {
   const u = await User.findById(userId).select('tokenWallet').lean();
   return u.tokenWallet.plan + u.tokenWallet.addon;
@@ -91,7 +97,7 @@ describe('TTS 进钱包（33 token/字符）', () => {
     const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
     expect(refund.delta).toBe(-spend.delta);
     // 一来一回，余额回到发放值
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('余额不足 → 402，且**不调上游**（白嫖不了）', async () => {
@@ -167,7 +173,7 @@ describe('ASR 进钱包（5,000 token/分钟，预扣多退）', () => {
     const res = await request(app).post('/api/asr').set('Authorization', `Bearer ${token}`).set('Content-Type', 'audio/wav').send(Buffer.alloc(96000, 1));
     expect(res.status).toBe(200);
     expect(res.body.silent).toBe(true);
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('余额不足 → 402 且不调上游', async () => {
@@ -195,7 +201,7 @@ describe('冲正与异常路径（2026-09-25 评审补）', () => {
     const spend = await TokenLedger.findOne({ user: user._id, reason: 'ark_spend' }).lean();
     const refund = await TokenLedger.findOne({ user: user._id, reason: 'ark_refund' }).lean();
     expect(refund.delta).toBe(-spend.delta);
-    expect(await balance(user._id)).toBe(tokens.planOf('free').monthlyTokens);
+    expect(await balance(user._id)).toBe(freshTotal());
   });
 
   it('★ 预扣的冲正回 plan，不进 addon —— 否则就是一条「把当月额度洗成永久余额」的路', async () => {
@@ -275,6 +281,18 @@ describe('每日上限（§14.10）', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('★ 充过钱、套餐还是免费版：日上限按付费档算（与免费档门禁同一个「付费用户」口径，isPaidUser）', async () => {
+    // 否则门禁放他用电影级，日上限却在第一段之后就把他挡在当天门外（样片第二步一发就是上百万）
+    const { user, token } = await makeUser();
+    await wallet.credit(user._id, 5_000_000, 'recharge', '订单');
+    await TokenLedger.create({ user: user._id, delta: -tokens.DAILY_LIMITS.freeDaily, reason: 'ark_spend', balanceAfter: 0 });
+    fetchSpy.mockResolvedValueOnce(ttsOk());
+    const res = await request(app).post('/api/tts').set('Authorization', `Bearer ${token}`).send({ text: '你好' });
+    expect(res.status).not.toBe(429);
+    expect(tokens.dailyCapDenial({ planId: 'free', paid: true, spentToday: tokens.DAILY_LIMITS.freeDaily })).toBeNull();
+    expect(tokens.dailyCapDenial({ planId: 'free', paid: false, spentToday: tokens.DAILY_LIMITS.freeDaily })).toMatch(/上限/);
+  });
+
   it('退款要抵掉当天用量：扣了又退的失败调用不该吃掉额度', async () => {
     const { user } = await makeUser();
     await TokenLedger.create({ user: user._id, delta: -50000, reason: 'ark_spend', balanceAfter: 0 });
@@ -284,8 +302,17 @@ describe('每日上限（§14.10）', () => {
 
   it('免费档的日上限不能低到「一段视频都出不来」（死配置自检）', () => {
     // 方案 §14.10 自己点名的形状：日上限 < 最短一段的价钱 ⇒ 那条闸门永远触发不到
-    const cheapestVideo = 67200; // H3-Max 480P 最短一段（方案 §18.2）
+    // ★ 2026-10-07 起免费版只能用 FREE_VIDEO_ALLOW 里的档出片（极速 / 草稿），而极速 11-24 停用 ——
+    //   所以按「停用之后还开着的免费档」里最便宜的一段算（4 秒草稿 = 61,603）。
+    //   别拿已停用的极速 3 秒（18,144）蒙混过关：那一天之后它根本点不了，自检就成了假的。
+    const afterRetire = Math.max(...Object.values(tokens.RETIRED_MODELS_AT).map((s) => Date.parse(s)));
+    const open = tokens.freeVideoTiers(afterRetire);
+    expect(open.length).toBeGreaterThan(0);
+    const cheapestVideo = Math.min(...open.map((t) => tokens.segTokens(tokens.videoSecWindow(t.model)[0], t.model, t.resolution)));
+    expect(cheapestVideo).toBe(61603);
     expect(tokens.DAILY_LIMITS.freeDaily).toBeGreaterThanOrEqual(cheapestVideo);
+    // 同一个形状的另一半：新人额度要够出**几段**（主人 2026-10-07：「而不是连一个视频都生成不了」）
+    expect(tokens.planOf('free').welcomeTokens).toBeGreaterThanOrEqual(2 * cheapestVideo);
   });
 });
 

@@ -4,7 +4,7 @@
 // ══ 为什么要有这张表（两阶段拆分的全部理由）════════════════════════════
 // V2 第一版的 `POST /api/branch/templates/blockoutize` 是**一条同步长请求**：服务端在
 // 同一条请求里做完九步（含最长 5 分钟的轮询）才返回。而这条链路的钱是**在中途花掉的**
-// （看帧一笔 + r2v 受理一笔，受理后失败不退，F11）——于是：
+// （看帧一笔 + r2v 受理一笔；2026-10-07 起 r2v 那一笔在方舟明说失败时自动退回，看帧那一笔不退）——于是：
 //   · 手机切后台 / 息屏          → 连接被系统收走
 //   · 弱网断线 / 切基站          → socket 断
 //   · App 进程被系统回收         → 请求方没了
@@ -105,7 +105,8 @@ const blockoutJobSchema = new mongoose.Schema(
      * claimed  —— 某一发 finish 正在取（并发的第二发不许同时建模板；卡死超过
      *             CLAIM_STALE_MS 后可被重新认领，否则等于把凭据锁死）
      * done     —— 已经建成模板（templateId 指向它）。重复 finish 回同一个模板，不再建第二个
-     * failed   —— 向方舟核实到这一发失败了（真人脸等）。**钱不退**，照实说
+     * failed   —— 向方舟核实到这一发失败了（真人脸等）。r2v 那一笔自动退回（services/taskRefund，2026-10-07 起），
+     *             看帧那一笔不退；产物不合格（方舟出成了、我们用不了）那几种也落这里 —— 那时方舟收了钱，照实说不退
      * expired  —— 超过 24h。只是备忘：真正的判据永远是 expiresAt（见 stateOf）
      */
     status: { type: String, enum: ["pending", "claimed", "done", "failed", "expired"], default: "pending", index: true },
@@ -239,9 +240,8 @@ blockoutJobSchema.statics.stateOf = function stateOf(job, now = new Date()) {
       ...base,
       state: "failed",
       canFinish: false,
-      message:
-        job.failMessage ||
-        "这一发 AI 中途没能出片，没有模板建出来。任务已经被受理并消耗了算力，**这一发的费用不退**，需要重新做一次。",
+      // 兜底那句只在 failMessage 没写进去时出现（老凭据）；说不清退没退，就不替它说"退了"或"不退"
+      message: job.failMessage || "这一发 AI 中途没能出片，没有模板建出来，需要重新做一次。出片那一笔是否退回，以余额与通知为准。",
     };
   }
   if (remainingSec <= 0) {
@@ -251,9 +251,13 @@ blockoutJobSchema.statics.stateOf = function stateOf(job, now = new Date()) {
       canFinish: false,
       // ★★ 这句话必须说满：只说"已过期"会让用户以为再开一发就好了（然后发现又扣了一次钱）。
       //   产物过期不是我们的保留策略，是方舟那条 TOS 签名地址的物理寿命（24h，F12）。
+      // ★ 2026-10-07 起钱要分两种情况说：方舟那边若是**失败**了，r2v 那一笔会被自动退回（taskRefund，退的时候
+      //   这张单会被改成 failed、换上退款那句话 —— 走到这里就说明还没看到失败）；若是**出成了**却没取回，
+      //   方舟已经收了这笔钱，那才是真的无法挽回。两种都要说，别替方舟宣判。
       message:
         `这一发的白模产物已经过期了——AI 给的产物地址只保 ${TTL_HOURS} 小时，现在已经拉不下来，没法再建成模板。` +
-        "这一发的费用在开炼时就已经产生、**无法挽回**，要做的话得重新走一次（会重新计费）。",
+        "如果 AI 那边其实是失败了，出片那一笔会自动退回（到账时会通知你）；如果是出成了却没来得及取回，这一发的费用**无法挽回**。" +
+        "要做的话得重新走一次（会重新计费）。",
     };
   }
   if (job?.status === "claimed" && job.claimedAt && now.getTime() - new Date(job.claimedAt).getTime() < CLAIM_STALE_MS) {
@@ -263,9 +267,44 @@ blockoutJobSchema.statics.stateOf = function stateOf(job, now = new Date()) {
     ...base,
     state: "pending",
     canFinish: true,
-    message: `这一发还没取回结果。等 AI 出片之后回来点「取回结果」就会建成模板；产物 ${TTL_HOURS} 小时后过期（${base.remainingText}），过期后这一发的费用无法挽回。`,
+    message: `这一发还没取回结果。等 AI 出片之后回来点「取回结果」就会建成模板；产物 ${TTL_HOURS} 小时后过期（${base.remainingText}），出成了却过期没取回的话这一发的费用无法挽回（AI 中途失败的会自动退回出片那一笔）。`,
   };
 };
+
+/**
+ * 「方舟明说这一发没成」时那句话 —— **唯一措辞**（铁律六）。白模化取回（branchTemplate 的 finish）与
+ * 失败退款（services/taskRefund 在清扫器 / 别人轮询时退了钱，顺手把这张单钉成 failed）两处共用：
+ * 各写一句的话，同一发在列表里和点开之后会说成两种话。
+ *
+ * @param {object} o
+ * @param {string} [o.detail] 方舟的错误原话（截 300 字；清扫器那条路上没有就不说）
+ * @param {{state:string, tokens:number}|null|undefined} o.refund taskRefund.refundView 的结论：
+ *   对象 = 这一发有账（退了 / 正在退 / 免单…）；null = 没有这笔账（自动退款上线之前提交的）；undefined = 没问出来
+ */
+function failedMessage({ detail = "", refund } = {}) {
+  const why = String(detail || "").slice(0, 300);
+  let money;
+  if (refund === undefined) {
+    money = "出片那一笔若符合自动退款，会在确认之后退回并通知你；看画面那一步的费用不退。";
+  } else if (refund === null) {
+    money = "这一发是在「失败自动退款」上线之前提交的，出片那一笔没有自动退回——需要的话请联系客服（support@ideahubs.org）。";
+  } else if (refund.state === "refunded") {
+    money = `白模出片那一笔（${refund.tokens} token）已经自动退回你的余额；看画面那一步的费用不退。`;
+  } else if (refund.state === "refunding" || refund.state === "pending") {
+    money = "白模出片那一笔会自动退回你的余额（正在办，稍后到账）；看画面那一步的费用不退。";
+  } else if (refund.state === "skipped") {
+    money = ""; // 管理员免单 / 账号不在：没有要退的
+  } else {
+    money = "出片那一笔没能自动退回，请联系客服（support@ideahubs.org）。";
+  }
+  return (
+    `AI 中途没能出完这一发白模${why ? `（${why}）` : ""}，没有模板建出来。` +
+    "视频里出现真人面孔时最容易发生这种情况，建议换一段没有真人面孔的素材再试。" +
+    money
+  );
+}
+
+blockoutJobSchema.statics.failedMessage = failedMessage;
 
 blockoutJobSchema.statics.WORKING_HINT = WORKING_HINT;
 blockoutJobSchema.statics.TTL_MS = TTL_MS;

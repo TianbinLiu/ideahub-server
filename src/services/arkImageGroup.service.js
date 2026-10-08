@@ -11,7 +11,7 @@
 //      所以对方舟走流式（SSE），一张一条事件。
 //
 // ★ 钱的序列仍只有 services/billing 那一份：preAuthorize（冻结 → 套餐门禁 → 每日上限 → 原子预扣）、
-//   refundUnaccepted（一张没拿到 = 上游等于没受理，全退进 addon）、settleOverCharge（拿到 k 张，多扣的按扣的那一侧冲正回 plan）、
+//   refundUnaccepted（一张没拿到 = 上游等于没受理，按扣的那两桶原样全退：受理时把 took 记在这一组上）、settleOverCharge（拿到 k 张，多扣的按扣的那一侧冲正回 plan）、
 //   noteFreeCall（管理员免单照实记账）。这里不另写一套记账。
 // ★ 「用户只为拿到手的图付钱」：结算按收到的图片张数，不按方舟 usage.generated_images（两者不等时只记日志对账）——
 //   流中途断开时方舟那边可能还画了几张、也向我们收了钱，那几张用户拿不到，差价我们吃。
@@ -19,14 +19,12 @@
 //   扫描要做实例判断），改成**懒回收**：这个人下次查询 / 开新的一组时，把超过 STALE_MS 还没结束的按「画到哪张算哪张」结掉。
 const mongoose = require("mongoose");
 const ArkImageGroup = require("../models/ArkImageGroup");
-const wallet = require("./tokenWallet.service");
 const billing = require("./billing.service");
 const { ADMIN_ROLE } = require("../utils/roles");
 const { arkConfigured, openArkStream } = require("./arkGateway.service");
 const {
   imageTokensOf,
   priceOf,
-  paidOnlyDenial,
   GROUP_IMAGE_MODELS,
   GROUP_MAX_IMAGES,
   GROUP_MAX_REFS,
@@ -176,8 +174,10 @@ async function settleMoney(job, billable, snapshot = null) {
     if (billable > 0) await billing.noteFreeCall({ user, cost: actual, memo, snapshot });
     return;
   }
-  // 一张没拿到 = 上游等于没受理：全退进 addon（W2，我们亏待了用户，月末不该蒸发）
-  if (billable === 0) await billing.refundUnaccepted({ user, cost: job.prepaid, memo });
+  // 一张没拿到 = 上游等于没受理：全退，**按扣的那两桶原样退回**（W2；受理时记下的 took）。
+  //   ★ 2026-10-07 之前一律退进 addon —— 「要 15 张、一张不给」就是把当月额度洗成永久余额的路。
+  //     老的那几组没有 took（字段上线之前受理的），refundUnaccepted 自己退回 addon 兜底。
+  if (billable === 0) await billing.refundUnaccepted({ user, cost: job.prepaid, memo, took: job.took });
   // 拿到 k 张：多扣的冲正回 plan（不进 addon —— 否则「要 15 张、只画 1 张」就是把当月额度洗成永久余额的路）
   else await billing.settleOverCharge({ user, prepaid: job.prepaid, actual, memo });
 }
@@ -367,9 +367,10 @@ async function startImageGroup({ user, body }) {
 
   let pre;
   try {
-    // 套餐门禁的判据只有 paidOnlyDenial 一处（与 chargedArkCall 同一个读法）
-    const before = await wallet.getWallet(user._id);
-    pre = await billing.preAuthorize({ user, cost, memo, denyReason: paidOnlyDenial(before?.planId, req.model) || "" });
+    // ★ 组图**不过**免费档门禁（2026-10-07 起门禁只管出视频，config/tokens.videoPlanDenial）：
+    //   免费额度本来就该能出图。原来这里调过一次「仅付费模型」的判据，而它对出图模型恒为放行 ——
+    //   留着一个永远不拒的调用，只会诱导下一个人往里加条件、误伤免费用户，所以连调用一起删了。
+    pre = await billing.preAuthorize({ user, cost, memo });
   } catch (e) {
     await ArkImageGroup.deleteOne({ _id: job._id }).catch(() => {});
     throw e;
@@ -380,10 +381,10 @@ async function startImageGroup({ user, body }) {
   }
   const prepaid = pre.free ? 0 : cost;
   try {
-    await ArkImageGroup.updateOne({ _id: job._id }, { $set: { prepaid, free: pre.free } });
+    await ArkImageGroup.updateOne({ _id: job._id }, { $set: { prepaid, free: pre.free, took: pre.took } });
   } catch (e) {
     // 钱扣了、账没记上：当场退、撤掉这一组（不然它挂着 running 挡住下一组，回收时又不知道该退多少）
-    await billing.refundUnaccepted({ user, cost: prepaid, memo });
+    await billing.refundUnaccepted({ user, cost: prepaid, memo, took: pre.took });
     await ArkImageGroup.deleteOne({ _id: job._id }).catch(() => {});
     throw e;
   }

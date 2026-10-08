@@ -9,11 +9,24 @@
 // ★ 为什么不能只信客户端报的价：改客户端就能报 0。整个"把钱包搬到服务端"这件事，
 //   要害就在这里——余额判断与扣费必须发生在**服务端拿到请求体之后、转发出去之前**。
 
-/** 订阅套餐。plan 额度每月刷新（作废未用完的），addon 永不过期 */
+/**
+ * 订阅套餐。付费套餐的 plan 额度每月刷新（作废未用完的），addon 永不过期。
+ *
+ * ★★ 免费版（2026-10-07 主人拍板）不再是「每月 300,000」，而是 **新人一次 170,000 + 每天 2,000（最多攒 7 天 = 14,000）**：
+ *   · `welcomeTokens` 只在**新建钱包**那一刻发一次，进 **addon**（不过期 —— 这是「送你的」，不该月底蒸发）；
+ *     已有钱包的老账号不补发（他们已经拿过改版前那份月度额度）。
+ *   · `dailyTokens` 每过一个 UTC 日往 **plan** 里加一次，加到 `dailyCapTokens` 为止；**从不往下削**一个已经更高的 plan
+ *     （老账号改版前剩下的月度额度原样留着，花到 14,000 以下才开始按天补）。
+ *   · 免费版**不再有**月度刷新（monthlyTokens 0）：刷新会把攒了几天的那点 plan 一把清零。付费套餐照旧按月刷新。
+ *   为什么这么改：300,000/月 的免费额度一段「标准」都出不了几段、却够把高价档试一遍 —— 新的额度配「免费版只能用极速 / 草稿」
+ *   （config/tokens.videoPlanDenial），够出几段几秒的片，又给升级一个理由。判据与发放的唯一实现在 tokenWallet.service.ensureWallet。
+ * ★ 付费套餐的额度按「约多少段 5 秒高清」定（标准 ≈ 10 段、专业 ≈ 35 段；一段 5 秒高清 = 165,600）。
+ * ★ 与 app 的 PLANS **逐条相等**（跨仓契约，钉在 tests/payOrder.spec.js「跨仓价目一致性」）。
+ */
 const PLANS = [
-  { id: "free", name: "免费版", price: 0, monthlyTokens: 300_000 },
-  { id: "std", name: "标准套餐", price: 30, monthlyTokens: 2_000_000 },
-  { id: "pro", name: "专业套餐", price: 98, monthlyTokens: 8_000_000 },
+  { id: "free", name: "免费版", price: 0, monthlyTokens: 0, welcomeTokens: 170_000, dailyTokens: 2_000, dailyCapTokens: 14_000 },
+  { id: "std", name: "标准套餐", price: 30, monthlyTokens: 1_660_000 },
+  { id: "pro", name: "专业套餐", price: 98, monthlyTokens: 5_800_000 },
 ];
 
 const DEFAULT_PLAN_ID = "free";
@@ -212,12 +225,16 @@ const ASR_BYTES_PER_SECOND = Object.freeze({ wav: 32000, mp3: 4000, ogg: 4000 })
 const MODEL3D_TOKENS = 160_000;
 
 /**
- * Seedance 2.5 的模型 id。单独提出来是因为它同时出现在三个地方
- * （档位系数、仅付费白名单、ark.routes 的 ALLOWED_MODELS），
+ * Seedance 2.5 的模型 id。单独提出来是因为它同时出现在好几个地方
+ * （档位系数、像素表、样片两步、ark.routes 的 ALLOWED_MODELS），
  * 写字面量的话改版本戳时必然漏一处，而漏掉的那处不会报错——
  * 只会表现成"这一档突然按 1 倍收费"或"付费门禁形同虚设"。
  */
 const SEEDANCE_2_5 = "doubao-seedance-2-5-260628";
+/** 同上的理由：2.0 mini 同时是「高清」（720p）与「草稿」（480p）两档 —— 两档只差分辨率，判据必须连分辨率一起看 */
+const SEEDANCE_MINI = "doubao-seedance-2-0-mini-260615";
+const SEEDANCE_FAST = "doubao-seedance-1-0-pro-fast-251015";
+const SEEDANCE_STD = "doubao-seedance-1-0-pro-250528";
 
 /** Seedance 档位系数（相对标准档 1-0-pro）。★ 与 app 的 VIDEO_TIERS 一一对应 */
 const VIDEO_MULT = {
@@ -302,20 +319,171 @@ function videoSecWindow(model) {
   return VIDEO_SEC_WINDOW[String(model || "")] ?? [3, 10];
 }
 
+// ── 分辨率与像素（2026-10-07，「草稿」档与电影级「样片」）────────────────
+//
+// ★★ 为什么价钱要跟着像素走：方舟的用量公式是 (输入时长 + 输出时长) × 宽 × 高 × 24 ÷ 1024（官方「创建视频生成任务」
+//   像素表 + 价目页的用量公式），而 2026-10-07 之前 segTokens 写死了 1280×720 —— 那时代理只放 720p，没出过事。
+//   一放开 480p 就是"按 720p 收 480p 的钱"（2.0 mini 480p 9:16 是 496×864，约 720p 的 46%，按 720p 收就是收了 2.15 倍的钱）；
+//   反过来 1080p 的像素是 720p 的 2.25 倍，按 720p 收就只收了不到一半。所以：720p 维持改版前一刀切的 21,600（价目一个字不变），
+//   其余分辨率一律**按官方像素表逐格查**。
+// ★ 与 app 仓 `src/data/economy.ts` 的像素表**逐格相等**（跨仓契约，钉在 tests/arkProxy.spec.js「跨仓像素表与 480p / 1080p 价目」）。
+
+/** 720p 一秒的 raw token（1280×720×24/1024）。720p 全档、全画幅都按它收（改版前的口径，一个字不变） */
+const SEC_720P_TOKENS = 21_600;
+
+/** 官方像素表：Seedance 2.0 系列（含 mini）的 480p */
+const PX_2_0_480P = Object.freeze({
+  "16:9": Object.freeze([864, 496]),
+  "9:16": Object.freeze([496, 864]),
+  "4:3": Object.freeze([752, 560]),
+  "3:4": Object.freeze([560, 752]),
+  "1:1": Object.freeze([640, 640]),
+  "21:9": Object.freeze([992, 432]),
+});
+/** 官方像素表：Seedance 2.5 的 480p（16:9 / 9:16 与 2.0 系列不同：854×480） */
+const PX_2_5_480P = Object.freeze({
+  "16:9": Object.freeze([854, 480]),
+  "9:16": Object.freeze([480, 854]),
+  "4:3": Object.freeze([752, 560]),
+  "3:4": Object.freeze([560, 752]),
+  "1:1": Object.freeze([640, 640]),
+  "21:9": Object.freeze([992, 432]),
+});
+/** 官方像素表：Seedance 2.5 的 1080p（只给「样片」第二步用：官方规定样片转成片只出 1080p） */
+const PX_2_5_1080P = Object.freeze({
+  "16:9": Object.freeze([1920, 1080]),
+  "9:16": Object.freeze([1080, 1920]),
+  "4:3": Object.freeze([1664, 1248]),
+  "3:4": Object.freeze([1248, 1664]),
+  "1:1": Object.freeze([1440, 1440]),
+  "21:9": Object.freeze([2206, 946]),
+});
+
+/** 分辨率 → 模型 → 画幅 → [宽, 高]。720p 不在表里（一刀切 SEC_720P_TOKENS） */
+const VIDEO_PIXELS = Object.freeze({
+  "480p": Object.freeze({ [SEEDANCE_MINI]: PX_2_0_480P, [SEEDANCE_2_5]: PX_2_5_480P }),
+  "1080p": Object.freeze({ [SEEDANCE_2_5]: PX_2_5_1080P }),
+});
+
 /**
- * 仅付费套餐可调用的模型。★ **"这一档对不对某个套餐开放"的判据只有 `paidOnlyDenial` 一处**，
- * 这个集合只是它的数据。
- *
- * 为什么 2.5 要挡住免费版：按上面的系数，**即使取最短的 3 秒**，
- * 一段 = 3×1280×720×24/1024 × 4.7 ≈ 304,560 token，已经超过免费版**整月**的
- * 300,000 额度。也就是说免费用户点下去必定 402——与其让他花几十秒填完需求、
- * 推演完方案、在最后一步被"余额不足"打回来（钱还真扣过 Seedream 的图），
- * 不如在提交的那一刻就把原因说清楚。
- *
- * ★ 客户端也会把这一档置灰，但那只是**提示**，不是安全边界：改一行前端就能绕过去，
- *   而绕过去的代价是我们替他付 70 元/M 的账单。真正的门在这里。
+ * 查不到像素的组合（表外的分辨率 / 模型）按这个收：官方像素表里**最大的一格**（2.0 的 4k 21:9，4398×1886）。
+ * ★ 路由上够不着（pinPlainVideoTask 只放表内的组合），这是导出函数的第二道保险 ——
+ *   方向与 imageTokensOf 的兜底一样：少收是隐形的、多收当天就会被投诉出来。
  */
-const PAID_ONLY_MODELS = new Set([SEEDANCE_2_5]);
+const MAX_SEC_TOKENS = (4398 * 1886 * 24) / 1024;
+
+/**
+ * 纯任务（没有参考视频）每个模型放哪几档分辨率 —— **产品口径**（判据在 ark.routes 的 pinPlainVideoTask）。
+ *   · 1.0 两档：只放 720p（方舟对 1.0 不传 resolution 的缺省是 **1080p**，所以钉子会把缺省补成 720p）；
+ *   · 2.0 mini：480p（「草稿」）与 720p（「高清」）；
+ *   · 2.5：只放 720p —— 480p 只在 `draft: true`（样片第一步）时放，1080p 只给样片第二步（resolveDraftFinal 另钉）。
+ * ★ 与 app 的 `VideoTier.resolution` 对得上（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
+ */
+const VIDEO_RESOLUTIONS = Object.freeze({
+  [SEEDANCE_FAST]: Object.freeze(["720p"]),
+  [SEEDANCE_STD]: Object.freeze(["720p"]),
+  [SEEDANCE_MINI]: Object.freeze(["480p", "720p"]),
+  [SEEDANCE_2_5]: Object.freeze(["720p"]),
+});
+/**
+ * 纯任务出 720p 时放哪几种画幅（判据在 ark.routes 的 pinPlainVideoTask；2026-10-07 评审）。
+ *
+ * ★★ 为什么要管：720p 一刀切按 1280×720 收（SEC_720P_TOKENS），而官方像素表里 720p 有几格**比它大**——
+ *   1.0 系列 21:9 = 1504×640（贵 4.4%）、4:3 = 1120×832（贵 1.1%）；2.0 / 2.5 的 4:3 / 3:4 = 1112×834（0.6%）、21:9 = 1470×630（0.5%）。
+ *   方舟按真实像素结算，手搓一个 21:9 的请求就能让我们倒贴（免费版的「极速」也够得着）。App 只发 16:9 / 9:16（2.5 的首帧任务发 adaptive），
+ *   所以只放不比 1280×720 大的几格：16:9 / 9:16 / 1:1（1.0 的 16:9 / 9:16 是 1248×704，更小）。
+ * ★ 2.0 / 2.5 另放 `adaptive`：2.5 的首帧 / 首尾帧任务**只收** adaptive（官方注意事项，App 的 arkClient.ratioFor），不放就出不了片。
+ *   代价写明：adaptive 落到 4:3 那一格时少收 ≤0.63%（1112×834 对 1280×720）—— 一个画幅的差，不值得为它把 720p 改成按表收
+ *   （720p 一刀切是两仓共用的口径，App 的报价逐条对着它）。1.0 不放 adaptive：它落到 21:9 那一格要少收 4.4%。
+ * ★ 1.0 不写画幅时方舟的缺省：文生视频 16:9（在名单里）、图生视频 adaptive（不在）—— 钉子对后一种整句拒，不替人猜一个画幅
+ *   （猜错了是一刀裁切）。
+ */
+const VIDEO_720P_RATIOS = Object.freeze({
+  [SEEDANCE_FAST]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_STD]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_MINI]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+  [SEEDANCE_2_5]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+});
+/** 样片第一步只能出 480p、第二步只能出 1080p（官方 Seedance 2.5「样片模式」两条注意事项） */
+const DRAFT_RESOLUTION = "480p";
+const DRAFT_FINAL_RESOLUTION = "1080p";
+
+/** 一行像素表里最大的那一格（画幅缺省 / adaptive / 认不出时按它收：宁高不低） */
+function largestCell(row) {
+  return Object.values(row).reduce((a, b) => (b[0] * b[1] > a[0] * a[1] ? b : a));
+}
+
+/**
+ * 一秒视频的 raw token（= 宽 × 高 × 24 ÷ 1024，还没乘档位系数）。**判据只有这一处**（铁律六）。
+ *
+ * ★ 画幅缺省 / `adaptive` / 认不出 → 按这一行**最大**的一格收：adaptive 的真实画幅要等方舟出完才知道，
+ *   按小的收就是少收（例：草稿 9:16 = 10,044/秒，21:9 = 992×432 也是 10,044；2.5 的 480p 9:16 是 9,607.5，最大格 10,044）。
+ * ★ resolution / ratio / model 都是**用户可控的字符串**：查表用 Object.hasOwn，别让 `constructor` 之类顺着原型链拿到函数
+ *   （同 imageTokensOf 那条的理由）。
+ */
+function perSecTokens(model, resolution = "720p", ratio) {
+  if (resolution === "720p") return SEC_720P_TOKENS;
+  const res = String(resolution);
+  const byModel = Object.hasOwn(VIDEO_PIXELS, res) ? VIDEO_PIXELS[res] : null;
+  const row = byModel && Object.hasOwn(byModel, String(model)) ? byModel[String(model)] : null;
+  if (!row) {
+    console.error(
+      `[tokens] 视频 ${String(model).slice(0, 64)} @ ${res.slice(0, 16)} 不在像素表里，按最大一格 ${MAX_SEC_TOKENS}/秒 收费（调用方该先钉住分辨率）`,
+    );
+    return MAX_SEC_TOKENS;
+  }
+  const cell = ratio !== undefined && Object.hasOwn(row, String(ratio)) ? row[String(ratio)] : largestCell(row);
+  return (cell[0] * cell[1] * 24) / 1024;
+}
+
+// ── 免费版能用哪几档出片（2026-10-07 主人拍板）──────────────────────────
+//
+// ★★ 规则：**没付过钱的用户只能用「极速」（1.0 pro fast · 720p）与「草稿」（2.0 mini · 480p）出普通片**；
+//   标准 / 高清 / 电影级（含样片两步）/ 真人档（MiniMax、Runway）/ 一切带参考视频的出片（白模、返修、延长、素材参考）
+//   都要付过钱。为什么这么划：免费额度（新人一次 + 每天一点）要够出几段几秒的片，而不是一段都出不来；
+//   同时把更好的档位留给付费的人，给升级一个理由。
+// ★ 「付过钱」= 有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买都算）—— 判据只有 isPaidUser 一处。
+// ★ 草稿与高清**是同一个模型**，只差分辨率 ⇒ 这张表必须按 (model, resolution) 认，只按 model 认就会把高清一起放给免费版。
+// ★ 与 app 仓 `VideoTier.freeOk` 一一对应（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。客户端置灰只是提示，门在这里。
+
+/** 免费版能出普通片的 (模型, 分辨率)。label 是给人看的档名（拒绝那句话与 /health 里用，不出现模型 id） */
+const FREE_VIDEO_ALLOW = Object.freeze([
+  Object.freeze({ model: SEEDANCE_FAST, resolution: "720p", label: "极速" }),
+  Object.freeze({ model: SEEDANCE_MINI, resolution: "480p", label: "草稿" }),
+]);
+
+/**
+ * 我们自己停用的模型与停用时刻。★ 方舟第十批下线公告：Seedance 1.0 pro / pro fast **2026-11-24 14:00（北京时间）**停服；
+ * 我们提前一小时（13:00）自己停 —— 停服那一刻还在排队的任务结局不可知，提前停掉就不会有人在最后几分钟付钱下单。
+ * ★ 与 app 仓 `VideoTier.retireAt` 逐条相等（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
+ */
+const RETIRED_MODELS_AT = Object.freeze({
+  [SEEDANCE_STD]: "2026-11-24T13:00:00+08:00",
+  [SEEDANCE_FAST]: "2026-11-24T13:00:00+08:00",
+});
+
+/** 这个模型此刻是否已经停用。判据只有这一处（钉子拒新任务、免费档清单、/health 都问它） */
+function isRetired(model, now = Date.now()) {
+  const key = String(model || "");
+  if (!Object.hasOwn(RETIRED_MODELS_AT, key)) return false;
+  return Number(now) >= Date.parse(RETIRED_MODELS_AT[key]);
+}
+
+/**
+ * 停用模型的拒绝理由（整句，能直接显示）。null = 没停用。
+ * ★ 不在句子里写模型 id，也不写档名：同一句话会落到标准与极速两档上，而 App 侧有自己的档名。
+ */
+function retiredDenial(model, now = Date.now()) {
+  if (!isRetired(model, now)) return null;
+  // ★ 末尾那半句给旧版 App（2.61 及更早）：它们没有「草稿」，免费版用户在那些包里停用之后一档都没得用 ——
+  //   原样显示这句话的包里，这是他唯一能读到的出路。新版 App 看得到草稿，这半句对它也不算错话。
+  return "这一档用的 Seedance 1.0 已于 2026-11-24 停止服务（火山方舟下线了这一代模型），请换一档再出片（档位里没有「草稿」的话，请先更新 App）——当前请求未被受理，也没有扣费。";
+}
+
+/** 此刻免费版还能用的档（停用的那几档自动出局：11-24 之后只剩「草稿」） */
+function freeVideoTiers(now = Date.now()) {
+  return FREE_VIDEO_ALLOW.filter((t) => !isRetired(t.model, now));
+}
 
 /** 这个套餐是不是免费档。判据是**月费为 0**，不是 `id === "free"`——
  *  以后加一个 0 元的体验档，按 id 判会把它当付费用户放进来。 */
@@ -324,20 +492,73 @@ function isFreePlan(planId) {
 }
 
 /**
- * 免费套餐调用「仅付费」模型时的拒绝理由。
- *
- * @returns {string|null} null = 放行；字符串 = 直接显示给用户的原因
- *
- * ★ 返回的是**能直接显示的整句话**，不是错误码：全 app 没有任何地方监听
- *   `emitApiError`，服务端只回一个 `PLAN_REQUIRED` 的话，客户端要么显示成天书、
- *   要么自己再拼一遍文案（第二处实现，两边措辞一分叉就没人知道以哪份为准）。
- * ★ 与 402「余额不足」是**两件事**，不能合并：402 充值就能解决，这一条充多少钱
- *   都没用（要换套餐）。把它们做成同一个错误，用户会一直充值一直被拒。
+ * 「这个人算不算付费用户」—— **判据只有这一处**（铁律六）。
+ * 付费套餐（月费 > 0）**或者**付过任何一笔钱（`paidEver`，由支付入账那几处置真）。
+ * ★ 为什么不只看套餐：生产上至今只有充值包能买（Play 只卖消耗型充值包，买套餐的渠道还没接），
+ *   只认套餐的话「付费用户」这个集合在线上是空的 —— 充了钱的人也只能用免费档，规则成了纯降级。
+ * ★ 入参是 tokenWallet.getWallet 的返回（或同形状的对象）；拿不到钱包（null）按没付过钱处理（从严）。
  */
-function paidOnlyDenial(planId, model) {
-  if (!PAID_ONLY_MODELS.has(String(model || ""))) return null;
-  if (!isFreePlan(planId)) return null;
-  return `这一档（${model}）仅对付费套餐开放：单段消耗超过免费版整月额度，升级套餐后即可使用。`;
+function isPaidUser(wallet) {
+  if (!wallet) return false;
+  return planOf(wallet.planId).price > 0 || wallet.paidEver === true;
+}
+
+/** 免费档限制的总开关：`FREE_VIDEO_GATE=off` 关掉（缺省开）。每次现读 env —— 运维改完重启即生效，测试也能切 */
+function freeVideoGateOn() {
+  return String(process.env.FREE_VIDEO_GATE ?? "").trim().toLowerCase() !== "off";
+}
+
+/** 这一发是不是「出视频」：Seedance 任务、真人档（MiniMax / Runway）。出图 / 对话 / 语音 / Seed3D 都不是 */
+function isVideoGeneration(kind, model) {
+  if (kind === "minimax_video" || kind === "runway") return true;
+  return kind === "task" && Object.hasOwn(VIDEO_MULT, String(model || ""));
+}
+
+/**
+ * 免费版出视频的门禁。**「这一发对这个人开不开」的判据只有这一处**（铁律六）——
+ * arkGateway.chargedArkCall（/api/ark 代理、真人档 MiniMax、白模化的 r2v）、白模化的前置预检、Runway 都只调它。
+ *
+ * @param {object} o
+ * @param {boolean} o.paid       isPaidUser(钱包) 的结论（调用方读钱包，这里不碰库）
+ * @param {string}  o.kind       priceOf 的 kind：task / minimax_video / runway / image / chat …
+ * @param {string}  o.model
+ * @param {string}  [o.resolution] **钉子补齐之后**的分辨率（pinPlainVideoTask 会把缺省补成 720p）
+ * @param {object|null} [o.r2v]  resolveR2v 的结论；有它 = 带参考视频的出片
+ * @param {boolean} [o.draft]    样片第一步（draft: true）
+ * @param {object|null} [o.draftFinal] 样片第二步（resolveDraftFinal 的结论）
+ * @returns {{message:string, allowed:string[]|null}|null} null = 放行；否则 message 是能直接显示的整句、
+ *   allowed 是此刻免费版能用的档名（结构化给客户端：英文界面不显示服务端的中文句子，靠它自己说）
+ *
+ * ★ 只管「出视频」：出图 / 对话 / 语音 / Seed3D 一律放行（免费额度本来就该能做这些）。
+ * ★ 与 402「余额不足」是**两件事**，不能合并：402 充值就能解决（充了也就成了付费用户），
+ *   这一条在没付过钱之前怎么都过不去。做成同一个错误，用户会在错的地方找原因。
+ * ★ 返回整句话而不是错误码：全 app 没有任何地方监听 `emitApiError`，服务端只回一个码的话，
+ *   客户端要么显示成天书、要么自己再拼一遍文案（第二处实现）。句子里**不许有 ASCII 双引号**：
+ *   老 App 用 `"message"\s*:\s*"([^"]+)"` 抠这句话，带引号会被拦腰截断。
+ */
+function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, now = Date.now() }) {
+  const m = String(model ?? "");
+  if (!isVideoGeneration(kind, m)) return null;
+  if (paid) return null;
+  if (!freeVideoGateOn()) {
+    // 关闸 = 退回改版前的口径：只有 2.5 挡免费版（10 秒一段 ≈ 101 万 token，它从来就不是免费额度够得着的东西）
+    if (kind === "task" && m === SEEDANCE_2_5) {
+      return { message: "「电影级」只对付费用户开放：单段消耗远超免费版的额度。开通任意付费套餐，或充值过任意一次，即可使用。", allowed: null };
+    }
+    return null;
+  }
+  const open = freeVideoTiers(now);
+  const plain = kind === "task" && !r2v && !draft && !draftFinal;
+  if (plain && open.some((t) => t.model === m && t.resolution === resolution)) return null;
+  const allowed = open.map((t) => t.label);
+  // ★ 旧版 App（2.61 及更早）原样显示这句话，而它们的档位表里**没有「草稿」**（只有「极速」可用；11-24 之后连它都停了）——
+  //   只说「只能用草稿」，那些包里的人找不到这一档。所以点到草稿时补半句「看不到就更新 App」：新版 App 看得到，这半句对它不算错话。
+  //   请求里没有版本号可以分辨新旧包，只能一句话两边都成立。
+  const updateHint = allowed.includes("草稿") ? "（档位里看不到「草稿」的话，请先更新 App）" : "";
+  const head = allowed.length
+    ? `免费版只能用${allowed.map((l) => `「${l}」`).join("")}出普通片${updateHint}，参考视频、返修、延长、样片、真人档都不在内`
+    : "免费版暂时没有可用的出片档位";
+  return { message: `${head}；这一项需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。`, allowed };
 }
 
 /**
@@ -360,13 +581,13 @@ const RUNWAY_REF_IMAGE_TOKENS = Object.freeze({ hailuo3: 9000 });
 /**
  * **每日 token 上限**（方案 §14.10）。余额是「一个月能花多少」，日上限是「一天能花多少」——
  * 两者不能互相替代：
- *  · 免费档：月额度本身就小，日上限防的是「一天之内把整月额度喂给刷子」；
+ *  · 免费档：额度本身就小（新人一次 + 每天一点），日上限防的是「一天之内把整份新人额度喂给刷子」；
  *  · **付费档：没有日上限就等于没有上限。** 一个被滥用（或被盗号）的订阅者一天能烧掉
  *    这个订阅二百多个月的净收入，而账单要到月底才看得见。
  *
  * ★ 迎新期单独放宽：刚注册那几天日上限压到 15,000，用户连一段最短的视频都出不了
  *   （最短一段 67,200），那是个**永远触发不到的死配置**，还正好毁掉第一印象。
- * ★ 超限**只拒当天、不封号**，且返回的是能直接显示给用户的整句话（照 paidOnlyDenial 的先例）。
+ * ★ 超限**只拒当天、不封号**，且返回的是能直接显示给用户的整句话（照 videoPlanDenial 的先例）。
  *
  * ★★ 判据是「**今天已经花掉的** ≥ 上限」，**刻意不把本次报价算进去**。
  *   写成 `已花 + 这次 > 上限` 看着更严谨，实际会制造一个**永远点不动的按钮**：
@@ -377,10 +598,11 @@ const RUNWAY_REF_IMAGE_TOKENS = Object.freeze({ hailuo3: 9000 });
  */
 const DAILY_LIMITS = Object.freeze({
   // ⚠ 方案 §14.10 给的是 **15,000/日**，那个数配的是「月额度降到 30,000」之后的免费档。
-  //   今天的免费档仍是 **300,000/月**（`PLANS.free`），15,000/日会让一段最短的视频
-  //   （67,200）**永远出不来** —— 那正是 §14.10 自己点名要避免的「死配置」形状。
-  //   ⇒ 这里先取 150,000/日：既挡住「一天烧光整月额度」，又不会把现有功能锁死。
-  //   **调月额度的那次改动必须同时把这个数改回 15,000**，两者是一对。
+  //   2026-10-07 起免费档是「新人一次 170,000 + 每天 2,000」（`PLANS.free`），**没有走那条路**：
+  //   15,000/日会让新人那 170,000 一天只能出一段最短的「草稿」（61,603，判据不含本次报价、所以一天还能放一发），
+  //   等于把新人额度拆成十来天才用得完 —— 而它本来就是让人一进来能多试几段的。
+  //   ⇒ 维持 150,000/日：仍挡住「一天烧光整份新人额度」，又不把它锁死。
+  //   以后要再改免费额度的形状，这个数要一起重新算（两者是一对）。
   freeDaily: 150000,
   newcomerDaily: 150000,
   newcomerDays: 7,
@@ -389,13 +611,17 @@ const DAILY_LIMITS = Object.freeze({
 });
 
 /**
- * 今天还能不能再花 `cost`。**判据只有这一处**（与 paidOnlyDenial 同一格调用）。
+ * 今天还能不能再花 `cost`。**判据只有这一处**（与 videoPlanDenial 同在 billing.preAuthorize 那一格起作用）。
+ * @param {boolean} [o.paid] isPaidUser(钱包) 的结论。★★ 2026-10-07 起「付费用户」= 付费套餐**或者付过任何一笔钱**
+ *   （config/tokens.isPaidUser）。日上限按同一个口径分档：只看套餐的话，一个充了 450 万 token 的免费版用户每天只能花 15 万 ——
+ *   一段 5 秒的电影级样片第二步（124 万）他一天里根本点不出来，而门禁刚刚才放他用这一档。不传时退回只看套餐（老调用点）。
  * @returns {string|null} 整句拒绝理由；null = 放行
  */
-function dailyCapDenial({ planId, spentToday, cost, accountAgeDays }) {
+function dailyCapDenial({ planId, paid, spentToday, cost, accountAgeDays }) {
   const spent = Math.max(0, Number(spentToday) || 0);
   void cost; // 见下面 ★★：判据刻意**不含**本次报价
-  if (isFreePlan(planId)) {
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  if (!isPaid) {
     const newcomer = Number(accountAgeDays) >= 0 && Number(accountAgeDays) < DAILY_LIMITS.newcomerDays;
     const cap = newcomer ? DAILY_LIMITS.newcomerDaily : DAILY_LIMITS.freeDaily;
     if (spent < cap) return null;
@@ -405,23 +631,58 @@ function dailyCapDenial({ planId, spentToday, cost, accountAgeDays }) {
   return `今天的用量已达单日上限（${DAILY_LIMITS.paidHardDaily} token，已用 ${spent}）。这是防滥用的保护线，明天 0 点（UTC）重置；确有大批量需求请联系我们。`;
 }
 
-/** 到没到该提醒一声的线（只记日志/告警，不拒） */
-function dailySoftWarn({ planId, spentToday }) {
-  return !isFreePlan(planId) && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
+/** 到没到该提醒一声的线（只记日志/告警，不拒）。paid 的口径同 dailyCapDenial */
+function dailySoftWarn({ planId, paid, spentToday }) {
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  return isPaid && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
 }
 
 const MODEL3D_ID = "doubao-seed3d-2-0-260328";
 
 /**
- * 一段 720p 视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数）。
+ * 一段纯任务视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数）= round(秒 × perSecTokens × 系数)。
  * ★ 时长夹到这个模型的窗口（videoSecWindow；2026-10-03 之前一刀切 [3,10]）。路由层已经把窗口外的时长整句拒了
- *   （pinPlainVideoTask），这里的夹取只是导出函数的第二道保险。缺省 5 = 方舟不传 duration 时的默认时长。
+ *   （pinPlainVideoTask），这里的夹取只是导出函数的第二道保险。缺省 5 = 钉子给缺省时长补的那个数。
+ * ★ resolution 缺省 720p、ratio 可不传：`segTokens(d, model)` 与改版前逐位相等（720p 一刀切 21,600/秒）。
+ *   写成带缺省值的位置参数而不是一个对象，是为了让 `segTokens.length` 仍是 2 —— arkProxy.spec 用它钉着
+ *   「计价公式里没有音频这个入参」，而 Function.length 不数带缺省值的参数。
+ * ★ 乘法顺序（秒 × 每秒 × 系数，再 round）与 app 的 economy.segTokens 一致：480p 的每秒是小数（9,607.5），
+ *   换个乘法顺序浮点尾数可能差到 round 的另一侧，表现就是两仓差 1 token。
  */
-function segTokens(durationSec, model) {
+function segTokens(durationSec, model, resolution = "720p", ratio) {
   const [lo, hi] = videoSecWindow(model);
   const d = Math.max(lo, Math.min(hi, Math.round(Number(durationSec) || 5)));
-  const base = (d * 1280 * 720 * 24) / 1024;
-  return Math.round(base * (VIDEO_MULT[model] ?? 1));
+  const mult = Object.hasOwn(VIDEO_MULT, String(model)) ? VIDEO_MULT[String(model)] : 1;
+  return Math.round(d * perSecTokens(model, resolution, ratio) * mult);
+}
+
+/**
+ * 电影级「样片」第二步（把一条 480p 样片转成 1080p 成片）的系数：2.5 的 1080p「输入不含视频」刊例 **77 元/M** ÷ 15。
+ * ★ 出处：方舟价目页「按 token 单价」—— Seedance 2.5「输出视频分辨率为 1080p · 输入不含视频：77.00」；
+ *   样片两步「独立计费」，第二步「按目标分辨率计费」、「单价根据 Step 1 是否包含输入视频确定」。
+ *   我们的样片第一步不许带视频输入（pinPlainVideoTask），所以第二步只有这一个单价。
+ * ⚠ 还没有账单核对过（与 VIDEO_MULT 里 2.5 那一格同一个状况）。核出来不是 77 就两仓一起改（app economy 同名常量）。
+ */
+const DRAFT_FINAL_MULT = 77 / 15;
+
+/**
+ * 样片第二步扣多少：round(秒 × 2.5 的 1080p 每秒 × 77/15)。
+ * @param {number} durationSec **样片的时长**（服务端登记的那一份，见 ark.routes 的 resolveDraftFinal；请求体里一个数都不信）
+ * @param {string} [ratio]     样片的画幅（方舟查询回的那一份）；缺省 / adaptive / 认不出按 1080p 最大一格收
+ * ★ 方舟规定第二步**复用**第一步的时长与画幅、禁止重传 —— 所以这两个数只能来自我们自己记下的第一步。
+ * ★ 时长认不出时按 2.5 窗口的**上限**收并吼一嗓子（路由已经拒了这种情况，这里是第二道保险，方向宁高不低）。
+ */
+function draftFinalTokens(durationSec, ratio) {
+  const [lo, hi] = videoSecWindow(SEEDANCE_2_5);
+  const raw = Math.round(Number(durationSec));
+  let d;
+  if (Number.isFinite(raw) && raw > 0) {
+    d = Math.max(lo, Math.min(hi, raw));
+  } else {
+    console.error(`[tokens] 样片转成片的时长认不出（${String(durationSec)}），按上限 ${hi} 秒收费`);
+    d = hi;
+  }
+  return Math.round(d * perSecTokens(SEEDANCE_2_5, DRAFT_FINAL_RESOLUTION, ratio) * DRAFT_FINAL_MULT);
 }
 
 // ── r2v（参考视频生视频 / 白模模板）─────────────────────────────────
@@ -431,8 +692,9 @@ function segTokens(durationSec, model) {
 // 输出是 720p 档（16:9 给 1280×720=921,600px；自适应给 1266×728=921,648px，
 // 都是 92 万 px 级）、fps=24 ⇒ 每秒 21,600 raw token。
 
-/** r2v 每秒 raw token（720p 档 92 万 px × 24fps ÷ 1024）。上面公式的落点 */
-const R2V_TOKENS_PER_SEC = 21_600;
+/** r2v 每秒 raw token（720p 档 92 万 px × 24fps ÷ 1024）。上面公式的落点。
+ *  ★ 就是 SEC_720P_TOKENS：r2v 各分支都把分辨率钉在 720p（resolveR2v），所以不查像素表 */
+const R2V_TOKENS_PER_SEC = SEC_720P_TOKENS;
 
 /**
  * r2v 档位系数（相对标准档 1-0-pro 的 15 元/M 折算口径，与 VIDEO_MULT 同一把尺子）。
@@ -600,7 +862,12 @@ function minimaxFlatCost(model, duration) {
   return row[Number(duration)] ?? null;
 }
 
-function priceOf(kind, body, r2v = null) {
+/**
+ * @param {{draftTaskId:string, durationSec:number, ratio?:string}|null} [draftFinal] 样片第二步的结论
+ *   （ark.routes 的 resolveDraftFinal 给的：时长与画幅取自第一步的服务端登记与方舟查询，请求体一个数都不信）。
+ *   有它 = 按 draftFinalTokens 计价。
+ */
+function priceOf(kind, body, r2v = null, draftFinal = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
   // ★ 乘上「最多几张」：组图 / 图层拆分按实际张数计费，按一张收就是白送（见 imageCountCap 的 ★★）
   if (kind === "image") return imageTokensOf(String(body?.model ?? "")) * imageCountCap(body);
@@ -639,6 +906,8 @@ function priceOf(kind, body, r2v = null) {
   if (kind === "task") {
     const model = String(body?.model ?? "");
     if (model === MODEL3D_ID) return MODEL3D_TOKENS;
+    // 样片第二步：时长 / 画幅由路由从第一步的登记里取（请求体里那一发根本不带这两个数）
+    if (draftFinal) return draftFinalTokens(draftFinal.durationSec, draftFinal.ratio);
     // r2v（白模出片）：输入时长计进 token，走单独的公式与系数表。
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
@@ -648,7 +917,9 @@ function priceOf(kind, body, r2v = null) {
       if (r2v.kind === "material" || r2v.kind === "ownExtend") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
       return r2vTokens(r2v.durationSec, model);
     }
-    return segTokens(body?.duration, model);
+    // ★ 分辨率与画幅都要读（480p「草稿」/ 样片第一步按像素表计价）。resolution 在这里不会缺：
+    //   pinPlainVideoTask 已经把缺省补成 720p（方舟对 1.0 的缺省是 1080p，不补就是按 720p 收 1080p 的钱）。
+    return segTokens(body?.duration, model, body?.resolution, body?.ratio);
   }
   return 0;
 }
@@ -694,7 +965,29 @@ module.exports = {
   MODEL3D_TOKENS,
   MODEL3D_ID,
   SEEDANCE_2_5,
+  SEEDANCE_MINI,
+  SEEDANCE_FAST,
+  SEEDANCE_STD,
   VIDEO_MULT,
+  SEC_720P_TOKENS,
+  VIDEO_PIXELS,
+  MAX_SEC_TOKENS,
+  VIDEO_RESOLUTIONS,
+  VIDEO_720P_RATIOS,
+  DRAFT_RESOLUTION,
+  DRAFT_FINAL_RESOLUTION,
+  perSecTokens,
+  DRAFT_FINAL_MULT,
+  draftFinalTokens,
+  FREE_VIDEO_ALLOW,
+  RETIRED_MODELS_AT,
+  isRetired,
+  retiredDenial,
+  freeVideoTiers,
+  isPaidUser,
+  freeVideoGateOn,
+  isVideoGeneration,
+  videoPlanDenial,
   VIDEO_SEC_WINDOW,
   videoSecWindow,
   VIDEO_AUDIO,
@@ -703,9 +996,7 @@ module.exports = {
   R2V_TOKENS_PER_SEC,
   r2vTokens,
   materialRefTokens,
-  PAID_ONLY_MODELS,
   isFreePlan,
-  paidOnlyDenial,
   segTokens,
   priceOf,
 };

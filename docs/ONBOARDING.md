@@ -39,6 +39,12 @@ cp .env.example .env
 
 其余（OAuth、邮件、AI、Cloudinary、短信）不填时对应功能不可用，但服务能起来。
 
+`FREE_VIDEO_GATE`（可选）：免费档出片限制的应急总开关，缺省开；写 `off` 退回改版前的口径（只有电影级挡免费版）。
+规则本身见 `docs/api-contract.md`「视频档位与模型能力」。
+
+`MINIMAX_FAIL_REFUND`（可选）：真人档（MiniMax）受理之后报 Fail 时退不退钱，缺省退；写 `off` 关掉。
+方舟那边的失败退款没有开关（方舟只对成功的视频计费）。规则见 `docs/api-contract.md`「扣费」与「失败退款」。
+
 ⚠️ `.env` 已被 gitignore，**永远不要提交**，也不要把值贴进聊天或文档。
 生产密钥一律在服务器上用 `openssl rand -base64 48` 生成。
 

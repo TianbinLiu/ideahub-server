@@ -43,6 +43,13 @@ const NotificationSchema = new mongoose.Schema(
         // ★ 金额在 payload.tokens（数），**不拼成一句话**放 commentText：句子由 App 按界面语言说。
         // ⚠ 老 App（≤ 2.60）**收不到**这一类（请求层白名单，同 BRANCH_REVISED 那段）：币照到，只是没有那条通知。
         "BRANCH_REMIX_REWARD",
+        // 生成失败、token 已退回（2026-10-07，写入只在 services/taskRefund.service.js 一处）。收件人 = 那一发的主人。
+        //   payload { tokens, kind: video|draft|draftFinal|3d|blockout|minimax, taskId, provider: ark|minimax }，不带 actorId（平台口径）。
+        // ★ 只在钱**不是**在本人那次轮询里退的时候发（清扫器、别人的轮询、并发的另一发）：本人轮询的响应里已经带着 refund，
+        //   再发一条是噪音；不发的话，App 里没有流水页 —— 一笔说不出来历的余额变动比一条通知糟（同 BRANCH_REMIX_REWARD 的理由）。
+        // ★ 金额在 payload.tokens（数），句子由 App 按界面语言说。
+        // ⚠ 老 App 收不到这一类（请求层白名单，同 BRANCH_REVISED 那段）：钱照退，只是没有那条通知。
+        "GEN_TASK_REFUND",
         // 平台通知（管理员手动发给某个用户的自由文本）。payload 形状：{ text }。
         // ★ **不带 actorId**（写入点在 branchAdmin.controller 的 notifyUser，传的就是
         //   undefined）：通知以**平台口径**发出，「具体是哪个管理员发的」不透给用户 ——

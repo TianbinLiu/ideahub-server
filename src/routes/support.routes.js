@@ -491,7 +491,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
   }
   // 一个字都没出来 = 上游没受理 ⇒ 退款（受理后才失败的不退：算力已经花掉了）
   // ★ 输出侧被拦（blocked）同样算「受理了」—— 模型已经调过、钱已经花出去，照 text 判。
-  if (!text) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat support" });
+  if (!text) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat support", took: pre.took });
   else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat support", snapshot: pre.before });
   if (failed && !blocked) send("error", { message: "support upstream failed", ...extra });
   else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });

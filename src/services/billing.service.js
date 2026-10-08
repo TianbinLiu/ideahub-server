@@ -14,8 +14,10 @@
  * ★ 顺序不能动，每一步都有事故背书：
  *   ① 冻结（退款欠额）与套餐门禁在最前 —— 拒了就一分钱不动；
  *   ② **扣费必须在转发之前**：读-改-写或先转发后扣费，并发下都会双花；
- *   ③ 上游**没受理**才退（W2）。受理之后才失败（排队跑完报 failed）**不退** ——
- *      那时算力已经消耗、上游已经向我们计费。这是刻意的，不是遗漏；
+ *   ③ 上游**没受理**就当场退（W2，按扣的那两桶原样退回：refundSplit）。
+ *      受理之后才失败（排队跑完报 failed / cancelled / expired、MiniMax 报 Fail）2026-10-07 起**也退**，
+ *      但不在这条同步序列里 —— 结局要等上游明说，那时请求早回去了。唯一实现在 services/taskRefund.service.js，
+ *      它要的「扣了多少、从哪两桶扣的」由这里交出去（preAuthorize / chargedCall 的 `took`）；
  *   ④ 管理员免单不动余额，但**必须落一笔 costTokens**，否则月底对账会多出一截
  *      查不到来源的钱（见 tokenWallet.noteAdminFree 的 ★★）。
  */
@@ -23,7 +25,7 @@ const wallet = require("./tokenWallet.service");
 // 「谁是管理员」只有 utils/roles 一处判据（铁律六）：角色名散着写，
 // 哪天多出一个 moderator 就会漏改，而漏改的表现是某条链路悄悄变成免费
 const { isAdmin } = require("../utils/roles");
-const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
+const { dailyCapDenial, dailySoftWarn, isPaidUser } = require("../config/tokens");
 
 /**
  * 跑一次要花钱的上游调用。
@@ -34,6 +36,8 @@ const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
  * @param {Function} o.forward   async () => ({ accepted: boolean, ... })，返回值原样带回
  * @param {string}   [o.refundTag="ark_refund"] 退款流水的类别（分得出哪家上游退的）
  * @param {string}   [o.denyReason] 额外的门禁（套餐不足等）：给了就直接 403，不扣费
+ * @param {object}   [o.denyExtra]  拒绝时并进 403 回包的结构化字段（免费档门禁的 `allowed`：此刻免费版能用的档名。
+ *                                  英文界面不显示服务端的中文句子，客户端靠它自己说「哪几档能用」）
  * @returns {Promise<{ok:boolean, status?:number, body?:object, wallet:object|null, cost:number, free:boolean, result?:object}>}
  *   `ok:false` 时 status/body 是**可以直接回给客户端**的完整响应。
  */
@@ -44,13 +48,16 @@ const { dailyCapDenial, dailySoftWarn } = require("../config/tokens");
  *   包不进 `chargedCall` 的 forward —— 而「先扣再转发」这个顺序是不能让步的
  *   （先转发后扣费，并发下必然双花）。所以那几条用 preAuthorize + refundUnaccepted 两段，
  *   序列本身仍然只有这一份实现。
- * @returns {{ok:false,status,body,wallet}|{ok:true,wallet,free,cost}}
+ * @returns {{ok:false,status,body,wallet}|{ok:true,wallet,before,free,cost,took}}
+ *   `took` = 这一次从 plan / addon 各扣了多少（管理员免单两桶都是 0）。没受理退款（refundUnaccepted）与
+ *   受理后失败退款（taskRefund）都按它原样退回 —— 调用方退款时**把它传回来**。
  */
-async function preAuthorize({ user, cost, memo, denyReason = "" }) {
+async function preAuthorize({ user, cost, memo, denyReason = "", denyExtra = null }) {
   const free = isAdmin(user);
   // 一趟读，三个用途：冻结判据、402 时报给用户的余额、顺带完成钱包初始化与跨月刷新
   const before = await wallet.getWallet(user._id);
   let w = before;
+  let took = { plan: 0, addon: 0 };
 
   if (!free) {
     // ★ 退款欠额冻结（§15.4 R-7/R-8）：403 而不是 402 —— 402 的含义是「充值就能继续」，
@@ -79,7 +86,8 @@ async function preAuthorize({ user, cost, memo, denyReason = "" }) {
       return {
         ok: false,
         status: 403,
-        body: { ok: false, code: "PLAN_REQUIRED", message: denyReason, planId: before?.planId ?? null },
+        // ★ denyExtra 先摊、四个固定字段后写：附加字段只能**加**东西，盖不掉 code / message
+        body: { ...(denyExtra || {}), ok: false, code: "PLAN_REQUIRED", message: denyReason, planId: before?.planId ?? null },
         wallet: before,
         cost,
         free,
@@ -90,7 +98,9 @@ async function preAuthorize({ user, cost, memo, denyReason = "" }) {
     //   而「一天之内烧光」正是被盗号与脚本滥用的形状，账单要到月底才看得见。
     //   超限只拒当天、不封号，返回的是能直接显示给用户的整句话。
     const spent = await wallet.spentToday(user._id);
-    const capped = dailyCapDenial({ planId: before?.planId, spentToday: spent, cost, accountAgeDays: accountAgeDays(user) });
+    // ★ 付费与否按 isPaidUser（付费套餐或付过钱）分档 —— 与免费档门禁同一个口径（见 dailyCapDenial 的 ★★）
+    const paid = isPaidUser(before);
+    const capped = dailyCapDenial({ planId: before?.planId, paid, spentToday: spent, cost, accountAgeDays: accountAgeDays(user) });
     if (capped) {
       return {
         ok: false,
@@ -101,11 +111,17 @@ async function preAuthorize({ user, cost, memo, denyReason = "" }) {
         free,
       };
     }
-    if (dailySoftWarn({ planId: before?.planId, spentToday: spent })) {
+    if (dailySoftWarn({ planId: before?.planId, paid, spentToday: spent })) {
       console.warn(`[billing] 付费账号 ${user._id} 今日已用 ${spent} token（软告警线）`);
     }
 
-    w = await wallet.debit(user._id, cost, memo);
+    const debited = await wallet.debitSplit(user._id, cost, memo);
+    if (debited) {
+      w = debited.wallet;
+      took = debited.took;
+    } else {
+      w = null;
+    }
     if (!w) {
       // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
       return {
@@ -124,16 +140,25 @@ async function preAuthorize({ user, cost, memo, denyReason = "" }) {
       };
     }
   }
-  return { ok: true, wallet: w, before, free, cost };
+  return { ok: true, wallet: w, before, free, cost, took };
 }
 
 /**
- * 上游**没受理**时把钱退回去（W2）。受理之后才失败的不走这里 ——
- * 那时算力已经消耗、上游已经向我们计费。
+ * 上游**没受理**时把钱退回去（W2）。受理之后才失败的不走这里，走 services/taskRefund（结局要等上游明说）。
+ *
+ * @param {{plan:number, addon:number}} [o.took] preAuthorize 交出来的两桶。**给了就按原桶退回**（refundSplit）；
+ *   没给（老调用点 / 两桶对不上）才退回 addon 兜底 —— 那是改版前的行为，只会让用户多一点不过期的余额，不会让钱蒸发。
+ * ★★ 为什么要按原桶（2026-10-07）：原来一律进 addon，于是「敏感词提示词 → 400 → 从 plan 扣的钱退进 addon」
+ *   就是一条把会过期的当月额度洗成永久余额的路，零成本、可以反复走。
  */
-async function refundUnaccepted({ user, cost, memo, refundTag = "ark_refund" }) {
+async function refundUnaccepted({ user, cost, memo, refundTag = "ark_refund", took = null }) {
   if (isAdmin(user) || !cost) return null;
   console.warn(`[billing] ${memo} 上游未受理，已退回 ${cost} token`);
+  const p = Number(took?.plan);
+  const a = Number(took?.addon);
+  if (Number.isInteger(p) && Number.isInteger(a) && p >= 0 && a >= 0 && p + a === Number(cost)) {
+    return wallet.refundSplit(user._id, { plan: p, addon: a }, refundTag, `${memo} 未受理`);
+  }
   return wallet.credit(user._id, cost, refundTag, `${memo} 未受理`);
 }
 
@@ -147,11 +172,11 @@ async function noteFreeCall({ user, cost, memo, snapshot = null }) {
  * 跑一次要花钱的上游调用（非流式链路用这一条：门禁 → 预扣 → 转发 → 没受理退 → 免单记账）。
  * @param {Function} o.forward async () => ({ accepted: boolean, ... })，返回值原样带回
  */
-async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund", denyReason = "" }) {
-  const pre = await preAuthorize({ user, cost, memo, denyReason });
+async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund", denyReason = "", denyExtra = null }) {
+  const pre = await preAuthorize({ user, cost, memo, denyReason, denyExtra });
   if (!pre.ok) return pre;
   let { wallet: w } = pre;
-  const { free, before } = pre;
+  const { free, before, took } = pre;
 
   // ★★ forward **抛异常**时钱也必须退（2026-09-25 评审）。原来这里是裸 await：
   //   `tts.routes.js` 的 `await up.text()` 在它自己的 try 之外，上游 mid-stream 断开
@@ -161,20 +186,21 @@ async function chargedCall({ user, cost, memo, forward, refundTag = "ark_refund"
   try {
     result = await forward()
   } catch (e) {
-    await refundUnaccepted({ user, cost, memo: `${memo} 异常`, refundTag })
+    await refundUnaccepted({ user, cost, memo: `${memo} 异常`, refundTag, took })
     throw e
   };
   const accepted = Boolean(result && result.accepted);
 
   if (!accepted) {
-    const back = await refundUnaccepted({ user, cost, memo, refundTag });
+    const back = await refundUnaccepted({ user, cost, memo, refundTag, took });
     w = back ?? w;
   }
   // ★ 管理员那笔账记在转发之后、且只在上游受理时记，与扣费的顺序正好相反：
   //   扣费必须在前（并发双花），而免单这一路不动余额，可以等"确实花出去了"再落账。
   if (accepted) await noteFreeCall({ user, cost, memo, snapshot: before });
 
-  return { ok: true, wallet: w, cost, free, accepted, result };
+  // `took`：受理了的异步任务要记进 GenTaskCharge（受理后失败时按它原样退回，见 services/taskRefund）
+  return { ok: true, wallet: w, cost, free, accepted, result, took };
 }
 
 /**

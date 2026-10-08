@@ -21,7 +21,8 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const billing = require("../services/billing.service");
-const { priceOf } = require("../config/tokens");
+const wallet = require("../services/tokenWallet.service");
+const { priceOf, videoPlanDenial, isPaidUser } = require("../config/tokens");
 const { setWalletHeaders } = require("../services/arkGateway.service");
 
 const router = express.Router();
@@ -95,12 +96,19 @@ router.post("/video", requireAuth, genLimit, async (req, res) => {
     return res.status(501).json({ ok: false, code: "RUNWAY_NOT_PRICED", message: "这个 Runway 档位还没有价目，暂不开放" });
   }
 
+  // ★ 免费档门禁（2026-10-07）：真人档只对付过钱的用户开放 —— 判据只有 config/tokens.videoPlanDenial 一处。
+  //   在此之前这条路**没有任何套餐门禁**：今天没配 key 所以够不着，配上 key 的那一天它就是免费版绕开档位限制的旁门。
+  //   管理员的豁免在 billing.preAuthorize 里（denyReason 对免单不生效），与 /api/ark 同口径。
+  const denied = videoPlanDenial({ paid: isPaidUser(await wallet.getWallet(req.user._id)), kind: "runway", model: create.model });
+
   let up;
   const charged = await billing.chargedCall({
     user: req.user,
     cost,
     memo: `runway ${String(create.model || "?")}`,
     refundTag: "ark_refund",
+    denyReason: denied?.message || "",
+    denyExtra: denied?.allowed ? { allowed: denied.allowed } : null,
     forward: async () => {
       try {
         up = await fetch(`${RUNWAY_BASE}/image_to_video`, {

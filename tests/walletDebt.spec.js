@@ -117,7 +117,8 @@ describe('回收（§15.4 R-1/R-2）', () => {
     // 这条只走真实路径（发放 → 回收 → 充值抵扣），不用 setBalance 直接改库，
     // 否则账本里天然少一行、对不上的是测试而不是代码。
     const { user } = await makeUser();
-    const granted = (await wallet.ensureWallet(user._id)).plan; // 免费档当月额度
+    const w0 = await wallet.ensureWallet(user._id); // 免费版新人额度（addon）+ 当天那一份（plan）
+    const granted = w0.plan + w0.addon;
     await wallet.revokeTokens({ userId: user._id, amount: granted + 50000 });
     await wallet.credit(user._id, 200000, 'recharge');
     const rows = await TokenLedger.find({ user: user._id }).sort({ createdAt: 1, _id: 1 }).lean();
@@ -248,8 +249,10 @@ describe('抵债（R-9/R-10）', () => {
   });
 
   it('★ 跨月刷新不抵债：否则等到下月 1 号欠额自动清零，退款套利成本归零', async () => {
+    // 付费套餐按月刷新（2026-10-07 起免费版不按月刷新，见下一条）
     const { user } = await makeUser();
     await setBalance(user._id, 0, 0);
+    await User.updateOne({ _id: user._id }, { $set: { 'tokenWallet.planId': 'std' } });
     await wallet.revokeTokens({ userId: user._id, amount: 50000 });
     // 把 cycle 拨回上个月，再触达一次
     await User.updateOne({ _id: user._id }, { $set: { 'tokenWallet.cycle': '2000-01' } });
@@ -257,6 +260,20 @@ describe('抵债（R-9/R-10）', () => {
     expect(after.debt).toBe(50000);
     expect(after.frozen).toBe(true);
     expect(after.plan).toBeGreaterThan(0); // 额度确实发了
+    expect(await TokenLedger.countDocuments({ user: user._id, reason: 'debt_repaid' })).toBe(0);
+  });
+
+  it('★ 免费版的每日补发也不抵债（同一个理由：那是我们印的钱）', async () => {
+    const { user } = await makeUser();
+    await setBalance(user._id, 0, 0);
+    await wallet.revokeTokens({ userId: user._id, amount: 50000 });
+    // 把 day 拨回三天前，再触达一次：补 3 × 2,000
+    const threeDaysAgo = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+    await User.updateOne({ _id: user._id }, { $set: { 'tokenWallet.day': threeDaysAgo } });
+    const after = await wallet.ensureWallet(user._id);
+    expect(after.debt).toBe(50000);
+    expect(after.frozen).toBe(true);
+    expect(after.plan).toBe(6000); // 补了，没拿去抵债
     expect(await TokenLedger.countDocuments({ user: user._id, reason: 'debt_repaid' })).toBe(0);
   });
 
