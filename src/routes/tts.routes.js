@@ -179,10 +179,17 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
   if (narration) {
     const held = await narrationFree.reserve(req.user._id, line.length);
     if (!held.ok) {
+      // ★ 同一个 code 两种情况：今天一个字都不剩了，或者还剩一些、只是这一句放不下（短一点的还配得上）。
+      //   话分开说；数挂在 details 上（App 的 throwHttp / request 都只认 details），顶层那三个留着给 #111 那一版读
+      const left = Math.max(0, held.limit - held.used);
       return res.status(429).json({
         ok: false,
         code: "NARRATION_DAILY_LIMIT",
-        message: `今天的免费配音用完了（每天 ${held.limit} 字，已用 ${held.used}，这一句 ${line.length} 字）。明天 0 点（UTC）重置。`,
+        message:
+          left > 0
+            ? `今天的免费配音还剩 ${left} 字，这一句 ${line.length} 字放不下 —— 改短一点，或者明天 0 点（UTC）重置之后再配。`
+            : `今天的免费配音用完了（每天 ${held.limit} 字）。明天 0 点（UTC）重置。`,
+        details: { limit: held.limit, used: held.used, need: line.length },
         limit: held.limit,
         used: held.used,
         need: line.length,

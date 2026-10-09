@@ -2096,7 +2096,8 @@ SSE（turns / preview）事件与 companion 同形：`token {t}` · `sentence {i
 - `502/504` 上游偶发失败 → 只是这一句没出声，不关云端（下一句照常重试）
 - `400` 空文本；`TTS_PURPOSE` 认不出的 purpose；`NARRATION_SHAPE` 旁白带了混音 / 表现力 / 语调指令 / 情绪
 - `402 INSUFFICIENT_TOKENS` / `403 WALLET_FROZEN|PLAN_REQUIRED` / `429 DAILY_LIMIT`：按字计费的那条路上，钱包门禁原样回（billing 的形状）
-- `429 NARRATION_DAILY_LIMIT`：今天的免费旁白用完了，回包带 `{ limit, used, need }`（都是字数），不调上游、不扣钱
+- `429 NARRATION_DAILY_LIMIT`：今天的免费旁白放不下这一句 —— 一个字都不剩了，**或者**还剩一些、只是这一句比剩下的长（短一点的还配得上；`message` 两种说法分开）。
+  回包带 `details: { limit, used, need }`（都是字数；2026-10-09 起，App 认这一份），顶层另有同样三个字段（#111 那一版的形状，留着兼容）。不调上游、不扣钱
 
 ★ **剪辑页旁白免费 + 限量**（2026-10-08；主人 2026-09-30 定「配音免费 + 限量」，而这条链路 2026-09-25 起已经按字扣钱 ——
 App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。带 `purpose:"cut-narration"` 的一句：

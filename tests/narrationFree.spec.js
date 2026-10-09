@@ -150,6 +150,10 @@ describe("剪辑页旁白：限量", () => {
     expect(over.body.limit).toBe(LIMIT());
     expect(over.body.used).toBe(LIMIT() - 3);
     expect(over.body.need).toBe(4);
+    // App 认 details（throwHttp / request 只搬 details）；还剩 3 字时说的是「放不下」，不是「用完了」
+    expect(over.body.details).toEqual({ limit: LIMIT(), used: LIMIT() - 3, need: 4 });
+    expect(over.body.message).toMatch(/还剩 3 字/);
+    expect(over.body.message).not.toMatch(/用完了/);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(await usedToday(user._id)).toBe(LIMIT() - 3);
 
@@ -159,6 +163,8 @@ describe("剪辑页旁白：限量", () => {
 
     const again = await say(token, { text: "一", purpose: N });
     expect(again.status).toBe(429);
+    expect(again.body.message).toMatch(/用完了/);
+    expect(again.body.details).toEqual({ limit: LIMIT(), used: LIMIT(), need: 1 });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     // ★ 用完不转成扣钱：余额一分没动
     expect(await balance(user._id)).toBe(before);
