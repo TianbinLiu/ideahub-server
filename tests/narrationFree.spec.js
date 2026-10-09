@@ -205,6 +205,36 @@ describe("剪辑页旁白：限量", () => {
     }
   });
 
+  it("★ 拒了之后报数时别的句子刚好把额度还回来（余量又够了）→ 再占一次，不报一句自相矛盾的「放不下」", async () => {
+    const { user } = await makeUser();
+    const day = wallet.currentDay();
+    await NarrationFreeUsage.create({ userId: user._id, day, chars: LIMIT() - 5 });
+    // 在拒绝之后、读余量那一下之前插进来一次 release（同一个人别的句子没出声，还了 300）
+    const realFindOne = NarrationFreeUsage.findOne.bind(NarrationFreeUsage);
+    let injected = false;
+    const spy = jest.spyOn(NarrationFreeUsage, "findOne").mockImplementation((...args) => {
+      if (!injected) {
+        injected = true;
+        return {
+          select: () => ({
+            lean: async () => {
+              await NarrationFreeUsage.updateOne({ userId: user._id, day }, { $inc: { chars: -300 } });
+              return realFindOne(...args).select("chars").lean();
+            },
+          }),
+        };
+      }
+      return realFindOne(...args);
+    });
+    try {
+      const r = await narrationFree.reserve(user._id, 10);
+      expect(injected).toBe(true);
+      expect(r).toMatchObject({ ok: true, chars: 10, used: LIMIT() - 5 - 300 + 10 });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("额度按 UTC 日算：昨天用满不影响今天", async () => {
     const { user } = await makeUser();
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);

@@ -23,7 +23,8 @@ const narrationFreeUsageSchema = new mongoose.Schema(
   { timestamps: true, versionKey: false }
 );
 
-// ★ 唯一索引是「够才加」成立的前提：upsert 撞上它（E11000）= 当天那一行已经在、而且余量不够
+// ★ 唯一索引是「够才加」成立的前提：没有它，余量不够时 upsert 会另插一行。upsert 撞上它（E11000）有两种来由 ——
+//   当天那一行已经在、而且余量不够；或者当天第一批并发的几发同时去插、只有一发插成。reserve 撞了会不带 upsert 再占一次，不中才拒
 narrationFreeUsageSchema.index({ userId: 1, day: 1 }, { unique: true });
 narrationFreeUsageSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 

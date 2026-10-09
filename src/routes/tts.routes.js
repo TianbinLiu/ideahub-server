@@ -181,14 +181,17 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
     if (!held.ok) {
       // ★ 同一个 code 两种情况：今天一个字都不剩了，或者还剩一些、只是这一句放不下（短一点的还配得上）。
       //   话分开说；数挂在 details 上（App 的 throwHttp / request 都只认 details），顶层那三个留着给 #111 那一版读
+      //   第三种（极罕见）：拒的那一刻余量不够、报数时别的句子刚把额度还回来，读到的余量反而够 —— 不能说「放不下」也不能说「用完了」
       const left = Math.max(0, held.limit - held.used);
       return res.status(429).json({
         ok: false,
         code: "NARRATION_DAILY_LIMIT",
         message:
-          left > 0
-            ? `今天的免费配音还剩 ${left} 字，这一句 ${line.length} 字放不下 —— 改短一点，或者明天 0 点（UTC）重置之后再配。`
-            : `今天的免费配音用完了（每天 ${held.limit} 字）。明天 0 点（UTC）重置。`,
+          left <= 0
+            ? `今天的免费配音用完了（每天 ${held.limit} 字）。明天 0 点（UTC）重置。`
+            : left < line.length
+              ? `今天的免费配音还剩 ${left} 字，这一句 ${line.length} 字放不下 —— 改短一点，或者明天 0 点（UTC）重置之后再配。`
+              : `这一句刚才没占上今天的免费配音额度（同时在配的别的句子占着），再配一次就好。`,
         details: { limit: held.limit, used: held.used, need: line.length },
         limit: held.limit,
         used: held.used,

@@ -48,8 +48,15 @@ async function reserve(userId, chars, now = new Date()) {
     return { ok: true, day, chars: n, used: doc.chars, limit };
   } catch (e) {
     if (e?.code !== 11000) throw e;
-    const doc = await take(false);
-    if (doc) return { ok: true, day, chars: n, used: doc.chars, limit };
+    // ★ 拒的时候报的 used 是另读的一次：两次之间同一个人别的句子没出声、把占的那份还回来（release），
+    //   读到的余量就会够这一句 —— 报出去成了「还剩 305 字，这一句 10 字放不下」这种自相矛盾的话。
+    //   所以读到够的话再占一次（最多三轮，余量只会被 release 加回来，几毫秒的窗口里撞上两次已经极罕见）
+    for (let i = 0; i < 3; i += 1) {
+      const doc = await take(false);
+      if (doc) return { ok: true, day, chars: n, used: doc.chars, limit };
+      const used = await usedNow();
+      if (limit - used < n) return { ok: false, used, limit };
+    }
     return { ok: false, used: await usedNow(), limit };
   }
 }
