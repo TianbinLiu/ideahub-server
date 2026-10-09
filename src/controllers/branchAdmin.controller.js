@@ -40,6 +40,7 @@ const GenTaskCharge = require("../models/GenTaskCharge");
 const ArkVideoTask = require("../models/ArkVideoTask");
 const BlockoutJob = require("../models/BlockoutJob");
 const ArkImageGroup = require("../models/ArkImageGroup");
+const NarrationFreeUsage = require("../models/NarrationFreeUsage");
 const Follow = require("../models/Follow");
 const Notification = require("../models/Notification");
 const SearchHistory = require("../models/SearchHistory");
@@ -330,6 +331,7 @@ async function unbanUser(req, res, next) {
  *      ArkVideoTask（视频任务登记，里面有提示词前 300 字）、BlockoutJob（白模化取件单）、ArkImageGroup（组图）→ deleteMany。
  *      它们一两天就会自己过期，但等过期期间是这个人的提示词与产物地址 —— 删号就该当场没。
  *      ⚠ 在画的那一组被删掉之后，它的后台结算会找不到这一行、什么都不做（钱包也没了，没有可退的人）。
+ *      还有剪辑页免费配音的计数器 NarrationFreeUsage（2026-10-08）→ deleteMany：只是当天用了几个字，3 天自己过期，删号就当场没。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
  *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
@@ -522,6 +524,7 @@ async function purgeUserCascade(userId) {
   removed.arkVideoTasks = (await ArkVideoTask.deleteMany({ userId: uid })).deletedCount;
   removed.blockoutJobs = (await BlockoutJob.deleteMany({ ownerId: uid })).deletedCount;
   removed.arkImageGroups = (await ArkImageGroup.deleteMany({ userId: uid })).deletedCount;
+  removed.narrationFreeUsage = (await NarrationFreeUsage.deleteMany({ userId: uid })).deletedCount;
 
   // ⑩ 关注、通知、搜索记录
   removed.follows = (await Follow.deleteMany({ $or: [{ follower: uid }, { following: uid }] })).deletedCount;

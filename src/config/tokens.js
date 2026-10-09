@@ -203,6 +203,18 @@ const TUTOR_PRICES = Object.freeze({ tutor_turn: CHAT_TURN_TOKENS, tutor_distill
 const TTS_TOKENS_PER_CHAR = 33;
 
 /**
+ * 剪辑页配音的免费额度：每个账号每个 UTC 日 **1,000 个字符**（2026-10-08；主人 2026-09-30 定「配音免费 + 限量」）。
+ *
+ * ★ 只给带 `purpose: "cut-narration"` 的请求（routes/tts.routes 的旁白那一支，额度的占 / 还在 services/narrationFree）。
+ *   这个标记**谁都能带**，所以它不是凭证 —— 兜住敞口的是这个上限：标记只决定这一发从哪个桶出，桶每天就这么大。
+ *   旁白那一支另外只收「只念字」的请求（混音 / 表现力 / 语调指令 / 情绪一律拒），客服与看板娘那几种嗓子仍然按字计费。
+ * ★ 单位与计价同一把尺：截断后的 `text.length`（与 priceOf("tts") 一致，英文字母也算一个）。合成没成的那一发不算。
+ * ★ 1,000 的量法：一条八段 5 秒的片子旁白约 190 字，App 那边一句念不完会提语速再合成一次，最坏翻倍 ⇒ 一天够配两到五条片子。
+ * ★ 用完当天就不再免费（429 `NARRATION_DAILY_LIMIT`），**不悄悄转成扣钱**：界面上写的是「免费」，转成扣钱就是另一种说错。
+ */
+const NARRATION_FREE_DAILY_CHARS = 1000;
+
+/**
  * 语音识别：**每分钟** 5,000 token（豆包 ASR，大陆价 ¥4.5/小时）。非大陆 2,800。
  * ★ 计费口径是**上游认定的时长**，不是文件大小 —— 但时长要等识别完才知道，
  *   所以路由先按字节数估一个**上界**预扣，拿到真实时长后多退（billing.settleOverCharge）。
@@ -942,6 +954,7 @@ module.exports = {
   dailyCapDenial,
   dailySoftWarn,
   TTS_TOKENS_PER_CHAR,
+  NARRATION_FREE_DAILY_CHARS,
   ASR_TOKENS_PER_MINUTE,
   ASR_BYTES_PER_SECOND,
   MINIMAX_FLAT_COST,

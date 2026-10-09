@@ -64,6 +64,10 @@ const TOKEN_REASONS = [
   "remix_reward",
   // 免费版的每日额度（2026-10-07，见上面 daily_grant 那行）。★ 「我们印了钱」：不进 REPAY_REASONS、不进 SPEND_REASONS
   "daily_grant",
+  // 剪辑页的免费配音（2026-10-08，config/tokens.NARRATION_FREE_DAILY_CHARS）：与 admin_free 同一个形状 ——
+  // **余额不动（delta=0），但语音合成真花出去了**，按 priceOf("tts") 记在 costTokens。唯一写入方 tokenWallet.noteNarrationFree。
+  // ★ 不进 SPEND_REASONS（不是用户花的钱，不占他的每日用量上限）、不进 REPAY_REASONS。对账时与 tts 的 ark_spend 加在一起才是语音合成的账单。
+  "narration_free",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(

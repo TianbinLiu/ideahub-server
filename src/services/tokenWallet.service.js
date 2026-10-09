@@ -638,6 +638,25 @@ async function noteAdminFree(userId, cost, memo = "", snapshot = null, now = new
   return w;
 }
 
+/**
+ * 剪辑页的一句免费配音（config/tokens.NARRATION_FREE_DAILY_CHARS）：不动余额，但落一笔 costTokens ——
+ * 理由与 noteAdminFree 一字不差：钱真花出去了，不落账的话月底语音合成的账单会多出一截查不到来源的。
+ * 只在上游**确实出了声**之后调（没出声的那一发额度也还回去了，见 narrationFree.release）。
+ * ★ 永不抛（与 writeEntry 同一条理由）：声音已经合成好了，记账失败不能让这一句变成 500。
+ */
+async function noteNarrationFree(userId, cost, memo = "", now = new Date()) {
+  const n = toTokens(cost);
+  if (n === null) return;
+  let balanceAfter = null;
+  try {
+    const w = await ensureWallet(userId, now);
+    if (w) balanceAfter = Number(w.plan) + Number(w.addon);
+  } catch (e) {
+    console.error(`[tokens] 免费配音记账时读不到钱包 user=${userId}:`, e?.message || e);
+  }
+  await writeEntry(userId, 0, "narration_free", balanceAfter, memo, { costTokens: n });
+}
+
 /** 购/续套餐：立即发放该套餐的当月额度（叠加在剩余 plan 上），并记住档位。
  *  ★ 同一次原子更新里把 `paidEver` 置真（付过钱，见 credit 的 ★）—— 套餐的月费本身也已经让 isPaidUser 为真，
  *    置真是为了「哪天套餐被降回免费（今天没有这条路）」时他仍算付过钱的人。 */
@@ -732,6 +751,7 @@ module.exports = {
   forgiveDebt,
   credit,
   noteAdminFree,
+  noteNarrationFree,
   buyPlan,
   mintedToday,
   listLedger,
