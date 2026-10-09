@@ -180,6 +180,25 @@ describe("剪辑页旁白：限量", () => {
     expect(await TokenLedger.countDocuments({ user: user._id, reason: "narration_free" })).toBe(ok);
   });
 
+  // ★ 上一条走 HTTP，中间件把几发错开了，当天第一批并发「都去插那一行、只有一发插成」的那一下撞不上（跑十几遍都绿）。
+  //   这里直接并发打 reserve：撞唯一索引的那几发余量其实够，不许被当成「用完了」。
+  it("★ 当天第一批并发直接打 reserve：余量够就都占成；余量不够时占成的合计正好是放得下的那几发", async () => {
+    for (let trial = 0; trial < 10; trial += 1) {
+      const { user } = await makeUser();
+      const small = await Promise.all(Array.from({ length: 5 }, () => narrationFree.reserve(user._id, 10)));
+      expect(small.filter((r) => r.ok)).toHaveLength(5);
+      expect(await usedToday(user._id)).toBe(50);
+    }
+    for (let trial = 0; trial < 5; trial += 1) {
+      const { user } = await makeUser();
+      const k = Math.ceil(LIMIT() / 300) + 3;
+      const res = await Promise.all(Array.from({ length: k }, () => narrationFree.reserve(user._id, 300)));
+      const granted = res.filter((r) => r.ok).length;
+      expect(granted).toBe(Math.floor(LIMIT() / 300));
+      expect(await usedToday(user._id)).toBe(granted * 300);
+    }
+  });
+
   it("额度按 UTC 日算：昨天用满不影响今天", async () => {
     const { user } = await makeUser();
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
