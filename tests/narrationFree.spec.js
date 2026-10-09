@@ -150,6 +150,10 @@ describe("剪辑页旁白：限量", () => {
     expect(over.body.limit).toBe(LIMIT());
     expect(over.body.used).toBe(LIMIT() - 3);
     expect(over.body.need).toBe(4);
+    // App 认 details（throwHttp / request 只搬 details）；还剩 3 字时说的是「放不下」，不是「用完了」
+    expect(over.body.details).toEqual({ limit: LIMIT(), used: LIMIT() - 3, need: 4 });
+    expect(over.body.message).toMatch(/还剩 3 字/);
+    expect(over.body.message).not.toMatch(/用完了/);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(await usedToday(user._id)).toBe(LIMIT() - 3);
 
@@ -159,6 +163,8 @@ describe("剪辑页旁白：限量", () => {
 
     const again = await say(token, { text: "一", purpose: N });
     expect(again.status).toBe(429);
+    expect(again.body.message).toMatch(/用完了/);
+    expect(again.body.details).toEqual({ limit: LIMIT(), used: LIMIT(), need: 1 });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     // ★ 用完不转成扣钱：余额一分没动
     expect(await balance(user._id)).toBe(before);
@@ -178,6 +184,55 @@ describe("剪辑页旁白：限量", () => {
     expect(await usedToday(user._id)).toBeLessThanOrEqual(LIMIT());
     expect(fetchSpy).toHaveBeenCalledTimes(ok);
     expect(await TokenLedger.countDocuments({ user: user._id, reason: "narration_free" })).toBe(ok);
+  });
+
+  // ★ 上一条走 HTTP，中间件把几发错开了，当天第一批并发「都去插那一行、只有一发插成」的那一下撞不上（跑十几遍都绿）。
+  //   这里直接并发打 reserve：撞唯一索引的那几发余量其实够，不许被当成「用完了」。
+  it("★ 当天第一批并发直接打 reserve：余量够就都占成；余量不够时占成的合计正好是放得下的那几发", async () => {
+    for (let trial = 0; trial < 10; trial += 1) {
+      const { user } = await makeUser();
+      const small = await Promise.all(Array.from({ length: 5 }, () => narrationFree.reserve(user._id, 10)));
+      expect(small.filter((r) => r.ok)).toHaveLength(5);
+      expect(await usedToday(user._id)).toBe(50);
+    }
+    for (let trial = 0; trial < 5; trial += 1) {
+      const { user } = await makeUser();
+      const k = Math.ceil(LIMIT() / 300) + 3;
+      const res = await Promise.all(Array.from({ length: k }, () => narrationFree.reserve(user._id, 300)));
+      const granted = res.filter((r) => r.ok).length;
+      expect(granted).toBe(Math.floor(LIMIT() / 300));
+      expect(await usedToday(user._id)).toBe(granted * 300);
+    }
+  });
+
+  it("★ 拒了之后报数时别的句子刚好把额度还回来（余量又够了）→ 再占一次，不报一句自相矛盾的「放不下」", async () => {
+    const { user } = await makeUser();
+    const day = wallet.currentDay();
+    await NarrationFreeUsage.create({ userId: user._id, day, chars: LIMIT() - 5 });
+    // 在拒绝之后、读余量那一下之前插进来一次 release（同一个人别的句子没出声，还了 300）
+    const realFindOne = NarrationFreeUsage.findOne.bind(NarrationFreeUsage);
+    let injected = false;
+    const spy = jest.spyOn(NarrationFreeUsage, "findOne").mockImplementation((...args) => {
+      if (!injected) {
+        injected = true;
+        return {
+          select: () => ({
+            lean: async () => {
+              await NarrationFreeUsage.updateOne({ userId: user._id, day }, { $inc: { chars: -300 } });
+              return realFindOne(...args).select("chars").lean();
+            },
+          }),
+        };
+      }
+      return realFindOne(...args);
+    });
+    try {
+      const r = await narrationFree.reserve(user._id, 10);
+      expect(injected).toBe(true);
+      expect(r).toMatchObject({ ok: true, chars: 10, used: LIMIT() - 5 - 300 + 10 });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("额度按 UTC 日算：昨天用满不影响今天", async () => {
