@@ -68,6 +68,13 @@ app.use(cors({
   //   `X-App-Version`（middleware/appVersion）。哪天要收紧成白名单，**这几个一个都不能漏**：漏了的症状是
   //   App 的每一个请求预检被拒、整个连不上，而服务端日志里一行都没有（预检在这里就答完了）。
   //   tests/appVersion.spec.js 钉着「带 x-app-version 的预检能过」。
+  // ★ 预检的结论让浏览器记 2 小时（Access-Control-Max-Age）。不写这个头，Chromium（App 的 WebView）只记 **5 秒**：
+  //   2.63 起每个请求都带 X-App-Version，原来不用预检的 GET（没登录刷首页、`/api/ark/health` 探能力）也要先发一发
+  //   OPTIONS，几乎每一发都变成两趟往返（CF → nginx → Node）；带 Authorization 的请求本来就每发都要预检，一并受益。
+  //   7200 是 Chromium 的上限（写得更大也按 7200 算）。缓存按「源 + 完整地址」记 —— 是每个地址两小时一次，不是整个会话一次。
+  //   代价只有一条：两小时内改了允许的请求头 / 方法，已经记住的地址不会立刻跟上；真请求的 Allow-Origin 仍然每一发现判，
+  //   源白名单收紧照样当场生效。tests/appVersion.spec.js 钉着预检带这个头。
+  maxAge: 7200,
   // ★ 跨域下自定义响应头默认对 JS **不可见**（只能读到那几个 CORS 安全头）。
   //   APK 里 WebView 的源是 https://localhost，打 api.ideahubs.org 是跨域的，
   //   不放行这两个头的话 /api/ark 回来的余额读不到，App 的钱包镜像就只能靠

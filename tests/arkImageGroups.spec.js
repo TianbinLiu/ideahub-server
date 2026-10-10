@@ -128,7 +128,8 @@ describe("计价：一次出多张按上限算（第二道保险）", () => {
 
   test("能出组图的模型都在册、都有价；5.0 pro 与老客户端那一档不在里面", () => {
     for (const m of tokens.GROUP_IMAGE_MODELS) expect(tokens.IMAGE_MODELS.has(m)).toBe(true);
-    // App 2.63 的九宫格发 4.0 新版本；≤ 2.62 发的老 4.0 / 4.5 也得留着（装机的包改不了）
+    // App 2.63 的九宫格发 4.0 新版本；≤ 2.62 的九宫格发老 4.0（装机的包改不了）；4.5 没有包往组图上发，
+    // 但组图上线起契约就收它，留着（删掉 = 契约里能用的值变成 400）
     for (const m of ["doubao-seedream-4-0-20260415", "doubao-seedream-4-0-250828", "doubao-seedream-4-5-251128"]) {
       expect(tokens.GROUP_IMAGE_MODELS.has(m)).toBe(true);
     }

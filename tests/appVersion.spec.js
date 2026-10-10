@@ -75,6 +75,20 @@ describe("CORS 预检放行 X-App-Version（真的 app.js，白名单里有 App 
     },
   );
 
+  // ★ 预检要让浏览器记住：不带 Access-Control-Max-Age 时 Chromium（App 的 WebView）只记 5 秒，而 2.63 起每个请求都带
+  //   版本头 = 每个请求都要预检 —— 原来不用预检的 GET（没登录刷首页、探能力）几乎每一发都多一趟往返（理由见 app.js 的 cors()）。
+  test("预检带 Access-Control-Max-Age: 7200（Chromium 的上限），GET 带版本头的预检也一样", async () => {
+    const res = await preflight("/api/ark/images/generations", "https://localhost", "authorization,content-type,x-app-version").expect(204);
+    expect(res.headers["access-control-max-age"]).toBe("7200");
+    const get = await request(app)
+      .options("/api/ark/health")
+      .set("Origin", "https://localhost")
+      .set("Access-Control-Request-Method", "GET")
+      .set("Access-Control-Request-Headers", "x-app-version")
+      .expect(204);
+    expect(get.headers["access-control-max-age"]).toBe("7200");
+  });
+
   // 余额头顺手钉住：收紧 CORS 时最容易和版本头一起弄丢
   test("实际请求带着版本头照常通（不因为这个头被拒），且余额头仍在 exposedHeaders 里", async () => {
     const res = await request(app).get("/api/health").set("Origin", "https://localhost").set("X-App-Version", "2.63+75").expect(200);
