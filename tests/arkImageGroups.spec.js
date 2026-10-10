@@ -128,6 +128,10 @@ describe("计价：一次出多张按上限算（第二道保险）", () => {
 
   test("能出组图的模型都在册、都有价；5.0 pro 与老客户端那一档不在里面", () => {
     for (const m of tokens.GROUP_IMAGE_MODELS) expect(tokens.IMAGE_MODELS.has(m)).toBe(true);
+    // App 2.63 的九宫格发 4.0 新版本；≤ 2.62 发的老 4.0 / 4.5 也得留着（装机的包改不了）
+    for (const m of ["doubao-seedream-4-0-20260415", "doubao-seedream-4-0-250828", "doubao-seedream-4-5-251128"]) {
+      expect(tokens.GROUP_IMAGE_MODELS.has(m)).toBe(true);
+    }
     expect(tokens.GROUP_IMAGE_MODELS.has("doubao-seedream-5-0-pro-260628")).toBe(false);
     expect(tokens.GROUP_IMAGE_MODELS.has("doubao-seedream-5-0-260128")).toBe(false);
   });
@@ -231,7 +235,8 @@ describe("组图：受理 → 后台画 → 按拿到手的张数结算", () => 
     expect(init.headers.Authorization).toBe("Bearer test-key-not-real");
     const sent = JSON.parse(init.body);
     expect(sent).toEqual({
-      model: MODEL,
+      // 老 4.0（MODEL，≤ 2.62 的九宫格发它）部署即由出口换成 4.0 新版本；价钱、库里记的 model 仍是 MODEL（见 arkImageAlias.spec）
+      model: "doubao-seedream-4-0-20260415",
       prompt: groupBody().prompt,
       image: groupBody().image,
       size: "1440x2560",

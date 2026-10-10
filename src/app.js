@@ -63,12 +63,20 @@ app.use(cors({
     return cb(null, allowedOrigins.includes(origin.replace(/\/+$/, "")));
   },
   credentials: false,
+  // ★★ 刻意**不写 allowedHeaders**：不写 = 预检要什么请求头就放什么（cors 包原样反射 Access-Control-Request-Headers）。
+  //   App 跨域发的自定义请求头不止一个 —— Authorization、Content-Type: application/json、2.63 起每个请求都带的
+  //   `X-App-Version`（middleware/appVersion）。哪天要收紧成白名单，**这几个一个都不能漏**：漏了的症状是
+  //   App 的每一个请求预检被拒、整个连不上，而服务端日志里一行都没有（预检在这里就答完了）。
+  //   tests/appVersion.spec.js 钉着「带 x-app-version 的预检能过」。
   // ★ 跨域下自定义响应头默认对 JS **不可见**（只能读到那几个 CORS 安全头）。
   //   APK 里 WebView 的源是 https://localhost，打 api.ideahubs.org 是跨域的，
   //   不放行这两个头的话 /api/ark 回来的余额读不到，App 的钱包镜像就只能靠
   //   每次调用后再 GET 一次 —— 多一趟往返，还会在两次请求之间显示旧余额。
   exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon", "X-Wallet-Debt"],
 }));
+
+// App 的版本头 → req.appVersion（只进日志，不做任何判断；理由见 middleware/appVersion 文件头）
+app.use(require("./middleware/appVersion").appVersion);
 
 // 两处需要放宽 body 上限（默认 100kb 会 413），且必须排在全局 express.json() 之前
 // ——body-parser 解析过一次就不会重复解析，排在后面等于没挂：
