@@ -198,6 +198,8 @@ function billedForward(kind, path, timeoutMs) {
         // req.draftFinal 由 resolveDraftFinal 挂上：样片第二步按样片的登记时长 × 1080p 计价
         draftFinal: req.draftFinal ?? null,
         timeoutMs,
+        // 只进「哪个版本还在发方舟下线了的出图 id」那一行日志（middleware/appVersion），不影响这一发怎么走
+        appVersion: req.appVersion ?? null,
       });
 
       if (!out.ok) {
@@ -317,8 +319,10 @@ function pinSingleImage(req, res, next) {
   return next();
 }
 
-/** Seedream 出图。★ **按 body.model 计价**（三档差 3 倍：13,333 / 16,667 / 40,000），
- *  不是一口价——写成常量就是"顶档按最低档收费"，零症状白送。见 config/tokens.imageTokensOf */
+/** Seedream 出图。★ **按 body.model 计价**（档位差 3 倍：13,333 / 16,667 / 40,000），
+ *  不是一口价——写成常量就是"顶档按最低档收费"，零症状白送。见 config/tokens.imageTokensOf
+ *  ★ 方舟下线了的老 id（2026-11-24）在转发那一刻换成接班型号（config/tokens.upstreamImageModel），
+ *    在册 / 计价 / 门禁仍认发来的 id —— 实现在 arkGateway.chargedArkCall，这里不另写。 */
 router.post("/images/generations", requireAuth, genLimit, pinSingleImage, billedForward("image", "/images/generations", T_CREATE));
 
 /**
@@ -328,7 +332,7 @@ router.post("/images/generations", requireAuth, genLimit, pinSingleImage, billed
  */
 router.post("/image-groups", requireAuth, genLimit, async (req, res, next) => {
   try {
-    const out = await imageGroups.startImageGroup({ user: req.user, body: req.body });
+    const out = await imageGroups.startImageGroup({ user: req.user, body: req.body, appVersion: req.appVersion ?? null });
     setWalletHeaders(res, out.wallet);
     return res.status(out.status).json(out.body);
   } catch (err) {

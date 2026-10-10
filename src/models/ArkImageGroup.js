@@ -37,7 +37,14 @@ const arkImageGroupSchema = new mongoose.Schema(
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     /** running → done（至少拿到一张）/ failed（一张都没有，钱全退） */
     status: { type: String, enum: ["running", "done", "failed"], default: "running" },
+    /** 客户端发来的出图 id（在册、计价、GET 回给客户端的都是它 —— 含义没变） */
     model: { type: String, required: true, maxlength: 80 },
+    /**
+     * 真发给方舟的型号（2026-10-10：方舟下线了的老 id 由出口换成接班型号，config/tokens.upstreamImageModel）。
+     * 没接班时与 model 相同。只为对账：受理 / 结算 / 懒回收三笔流水的 memo 都按它写（一组可能横跨切换时刻，不现算）。
+     * 不回给客户端。字段上线之前的老组没有它（undefined）= 当时没换。
+     */
+    upstreamModel: { type: String, default: undefined, maxlength: 80 },
     maxImages: { type: Number, required: true },
     /** 一张多少 token（受理那一刻的价目表，结算按它算，价目表中途改了也不影响这一组） */
     unitCost: { type: Number, required: true },

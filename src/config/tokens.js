@@ -51,15 +51,18 @@ function planOf(id) {
 //   真实结算永远以账单为准；发现偏差改这一张表，并同步 app 的 IMAGE_TOKENS_BY_MODEL。
 
 /**
- * 三档铸卡（速写/定妆/精绘）用的出图模型与单价。
+ * App **当前版本**（2.63 起：速写 / 精绘两档）铸卡用的出图模型与单价。
  * ★ 与 app 仓 `src/data/economy.ts` 的 `IMAGE_TOKENS_BY_MODEL` **逐条相等**（跨仓契约）。
  *   对照钉在 `tests/arkProxy.spec.js`「跨仓出图价目一致性」，改一边不改另一边就会红。
+ * ★ 2026-10-10 主人拍板（方舟第十批下线，2026-11-24 14:00 停服）：速写换成 4.0 的新版本（20260415）；
+ *   「定妆」（4.5）这一档从 App 里撤掉。≤ 2.62 的两个老 id 挪进下面的 LEGACY_IMAGE_TOKENS —— 还在册、
+ *   还按老包的报价收，发给方舟时由出口换成接班型号（见下面的 IMAGE_MODEL_SUCCESSORS）。
  */
 const IMAGE_TOKENS_BY_MODEL = {
-  // 0.20 元/张 ÷ 15 元/M = 13,333。像素区间实测 [921,600, 16,777,216]
-  "doubao-seedream-4-0-250828": 13_333,
-  // 0.25 元/张 ÷ 15 元/M = 16,667。像素区间实测 [3,686,400, 16,777,216]
-  "doubao-seedream-4-5-251128": 16_667,
+  // 0.20 元/张 ÷ 15 元/M = 13,333。★ 单价按老 4.0 同价**推定**，等账单核对（发现偏差两仓一起改）。
+  // 像素区间 [921,600, 16,777,216]（与老 4.0 相同）；2026-10-10 付费验过：真人照片图生图放行、
+  // 卡面 1728×2304 约 12~15 秒、设定帧 1440×2560 约 34 秒。
+  "doubao-seedream-4-0-20260415": 13_333,
   // 0.60 元/张 ÷ 15 元/M = 40,000。
   // ★ 为什么按 0.60 不按 0.30：pro 的单价按**输出像素**分档（≤261 万 0.30、>261 万 0.60），
   //   而铸卡画布 CARD_SIZE = 1728×2304 = 3,981,312 像素，落在贵的那一档。
@@ -69,29 +72,38 @@ const IMAGE_TOKENS_BY_MODEL = {
 };
 
 /**
- * 老客户端还在发的出图模型。**不能从在册名单里删。**
+ * 老客户端（已经装机的 APK）还在发的出图模型。**不能从在册名单里删。**
  *
- * 新版 app 已经把 `arkClient.MODELS.image` 改成跟着默认档走
- * （`imageTierOf(DEFAULT_IMAGE_TIER).model` = 4.0），所以**新包不再发它**；
- * 但**已经装机的 APK 改不了** —— 它们补设定帧、推三套方案的首尾帧、出 AI 封面
- * 全都还在发这个 id。从白名单里删掉的表现不是"降级"，是那批用户**出图整条 400**
+ * 已经装机的 APK 改不了 model —— 它们补设定帧、推三套方案的首尾帧、出 AI 封面、铸卡、九宫格
+ * 全都还在发这几个 id。从白名单里删掉的表现不是"降级"，是那批用户**出图整条 400**
  * （而客户端把 400 当敏感词处理，连重试都不会做）。铁律七。
- *
- * ⚠⚠ 2026-08-13 **账单实测**：这个 id 在账单里的名字是 **Doubao-Seedream 5.0 Lite**，
- *   单价 **¥0.22/张**（文生图与图像编辑同价）⇒ 真值应是 0.22/15 = **14,667**。
- *   （此前这里写着"公开价目里查不到"—— 那句话是错的，查不到只是因为它在账单里
- *   叫另一个名字。app 的档位表当初把它排除在外，依据的正是那个错误前提。）
- *
- * ★★ 即便如此，这一格**仍然保持 13,300，不许改成 14,667**：
- *   老包的 `economy.IMAGE_TOKENS` 就是 13,300，它按这个数**给用户报价**。
- *   服务端改成 14,667 就成了"页面报 13,300、实际扣 14,667" —— 正是 CLAUDE.md 里
- *   「页面报 ¥25、实际扣 ¥15」那条事故，只是方向反过来、坑的是用户。
- *   老客户端改不了，所以只能让服务端迁就它。
- * ★ 代价是每张少收 1,367（约 10%），差价我们自己吃。**明知故犯，不是遗漏** ——
- *   多收才是骗人，少收只是我们亏钱；而且这批调用会随老版本淘汰而归零。
- * ★ 这张表的寿命 = 老版本的寿命。确认线上没有旧包在发它之后，连同白名单一起删。
+ * ★ 每一格都是**老包自己报的那个价**（「页面报多少就扣多少」）。方舟下线之后真发出去的是接班型号
+ *   （IMAGE_MODEL_SUCCESSORS），单价可能与这里不同 —— 照样按这一格收，不按接班型号的价收：
+ *   老包里的报价改不了，改服务端的价就成了"页面报 X、实际扣 Y"。差价由我们承担，随老版本淘汰归零。
+ * ★ 这张表的寿命 = 老版本的寿命。确认线上没有旧包在发之后，连同白名单、接班表里对应的那一行一起删
+ *   （哪些版本还在发：出口每个进程按「老 id → 接班型号 × App 版本」各记一行日志，见 arkGateway.noteImageAlias）。
  */
 const LEGACY_IMAGE_TOKENS = {
+  // ≤ 2.62 的「速写」（老 4.0）。0.20 元/张 ÷ 15 元/M = 13,333。像素区间实测 [921,600, 16,777,216]
+  "doubao-seedream-4-0-250828": 13_333,
+  // ≤ 2.62 的「定妆」（4.5；2.63 撤掉了这一档）。0.25 元/张 ÷ 15 元/M = 16,667。像素区间实测 [3,686,400, 16,777,216]
+  "doubao-seedream-4-5-251128": 16_667,
+  /*
+   * 更老的包（全站默认出图模型还是它的那几版）。
+   *
+   * ⚠⚠ 2026-08-13 **账单实测**：这个 id 在账单里的名字是 **Doubao-Seedream 5.0 Lite**，
+   *   单价 **¥0.22/张**（文生图与图像编辑同价）⇒ 真值应是 0.22/15 = **14,667**。
+   *   （此前这里写着"公开价目里查不到"—— 那句话是错的，查不到只是因为它在账单里
+   *   叫另一个名字。app 的档位表当初把它排除在外，依据的正是那个错误前提。）
+   *
+   * ★★ 即便如此，这一格**仍然保持 13,300，不许改成 14,667**：
+   *   老包的 `economy.IMAGE_TOKENS` 就是 13,300，它按这个数**给用户报价**。
+   *   服务端改成 14,667 就成了"页面报 13,300、实际扣 14,667" —— 正是 CLAUDE.md 里
+   *   「页面报 ¥25、实际扣 ¥15」那条事故，只是方向反过来、坑的是用户。
+   *   老客户端改不了，所以只能让服务端迁就它。
+   * ★ 代价是每张少收 1,367（约 10%），差价我们自己吃。**明知故犯，不是遗漏** ——
+   *   多收才是骗人，少收只是我们亏钱；而且这批调用会随老版本淘汰而归零。
+   */
   "doubao-seedream-5-0-260128": 13_300,
 };
 
@@ -162,11 +174,22 @@ function imageTokensOf(model) {
 
 /**
  * 能出组图的在册模型（官方：Seedream 5.0 lite / 4.5 / 4.0 支持组图，5.0 pro / flash 不支持）。
+ * ★ 4.0 的新版本（20260415）能出组图是 **2026-10-07** 付费验的（两遍各 6 张、约 4 分钟一组；app 仓
+ *   docs/seedream-grid-fix-research.md 第七节）。10-10 那一次付费验的是真人照片图生图、卡面与设定帧尺寸，没验组图。
+ *   App 2.63 的九宫格发它。
+ * ★ 老 4.0 **留着**：已经装机的 2.62 九宫格发的就是它（2.62 的 `MODELS.image`；发给方舟时由出口换成 4.0 新版本，部署即切）。
+ * ★ 4.5 也**留着**，但**没有哪个已发的包往组图上发它**（2.62 的九宫格只发老 4.0，4.5 只用在铸卡「定妆」那条单张出图上）：
+ *   留着是因为组图 2026-10-05 上线起契约就收它，删掉 = 把契约里写着能用的值改成 400。它在组图这条路上 2026-11-24 13:00
+ *   之前原样发 4.5，之后接到 4.0 新版本、不接出不了组图的 5.0 pro（IMAGE_MODEL_SUCCESSORS 的 groupTo）。
  * ★ 老客户端那一档（`doubao-seedream-5-0-260128`，账单名 5.0 lite）**刻意不放进来**：它按老包的 13,300 收、
  *   真价 14,667（见 LEGACY_IMAGE_TOKENS），单张时每张亏 10% 是为了不坑老用户；组图是新功能，没有老用户要迁就，
  *   放进来只是把那 10% 乘上十几张。
  */
-const GROUP_IMAGE_MODELS = new Set(["doubao-seedream-4-0-250828", "doubao-seedream-4-5-251128"]);
+const GROUP_IMAGE_MODELS = new Set([
+  "doubao-seedream-4-0-20260415",
+  "doubao-seedream-4-0-250828",
+  "doubao-seedream-4-5-251128",
+]);
 /** 一组最多几张（协议上限）；参考图 + 出图 ≤ 15 */
 const GROUP_MAX_IMAGES = 15;
 /** 组图最多带几张参考图（协议上限 14） */
@@ -183,6 +206,69 @@ function imageCountCap(body) {
   const n = Number(body?.sequential_image_generation_options?.max_images);
   // 缺省 15 是官方的默认值；不是整数 / 越界都按上限算
   return Number.isInteger(n) && n >= 1 && n <= GROUP_MAX_IMAGES ? n : GROUP_MAX_IMAGES;
+}
+
+// ── 出图模型的接班（方舟第十批下线：2026-11-24 14:00 北京时间停服）──────────────
+//
+// ★★ 为什么在**出口**改写，而不是让老包改发新 id：已经装机的 App 改不了 model（铁律七），方舟下线之后
+//   老 id 一律被拒 —— 那批用户的补设定帧 / 推三套 / 铸卡 / 封面 / 九宫格会整条坏掉。所以服务端**只在发给方舟的
+//   那一刻**把老 id 换成接班型号；在册、价目、门禁、每日上限、流水、库里记的 `model` 一律还是**客户端发来的那个 id**
+//   （老包按自己的报价收钱，理由见 LEGACY_IMAGE_TOKENS），流水 memo 写成 `image <发来的>→<真发的>`，
+//   方舟账单上的型号对得上（arkGateway.withUpstreamImageModel / imageMemoModel）。
+// ★ 视频不归这张表管：1.0 两档是**停用**（RETIRED_MODELS_AT，新任务一律 400），不是接班 ——
+//   出片的画面与价钱都跟着模型走，悄悄换模型等于换了用户买的东西。出图的接班型号画的是同一类东西、按老价收。
+//
+// 三条接班（主人 2026-10-10 拍板）：
+//   · 老 4.0（250828）→ 4.0 新版本（20260415）：**部署即切**（「验过就切」：10-10 付费验过，见 IMAGE_TOKENS_BY_MODEL 那一格）。
+//     早切的好处是 11-24 之前就把它在真流量上跑熟，出问题还有一个多月可以退（ARK_IMAGE_ALIAS=off）。
+//   · 4.5（251128）→ 5.0 pro（260628）：**11-24 13:00 才切**，在那之前 4.5 照常用。**组图例外**：5.0 pro 出不了组图，
+//     组图那条路上的 4.5 接到 4.0 新版本（`groupTo`）。
+//   · 5.0 lite（260128，只有很老的包还在发）→ 4.0 新版本：11-24 13:00 切。
+// ★ 13:00 而不是 14:00：与 RETIRED_MODELS_AT（视频停用）同一个口径 —— 停服那一刻在路上的请求结局不可知，
+//   提前一小时切过去就不会有人撞上最后几分钟。
+// ★ 应急开关 `ARK_IMAGE_ALIAS=off`：整张表不生效、老 id 原样发出去（回滚用；每次现读 env，改完重启即生效）。
+//   ⚠ 11-24 14:00 之后还关着它 = 老 id 发给一个已经下线的模型 = 那批出图整条被方舟拒（钱按「没受理就退」退回，图出不来）。
+
+/** 4.0 的新版本：三条接班里两条接到它（也是 App 2.63 的速写） */
+const SEEDREAM_4_0_NEXT = "doubao-seedream-4-0-20260415";
+/** 方舟第十批下线那天我们切过去的时刻（北京时间，比停服早一小时） */
+const IMAGE_SUCCESSION_AT = "2026-11-24T13:00:00+08:00";
+
+/**
+ * 老 id → { to: 单张出图的接班型号, groupTo?: 组图的接班型号（缺省同 to）, from: 从哪一刻起（null = 部署即切） }。
+ * ★ 接班型号必须在册、有价（IMAGE_MODELS），组图的接班型号必须能出组图（GROUP_IMAGE_MODELS）——
+ *   tests/arkImageAlias.spec.js 钉着：接到一个方舟不认的 / 出不了组图的型号，症状是那一档整条 400、钱退回、图没有。
+ */
+const IMAGE_MODEL_SUCCESSORS = Object.freeze({
+  "doubao-seedream-4-0-250828": Object.freeze({ to: SEEDREAM_4_0_NEXT, from: null }),
+  "doubao-seedream-4-5-251128": Object.freeze({
+    to: "doubao-seedream-5-0-pro-260628",
+    groupTo: SEEDREAM_4_0_NEXT,
+    from: IMAGE_SUCCESSION_AT,
+  }),
+  "doubao-seedream-5-0-260128": Object.freeze({ to: SEEDREAM_4_0_NEXT, from: IMAGE_SUCCESSION_AT }),
+});
+
+/** 接班表的总开关：`ARK_IMAGE_ALIAS=off` 关掉（缺省开）。每次现读 env —— 运维改完重启即生效，测试也能切 */
+function imageAliasOn() {
+  return String(process.env.ARK_IMAGE_ALIAS ?? "").trim().toLowerCase() !== "off";
+}
+
+/**
+ * 这一发出图**真发给方舟**的型号。判据只有这一处（铁律六）—— 单张出图（arkGateway.chargedArkCall）与
+ * 组图（arkImageGroup.startImageGroup）两个出口都问它。不在表里 / 还没到时刻 / 开关关着 → 原样返回。
+ * ★ 只管出图：调用方只在出图的出口上调它（视频 id 不在表里，误调也是原样返回）。
+ * ★ `now` 可注入（测试按切换时刻前后各跑一遍；缺省现在）。model 是用户可控的字符串：查表用 Object.hasOwn。
+ * @param {string} model 客户端发来的 id（已过在册检查）
+ * @param {{group?: boolean, now?: number|Date}} [opts]
+ * @returns {string}
+ */
+function upstreamImageModel(model, { group = false, now = Date.now() } = {}) {
+  const key = String(model ?? "");
+  if (!imageAliasOn() || !Object.hasOwn(IMAGE_MODEL_SUCCESSORS, key)) return key;
+  const rule = IMAGE_MODEL_SUCCESSORS[key];
+  if (rule.from !== null && Number(now) < Date.parse(rule.from)) return key;
+  return group ? rule.groupTo ?? rule.to : rule.to;
 }
 
 /** 一次豆包对话往返（含人设与历史的保守值） */
@@ -973,6 +1059,9 @@ module.exports = {
   GROUP_MAX_IMAGES,
   GROUP_MAX_REFS,
   imageCountCap,
+  IMAGE_MODEL_SUCCESSORS,
+  imageAliasOn,
+  upstreamImageModel,
   CHAT_TURN_TOKENS,
   TUTOR_PRICES,
   MODEL3D_TOKENS,

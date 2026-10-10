@@ -21,7 +21,13 @@ const mongoose = require("mongoose");
 const ArkImageGroup = require("../models/ArkImageGroup");
 const billing = require("./billing.service");
 const { ADMIN_ROLE } = require("../utils/roles");
-const { arkConfigured, openArkStream } = require("./arkGateway.service");
+const {
+  arkConfigured,
+  openArkStream,
+  withUpstreamImageModel,
+  imageMemoModel,
+  noteImageAlias,
+} = require("./arkGateway.service");
 const {
   imageTokensOf,
   priceOf,
@@ -38,8 +44,13 @@ const STALE_MS = 20 * 60_000;
 const PROMPT_MAX = 6000;
 /** 尺寸只收两种写法：WxH 像素，或 1K/2K/4K 档位（与单张出图同一套，方舟按模型再校验一次） */
 const SIZE_RE = /^(?:\d{3,5}x\d{3,5}|[1-4]K)$/i;
-/** 「这一组的 memo」：前缀与单张出图一致（`image <model>`），对账时按模型归类不用另写规则 */
-const memoOf = (model, maxImages) => `image ${model} 组图×${maxImages}`;
+/**
+ * 「这一组的 memo」：前缀与单张出图一致（`image <model>`），对账时按模型归类不用另写规则。
+ * 接了班的写成 `image <发来的>→<真发的> 组图×N`（与单张同一个写法，arkGateway.imageMemoModel）。
+ * ★ 受理、结算、懒回收三处都按**这一组记下的** upstreamModel 写，不现算：一组可能横跨切换时刻（受理在 12:59、结算在 13:05），
+ *   现算的话扣钱那一笔与退钱那一笔写着两个不同的型号，对账时对不上。
+ */
+const memoOf = (model, upstreamModel, maxImages) => `image ${imageMemoModel(model, upstreamModel)} 组图×${maxImages}`;
 
 /**
  * 校验并翻译成上游请求体（白名单：只有这几个键会被发出去）。
@@ -168,7 +179,8 @@ const userOf = (job) => ({ _id: job.userId, ...(job.free ? { role: ADMIN_ROLE } 
  */
 async function settleMoney(job, billable, snapshot = null) {
   const user = userOf(job);
-  const memo = memoOf(job.model, job.maxImages);
+  // 老组（字段上线之前受理的）没有 upstreamModel：按没接班写，与它受理时那一笔的 memo 一致
+  const memo = memoOf(job.model, job.upstreamModel, job.maxImages);
   const actual = billable * job.unitCost;
   if (job.free) {
     if (billable > 0) await billing.noteFreeCall({ user, cost: actual, memo, snapshot });
@@ -332,7 +344,7 @@ function shapeGroup(g) {
  * 受理一组。返回的 status / body 可以直接回给客户端；wallet 由路由写进响应头。
  * @returns {Promise<{status:number, body:object, wallet?:object|null}>}
  */
-async function startImageGroup({ user, body }) {
+async function startImageGroup({ user, body, now = Date.now(), appVersion = null }) {
   if (!arkConfigured()) return { status: 501, body: { ok: false, message: "ark not configured" } };
   const req = parseGroupRequest(body);
   if (req.issue) {
@@ -340,15 +352,25 @@ async function startImageGroup({ user, body }) {
   }
   await reapStale({ userId: user._id });
 
+  // ★ 单价与「一组值多少」认的都是**客户端发来的** id（老包按自己的报价收钱）——所以都排在换接班型号之前
   const unitCost = imageTokensOf(req.model);
   // 「一组值多少」只在 config/tokens.imageCountCap 一处算（= 单价 × max_images）
   const cost = priceOf("image", req.upstream);
-  const memo = memoOf(req.model, req.maxImages);
+  // 方舟下线了的老 id 换成**能出组图的**接班型号（group: true —— 4.5 的单张接班型号 5.0 pro 出不了组图）。
+  // 换的只是发给方舟的那一份；这一组记下的 model 仍是发来的 id（GET 回给客户端的就是它）
+  const sent = withUpstreamImageModel(req.upstream, { group: true, now });
+  const memo = memoOf(req.model, sent.upstreamModel, req.maxImages);
 
   // ★ 先占位、再扣钱：并发两发只有一发建得出来（部分唯一索引），输的那一发一分钱没动
   let job;
   try {
-    job = await ArkImageGroup.create({ userId: user._id, model: req.model, maxImages: req.maxImages, unitCost });
+    job = await ArkImageGroup.create({
+      userId: user._id,
+      model: req.model,
+      upstreamModel: sent.upstreamModel,
+      maxImages: req.maxImages,
+      unitCost,
+    });
   } catch (e) {
     if (e && e.code === 11000) {
       const running = await ArkImageGroup.findOne({ userId: user._id, status: "running" }).select("_id").lean();
@@ -390,7 +412,8 @@ async function startImageGroup({ user, body }) {
   }
 
   // 后台画：不 await —— 请求马上回任务号（runGroup 自己兜住一切异常并结算）
-  void runGroup({ jobId: job._id, upstream: req.upstream, snapshot: pre.before });
+  noteImageAlias(req.model, sent.upstreamModel, appVersion);
+  void runGroup({ jobId: job._id, upstream: sent.body, snapshot: pre.before });
   return { status: 202, body: { ok: true, id: String(job._id), maxImages: req.maxImages, unitCost, prepaid }, wallet: pre.wallet };
 }
 
