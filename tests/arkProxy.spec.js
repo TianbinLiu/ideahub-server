@@ -993,19 +993,24 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
   //   于是**顶档按最低档收费**（三档差 3 倍）。它没有任何症状 —— 用户无感、界面无错、
   //   测试全绿，只有火山账单知道。所以必须由测试从外面把"真的读了 model"钉住。
   //
-  // 抄自 app/src/data/economy.ts 的 IMAGE_TIERS + IMAGE_TOKENS_BY_MODEL。
+  // 抄自 app/src/data/economy.ts 的 IMAGE_TIERS + IMAGE_TOKENS_BY_MODEL —— **App 2.63 那一版**（2026-10-10 主人拍板：
+  // 速写换成 4.0 新版本 20260415，「定妆」4.5 撤掉）。App 那一边的 PR 把 economy.ts 改成同一张表；
+  // 这里是抄来的一份，不读 app 仓，所以 App 的 PR 合没合都不影响这条用例（先合哪边都是绿的）。
   // 为什么抄而不是 fs 读 app 仓：理由同上面视频那组（server 独立部署，CI 里没有 app 的代码；
   // 会自己跳过的用例是本项目最怕的静默失败）。
   const APP_IMAGE_TIERS = [
-    { id: "sketch", model: "doubao-seedream-4-0-250828", tokens: 13_333 }, // 0.20 元/张
-    { id: "studio", model: "doubao-seedream-4-5-251128", tokens: 16_667 }, // 0.25 元/张
+    { id: "sketch", model: "doubao-seedream-4-0-20260415", tokens: 13_333 }, // 0.20 元/张（按老 4.0 推定，待账单）
     { id: "master", model: "doubao-seedream-5-0-pro-260628", tokens: 40_000 }, // 0.60 元/张
   ];
 
-  /** 老客户端（已装机的 APK）还在发的出图模型：新包的 MODELS.image 已经改成 4.0，
-   *  但装出去的那些改不了。老包对它的报价是 economy.IMAGE_TOKENS = 13,300 */
-  const LEGACY_IMAGE_MODEL = "doubao-seedream-5-0-260128";
-  const LEGACY_IMAGE_TOKENS = 13_300;
+  /** 老客户端（已装机的 APK）还在发的出图模型 —— 装出去的那些改不了，每一个都按**老包自己的报价**收：
+   *  ≤ 2.62 的速写（老 4.0）13,333、定妆（4.5）16,667；更老的包的 economy.IMAGE_TOKENS = 13,300。
+   *  （发给方舟时由出口换成接班型号，那一半在 tests/arkImageAlias.spec.js。） */
+  const LEGACY_IMAGES = [
+    { model: "doubao-seedream-4-0-250828", tokens: 13_333 },
+    { model: "doubao-seedream-4-5-251128", tokens: 16_667 },
+    { model: "doubao-seedream-5-0-260128", tokens: 13_300 },
+  ];
 
   test("两张表的 key 集合与数值完全相等", () => {
     const { IMAGE_TOKENS_BY_MODEL } = require("../src/config/tokens");
@@ -1019,8 +1024,8 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
     for (const t of APP_IMAGE_TIERS) {
       expect({ id: t.id, cost: priceOf("image", { model: t.model }) }).toEqual({ id: t.id, cost: t.tokens });
     }
-    // ★ 再钉一条"三个价互不相同"：只有上面那三条逐条断言的话，把实现换成
-    //   「常量恰好等于其中一档」会红两条 —— 而这里要证明的不是"某一档对不对"，
+    // ★ 再钉一条"各档的价互不相同"：只有上面逐条断言的话，把实现换成
+    //   「常量恰好等于其中一档」只会红一部分 —— 而这里要证明的不是"某一档对不对"，
     //   是"根本有没有读 model"。互不相同是那件事最直接的形状。
     const distinct = new Set(APP_IMAGE_TIERS.map((t) => priceOf("image", { model: t.model })));
     expect(distinct.size).toBe(APP_IMAGE_TIERS.length);
@@ -1055,7 +1060,7 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
     }
   });
 
-  test("三档的出图模型都在册（漏一行的症状是这一档永远 400）", async () => {
+  test("每一档的出图模型都在册（漏一行的症状是这一档永远 400）", async () => {
     // 白名单是私有常量，所以从行为上验：501 = 已经走到 forward，说明在册与扣费都过了。
     for (const t of APP_IMAGE_TIERS) {
       const res = await request(app)
@@ -1068,23 +1073,28 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
   });
 
   test("老客户端的出图模型仍在册且按老价收（已装机的 APK 改不了 model）", async () => {
-    // ★ 把它从白名单里删掉不是"降级"，是那批用户**出图整条全挂 400**：补设定帧 /
-    //   三套方案的首尾帧 / AI 封面全走这条路，而客户端把 400 当敏感词处理，连重试都没有。
-    const { priceOf } = require("../src/config/tokens");
+    // ★ 把它们从白名单里删掉不是"降级"，是那批用户**出图整条全挂 400**：补设定帧 /
+    //   三套方案的首尾帧 / AI 封面 / 铸卡全走这条路，而客户端把 400 当敏感词处理，连重试都没有。
+    const { priceOf, LEGACY_IMAGE_TOKENS } = require("../src/config/tokens");
+    // 抄来的这份与服务端那张表**双向**相等：多一个、少一个、价差一点都红
+    expect(LEGACY_IMAGE_TOKENS).toEqual(Object.fromEntries(LEGACY_IMAGES.map((t) => [t.model, t.tokens])));
     const spy = jest.spyOn(console, "error").mockImplementation(() => {});
     try {
       // 有价，且是**老包自己报的那个价** —— 这次改价对老用户必须是零影响。
-      // 落到"认不出"的兜底上就是老客户端被按顶档多扣 3 倍（40,000 vs 报价 13,300）。
-      expect(priceOf("image", { model: LEGACY_IMAGE_MODEL })).toBe(LEGACY_IMAGE_TOKENS);
+      // 落到"认不出"的兜底上就是老客户端被按顶档多扣（40,000 vs 报价 13,300）。
+      for (const t of LEGACY_IMAGES) expect({ model: t.model, cost: priceOf("image", { model: t.model }) }).toEqual({ model: t.model, cost: t.tokens });
       expect(spy).not.toHaveBeenCalled();
     } finally {
       spy.mockRestore();
     }
-    const res = await request(app)
-      .post("/api/ark/images/generations")
-      .set({ Authorization: `Bearer ${paidToken}` })
-      .send({ model: LEGACY_IMAGE_MODEL, prompt: "x" });
-    expect(res.status).toBe(501);
+    for (const t of LEGACY_IMAGES) {
+      const res = await request(app)
+        .post("/api/ark/images/generations")
+        .set({ Authorization: `Bearer ${paidToken}` })
+        .send({ model: t.model, prompt: "x" });
+      expect({ model: t.model, status: res.status }).toEqual({ model: t.model, status: 501 });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled(); // 501 在发请求之前返回
   });
 });
 

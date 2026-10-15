@@ -16,9 +16,11 @@
 //  · 管理员免单跳过②③，但**照实记一笔流水**（火山账单上是真花了钱的），
 //    且那笔账等转发回来、确认受理了才落 —— 敏感词 400 那种根本没被受理的调用
 //    记进去，等于自己给自己造对不上的账。
+//  · 出图在④那一刻才把方舟下线了的老 id 换成接班型号（withUpstreamImageModel，2026-10-10）：
+//    ①②③ 认的都是客户端发来的 id —— 老包按自己的报价收钱。组图那个出口（arkImageGroup）走同一个换法。
 const wallet = require("./tokenWallet.service");
 const billing = require("./billing.service");
-const { priceOf, videoPlanDenial, isPaidUser, VIDEO_MULT } = require("../config/tokens");
+const { priceOf, videoPlanDenial, isPaidUser, VIDEO_MULT, upstreamImageModel } = require("../config/tokens");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
 
 const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
@@ -62,6 +64,49 @@ function withServerTaskFields(kind, body) {
   for (const k of STRIPPED_TASK_FIELDS) delete out[k];
   if (!Object.hasOwn(VIDEO_MULT, String(body.model ?? ""))) return out;
   return { ...out, ...SERVER_TASK_FIELDS };
+}
+
+/**
+ * 出图请求体换上**真发给方舟**的型号（方舟下线了的老 id → 接班型号；判据在 config/tokens.upstreamImageModel）。
+ * 返回新对象（不改调用方的 body），没换就原样返回同一个对象。
+ * ★ 两个出图出口（单张：chargedArkCall；组图：arkImageGroup.startImageGroup）都只经这一处换 ——
+ *   而且都排在在册、计价、门禁**之后**：那几样认的是客户端发来的 id（老包按自己的报价收钱）。
+ *   在计价之前换的话，4.5 的老包会按接班型号的价被扣钱，"页面报 X、实际扣 Y"。
+ * @returns {{ body: object, model: string, upstreamModel: string }}
+ */
+function withUpstreamImageModel(body, { group = false, now = Date.now() } = {}) {
+  const model = String(body?.model ?? "");
+  const upstreamModel = upstreamImageModel(model, { group, now });
+  return { body: upstreamModel === model ? body : { ...body, model: upstreamModel }, model, upstreamModel };
+}
+
+/**
+ * 出图流水 memo 里的型号：接了班就写成 `<发来的>→<真发的>`，没接班就是发来的那个。
+ * ★ 两半都要：前一半对得上**用户被收了多少**（价目按它），后一半对得上**方舟账单上的型号**。只写一半的话，
+ *   月底对账时这批调用要么在我们的流水里找不到账单上的型号，要么看不出是哪一档的老包按哪个价收的。
+ */
+function imageMemoModel(model, upstreamModel) {
+  return upstreamModel && upstreamModel !== model ? `${model}→${upstreamModel}` : model;
+}
+
+/** 每个进程记过的「老 id → 接班型号 × App 版本」组合（只为了不刷屏；上限防着伪造的版本头把它撑大） */
+const aliasSeen = new Set();
+const ALIAS_SEEN_MAX = 200;
+
+/**
+ * 记一行「这个版本的 App 还在发方舟下线了的出图 id」—— 同一组合每个进程只记一次。
+ * ★ 为什么要记：接班表与 LEGACY 价目的寿命 = 老版本的寿命，而在 App 2.63 带上版本头之前，
+ *   服务端根本分不出请求来自哪一版（见 middleware/appVersion）。没带版本头 = 2.62 及更早的包。
+ * ★ 只记日志，不影响这一发怎么走。
+ * @param {{raw?: string}|null} [appVersion] req.appVersion
+ */
+function noteImageAlias(model, upstreamModel, appVersion) {
+  if (!upstreamModel || upstreamModel === model) return;
+  const who = appVersion?.raw ? `App ${appVersion.raw}` : "没带版本头的 App（≤ 2.62）";
+  const key = `${model}→${upstreamModel}@${who}`;
+  if (aliasSeen.has(key) || aliasSeen.size >= ALIAS_SEEN_MAX) return;
+  aliasSeen.add(key);
+  console.info(`[ark] 出图接班：${model} → ${upstreamModel}（${who}；同一组合每个进程只记这一次）`);
 }
 
 /** 这台服务器配没配 key。健康端点与"要不要白跑一趟"都只问这一处 */
@@ -142,7 +187,7 @@ async function openArkStream({ path, body, timeoutMs }) {
  * @param {number} [args.timeoutMs]
  * @returns {Promise<
  *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean,
- *       took:{plan:number, addon:number}, memo:string }
+ *       took:{plan:number, addon:number}, memo:string, upstreamModel:string }
  *   | { ok:false, reason:"model"|"plan"|"funds", status:number, body:object, wallet:object|null }
  * >}
  */
@@ -185,6 +230,10 @@ async function chargedArkCall({
   acceptedOf = null,
   /** 退款流水的类别标签：月底对账要分得出哪家上游退的钱 */
   refundTag = "ark_refund",
+  /** 出图接班表按哪一刻判（config/tokens.upstreamImageModel；测试注入用，缺省现在） */
+  now = Date.now(),
+  /** req.appVersion（middleware/appVersion）：只进「哪个版本还在发老 id」那一行日志，不影响这一发怎么走 */
+  appVersion = null,
 }) {
   const model = String(body?.model ?? "");
   if (!modelAllowed(model)) {
@@ -197,12 +246,17 @@ async function chargedArkCall({
   //   故意选"每次都读"这种贵写法：换成"只有要挡的档才去读钱包"就等于把门禁的判据
   //   劈成两半，以后改免费档清单时漏改任何一半都不报错，只会静默放行。
   const before = await wallet.getWallet(user._id);
+  // ★ 计价读的是**客户端发来的** body（老包按自己的报价收钱）；出图的接班型号只换进下面转发的那一份（sent）
   const cost = priceOf(kind, body, r2v ?? null, draftFinal ?? null);
+  // 出图：方舟下线了的老 id 换成接班型号（只换转发的那一份，见 withUpstreamImageModel）。其余 kind 一律不碰
+  const image = kind === "image" ? withUpstreamImageModel(body, { now }) : null;
+  const upstreamModel = image ? image.upstreamModel : model;
   // r2v 的流水 memo 带来源标记：不带的话 `task <model>` 与纯任务一模一样，
   // 月底对方舟账单时分不出哪些钱是白模花的。
   //  · 命中已登记模板 → `r2v tpl:<模板id>`
   //  · 白模化那一发（还没有模板）→ `r2v src:<原视频 public_id>`
-  let memo = `${kind} ${model}`;
+  // 出图接了班的写成 `image <发来的>→<真发的>`（imageMemoModel 的 ★）
+  let memo = `${kind} ${imageMemoModel(model, upstreamModel)}`;
   if (r2v?.templateId) memo += ` r2v tpl:${r2v.templateId}`;
   // 本人成片（返修 / 延长）单独标子任务：对账时分得出「改自己的片」与「白模化那一发」
   else if (r2v?.kind === "ownEdit" || r2v?.kind === "ownExtend") memo += ` r2v ${r2v.kind === "ownEdit" ? "edit" : "extend"} own:${String(r2v.sourcePublicId || "?")}`;
@@ -222,8 +276,9 @@ async function chargedArkCall({
     draftFinal,
   });
   if (denied) console.warn(`[ark] 免费档门禁，拒绝 ${kind} ${model} @ ${String(body?.resolution ?? "-")}（planId=${before?.planId ?? "?"}）`);
-  // 每一发 Seedance 出片任务套上服务端钉死的字段（见 SERVER_TASK_FIELDS）：转发的是这一份，不是调用方那份
-  const sent = withServerTaskFields(kind, body);
+  // 每一发 Seedance 出片任务套上服务端钉死的字段（见 SERVER_TASK_FIELDS）：转发的是这一份，不是调用方那份。
+  // 出图转发换了接班型号的那一份（在册、门禁、计价都已经按发来的 id 判完了）
+  const sent = image ? image.body : withServerTaskFields(kind, body);
 
   // ★★ 「钱」的序列（冻结 → 门禁 → 原子扣 → 转发 → 没受理退 → 免单记账）搬到了
   //   services/billing.service.js，**四条链路共用那一份**（铁律六）。这里只负责
@@ -237,6 +292,8 @@ async function chargedArkCall({
     denyReason: denied?.message || "",
     denyExtra: denied?.allowed ? { allowed: denied.allowed } : null,
     forward: async () => {
+      // 真要发出去了才记（被余额 / 冻结 / 上限挡下的那几发没到方舟，不算「还在发老 id」）
+      if (image) noteImageAlias(model, upstreamModel, appVersion);
       upstream = forward ? await forward() : await callArk({ method: "POST", path, body: sent, timeoutMs });
       const ok = acceptedOf ? acceptedOf(upstream.status, upstream.text) : upstream.status >= 200 && upstream.status < 300;
       return { accepted: ok };
@@ -256,7 +313,8 @@ async function chargedArkCall({
   if (!accepted && !free) console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
 
   // took / memo：受理了的异步任务由调用方记进 GenTaskCharge（受理后失败按原桶退回，services/taskRefund）
-  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo };
+  // upstreamModel：真发给方舟的型号（出图接了班时与 body.model 不同；其余 kind 恒等于 body.model）
+  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo, upstreamModel };
 }
 
 module.exports = {
@@ -270,4 +328,7 @@ module.exports = {
   setWalletHeaders,
   SERVER_TASK_FIELDS,
   withServerTaskFields,
+  withUpstreamImageModel,
+  imageMemoModel,
+  noteImageAlias,
 };

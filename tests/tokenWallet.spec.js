@@ -193,9 +193,11 @@ describe("/api/ark 的扣费闸门", () => {
     //   顶档按最低档收 —— 用户无感、界面无错、测试全绿，只有火山账单知道。
     //   跨仓价目表的逐条对照在 arkProxy.spec.js，这里验的是"扣费链路真的用上了它"。
     const cases = [
-      ["doubao-seedream-4-0-250828", 13_333], // 速写
-      ["doubao-seedream-4-5-251128", 16_667], // 定妆
+      ["doubao-seedream-4-0-20260415", 13_333], // 速写（App 2.63 起）
       ["doubao-seedream-5-0-pro-260628", 40_000], // 精绘
+      // ≤ 2.62 装机的包还在发的两档：按老包的报价收（发给方舟时换成接班型号，见 arkImageAlias.spec）
+      ["doubao-seedream-4-0-250828", 13_333], // 老速写
+      ["doubao-seedream-4-5-251128", 16_667], // 老定妆
     ];
     for (const [model, cost] of cases) {
       const { token, userId } = await registerUser();
