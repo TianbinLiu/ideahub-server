@@ -44,6 +44,9 @@ Xerofocus 那份清单是按 AWS 写的；我们的实际拓扑是**阿里云香
 - 优雅退出：`SIGTERM/SIGINT` → drain in-flight → 断开 mongoose（部署不再硬切请求）
 - AI worker 移入 `connectDB()` 之后（原先不等数据库就开始轮询）
 - 开放重定向：`safeNextPath` 补 `/\` 与控制字符
+- OAuth 深链回程回带 App 的一次性 state（2026-10-15）：`/oauth/google|github?state=` 合形状的签进 OAuth state，成功 / 失败的回跳都带 `state=` 回去，App 对不上就丢 —— 手机上任何 App 都能发 `ideahub://oauth?token=…` 把受害者的登录态换成攻击者的（登录 CSRF）；验签失败的 state 一个字不回带，passport 的 `failureRedirect` 那一跳带不了（App 按「不是我发起的」丢）
+- 社区 Live2D 包的 model3.json 引用只许指向包内（2026-10-15）：动作 / 表情 / 物理 / 姿势 / cdi3 / 用户数据 / 声音全部过同一道 `resolveRef`，带协议（`https:` / `data:` / 盘符）、`//`、绝对路径、出包的整句 400 并点名 —— App 的 prefetch 会 fetch 每条引用，一条 `https://` 的动作引用就是装了它的每个人每次开客服页都向那台服务器报到
+- `POST /api/client-events`（2026-10-15）：免登录、按 IP 10 次/分钟、只写一行日志（字段限长限字符、控制字符剥掉）、不落库不读账号不做判断 —— 让 App 的白屏 / 更新失败 / IndexedDB 丢数据在 pm2 日志里看得见，又不给匿名请求任何可以影响状态的把手
 
 **Client（网站）**
 - `vercel.json` 全套安全头：CSP、HSTS(preload)、`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy`、`Permissions-Policy`、COOP

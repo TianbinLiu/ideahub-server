@@ -1118,6 +1118,8 @@ describe("健康端点", () => {
       // 两个运维开关的现状（2026-10-07 评审）：缺省都开着
       freeVideoGate: true,
       minimaxFailRefund: true,
+      // clientEvents：这台服务器有 POST /api/client-events（App 自报白屏 / 更新失败那几类，2026-10-15；tests/clientEvents.spec.js）
+      clientEvents: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

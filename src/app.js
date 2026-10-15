@@ -135,6 +135,9 @@ app.use(passport.initialize());
 app.use("/api", healthRoutes);
 // 安卓 App 的版本清单（无需登录，检查更新发生在登录之前）
 app.use("/api/app", require("./routes/appRelease.routes"));
+// App 自报的客户端事件（白屏 / 更新失败 / IndexedDB 丢数据 …）：免登录、按 IP 限流、**只进日志**（理由见文件头）。
+// 挂在 /api/app 旁边：都是「登录之前就要能打」的 App 基础设施；App 先探 /api/ark/health 的 clientEvents 能力位再发
+app.use("/api/client-events", require("./routes/clientEvents.routes"));
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/feed", require("./routes/feed.routes"));

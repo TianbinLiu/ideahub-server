@@ -139,6 +139,9 @@ router.get("/health", (_req, res) => {
   //     App 读到 false 要跟着放开置灰 —— 不报这一位的话，关闸只放开了服务端，App 照旧把标准 / 高清画成会员档，开关形同虚设。
   //   · minimaxFailRefund：MINIMAX_FAIL_REFUND 开没开。false = 真人档（MiniMax）受理之后的失败**不退**（账留着，开关打开后接着退），
   //     App 对真人档说「会自动退回」之前要看这一位，不能只看 failRefund（那一位只说方舟）。
+  // 2026-10-15 的能力位：
+  //   · clientEvents：有 POST /api/client-events（App 自报白屏 / 没接住的 Promise / 更新失败 / IndexedDB 丢数据 / 开机被拦，
+  //     只进日志；routes/clientEvents.routes.js 文件头）。App 见不到这一位就不发 —— 老服务端上那条路是 404，发了也只是白打。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -149,6 +152,7 @@ router.get("/health", (_req, res) => {
     freeVideo: freeVideoTiers().map(({ label, model, resolution }) => ({ label, model, resolution })),
     freeVideoGate: freeVideoGateOn(),
     minimaxFailRefund: taskRefund.minimaxRefundOn(),
+    clientEvents: true,
   });
 });
 
