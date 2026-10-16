@@ -40,8 +40,11 @@ async function createUser(prefix = "l2d") {
 
 const auth = (token) => ({ Authorization: `Bearer ${token}` });
 
-/** 一个最小但结构完整的 Cubism 4 包：model3.json + moc3 + 贴图 + 表情；可选夹带垃圾/危险文件 */
-function makeBundle({ withEvil = false, cubism2 = false, missingTexture = false, dir = "hiyori" } = {}) {
+/**
+ * 一个最小但结构完整的 Cubism 4 包：model3.json + moc3 + 贴图 + 表情；可选夹带垃圾/危险文件。
+ * refs 盖进 FileReferences、files 多塞几个文件（引用检查那一组用）
+ */
+function makeBundle({ withEvil = false, cubism2 = false, missingTexture = false, dir = "hiyori", refs = {}, files = {} } = {}) {
   const zip = new AdmZip();
   if (cubism2) {
     zip.addFile(`${dir}/hiyori.model.json`, Buffer.from(JSON.stringify({ model: "hiyori.moc", textures: ["tex.png"] })));
@@ -51,7 +54,7 @@ function makeBundle({ withEvil = false, cubism2 = false, missingTexture = false,
   }
   const model3 = {
     Version: 3,
-    FileReferences: { Moc: "hiyori.moc3", Textures: ["hiyori.4096/texture_00.png"], Expressions: [{ Name: "smile", File: "smile.exp3.json" }] },
+    FileReferences: { Moc: "hiyori.moc3", Textures: ["hiyori.4096/texture_00.png"], Expressions: [{ Name: "smile", File: "smile.exp3.json" }], ...refs },
   };
   zip.addFile(`${dir}/hiyori.model3.json`, Buffer.from(JSON.stringify(model3)));
   zip.addFile(`${dir}/hiyori.moc3`, Buffer.concat([Buffer.from("MOC3"), Buffer.alloc(4092, 7)])); // 真 moc3 前 4 字节是 "MOC3"，服务器现在校验
@@ -64,6 +67,7 @@ function makeBundle({ withEvil = false, cubism2 = false, missingTexture = false,
     zip.addFile(`${dir}/logo.svg`, Buffer.from("<svg onload=alert(1)></svg>"));
     zip.addFile("../../escape.png", Buffer.alloc(8, 9));
   }
+  for (const [name, data] of Object.entries(files)) zip.addFile(`${dir}/${name}`, data);
   return zip.toBuffer();
 }
 
@@ -267,5 +271,71 @@ describe("推荐嗓子来自声音市场的模板", () => {
     await request(app).delete(`/api/voice-templates/${templateId}`).set(auth(a.token)).expect(200);
     const after = await request(app).get(`/api/live2d-models/${id}`).set(auth(a.token));
     expect(after.body.model.voice).toEqual({ voiceId: "", mix, templateId: null, rate: 30, pitch: null, instruct: "", expressive: true });
+  });
+});
+
+// 2026-10-15（owasp-security-6）：App 的 prefetch 与 pixi 舞台拿 model3.json 里每条引用 new URL(ref, base) 去 fetch ——
+// 一条外链的动作 / 声音引用 = 装了它的每个人每次开客服页都向那台服务器报到。服务端在入口把引用收口到包内（live2dBundle.service 文件头 ★）
+describe("model3.json 的引用只许指向包内", () => {
+  const json = (o) => Buffer.from(JSON.stringify(o));
+  /** 每一种引用都有、都在包里的一份。声音文件会被扩展名白名单剥掉（.wav 不收），所以对 Sound 服务端只查「指向包内」 */
+  const ALL_REFS = {
+    Physics: "hiyori.physics3.json",
+    Pose: "hiyori.pose3.json",
+    DisplayInfo: "hiyori.cdi3.json",
+    UserData: "hiyori.userdata3.json",
+    Expressions: [{ Name: "smile", File: "smile.exp3.json" }, { Name: "angry", File: "exp/angry.exp3.json" }],
+    Motions: {
+      Idle: [{ File: "motions/idle.motion3.json", Sound: "sounds/idle.wav" }],
+      Tap: [{ File: "motions/tap.motion3.json" }],
+    },
+  };
+  const ALL_FILES = {
+    "hiyori.physics3.json": json({ Version: 3, Meta: {}, PhysicsSettings: [] }),
+    "hiyori.pose3.json": json({ Type: "Live2D Pose", Groups: [] }),
+    "hiyori.cdi3.json": json({ Version: 3, Parameters: [{ Id: "ParamAngleX", Name: "角度 X" }], Parts: [] }),
+    "hiyori.userdata3.json": json({ Version: 3, UserData: [] }),
+    "exp/angry.exp3.json": json({ Type: "Live2D Expression", Parameters: [] }),
+    "motions/idle.motion3.json": json({ Version: 3, Curves: [] }),
+    "motions/tap.motion3.json": json({ Version: 3, Curves: [] }),
+    "sounds/idle.wav": Buffer.alloc(64, 5),
+  };
+  const bundleWith = (patch, files = ALL_FILES) => makeBundle({ refs: { ...ALL_REFS, ...patch }, files });
+  const without = (files, ...names) => Object.fromEntries(Object.entries(files).filter(([k]) => !names.includes(k)));
+  const leftover = (user) => fs.readdir(path.join(MARKET_ROOT, String(user._id))).catch(() => []);
+
+  it("每一种引用都在包里 → 201，能力档案认出物理 / 姿势 / 动作 / 表情 / cdi3；声音文件被白名单剥掉也照收", async () => {
+    const { token } = await createUser("rf");
+    const res = await upload(token, { bundle: bundleWith({}) });
+    expect(res.status).toBe(201);
+    expect(res.body.model.capabilities).toMatchObject({ hasPhysics: true, hasPose: true, motionCount: 2, expressions: ["smile", "angry"], paramsKnown: true });
+  });
+
+  it.each([
+    ["外链的动作文件（https://）", { Motions: { Idle: [{ File: "https://evil.example/track.motion3.json" }] } }, /outside the bundle.*Motions\.Idle\[0\]\.File/],
+    ["协议相对的声音（//evil）", { Motions: { Idle: [{ File: "motions/idle.motion3.json", Sound: "//evil.example/ping.wav" }] } }, /outside the bundle.*Motions\.Idle\[0\]\.Sound/],
+    ["data: 的 cdi3", { DisplayInfo: "data:application/json,%7B%7D" }, /outside the bundle.*DisplayInfo/],
+    ["../ 出包的物理文件", { Physics: "../outside.physics3.json" }, /outside the bundle.*Physics/],
+    ["绝对路径的姿势文件", { Pose: "/etc/pose3.json" }, /outside the bundle.*Pose/],
+    ["反斜杠开头的用户数据（UNC）", { UserData: "\\\\evil\\share\\x.userdata3.json" }, /outside the bundle.*UserData/],
+    ["外链的表情文件", { Expressions: [{ Name: "x", File: "http://evil.example/x.exp3.json" }] }, /outside the bundle.*Expressions\[0\]\.File/],
+  ])("%s → 400 并点名，目录不留", async (_label, patch, re) => {
+    const { user, token } = await createUser("rx");
+    const res = await upload(token, { bundle: bundleWith(patch) });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(re);
+    expect(await leftover(user)).toEqual([]);
+  });
+
+  it.each([
+    ["物理", ["hiyori.physics3.json"], /missing.*Physics/],
+    ["动作", ["motions/tap.motion3.json"], /missing.*Motions\.Tap\[0\]\.File/],
+    ["表情", ["exp/angry.exp3.json"], /missing.*Expressions\[1\]\.File/],
+  ])("引用了包里没有的%s文件 → 400 并点名（坏包，与缺贴图同一口径）", async (_label, missing, re) => {
+    const { user, token } = await createUser("rm");
+    const res = await upload(token, { bundle: bundleWith({}, without(ALL_FILES, ...missing)) });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(re);
+    expect(await leftover(user)).toEqual([]);
   });
 });
