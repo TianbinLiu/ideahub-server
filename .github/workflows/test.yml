@@ -23,8 +23,9 @@
 #     67 个用到内存库的套件全红。不能上 7.0+：MMS 8 默认的 storageEngine 是 ephemeralForTest，
 #     7.0 起被移除了（本机 8.2.6 实测：`Cannot start server with an unknown storage engine:
 #     ephemeralForTest`），而 67 个套件都是不带参数的 `MongoMemoryServer.create()`。
-#     MONGOMS_DISTRO 钉 ubuntu-22.04：ubuntu-latest 2026-10 起在迁 26.04，MMS 会按 runner 的系统
-#     去拼 ubuntu2604 的包名（不存在）；22.04 的构建只依赖 glibc 与 libssl3，24.04 / 26.04 上都有。
+#     MONGOMS_DISTRO 钉 ubuntu-22.04：ubuntu-latest 2026-10-19 起分批迁 26.04（到 11-19 迁完），
+#     不钉的话 MMS 按 runner 的系统去拼 ubuntu2404 / ubuntu2604 的包名，6.0 没有这两种（下载 403）。
+#     22.04 的构建在 24.04 与 26.04 的 runner 上都实跑过（PR #121 的两轮：96 个套件 1654 条全绿）。
 #     本机 Windows 上跑的仍是 5.0.19（没设 MONGOMS_VERSION）—— 两边差一个大版本，测的是普通
 #     CRUD 与聚合，不靠版本差异；真要对齐生产的 Atlas 版本，得先把 MMS 升到 9+（改依赖，另议）。
 #   - Redis 6.0.16：与生产 `redis-server --version` 相同。没有 Redis 时 rateLimitRedis.spec.js
@@ -49,7 +50,8 @@ permissions:
 
 jobs:
   jest:
-    runs-on: ubuntu-26.04
+    # 不钉系统版本：上面那条 MONGOMS_DISTRO 已经让 mongod 与 runner 的系统脱钩，24.04 / 26.04 都验过
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
       redis:
@@ -74,7 +76,7 @@ jobs:
           node-version: "20.20.2"
           cache: npm
 
-      # mongod 的包约 70MB，每轮从 fastdl.mongodb.org 现下既慢又多一个会抖的外部依赖。
+      # mongod 的包几十 MB（缓存压缩后约 40MB），每轮从 fastdl.mongodb.org 现下既慢又多一个会抖的外部依赖。
       # key 带版本与发行版：改了上面两个 env 就是另一份缓存，不会拿错二进制。
       - name: 缓存 mongod 二进制
         uses: actions/cache@v5
@@ -94,7 +96,11 @@ jobs:
             const { MongoMemoryServer, MongoBinary } = require("mongodb-memory-server");
             (async () => {
               const t0 = Date.now();
-              console.log("mongod binary:", await MongoBinary.getPath());
+              const bin = await MongoBinary.getPath();
+              // 打出版本与 distmod（应为 ubuntu2204）：哪天换了版本 / 发行版，日志里一眼能对上
+              const v = require("child_process").execFileSync(bin, ["--version"], { encoding: "utf8" });
+              console.log("mongod binary:", bin);
+              console.log(v.split("\n").filter((l) => /db version|distmod/.test(l)).join("\n"));
               const m = await MongoMemoryServer.create();
               console.log("mongod ok:", m.getUri(), `${Date.now() - t0} ms`);
               await m.stop();
