@@ -1,0 +1,149 @@
+# .github/workflows/test.yml
+# 服务端测试门禁：每个 PR、每次进 main 都把 tests/ 下全部 jest 套件跑一遍。
+#
+# 【为什么加】（2026-10-19，App 2.63 发版后验证）
+#   这个仓库此前只有 deploy.yml（push main → ssh 跑 deploy.sh：npm ci --omit=dev + check:config
+#   + 装载自检，**不跑测试**）与 cert-expiry.yml。AGENTS.md 写着「合并前确认 npm test 全绿」，
+#   但能不能做到全靠人记得在本地跑；而这台 Windows 开发机上单进程跑全量会中途 exit 127、
+#   新 worktree 首跑会撞 beforeAll 5 秒超时 —— 本地跑一次全量要分七八批、十几分钟，最容易被省掉。
+#   58b934c 的「96 个文件 1654/1654」那份证据，在这之前只有 10-19 那一轮本机重跑。
+#
+# 【只加 CI，不改部署】
+#   deploy.yml 一个字没动：push main 照旧直接部署，这个 workflow 与它**并行**，不拦部署。
+#   要不要让部署等测试绿（deploy 改 workflow_run / ruleset 把 jest 设成 required）是部署行为与
+#   仓库设置的变化，要主人定。
+#
+# 【这台机器跑什么版本，为什么】
+#   - Node 钉到生产那一个小版本：2026-10-19 在 ECS 上只读查过，`node -v` 与 `pm2 jlist` 里两个
+#     ideahub-server 进程都是 v20.20.2（Ubuntu 22.04.5）。生产升 Node 时这里跟着改 —— 查法：
+#     `ssh deploy@<ECS> node -v`。⚠ Node 20 已在 2026-04-30 停止维护；锁里的 geoip-lite@2.0.3
+#     声明 engines >=24（npm ci 只告警不拦），生产在 20 上照样跑 —— 这里跑 20 正好替它作证。
+#   - MongoDB 6.0.29（ubuntu2204 的官方构建）：mongodb-memory-server@8 默认的 5.0.19 只有
+#     ubuntu2004 的包，要 libssl1.1，ubuntu 22.04 / 24.04 / 26.04 都没有 —— mongod 起不来、
+#     67 个用到内存库的套件全红。不能上 7.0+：MMS 8 默认的 storageEngine 是 ephemeralForTest，
+#     7.0 起被移除了（本机 8.2.6 实测：`Cannot start server with an unknown storage engine:
+#     ephemeralForTest`），而 67 个套件都是不带参数的 `MongoMemoryServer.create()`。
+#     MONGOMS_DISTRO 钉 ubuntu-22.04：ubuntu-latest 2026-10 起在迁 26.04，MMS 会按 runner 的系统
+#     去拼 ubuntu2604 的包名（不存在）；22.04 的构建只依赖 glibc 与 libssl3，24.04 / 26.04 上都有。
+#     本机 Windows 上跑的仍是 5.0.19（没设 MONGOMS_VERSION）—— 两边差一个大版本，测的是普通
+#     CRUD 与聚合，不靠版本差异；真要对齐生产的 Atlas 版本，得先把 MMS 升到 9+（改依赖，另议）。
+#   - Redis 6.0.16：与生产 `redis-server --version` 相同。没有 Redis 时 rateLimitRedis.spec.js
+#     的三条用例会「跳过」（用例体里 `if (!available) return`，jest 照样记 passed）—— Redis 分支
+#     零覆盖却是绿的。所以这里起一个 service，并在下面单设一步：日志里出现跳过提示就红。
+
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# PR 上连续 push 只留最后一轮；main 上的每一轮都跑完（每个进 main 的提交都要有自己的结论）
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  jest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:6.0.16-alpine
+        ports:
+          - 6379:6379
+        # 等 Redis 真能回 PONG 再开跑：容器起来了但还没监听的那几百毫秒里，探测会判「不可用」
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      MONGOMS_VERSION: "6.0.29"
+      MONGOMS_DISTRO: "ubuntu-22.04"
+      REDIS_TEST_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.20.2"
+          cache: npm
+
+      # mongod 的包约 70MB，每轮从 fastdl.mongodb.org 现下既慢又多一个会抖的外部依赖。
+      # key 带版本与发行版：改了上面两个 env 就是另一份缓存，不会拿错二进制。
+      - name: 缓存 mongod 二进制
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-${{ runner.arch }}-${{ env.MONGOMS_DISTRO }}-${{ env.MONGOMS_VERSION }}
+
+      # 严格按 package-lock 装（含 devDependencies：jest / supertest / mongodb-memory-server）。
+      # mongodb-memory-server 的 postinstall 会按上面的 MONGOMS_* 把 mongod 下好（缓存命中就跳过）。
+      - run: npm ci
+
+      # 先单独起一次 mongod 再跑套件：二进制缺了 / 起不来（缺动态库之类）时，在这一步就说清楚，
+      # 而不是 67 个套件各自撞 beforeAll 的 5 秒超时、刷出几千行连带失败。
+      - name: mongod 自检
+        run: |
+          node -e '
+            const { MongoMemoryServer, MongoBinary } = require("mongodb-memory-server");
+            (async () => {
+              const t0 = Date.now();
+              console.log("mongod binary:", await MongoBinary.getPath());
+              const m = await MongoMemoryServer.create();
+              console.log("mongod ok:", m.getUri(), `${Date.now() - t0} ms`);
+              await m.stop();
+            })().catch((e) => { console.error(e); process.exit(1); });
+          '
+
+      # npm test = `jest --runInBand`（单进程串行：各套件各起一份内存库、改 process.env、
+      # jest.resetModules，并行跑会互相踩）。--ci：快照缺失时失败而不是悄悄写一份新的。
+      # --json --outputFile：留一份机器可读的结果给下面的汇总步；人读的输出照常打在日志里。
+      # shell: bash = `bash -eo pipefail`，经 tee 之后的退出码仍是 jest 的。
+      - name: jest
+        shell: bash
+        run: npm test -- --ci --json --outputFile=jest-results.json 2>&1 | tee jest.log
+
+      - name: Redis 分支真的跑了
+        if: success() || failure()
+        shell: bash
+        run: |
+          if grep -qF "[跳过] Redis 限流集成测试" jest.log; then
+            echo "::error file=tests/rateLimitRedis.spec.js::Redis 没连上，rateLimitRedis 的三条用例只是空跑（记作 passed、Redis 分支零覆盖）"
+            exit 1
+          fi
+          echo "rateLimitRedis.spec.js 连上了 ${REDIS_TEST_URL}"
+
+      - name: 汇总
+        if: success() || failure()
+        shell: bash
+        run: |
+          [ -f jest-results.json ] || { echo "没有 jest-results.json（jest 没跑完）" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          node - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          const r = require("./jest-results.json");
+          const dur = (s) => (s.endTime - s.startTime) / 1000;
+          const total = (r.testResults.reduce((a, s) => Math.max(a, s.endTime), 0) - r.startTime) / 1000;
+          const rel = (s) => s.name.split(/[\\/]tests[\\/]/).pop();
+          console.log(`### jest：${r.success ? "全绿" : "有失败"}`);
+          console.log("");
+          console.log("| | 合计 | 通过 | 失败 | 跳过 | todo |");
+          console.log("|---|---|---|---|---|---|");
+          console.log(`| 套件（文件） | ${r.numTotalTestSuites} | ${r.numPassedTestSuites} | ${r.numFailedTestSuites}（其中没跑起来 ${r.numRuntimeErrorTestSuites}） | ${r.numPendingTestSuites} | — |`);
+          console.log(`| 用例 | ${r.numTotalTests} | ${r.numPassedTests} | ${r.numFailedTests} | ${r.numPendingTests} | ${r.numTodoTests} |`);
+          console.log("");
+          console.log(`jest 墙钟约 ${total.toFixed(0)} 秒。最慢的 10 个套件：`);
+          console.log("");
+          const slow = [...r.testResults].sort((a, b) => dur(b) - dur(a)).slice(0, 10);
+          for (const s of slow) console.log(`- ${rel(s)}：${dur(s).toFixed(1)} 秒`);
+          const failed = r.testResults.filter((s) => s.status !== "passed");
+          if (failed.length) {
+            console.log("");
+            console.log("没过的套件：");
+            for (const s of failed) console.log(`- ${rel(s)}：${s.message.split("\n")[0].slice(0, 200)}`);
+          }
+          EOF
