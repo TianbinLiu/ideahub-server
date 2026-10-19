@@ -252,12 +252,86 @@ describe("support.service 纯函数", () => {
     expect(k).toContain("「取回」= 避免二次付费");
     expect(k).toContain("客服禁止承诺的事项");
     expect(k).toContain("support@ideahubs.org");
-    expect(k.length).toBeLessThan(12000);
+    // ★ 长度（2026-10-19 改）：原来写死 < 12000，2.63 修订后这一问是 12,145 字 —— 永远带上的三节 5,115 + 挑出来的四节 7,018，
+    //   多出来的全是知识库正文变长，检索没有多挑一节。两道闸分开钉：永远带上的三节（禁止承诺 / 转人工判定 / 联系方式）合计别过 6000
+    //   —— 它们每一问都在，涨一字就是每一问多一字；整份上限放到 13000（量出来的 12,145 + 余量）。
+    //   ⚠ 别写成「≤ 8000 + 三节」：selectKnowledge 本身就按 8000 截，那样写恒真、等于没有上限（10-19 复核抓到）。
+    //   再撑破 13000 就回正本删字，别再往上抬。
+    const always = svc.loadKnowledge().sections.filter((s) => s.always);
+    const alwaysLen = always.reduce((n, s) => n + s.text.length, 0);
+    expect(alwaysLen).toBeLessThan(6000);
+    expect(k.length).toBeLessThan(13000);
   });
 
   it("检索：注销问题命中 2.6；iOS 问题命中下载页", () => {
     expect(svc.selectKnowledge("怎么注销账号？")).toContain("注销账号");
     expect(svc.selectKnowledge("有苹果版吗")).toContain("iOS 版还没有");
+  });
+
+  // 标题（去掉编号之后）以 title 开头的那一节，在喂给模型的那几节里排第几（每节以自己的 ## / ### 标题行开头；没喂进去 = 0）。
+  // 按标题行认、不按正文认：同一串字可能也出现在排在前面的别的节的正文里
+  function rankOf(knowledge, title) {
+    const esc = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m = new RegExp(`^#{2,3} \\S+ ${esc}`, "m").exec(knowledge);
+    if (!m) return 0;
+    return (knowledge.slice(0, m.index).match(/^#{2,3} /gm) || []).length + 1;
+  }
+
+  // ★ 2026-10-19 发版后验证查出来的：2.63 的这几件，单句问法要把对的那一节排进前 3、而且真的喂进去（没被 8000 字挤掉）。
+  //   问法照用户的说法写（撤回 / 找回、合并、v2.63、英文），不是照知识库的用词写
+  it.each([
+    ["2.63 更新了什么", "最新版本：当前版 2.63"],
+    ["v2.63 有什么新功能", "最新版本：当前版 2.63"],
+    ["最新版本有什么变化", "最新版本：当前版 2.63"],
+    ["删了一段能撤回吗", "删掉一段与撤销"],
+    ["删掉的段能找回来吗", "删掉一段与撤销"],
+    ["删草稿能撤销吗", "草稿"],
+    ["画布怎么放大缩小", "工作流画布：放大 / 缩小"],
+    ["登录时提示忽略了一条不是本机发起的登录链接", "Google / GitHub 登录没登上"],
+    ["登录链接过期了是怎么回事", "Google / GitHub 登录没登上"],
+    ["剪辑页合成失败怎么办", "剪辑页合成：报错"],
+    ["剪辑页合并失败", "剪辑页合成：报错"],
+    ["以后会强制更新吗", "更新机制"],
+    ["定妆档怎么没了", "出图档位"],
+    ["11 月 24 日之后速写还能用吗", "出图档位"],
+    ["What's new in version 2.63?", "最新版本：当前版 2.63"],
+    ["Can I undo deleting a segment?", "删掉一段与撤销"],
+    ["How do I zoom in on the workflow canvas?", "工作流画布：放大 / 缩小"],
+    ["How do I update the app?", "更新机制"],
+    ["Is version 2.63 forced?", "更新机制"],
+  ])("检索（2.63）：「%s」把「%s」那一节排进前 3", (q, heading) => {
+    const r = rankOf(svc.selectKnowledge(q), heading);
+    expect(r).toBeGreaterThanOrEqual(1);
+    expect(r).toBeLessThanOrEqual(3);
+  });
+
+  it("检索（2.63）：剪辑页合成失败第 1 名是 3.8，不再被「失败 → 敏感词」那条顶成 4.8；AI 出片失败照旧带 4.8", () => {
+    expect(rankOf(svc.selectKnowledge("剪辑页合成失败怎么办"), "剪辑页合成：报错")).toBe(1);
+    expect(svc.selectKnowledge("生成失败了为什么还扣我 token？")).toContain("生成失败的典型原因");
+    expect(svc.selectKnowledge("推演失败了")).toContain("生成失败的典型原因");
+    // 「视频合成 / AI 合成」多半是 AI 出片：带「合成」二字不等于剪辑页（2026-10-19 复核：原来整行有合成二字就让开，
+    //   这两问的 4.8 掉出前 5；「视频合成要多少钱」只喂了 3.8「合成不花 token」、价钱那两节被挤掉）
+    expect(svc.selectKnowledge("AI 合成视频失败了扣 token 吗")).toContain("生成失败的典型原因");
+    expect(svc.selectKnowledge("视频合成失败了扣钱吗")).toContain("生成失败的典型原因");
+    expect(svc.selectKnowledge("视频合成要多少钱")).toContain("视频档位");
+  });
+
+  it("检索（2.63）：新加的同义词不拉偏无关问法", () => {
+    expect(svc.selectKnowledge("两个账号能合并吗")).not.toContain("剪辑页合成：报错");
+    expect(svc.selectKnowledge("How do I update my nickname?")).not.toContain("更新机制");
+    expect(svc.selectKnowledge("How do I upgrade my plan?")).not.toContain("更新机制");
+    // 英文界面里会员档那颗「去升级」就是 "Upgrade"：光说 upgrade 是问买套餐，不是装新版（2026-10-19 复核）
+    for (const q of [
+      "How do I upgrade?",
+      "I want to upgrade to premium to use HD",
+      "How do I upgrade to unlock the cinema option?",
+      "Why can't I use HD? Do I need to upgrade?",
+      "How do I update my payment method?",
+    ]) {
+      expect(svc.selectKnowledge(q)).not.toContain("更新机制");
+    }
+    expect(svc.selectKnowledge("Why can't I use HD? Do I need to upgrade?")).toContain("视频档位");
+    expect(svc.selectKnowledge("Can I recover my deleted account?")).not.toContain("删掉一段与撤销");
   });
 
   it("parseHandoff / categoryFromText", () => {
