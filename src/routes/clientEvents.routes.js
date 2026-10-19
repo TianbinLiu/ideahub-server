@@ -38,10 +38,8 @@ const { validate } = require("../middleware/validate");
 const { rateLimit, clientIp } = require("../middleware/rateLimit");
 const { clientEventBody } = require("../schemas/clientEvents.schemas");
 
-/** 日志里只留可见 ASCII：控制字符 / 换行 / 非 ASCII 一律换成 `?`，一行日志永远只是一行（where / name 由 schema 限了字符集，只有 version 要过它） */
-function logSafe(value) {
-  return String(value).replace(/[^\x21-\x7e]/g, "?");
-}
+// 日志里只留可见 ASCII（where / name 由 schema 限了字符集，只有 version 要过它）—— 实现在 utils/logSafe，与 OAuth 回调出错那一行共用
+const { logSafe } = require("../utils/logSafe");
 
 router.post(
   "/",

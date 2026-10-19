@@ -7,9 +7,15 @@
 //   网页落点 `/oauth/callback?…` 与深链落点 `ideahub://oauth?…` 都带。
 //   为什么：回 App 的深链 `ideahub://oauth?token=…` 手机上**任何一个 App 都发得出**。不回带的话，攻击者的 App 只要拼一条带
 //   自己账号 token 的深链扔过去，受害者的 App 就把登录态换成攻击者的（登录 CSRF：之后受害者发的作品、充的值都落在攻击者名下，
-//   全程零报错）。App 比对自己发出的那一份，对不上就丢掉。形状、为什么不 400、passport 的 failureRedirect 为什么带不了：见 appStateOf。
+//   全程零报错）。App 比对自己发出的那一份，对不上就丢掉。形状、为什么不 400：见 appStateOf。
+// ★ 失败也回到 App（2026-10-19，2.63 发版后验证 oauth-4b）：用户在 provider 那边点「取消」、provider 报错、或在那边耽搁超过
+//   state 的 10 分钟，原来一律落到官网的错误页（failureRedirect 是写死的一串），原生 App 的用户停在系统浏览器里、App 什么都收不到。
+//   现在这几种失败统一从 failBack 出去：App 发起的回 `ideahub://oauth?error=…&state=…`，网页发起的与原来逐字节相同。
+//   App 下一版要把「回程没带 state」改成拒（App 仓 data/oauthState 的 ⚠ 那一支），到那时只有带着 state 回来的失败才会上屏 ——
+//   所以先发这一版服务端。老 App（2.62 及更早，起跳不带 state）的取消 / 出错也回到 App 了，只是不带 state（它们本来也不认）。
 
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 const router = require("express").Router();
 const passport = require("passport");
 const User = require("../models/User");
@@ -17,6 +23,7 @@ const { requireAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
+const { logSafe } = require("../utils/logSafe");
 const { signToken, signOauthState, verifyOauthState } = require("../utils/jwt");
 const { grantSignupBonus } = require("../services/points.service");
 const { qqLoginEnabled, exchangeCodeForOpenid, fetchProfile } = require("../services/qqOauth.service");
@@ -121,15 +128,38 @@ function decodeState(s) {
 }
 
 /**
+ * 失败回程专用：认「这串是不是我们签的 state」，**不管过没过期**。只用来决定失败送回哪儿（App 深链还是官网），
+ * 从不拿它登录 / 绑定 —— 那两件仍只认上面的 decodeState（签名对 + 没过期）。
+ * ★ 为什么过期的也认：签名对 = 这串是我们发出去的，next / app 是签发那一刻写进去的。过期只影响「还能不能登录」，
+ *   不影响「把失败送回原处」：起跳端点不用登录就能签一张新的（`/oauth/google?next=…&state=…`），过期那张不比新签的
+ *   多给谁一点能力；失败回程里也没有 token。而「在 provider 那边耽搁超过 10 分钟」恰恰是最该把人送回 App 的一种失败。
+ * ★ 签名不对 / 不是 JWT / alg 不对 / purpose 不对（同一把密钥签的登录 token）一律 null。
+ * ★ 「签名对、只是过期」靠 jsonwebtoken 的验证顺序认：verify.js 先查 alg、再验签（不对 → JsonWebTokenError），
+ *   都过了才看 exp（过了 → TokenExpiredError；9.0.3 的 verify.js 第 168~190 行）。所以 TokenExpiredError = 签名已经验过。
+ *   密钥 / 算法仍只在 utils/jwt.verifyOauthState 一处；这里只补 purpose 那一条（过期时它走不到自己的 purpose 判断）。
+ */
+function decodeStateForFail(s) {
+  if (!s) return null;
+  try {
+    return verifyOauthState(String(s));
+  } catch (e) {
+    if (!e || e.name !== "TokenExpiredError") return null;
+  }
+  const payload = jwt.decode(String(s));
+  return payload && typeof payload === "object" && payload.purpose === "oauth-state" ? payload : null;
+}
+
+/**
  * App 发起登录时自带的一次性 state（`?state=`）。只认 8～128 位 URL 安全字符（`APP_STATE_RE`），
  * 签进我们的 state 当 `app` 字段，回跳时原样回带 —— 理由见文件头。
- * ★ 不合形状的**静默忽略**（当没带），不是 400：2.63 及更早的 App 一个都不带，拒了等于把老包全部挡在门外；
+ * ★ 不合形状的**静默忽略**（当没带），不是 400：2.62 及更早的 App 一个都不带（2.63 起才带；这里原来写成「2.63 及更早」，
+ *   v2.63 的 utils/oauth.ts 已经在起跳时生成 state），拒了等于把老包全部挡在门外；
  *   而它只是回带给 App 自己比对的一串字符，服务端对它一个判断都不做（与 X-App-Version 同一条纪律）。
  * ★ 「认不认这个值」只有这一处实现：发起时签进去前过一遍，回调时从签好的 state 里取出来再过一遍（铁律六）——
  *   state 是我们自己签的，第二遍只是让「回带的东西永远只会是这个形状」不依赖签发那一侧的记忆。
- * ★ passport 的 failureRedirect（`/api/auth/oauth/fail`）那一跳**带不了它**：走到那儿是 provider 拒了或 passport 自己验签
- *   失败，state 已经不在手里。App 收到不带 state 的回程按「不是我发起的」丢掉 —— 表现是回到登录页、什么都没发生，
- *   而不是登错号；这是对的失败方向。
+ * ★ 失败那几跳也回带（2026-10-19 起，见 failBack）：provider 的错误回调照 RFC 6749 §4.1.2.1 是带着 state 回来的，原来是
+ *   写死的 failureRedirect（`/api/auth/oauth/fail?provider=…`）把它丢了 —— 不是「state 已经不在手里」（这句原来写错了）。
+ *   `/api/auth/oauth/fail` 本身仍不回带：那一跳的查询串里只有 provider，谁往后面拼一个 state= 都没签过名。
  * @returns {string} 合形状的原串；不合 / 没带 → ""
  */
 const APP_STATE_RE = /^[A-Za-z0-9_-]{8,128}$/;
@@ -196,6 +226,73 @@ function redirectFail(res, error, message, nextPath) {
       state: res.locals.oauthAppState,
     }),
   );
+}
+
+/** passport 的 fail 原来固定去的那一跳（落到官网 /oauth/callback?next=/），网页发起的失败照旧走它 */
+function webFailUrl(provider) {
+  return `/api/auth/oauth/fail?provider=${provider}`;
+}
+
+/**
+ * 走不到「拿 provider 交回来的人登录」那一步的失败，统一从这里出去：provider 拒了（取消授权）/ 报了别的错 / 换 token 失败，
+ * 以及我们自己的 state 验不过（过期、签名不对）。
+ * ★ App 发起的回到 App：state 的签名认得出（decodeStateForFail，过期的也算），签进去的 next 再过一遍 safeNextPath 之后
+ *   **正是** App 深链（isAppTarget，严格等值）⇒ `ideahub://oauth?error=oauth_failed&message=…&state=<app>`；
+ *   app 不合 APP_STATE_RE（appStateOf 第二遍）就不带 state。回程地址只经 buildRedirect 拼 —— 没有新开任何跳转目标。
+ * ★ 其余一律 `onWeb()`，也就是改之前那一跳（调用方给）：网页发起的（next 是站内路径）结果逐字节不变；签名不对 / 根本不是
+ *   我们的 state 也走这里、一个字都不回带 —— 它签进去说的「回 App」我们没法作保。
+ * ★ message 只用我们自己的固定文案：provider 的 error_description 不进 URL（那段字是 provider 或发链接的人写的，
+ *   App 会把 message 原样摆上屏）。
+ */
+function failBack(req, res, message, onWeb) {
+  const st = decodeStateForFail(req.query.state);
+  const nextPath = st ? safeNextPath(st.next) : "/";
+  if (!isAppTarget(nextPath)) return onWeb();
+  res.locals.oauthAppState = appStateOf(st.app);
+  return redirectFail(res, "oauth_failed", message, nextPath);
+}
+
+/**
+ * 两个登录回调里「我们的 state 验不过」那一支：签名对、只是过期（在 provider 那边耽搁超过 10 分钟）且是 App 发起的 → 回 App；
+ * 其余与原来一样落官网、不回带。不让它登录：过期的 state 只用来认「送回哪儿」。
+ */
+function redirectStateFail(req, res) {
+  const message = "Invalid or expired OAuth state";
+  return failBack(req, res, message, () => redirectFail(res, "oauth_failed", message, "/"));
+}
+
+/**
+ * 回调那一跳交给 passport 的写法（Google / GitHub 共用）：provider 交回来一个人 → 挂到 req.user 上交给下一棒
+ * （与原来 `session: false` 时 passport 自己做的一样：req.login 不开 session 时就只是 req.user = user）；
+ * 交不回来（fail：provider 拒了）或出错（error：provider 回了 access_denied 以外的错、换 token / 取资料失败）→ failBack。
+ * ★ 为什么不再用 `failureRedirect`：它是写死的一串，passport 走到它时不看 state，App 发起的失败只能落在官网。
+ * ★ access_denied 以外的 error（server_error / temporarily_unavailable / admin_policy_enforced …）passport-oauth2 走
+ *   this.error(AuthorizationError)，原来进全局错误处理回一段 JSON 的 5xx —— 原生 App 用户在系统浏览器里看到一段 JSON。
+ *   现在当登录失败送回去，原因记一行日志（只记类型 / 码 / 状态，不记 code、state）。
+ * ★ 不带 code 也不带 error 的请求，passport 当起跳、302 去 provider（strategy.redirect，不经这个回调），与原来一样。
+ */
+function oauthCallback(provider) {
+  return (req, res, next) =>
+    passport.authenticate(provider, { session: false }, (err, user) => {
+      if (err) {
+        // ★ provider 那边的三种（passport-oauth2 的 AuthorizationError / TokenError / InternalOAuthError）只记类型 / 码 / 状态：
+        //   AuthorizationError 的 code 就是回调查询串里的 error，谁都能填 —— 过 logSafe（去换行、限长），否则一个换行就伪造出整行假日志。
+        //   别的（TypeError 之类，我们自己的错）照 middleware/error.js 的 ★★「500 必须落堆栈」整份打出来：原来它们进全局错误处理时
+        //   有堆栈，改成送回 App 之后不能把排障线索一起吞掉（10-19 复核抓到）。
+        if (/^(AuthorizationError|TokenError|InternalOAuthError)$/.test(err.name || "")) {
+          console.warn(
+            `[oauth] ${provider} 回调出错，按登录失败送回: ${logSafe(err.name, 40)} ${logSafe(err.code, 64)} ${logSafe(err.status || err.oauthError?.statusCode || "-", 8)}`,
+          );
+        } else {
+          console.error(`[oauth] ${provider} 回调里的意外错误，按登录失败送回:`, err);
+        }
+      }
+      if (err || !user) {
+        return failBack(req, res, `${provider} login failed`, () => res.redirect(webFailUrl(provider)));
+      }
+      req.user = user;
+      return next();
+    })(req, res, next);
 }
 
 function getOauthConflictMessage(provider) {
@@ -361,14 +458,15 @@ router.get("/oauth/google", (req, res, next) => {
 
 router.get(
   "/oauth/google/callback",
-  passport.authenticate("google", { session: false, failureRedirect: "/api/auth/oauth/fail?provider=google" }),
+  oauthCallback("google"),
   async (req, res) => {
     const st = decodeState(req.query.state);
     // App 自带的 state 从签好的 state 里取出来，成功 / 失败的回跳都回带（redirectSuccess / redirectFail 从 res.locals 读）。
     // 验签失败时它是空串 —— 我们没法替一个没签过名的 state 作保，一个字都不回带。
     res.locals.oauthAppState = appStateOf(st && st.app);
-    // 登录流的 state 同样由我们签发（/oauth/google 里 encodeState），故解析失败=被篡改，直接打回。
-    if (!st) return redirectFail(res, "oauth_failed", "Invalid or expired OAuth state", "/");
+    // 登录流的 state 同样由我们签发（/oauth/google 里 encodeState），故解析失败 = 被篡改或过期，直接打回、不登录
+    // （只是过期、又是 App 发起的那种送回 App，见 redirectStateFail）。
+    if (!st) return redirectStateFail(req, res);
     const nextPath = safeNextPath(st.next);
 
     try {
@@ -465,12 +563,12 @@ router.get("/oauth/github", (req, res, next) => {
 
 router.get(
   "/oauth/github/callback",
-  passport.authenticate("github", { session: false, failureRedirect: "/api/auth/oauth/fail?provider=github" }),
+  oauthCallback("github"),
   async (req, res) => {
     const st = decodeState(req.query.state);
     // 与 google callback 同一句（理由见那里）：App 自带的 state 回带给成功 / 失败两种回跳
     res.locals.oauthAppState = appStateOf(st && st.app);
-    if (!st) return redirectFail(res, "oauth_failed", "Invalid or expired OAuth state", "/");
+    if (!st) return redirectStateFail(req, res);
     const nextPath = safeNextPath(st.next);
 
     try {
@@ -687,10 +785,11 @@ router.post(
   },
 );
 
+// 网页发起的登录失败落到这里（oauthCallback 的 webFailUrl），再一跳到官网 /oauth/callback?next=/。
+// ★ 这一跳不回带 state：查询串里只有 provider，谁往后面拼一个 state= 都没签过名。App 发起的失败不经过这里 ——
+//   2026-10-19 起由 failBack 直接送回 App 深链（之前也走这里、落在官网，App 什么都收不到）。
 router.get("/oauth/fail", (req, res) => {
   const provider = req.query.provider || "oauth";
-  // 从 fail 过来拿不到 state，所以 next 就给 "/"；App 自带的一次性 state 同样带不回去（appStateOf 的 ★：
-  // 这一跳是 passport 的 failureRedirect，state 不在手里，App 对这种回程按「不是我发起的」丢掉）
   return redirectFail(res, "oauth_failed", `${provider} login failed`, "/");
 });
 
