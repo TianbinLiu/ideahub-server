@@ -2265,9 +2265,14 @@ role 的 video_url"绕过、按纯任务价放行）的请求，代理在计费�
    - **edit**（白模复刻 / 白模化 / 返修）：`omni_reference_task_type` 必须是 `"edit"`、`duration` 只能缺省或 `-1`、
      `resolution` 只能缺省或 `"720p"`、`ratio` 只能缺省或 `"adaptive"`；计价 `r2vTokens` = (输入时长 × 2)×720p×24fps×系数；
    - **reference**（素材参考，分支三）：不许带 `omni_reference_task_type`（或显式 `"reference"`）、`duration` 是这个模型窗口内的整数（不收 -1）；
-     计价 `materialRefTokens` = (输入 + 输出)×…；
+     计价 `materialRefTokens` = (max(输入, ⌈2×输出/3⌉) + 输出)×…（输入的下限是方舟「含输入视频时的最低用量」，见下）；
    - **extend**（延长，分支四）：`omni_reference_task_type` 必须是 `"extend"`、`duration` 是窗口内的整数（不收 -1）、
-     `ratio` 只能缺省或 `"adaptive"`（方舟对延长的要求）、`resolution` 只能缺省或 `"720p"`；计价同 reference（输入 + 输出）。
+     `ratio` 只能缺省或 `"adaptive"`（方舟对延长的要求）、`resolution` 只能缺省或 `"720p"`；计价同 reference（输入 + 输出，输入有同一个下限）。
+   - **含输入视频时的最低用量**（2026-10-19 付费核过，server `tokens.videoInputFloorSec`）：方舟价目页写明 Seedance 2.0 系列与 2.5
+     「当输入包含视频时，存在最低 token 用量限制」，折成秒是**输出 o 秒时输入至少按 ⌈2o/3⌉ 秒算**。电影级从 4 秒的源延长 7 秒，
+     方舟收 (5 + 7) 秒（任务 cgt-20261020074220-c7l9g，用量 259,200）。reference 与 extend 两条都套；edit 输出跟随输入，够不着这条下限，不套。
+     App 的 `economy.materialRefCost` 是同一个式子。⚠ 这一条对延长 / 示例视频是**涨价**，上线顺序是 **App 先、服务端后**
+     （App 的报价只在本机算，服务端先换式子 = 老包报少扣多）。
    越出任一条 → 400。以 edit 为例：计费是 (输入时长×2)×720p×24fps，而代理原样转发
    请求体——不钉的话改一行客户端就能按 4s 模板的价买 30s/1080p 的产出（reference
    子任务 duration 自由、-1 上探 30s，A7 实测），差额全进我们的方舟账单且零症状。
@@ -2309,7 +2314,7 @@ Cloudinary `secure_url` 规范形态——塞一段 transformation 也绕不开�
 **分支三：已登记的用户素材参考视频**（工作流「自定义 = 多图 + 参考视频」，2026-08-28）
 
 按 URL 等值反查 `MaterialRefVideo`（登记时服务端从 Cloudinary 写入时长）；素材**私有**，只有登记者本人能用。
-走 reference 子任务（输出时长由用户选），计价 `materialRefTokens`（输入 + 输出）。
+走 reference 子任务（输出时长由用户选），计价 `materialRefTokens`（输入 + 输出，输入不低于 ⌈2×输出/3⌉）。
 
 **分支四：本人自己出的成片**（App「修这一段」：返修 / 片段重拍 / 延长，2026-10-05）
 
@@ -2318,7 +2323,7 @@ Cloudinary `secure_url` 规范形态——塞一段 transformation 也绕不开�
 - **计价输入时长由服务端向 Cloudinary 查**（Admin API，`media_metadata`），查过记进 `SegmentRefVideo`（TTL 一天：成片会被回收，
   缓存活得比文件久的话方舟拿不到视频是受理之后的失败）；客户端报的数一个不信。成片要过方舟参考视频窗口（`templateRefIssue`：4~30 秒等）。
   查不到（404）→ 400「找不到这一段成片」；别的读取失败 → 502；都不扣费。缓存没命中时同样走 `ark-r2v-source` 那道 6 次/分的桶。
-- 只收两种子任务：`edit`（返修 / 片段重拍，计价 `r2vTokens` 输入 × 2）与 `extend`（延长，计价 `materialRefTokens` 输入 + 输出）；
+- 只收两种子任务：`edit`（返修 / 片段重拍，计价 `r2vTokens` 输入 × 2）与 `extend`（延长，计价 `materialRefTokens` 输入 + 输出，输入不低于 ⌈2×输出/3⌉）；
   别的（含不带任务类型）→ 400。流水 memo 追加 ` r2v edit own:<publicId>` / ` r2v extend own:<publicId>`。
 - ⚠ 2026-10-05 之前没有这一条：App 的「返修」发的就是本段成片，**在正式包里一直被这道闸 400**（不扣钱），只在 dev 直连方舟时跑得通。
 - 高清档（2.0 mini）2026-10-05 起在 `VIDEO_MULT_R2V` 里（含视频输入的刊例 14 元/M ⇒ 14/15，主人「合」）：四条分支对它一样放行、按同一个式子结算。

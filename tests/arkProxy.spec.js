@@ -1865,7 +1865,8 @@ describe("跨仓 chat 定额一致性（app 的报价 vs 服务端的结算）",
 
 describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 参考视频，2026-08-28）", () => {
   // ★ 与前两条分支的差别：reference 子任务（不是 edit）、输出时长用户选（这个模型的窗口内，2.5 是 4~30）、
-  //   计价 = (登记输入 + 输出)×720p 锚×2.8（tokens.materialRefTokens）。
+  //   计价 = (登记输入 + 输出)×720p 锚×2.8（tokens.materialRefTokens），输入不低于 ⌈2×输出/3⌉（方舟的最低用量，
+  //   2026-10-19 起；这一组之外另有「含输入视频的最低用量」专门钉它）。
   //   参数钉子是素材专属那一套（omni 必须缺省、duration 必须是窗口内的整数）。
   const MaterialRefVideo = require("../src/models/MaterialRefVideo");
   let matUrl;
@@ -1915,8 +1916,9 @@ describe("r2v 第三条分支：用户素材参考视频（自定义 = 多图 + 
     // 计价公式独立断言（与 app economy.materialRefCost 跨仓逐字相等）
     const { materialRefTokens } = require("../src/config/tokens");
     expect(materialRefTokens(10, 5, "doubao-seedance-2-5-260628")).toBe(Math.round((10 + 5) * 21_600 * 2.8));
-    // 2026-10-03 起输出窗口跟模型走（2.5 到 30 秒）：30 秒的输出按 30 秒收，不再夹到 10
-    expect(materialRefTokens(10, 30, "doubao-seedance-2-5-260628")).toBe(Math.round((10 + 30) * 21_600 * 2.8));
+    // 2026-10-03 起输出窗口跟模型走（2.5 到 30 秒）：30 秒的输出按 30 秒收，不再夹到 10。
+    // 2026-10-19 起输入不低于 ⌈2×30/3⌉ = 20 秒（方舟的最低用量）：10 秒的素材按 20 秒收 ⇒ (20 + 30)，原来是 (10 + 30) = 2,419,200
+    expect(materialRefTokens(10, 30, "doubao-seedance-2-5-260628")).toBe(3_024_000);
   });
 
   test("高清（2.0-mini）素材参考 → 过闸并按 (10+5)×21600×14/15 扣（2026-10-05 开）", async () => {
@@ -2070,10 +2072,31 @@ describe("r2v 第四条分支：本人自己出的成片（返修 / 片段重拍
   test("延长（extend）→ 按 (输入 + 输出) 扣，不是 edit 的输入 × 2；流水标 extend own", async () => {
     await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(extendBody(segUrl(paidUserId, 9002), { duration: 8 })).expect(501);
     const expected = materialRefTokens(5.041667, 8, SEEDANCE_2_5);
-    expect(expected).toBe(786_240); // (5 + 8) × 21600 × 2.8
+    // (6 + 8) × 21600 × 2.8：5 秒的源延长 8 秒，输入被方舟的最低用量抬到 ⌈2×8/3⌉ = 6 秒（2026-10-19 之前是 (5 + 8) = 786,240）
+    expect(expected).toBe(846_720);
     expect(expected).not.toBe(r2vTokens(5.041667, SEEDANCE_2_5));
     const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: new RegExp(`r2v extend own:${segId(paidUserId, 9002)}`) }).lean();
     expect(spend.delta).toBe(-expected);
+  });
+
+  test("延长照 10-19 付费那一发（源 4.06 秒、延长 7 秒）→ 扣 725,760 = 方舟实收用量 259,200 × 2.8；小数时长不再吼「异常」", async () => {
+    // cgt-20261020074220-c7l9g：completion_tokens 259,200 = (5 + 7) × 21,600 —— 方舟按最低用量把输入抬到 5 秒，
+    //   旧式子 (4 + 7) 扣的是 665,280（少收 8.3%）
+    cloudMeta = { duration: 4.06, width: 720, height: 1280 };
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    const log = jest.spyOn(console, "log").mockImplementation(() => {});
+    await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(extendBody(segUrl(paidUserId, 9012), { duration: 7 })).expect(501);
+    const errLines = err.mock.calls.map((c) => c.join(" "));
+    const priceLines = log.mock.calls.map((c) => c.join(" ")).filter((l) => l.startsWith("[tokens] 视频输入计价"));
+    err.mockRestore();
+    log.mockRestore();
+    const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: new RegExp(`r2v extend own:${segId(paidUserId, 9012)}`) }).lean();
+    expect(spend.delta).toBe(-725_760);
+    expect(725_760).toBe(Math.round(259_200 * 2.8));
+    // Cloudinary 的时长本来就是小数，取整是计价规则的一部分 —— 不是「登记数据被弄坏了」
+    expect(errLines.filter((l) => l.includes("时长异常"))).toEqual([]);
+    // 统计用的那一行还在（不带「异常」），而且写出了被最低用量抬过
+    expect(priceLines).toEqual(["[tokens] 视频输入计价 参考/延长：输入 4.06s → 按 5s（最低用量，原 4s） + 输出 7s · doubao-seedance-2-5-260628"]);
   });
 
   test("同一段第二次用 → 读缓存，不再问 Cloudinary Admin API（全局配额）", async () => {
@@ -2172,5 +2195,166 @@ describe("r2v 第四条分支：本人自己出的成片（返修 / 片段重拍
     await request(app).post("/api/ark/contents/generations/tasks").set(asPaid()).send(ownBody(segUrl(paidUserId, 9500), { generate_audio: true })).expect(501);
     const spend = await TokenLedger.findOne({ user: paidUserId, reason: "ark_spend", memo: /r2v edit own:/ }).lean();
     expect(spend.delta).toBe(-r2vTokens(5.041667, SEEDANCE_2_5));
+  });
+});
+
+describe("含输入视频的最低用量（延长 / 示例视频出片，2026-10-19）", () => {
+  // ★ 方舟价目页：Seedance 2.0 系列与 2.5「当输入包含视频时，存在最低 token 用量限制」，估算用量低于它就按它收。
+  //   折成秒：输出 o 秒时，输入至少按 ⌈2o/3⌉ 秒算（tokens.videoInputFloorSec 头上有出处与推导）。
+  //   这一组盯三件事：① 官方最低用量表逐格对得上；② 输出 ≤ 1.5 × 输入时与旧式子一个数都不差（这次改动只抬「短源长输出」）；
+  //   ③ edit（r2vTokens）不受它影响 —— 那条没改，靠的就是这里的不变式。
+  const { SEEDANCE_2_5, SEEDANCE_MINI, VIDEO_MULT_R2V, videoSecWindow, videoInputFloorSec, materialRefTokens, r2vTokens } = require("../src/config/tokens");
+  const MODELS = [SEEDANCE_2_5, SEEDANCE_MINI];
+  /** 2026-10-19 之前的式子（输入不设下限），只用来对照 */
+  const oldTokens = (i, o, model) => Math.round((i + o) * 21_600 * VIDEO_MULT_R2V[model]);
+  let logSpy;
+  beforeEach(() => {
+    // 计价函数每次都打一行统计日志（见 tokens.videoInputSec 的 ★★）；下面的循环要算上千次，别刷屏
+    logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => logSpy.mockRestore());
+
+  test("官方最低用量表（2.5 · 720p；2.0 · 480p）逐格 = ⌈5×输出/3⌉ 秒 = 输出 + 输入下限", () => {
+    // 价目页链接的「火山方舟视频生成模型价格快查表」，2026-10-19 读：最低用量 ÷ 每秒数 = 秒
+    const TABLE_2_5_720P = { 4: 151_200, 5: 194_400, 6: 216_000, 7: 259_200, 8: 302_400, 10: 367_200, 15: 540_000, 23: 842_400 };
+    const TABLE_2_0_480P = { 4: 70_308, 7: 120_528, 15: 251_100 };
+    for (const [o, min] of Object.entries(TABLE_2_5_720P)) {
+      expect({ o, sec: min / 21_600 }).toEqual({ o, sec: Number(o) + videoInputFloorSec(Number(o)) });
+    }
+    for (const [o, min] of Object.entries(TABLE_2_0_480P)) {
+      expect({ o, sec: min / 10_044 }).toEqual({ o, sec: Number(o) + videoInputFloorSec(Number(o)) });
+    }
+    // 2.5 拿 4 秒的源延长到表里每一格：扣的 = max(估算用量, 最低用量) × 2.8
+    for (const [o, min] of Object.entries(TABLE_2_5_720P)) {
+      expect({ o, tokens: materialRefTokens(4, Number(o), SEEDANCE_2_5) }).toEqual({ o, tokens: Math.round(Math.max((4 + Number(o)) * 21_600, min) * 2.8) });
+    }
+  });
+
+  test("10-19 付费实测两发：电影级延长 4→7 秒、高清示例视频 4→7 秒，都按输入 5 秒收", () => {
+    // 延长 cgt-20261020074220-c7l9g：completion_tokens 259,200 = (5 + 7) × 21,600；旧式子扣 665,280
+    expect(materialRefTokens(4.06, 7, SEEDANCE_2_5)).toBe(725_760);
+    expect(725_760).toBe(Math.round(259_200 * 2.8));
+    expect(oldTokens(4, 7, SEEDANCE_2_5)).toBe(665_280);
+    // 示例视频 cgt-20261020074617-sxmps：completion_tokens 260,100 = (5 + 169/24) × 21,600（成片 169 帧，比 7 秒多 1 帧，
+    //   这 0.35% 是「产物 8n+1 帧、按整秒报价」的已知误差，不归这一条管）；旧式子扣 221,760
+    expect(materialRefTokens(4.064, 7, SEEDANCE_MINI)).toBe(241_920);
+    expect(241_920).toBe(Math.round((5 + 7) * 21_600 * (14 / 15)));
+    expect(oldTokens(4, 7, SEEDANCE_MINI)).toBe(221_760);
+  });
+
+  test("输出 ≤ 1.5 × 输入：与旧式子逐个相等（两个模型、各自窗口里的每一组整数秒）", () => {
+    let n = 0;
+    for (const model of MODELS) {
+      const [lo, hi] = videoSecWindow(model);
+      for (let i = 4; i <= 30; i++) {
+        for (let o = lo; o <= hi; o++) {
+          if (2 * o > 3 * i) continue;
+          expect({ model, i, o, tokens: materialRefTokens(i, o, model) }).toEqual({ model, i, o, tokens: oldTokens(i, o, model) });
+          n++;
+        }
+      }
+    }
+    expect(n).toBeGreaterThan(500); // 别让过滤条件写错成一个都不比
+  });
+
+  test("输出 > 1.5 × 输入：输入按 ⌈2×输出/3⌉ 算，严格比旧式子多", () => {
+    let n = 0;
+    for (const model of MODELS) {
+      const [lo, hi] = videoSecWindow(model);
+      for (let i = 4; i <= 30; i++) {
+        for (let o = lo; o <= hi; o++) {
+          if (2 * o <= 3 * i) continue;
+          const t = materialRefTokens(i, o, model);
+          expect({ model, i, o, tokens: t }).toEqual({ model, i, o, tokens: oldTokens(Math.ceil((2 * o) / 3), o, model) });
+          expect(t).toBeGreaterThan(oldTokens(i, o, model));
+          n++;
+        }
+      }
+    }
+    expect(n).toBeGreaterThan(50);
+    // 最坏的一格：电影级从 4 秒的源延长 30 秒，2.63 报 / 旧服务端扣 2,056,320，方舟按 50 秒收
+    expect(materialRefTokens(4, 30, SEEDANCE_2_5)).toBe(3_024_000);
+  });
+
+  test("下限只看取整之后的秒数（3 的倍数不多抬一秒）", () => {
+    expect([3, 4, 5, 6, 7, 9, 15, 23, 30].map(videoInputFloorSec)).toEqual([2, 3, 4, 4, 5, 6, 10, 16, 20]);
+  });
+
+  test("edit（r2vTokens = 输入 × 2）够不着这条下限：和「输出 = 输入」时的参考式子逐个相等，所以 r2vTokens 不用改", () => {
+    for (const model of MODELS) {
+      const [lo, hi] = videoSecWindow(model);
+      for (let i = Math.max(4, lo); i <= Math.min(30, hi); i++) {
+        expect({ model, i, tokens: r2vTokens(i, model) }).toEqual({ model, i, tokens: materialRefTokens(i, i, model) });
+      }
+    }
+  });
+
+  test("跨仓：app 的 economy.materialRefCost 必须给出同样的数（报价 = 实扣；App 先发、服务端后上）", () => {
+    // 抄自 app 仓 2.64 的 materialRefCost 应有的结果（为什么抄不 fs 读：与上面几组跨仓用例同一个理由）。
+    // 档位 → 模型：ultra = 2.5（[4,30]、2.8），hd = 2.0 mini（[4,15]、14/15）。
+    const APP_QUOTES = [
+      { tier: "ultra", i: 4, o: 7, tokens: 725_760 },
+      { tier: "ultra", i: 4, o: 30, tokens: 3_024_000 },
+      { tier: "ultra", i: 10, o: 30, tokens: 3_024_000 },
+      { tier: "ultra", i: 15, o: 30, tokens: 3_024_000 },
+      { tier: "ultra", i: 5, o: 8, tokens: 846_720 },
+      { tier: "ultra", i: 10, o: 5, tokens: 907_200 },
+      { tier: "hd", i: 4, o: 7, tokens: 241_920 },
+      { tier: "hd", i: 4, o: 15, tokens: 504_000 },
+      { tier: "hd", i: 10, o: 15, tokens: 504_000 },
+      { tier: "hd", i: 10, o: 5, tokens: 302_400 },
+    ];
+    const MODEL_OF = { ultra: SEEDANCE_2_5, hd: SEEDANCE_MINI };
+    for (const q of APP_QUOTES) {
+      expect({ ...q, tokens: materialRefTokens(q.i, q.o, MODEL_OF[q.tier]) }).toEqual(q);
+    }
+  });
+});
+
+describe("视频输入计价的日志：只在夹取改了取整后的值时才算「异常」（2026-10-19）", () => {
+  // ★ 原来 `夹取后 !== 原值` 就 console.error「登记数据可能被弄坏了」，而 Cloudinary 的时长都是小数 ——
+  //   每一发本人成片重拍 / 延长 / 示例视频都吼一次，真坏了的那一行淹在里面。
+  // ★ 普通日志那一行（不带「异常」）要留着：它是统计生产上这几条路用量的唯一现成依据。
+  const { SEEDANCE_2_5, r2vTokens, materialRefTokens } = require("../src/config/tokens");
+  let err;
+  let log;
+  beforeEach(() => {
+    err = jest.spyOn(console, "error").mockImplementation(() => {});
+    log = jest.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    err.mockRestore();
+    log.mockRestore();
+  });
+  const errLines = () => err.mock.calls.map((c) => c.join(" "));
+  const logLines = () => log.mock.calls.map((c) => c.join(" "));
+
+  test("小数时长（Cloudinary 的 4.096 / 4.064）→ 不报错，只打一行统计日志", () => {
+    r2vTokens(4.096, SEEDANCE_2_5);
+    materialRefTokens(4.064, 5, SEEDANCE_2_5);
+    r2vTokens(29.6, SEEDANCE_2_5); // 取整到 30，在窗口里
+    expect(errLines()).toEqual([]);
+    expect(logLines()).toEqual([
+      "[tokens] 视频输入计价 edit：输入 4.096s → 按 4s，输出跟随输入（共计 8s）· doubao-seedance-2-5-260628",
+      "[tokens] 视频输入计价 参考/延长：输入 4.064s → 按 4s + 输出 5s · doubao-seedance-2-5-260628",
+      "[tokens] 视频输入计价 edit：输入 29.6s → 按 30s，输出跟随输入（共计 60s）· doubao-seedance-2-5-260628",
+    ]);
+    expect(logLines().some((l) => l.includes("异常"))).toBe(false);
+  });
+
+  test.each([
+    ["越出上界", 31, 30],
+    ["越出下界", 3.4, 4],
+    ["不是数", "abc", 4],
+    ["缺失", undefined, 4],
+  ])("夹取改了取整后的值（%s）→ 照旧 console.error，计价照旧按夹回来的秒数", (_n, given, sec) => {
+    expect(r2vTokens(given, SEEDANCE_2_5)).toBe(Math.round(sec * 2 * 21_600 * 2.8));
+    expect(materialRefTokens(given, 4, SEEDANCE_2_5)).toBe(Math.round((Math.max(sec, 3) + 4) * 21_600 * 2.8));
+    const lines = errLines();
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatch(/^\[tokens\] r2v 输入时长异常/);
+    expect(lines[1]).toMatch(/^\[tokens\] 素材参考输入时长异常/);
+    // 统计那一行照样打（每次计价一行）
+    expect(logLines().filter((l) => l.startsWith("[tokens] 视频输入计价"))).toHaveLength(2);
   });
 });

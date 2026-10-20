@@ -533,7 +533,7 @@ async function resolveR2v(req, res, next) {
       //   （ownSegmentMeta，查过缓存一天），客户端报的数一个不信。
       // ★ 只收两种子任务，各钉各的计价假设（下面的钉子）：
       //   · edit（返修 / 片段重拍 / 换机位）：输出跟随输入 ⇒ r2vTokens（输入 × 2），与白模复刻同一个公式；
-      //   · extend（延长）：输出时长由用户选 ⇒ (输入 + 输出)，与素材参考同一个公式（tokens.materialRefTokens）。
+      //   · extend（延长）：输出时长由用户选 ⇒ (输入 + 输出)，与素材参考同一个公式（tokens.materialRefTokens，含最低用量的输入下限）。
       //   reference（拿自己的片当运镜参考另拍一段）这一期不开：计价形状与 extend 相同，但还没有调用方。
       const meta = await ownSegmentMeta(own.publicId, req.user._id);
       if (meta.status === 502) {
@@ -616,7 +616,8 @@ async function resolveR2v(req, res, next) {
 
     if (verdict.kind === "material") {
       // ★★ 素材参考（reference 子任务）的钉子 —— 与 edit 那套**分开**，各钉各的计价假设。
-      //   计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens）。
+      //   计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens；输入不低于 ⌈2×输出/3⌉，
+      //   方舟「含输入视频的最低用量」，2026-10-19 起）。
       const dur = req.body?.duration;
       // 收 undefined 或显式 "reference"：app 对 2.5 显式发 reference（auto 判错是**异步**
       // 失败（钱先扣、几十秒后才 failed —— 2026-10-07 起会自动退回，但人白等一趟），显式判错是提交时同步 400 ——
@@ -642,7 +643,8 @@ async function resolveR2v(req, res, next) {
         return deny("素材参考出片的画幅只收 16:9 / 9:16 / adaptive——当前请求未被受理，也没有扣费。");
       }
     } else if (verdict.kind === "ownExtend") {
-      // ★★ 延长（extend 子任务）的钉子：计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens），
+      // ★★ 延长（extend 子任务）的钉子：计价是 (登记输入时长 + 用户选的输出时长)×720p 锚×系数（tokens.materialRefTokens，
+      //   输入不低于 ⌈2×输出/3⌉ —— 方舟的最低用量），
       //   成立的前提是输出时长就是请求里那个整数 —— -1（智能时长）会推到上界，必须拒（素材参考那条 ★ 同一个理由）。
       const dur = req.body?.duration;
       const [lo, hi] = videoSecWindow(model);

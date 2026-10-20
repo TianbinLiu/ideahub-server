@@ -822,6 +822,50 @@ const VIDEO_MULT_R2V = {
 const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
 
 /**
+ * 参考视频的**输入**时长 → 计价秒数：取整，再夹到 [4,30]（方舟参考视频的输入窗口）。r2vTokens 与 materialRefTokens 共用，
+ * 「怎么取整、窗口多大、什么算异常」只在这一处（铁律六）。
+ *
+ * ★★ 什么算「异常」（2026-10-19 改）：只认**夹取改变了取整后的值**（时长越出 [4,30]，或者根本不是数）。
+ *   原来两处各写 `夹取后 !== 原值` 就 console.error「登记数据可能被弄坏了」，而 Cloudinary 回来的时长都是小数
+ *   （本人成片 4.096、示例视频 4.064）——于是每一发本人成片的重拍 / 延长 / 示例视频出片都吼一行「异常」，
+ *   真被弄坏的那一行会淹在里面。取整本来就是计价规则的一部分，不是异常。
+ * ★★ 原来那行 console.error 同时是**统计生产用量的唯一现成依据**（10-19 就是 grep 它数出「这几条路最近几乎没人用」；
+ *   流水 memo 只有 tpl / src / own 标记，看不出秒数，也看不出最低用量抬没抬）。所以两个调用方另打一行**不带「异常」字样**的
+ *   普通日志（console.log，进 pm2 的 out 日志），每次计价都打，前缀固定 `[tokens] 视频输入计价` —— 要统计就 grep 这个前缀。
+ *   ⚠ 计价发生在扣费之前（arkGateway 先 priceOf 再过余额 / 门禁），所以一行 = 一次计价，不一定 = 一发扣了钱的任务；
+ *   扣没扣以流水（TokenLedger 的 ark_spend memo）为准。
+ */
+function videoInputSec(given) {
+  const raw = Number(given);
+  const rounded = Math.round(Number.isFinite(raw) ? raw : 0);
+  const sec = Math.max(4, Math.min(30, rounded));
+  return { raw, sec, anomalous: !Number.isFinite(raw) || sec !== rounded };
+}
+
+/**
+ * 方舟「含输入视频时的最低 token 用量」折算成**输入秒数的下限**：输出 o 秒（整数）时，输入至少按 ⌈2o/3⌉ 秒算。
+ *
+ * ★★ 出处（2026-10-19 读）：官方价目页 https://docs.volcengine.com/docs/ark/model-pricing ——「对于 Seedance 2.0 系列、
+ *   Seedance 2.5 模型，当输入包含视频时，存在最低 token 用量限制」「如果估算 token 用量 ＜ 最低 token 用量，则按最低 token
+ *   用量计算视频价格」；页上链接的最低用量表（「火山方舟视频生成模型价格快查表」）2.5 · 720p 一栏：输出 4/5/6/7/8/10/15/23 秒
+ *   → 151,200 / 194,400 / 216,000 / 259,200 / 302,400 / 367,200 / 540,000 / 842,400 = ⌈5o/3⌉ × 21,600；2.0 · 480p 一栏
+ *   4/7/15 秒 → 70,308 / 120,528 / 251,100 = ⌈5o/3⌉ × 10,044（同一条规则）。估算用量 = (输入 + 输出) × 每秒数，所以
+ *   max(输入 + o, ⌈5o/3⌉) = o + max(输入, ⌈5o/3⌉ − o) = o + max(输入, ⌈2o/3⌉)（o 是整数时 ⌈5o/3⌉ − o = ⌈2o/3⌉）。
+ * ★★ 2026-10-19 付费实测（app 仓那条付费核账线，本机跑生产同一提交 58b934c、内存库）：
+ *   · 电影级延长 cgt-20261020074220-c7l9g：源 4.06 秒、延长 7 秒 → completion_tokens 259,200 = (5 + 7) × 21,600，
+ *     不是 (4 + 7) 的 237,600；我们按旧式子扣 665,280，比方舟少收 8.3%（¥0.91）。
+ *   · 高清示例视频出片 cgt-20261020074617-sxmps：示例视频 4.064 秒、出 7 秒（169 帧）→ 260,100 = (5 + 169/24) × 21,600，
+ *     不是 (4 + 7.04) 的 238,500；旧式子扣 221,760，少收 8.6%。
+ *   ⇒ 输出 ≤ 1.5 × 输入时这条下限够不着（⌈2o/3⌉ ≤ 输入），结果与旧式子一个数都不差；只有「短的源、长的输出」才会被抬。
+ * ★ 2o/3 在 o 是 3 的倍数时是精确整数（整数相除恰好整除时 IEEE 754 不丢精度），Math.ceil 不会多抬一秒。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 materialRefCost **同一个式子**（报价 = 实扣，跨仓契约，钉在 tests/arkProxy.spec.js
+ *   「含输入视频的最低用量」）。
+ */
+function videoInputFloorSec(outputSec) {
+  return Math.ceil((2 * outputSec) / 3);
+}
+
+/**
  * 一次 r2v 出片扣多少 token。
  *
  * @param {number} inputDurationSec 模板视频的登记时长（服务端从 Cloudinary 写入的那份，
@@ -839,13 +883,18 @@ const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
  * ★★ 上限 2026-08-15 随白模 V2 从 15 放宽到 30，**必须与那套窗口同时改**：
  *   窗口放到 30 而这里还夹 15 的话，一段 20s 的模板会按 15s 计价 ——
  *   页面报价 < 实际扣费，正是 CLAUDE.md 里的头号事故形状（且只有账单知道）。
+ * ★ **不套「含输入视频的最低用量」**（materialRefTokens 头上那条，2026-10-19 付费核过）：方舟要求输入至少按
+ *   ⌈2×输出/3⌉ 秒算，而 edit 的输出跟随输入（≈ 输入），输入又在 [4,30] 里，⌈2×输入/3⌉ ≤ 输入恒成立 —— 这条下限永远够不着。
+ *   实测：片段重拍 cgt-20261020073613-4gq5v（输入 4 秒、出 97 帧）用量 173,700 = (4 + 97/24) × 21,600，没有被抬。
+ *   套上去结果一个数都不变，只会让「为什么这里没有最低用量」变成一个要去推导的问题，所以不套、写在这里。
  */
 function r2vTokens(inputDurationSec, model) {
-  const raw = Number(inputDurationSec);
-  const d = Math.max(4, Math.min(30, Math.round(Number.isFinite(raw) ? raw : 0)));
-  if (d !== raw) {
+  const { raw, sec: d, anomalous } = videoInputSec(inputDurationSec);
+  if (anomalous) {
     console.error(`[tokens] r2v 输入时长异常（${String(inputDurationSec)}），已按 ${d}s 计价 —— 模板登记数据可能被弄坏了`);
   }
+  // 统计用的普通日志（不是告警），理由见 videoInputSec 的 ★★
+  console.log(`[tokens] 视频输入计价 edit：输入 ${raw}s → 按 ${d}s，输出跟随输入（共计 ${d * 2}s）· ${String(model).slice(0, 64)}`);
   let mult = VIDEO_MULT_R2V[model];
   if (mult === undefined) {
     // 路由上够不着（resolveR2v 已把不在表的模型 400 掉），这是导出函数的第二道保险
@@ -861,26 +910,37 @@ function r2vTokens(inputDurationSec, model) {
  * ★ 与 r2vTokens（edit 复刻）是**两个公式**：edit 输出≈输入所以是 输入×2；
  *   reference 的输出时长由用户选（这个模型的窗口内，2.5 是 4~30s），公式是 (输入 + 输出)×720p 锚×同一系数
  *   ——(输入+输出)×W×H×fps÷1024 那条账单公式的直接代入，系数同 VIDEO_MULT_R2V
- *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）。
+ *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）；输入另有最低用量的下限（下面第二个 ★★）。
  * ★★ 两个夹取区间必须与 app 的 economy.materialRefCost **逐字相等**（报价=实扣，
  *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹到这个模型的时长窗口（videoSecWindow，
  *   2026-10-03 之前是 [3,10]；resolveR2v 的素材钉子拒掉了窗口外与 -1，这里的夹取只是导出函数的第二道保险）。
+ * ★★ 夹完之后输入再取 max(输入, ⌈2×输出/3⌉)（2026-10-19，方舟「含输入视频时的最低用量」，出处与付费实测见
+ *   videoInputFloorSec）：扣 round((计价输入 + 输出) × 21,600 × 系数)。延长（ownExtend）与示例视频出片（material）
+ *   都走这里，所以两条路一起改了；edit 那条（r2vTokens）不套，理由写在它头上。
+ *   ⚠ **上线顺序是 App 先、服务端后**（这条对延长 / 示例视频是涨价）：App 的报价只在本机算、不问服务端，服务端先换式子的话，
+ *   没升级的 App 在「输出 > 1.5 × 输入」时会报得比扣得少（电影级从 4 秒的源延长 30 秒：报 2,056,320、扣 3,024,000）。
+ *   App 先发时方向反过来（报价 ≥ 实扣），所以这一改等新 App（2.64）发出约一周后再上（2026-10-19 定的顺序，
+ *   主人「你来调研后决定」）。还没升级的老包在那之后照样会少报，拦不住 —— 只能靠这几条路本来就很少有人用（生产日志）。
  */
 function materialRefTokens(inputDurationSec, outputDurationSec, model) {
-  const ri = Number(inputDurationSec);
-  const i = Math.max(4, Math.min(30, Math.round(Number.isFinite(ri) ? ri : 0)));
-  if (i !== ri) {
+  const { raw: ri, sec: i, anomalous } = videoInputSec(inputDurationSec);
+  if (anomalous) {
     console.error(`[tokens] 素材参考输入时长异常（${String(inputDurationSec)}），已按 ${i}s 计价 —— 登记数据可能被弄坏了`);
   }
   const ro = Number(outputDurationSec);
   const [lo, hi] = videoSecWindow(model);
   const o = Math.max(lo, Math.min(hi, Math.round(Number.isFinite(ro) ? ro : 0)));
+  const iEff = Math.max(i, videoInputFloorSec(o));
+  // 统计用的普通日志（不是告警），理由见 videoInputSec 的 ★★；被最低用量抬过的写出原来的秒数，统计时分得出抬了多少
+  console.log(
+    `[tokens] 视频输入计价 参考/延长：输入 ${ri}s → 按 ${iEff}s${iEff > i ? `（最低用量，原 ${i}s）` : ""} + 输出 ${o}s · ${String(model).slice(0, 64)}`,
+  );
   let mult = VIDEO_MULT_R2V[model];
   if (mult === undefined) {
     console.error(`[tokens] 素材参考模型 ${String(model).slice(0, 64)} 不在 VIDEO_MULT_R2V 里，按最贵档 ${MAX_R2V_MULT} 收费`);
     mult = MAX_R2V_MULT;
   }
-  return Math.round((i + o) * R2V_TOKENS_PER_SEC * mult);
+  return Math.round((iEff + o) * R2V_TOKENS_PER_SEC * mult);
 }
 
 /**
@@ -1010,7 +1070,8 @@ function priceOf(kind, body, r2v = null, draftFinal = null) {
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
     if (r2v) {
-      // 两个公式，kind 由 resolveR2v 定：素材参考（reference）与延长（extend）的输出时长由用户选 ⇒ (输入 + 输出)；
+      // 两个公式，kind 由 resolveR2v 定：素材参考（reference）与延长（extend）的输出时长由用户选 ⇒ (输入 + 输出)，
+      // 输入不低于 ⌈2×输出/3⌉（方舟的最低用量，见 videoInputFloorSec）；
       // 白模复刻与返修（edit）输出跟随输入 ⇒ 输入 × 2
       if (r2v.kind === "material" || r2v.kind === "ownExtend") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
       return r2vTokens(r2v.durationSec, model);
@@ -1097,6 +1158,7 @@ module.exports = {
   VIDEO_MULT_R2V,
   R2V_TOKENS_PER_SEC,
   r2vTokens,
+  videoInputFloorSec,
   materialRefTokens,
   isFreePlan,
   segTokens,
