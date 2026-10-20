@@ -17,7 +17,7 @@
  *   这份清单是从代码事实里逐条核出来的，模型看不到它就会凭常识乱承诺。
  *
  * @exports AGENT_NAME, QUICK_QUESTIONS, loadKnowledge, selectKnowledge, buildSupportSystemPrompt,
- *          parseHandoff, HANDOFF_RE, summarizeTicket, categoryFromText
+ *          isEnglishAsk, parseHandoff, HANDOFF_RE, stripHandoffTags, summarizeTicket, categoryFromText
  * @used_in routes/support.routes.js, scripts/evalSupport.js
  */
 const fs = require("fs");
@@ -111,10 +111,35 @@ const EN_STOPWORDS = new Set(
     .filter(Boolean),
 );
 
-/** 这一行（这一句）是不是英文问法：一个汉字都没有、而且有连着两个以上的字母。检索的英文表 / 虚词与提示词的英文叫法表共用这一个判据 */
-function isEnglishAsk(text) {
+/** 检索用：这一行一个汉字都没有、而且有连着两个以上的字母 —— 英文表（EN_GLOSSARY）与英文虚词只认这种行，带汉字的行一个都不碰 */
+function latinLine(text) {
   const t = String(text || "");
   return !/[㐀-鿿]/.test(t) && /[a-z]{2,}/i.test(t);
+}
+
+// 不算「英文词」的：中文用户顺手打的应答 / 口头语，和产品里本来就用拉丁字母写的名字（缩写另由「全大写」挡掉，这里只收小写也会打的）
+const NOT_EN_WORDS = new Set(
+  ("ok okay okk hi hey hmm emm en haha hhh lol thx thks tks ty pls plz bye " +
+    "token tokens app apk qq uid id vip hd ai ios iphone ipad android google github wechat")
+    .split(/\s+/)
+    .filter(Boolean),
+);
+
+/**
+ * 提示词用：这一问是不是英文（路由拿这一轮的原话判，判出来是英文就在提示词里说死「这一轮用英文回答」并带上英文界面叫法表）。
+ * 一个汉字都没有，而且至少有两个「英文词」：两个字母以上、不是全大写（QQ / UID / APK / VIP / HD / OK 是缩写）、不在上面那张表里。
+ * ★ 与检索的 latinLine 分开（2026-10-20 生产核对）：原来两边共用「没汉字 + 有两个字母」，中文用户追问一句「ok」「QQ」「token」「HD」，
+ *   提示词就说死「用户这一问是英文，这一轮就用英文回答」（模型照做就是一整段英文）。真英文问法再短也有两个实词（merge failed / Refund please /
+ *   thanks a lot）；只有一个词的（「Refund」「Help」）判不了，退回「默认用中文回复；用户用英文就用英文」那一句、让模型自己看。
+ *   整句全大写的英文（HOW DO I UNDO）也落在这一档，同样只是不说死。
+ * ★ 检索那边不跟着收：带汉字的行本来就不经过英文表（逐字节不变），只有一个拉丁词的行（「HD」「APK」）照旧走英文表 ——
+ *   中文追问一句「HD」拿到「高清 档位」正是想要的
+ */
+function isEnglishAsk(text) {
+  const t = String(text || "");
+  if (!latinLine(t)) return false;
+  const words = (t.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g) || []).filter((w) => w.length >= 2 && w !== w.toUpperCase() && !NOT_EN_WORDS.has(w.toLowerCase()));
+  return words.length >= 2;
 }
 
 /** 中文按相邻两字切，英文/数字按整词；全部小写 */
@@ -156,6 +181,23 @@ const CUT_MERGE_RE = /^(?!.*(语音|声音|配音|朗读|音色|预览图|挂卡
 const LOGIN_FAIL_GUARD = /^(?!.*(登录|登陆)(了|还是|一直|总是|老是|又|就|时|的时候|，|,){0,3}(提示)?失败)(?!.*登不进)/;
 const FAIL_SENSITIVE_RE = new RegExp(`${/敏感|拒绝|400|审核/.source}|${LOGIN_FAIL_GUARD.source}(?!(?:${CUT_MERGE_RE.source}))${/.*失败/.source}`);
 
+// 问的是注销 / 删掉整个账号（§2.6）。两处用：「注销 → 软删除 恢复」那条同义词拿它加词，SECTION_VETOES 拿它（再加上找回账号）把 §3.6 挡在外面。
+// ★ 销号 / 账号删了 / 删除账号这几种说法原来不在同义词里：「我要销号」一节都没喂进去（2026-10-20 量的）。只认「删」与「账号」
+//   挨着的说法（删除账号 / 账号被删了）；「删掉账号里的卡片」「账号里删掉的草稿」删的不是账号，不算。
+//   「找回账号」不进同义词：多半是忘了密码、被盗，喂注销那一节答偏了
+const ACCOUNT_DELETE_RE = /注销|删号|销号|恢复账号|(删除|删掉|删了|删)(我的|这个)?(账号|帐号)(?![里中上内])|(账号|帐号)(被)?(删除|删掉|删了|销)/;
+
+// 这一问像 X 时，某一节不喂（[判据, 小节标题里的一段字, 这一问里出现了就不拦]）。判据逐行看；「不拦」看整份查询（上一轮 + 这一轮）：
+// 上一轮问的是删段、这一轮接着问注销（或者反过来）时照旧喂 —— 只在整份查询都与段 / 草稿无关时才挡。
+// ★ 为什么要挡：§3.6「删掉一段与撤销」（2.63）正文里有「恢复 / 找回 / 删除」，问注销的那几句正好带着这几个字（扩展词里也有「软删除 … 恢复」）。
+//   2026-10-20 生产核对量的：「注销了还能找回吗」§3.6 排第 2、「我想删号」第 3、「注销之后还能恢复吗」第 4、「注销账号之后还能恢复吗」第 5
+//   —— 喂进去模型就可能把「6 秒内点撤销」说成注销也能撤回。只拿掉扩展词里的「软删除 / 恢复」挡不住（同日量的：用户原话自己就有找回 / 恢复，
+//   「注销了还能找回吗」§3.6 仍排第 3、「注销之后还能恢复吗」「删号之后能恢复吗」第 5）。找回账号（忘了密码、被盗）也挡：§3.6 讲的是段，
+//   对哪种找回账号都是噪音。英文「Can I recover my deleted account?」早由英文表的排除挡住（「删除 删掉」那条见了 account 不补）。
+// ★ 标题按一段字认、不按编号认：知识库从 app 仓重新生成时编号会挪（测试钉着这一节还在、还认得出）
+const ACCOUNT_RECOVER_RE = /找回(我的|这个)?(账号|帐号)|(账号|帐号)[^，。,.!?！？]{0,6}找回/;
+const SECTION_VETOES = [[new RegExp(`${ACCOUNT_DELETE_RE.source}|${ACCOUNT_RECOVER_RE.source}`), "删掉一段与撤销", /段|草稿/]];
+
 /** 常见口语 → 知识库用词，补几条同义词让检索更准（不是分类逻辑，只是召回） */
 const SYNONYMS = [
   // 快捷问题「出片失败了，扣的 token 会退吗？」里只有「会退吗」「扣的」——原来两条都不认，检索掉到 11.2 充值订单
@@ -185,7 +227,8 @@ const SYNONYMS = [
   [/苹果|iphone|ios|ipad/i, "iOS 安卓安装包 下载页"],
   // 「去升级 / 升级套餐 / 升级会员」是买套餐，不是装新版
   [/装不上|应用未安装|安装失败|更新不了|(?<!去)升级(?!.{0,3}(套餐|会员|档))/, "应用未安装 签名 卸载 更新 versionCode"],
-  [/注销|删号|删除账号|恢复账号/, "注销 软删除 support@ideahubs.org 恢复"],
+  // 判据在上面的 ACCOUNT_DELETE_RE（与 SECTION_VETOES 共用）
+  [ACCOUNT_DELETE_RE, "注销 软删除 support@ideahubs.org 恢复"],
   [/密码|登不上|登不进|登录不了|验证码|(?<!(通知|退款|消息|提醒).{0,6})收不到(?!.{0,4}(通知|退款|消息|提醒))/, "密码 验证码 登录 限流 重置"],
   [/改名|用户名|昵称|头像/, "昵称 用户名 username displayName 头像"],
   // 「token / 余额 / 钱不见了」不是草稿箱
@@ -216,6 +259,12 @@ const SYNONYMS = [
   // ★ 必须带「登录链接」或 Google / GitHub / 本机发起：光说「登录过期了」多半是登录状态过期（App 说「登录状态过期了 /
   //   登录已过期，请重新登录」，401），不是这一节；「分享链接 / 下载链接过期」也不是
   [/(登录|登陆|授权)链接|本机发起|(google|谷歌|github)[^，。,.!?！？]{0,12}(回来|回到|回不|跳回|没反应|过期|忽略|卡住|停在)/i, "Google GitHub 登录链接 忽略 过期 本机发起"],
+  // 在 Google / GitHub 的页面上点了「取消」/ 拒绝授权（§2.10：2026-10-20 起会回到 App 登录页、没登上、不扣钱）。上一条只认回不来 / 过期，
+  // 「我在谷歌登录页点了取消，现在怎么办」「谷歌登录取消了」§2.10 只排第 4（2026-10-20 生产核对量的）。
+  // ★ 要 Google / GitHub 在场：光说「取消」（取消订阅 / 合成 / 关注 / 授权）不是这一节。整行带订阅 / 续费 / 商店 / Play / 下载 / 安装 /
+  //   更新的让开：「Google Play 上的订阅怎么取消」是买东西，「GitHub 下载到一半取消了」是装包（§7.2 的 GitHub 镜像）。
+  //   「取消」在前的那种要紧跟登录 / 授权（「取消了谷歌登录」），免得「取消……谷歌」隔着半句话凑上
+  [/^(?!.*(订阅|续费|商店|play|下载|安装|更新|升级|apk))(?:.*(google|谷歌|github)[^，。,.!?！？]{0,12}(取消|拒绝|不同意|没同意|不授权|没授权)|.*(取消|拒绝)了?[^，。,.!?！？]{0,4}(google|谷歌|github)[^，。,.!?！？]{0,4}(登录|登陆|授权))/i, "Google GitHub 登录链接 忽略 过期 本机发起"],
   // 剪辑页的「合成」：判据在上面的 CUT_MERGE_RE（与下一条共用）
   [CUT_MERGE_RE, "剪辑页 合成 合并"],
   // 「失败 → 敏感词」：让开登录失败与剪辑页合成失败，判据见上面的 FAIL_SENSITIVE_RE
@@ -373,15 +422,18 @@ function selectKnowledge(query, { maxChars = 8000, topK = 5 } = {}) {
   let extras = "";
   for (const [re, extra] of SYNONYMS) if (lines.some((l) => re.test(l))) extras += " " + extra;
   // 英文问法：只认一个汉字都没有的那一行（见 EN_GLOSSARY 头上）；英文虚词也只从这几行里剥（见 EN_STOPWORDS 头上）
-  const enLines = lines.filter(isEnglishAsk);
+  const enLines = lines.filter(latinLine);
   for (const [re, extra] of EN_GLOSSARY) if (enLines.some((l) => re.test(l))) extras += " " + extra;
   const qGrams = new Set([
-    ...bigrams(lines.filter((l) => !isEnglishAsk(l)).join("\n") + extras),
+    ...bigrams(lines.filter((l) => !latinLine(l)).join("\n") + extras),
     ...bigrams(enLines.join("\n")).filter((w) => !EN_STOPWORDS.has(w)),
   ]);
+  // 这一问不该喂的小节（见 SECTION_VETOES 头上）
+  const vetoed = SECTION_VETOES.filter(([re, , keep]) => lines.some((l) => re.test(l)) && !lines.some((l) => keep.test(l))).map(([, title]) => title);
   const scored = kb.sections
     // 只有一行标题的章节（「## 4. AI 生成与费用」这种）没有内容，却照样吃标题加分、占前 5 的位置
     .filter((s) => !s.always && s.lines.slice(1).some((l) => l.trim() && l.trim() !== "---"))
+    .filter((s) => !vetoed.some((t) => s.title.includes(t)))
     .map((s) => {
       let score = 0;
       const seen = new Set();
@@ -435,7 +487,16 @@ const CANONICAL_FAQ = [
 ];
 
 // ── 提示词 ───────────────────────────────────────────────────────────
-const HANDOFF_RE = /^\s*\[handoff(?::([a-z_]+))?(?::([^\]]{0,60}))?\]\s*/i;
+// ★ 分隔符与 companion.parseTags 同一个口径（2026-10-20）：「:」「：」「=」都认，两边与方括号里头可以有空格。原来只认半角冒号，
+//   而关思考之后模型更爱写 [action=explain] 这种等号写法（parseTags 已经认了）—— 写成 [handoff=billing] / [handoff：billing] 时，
+//   这一段标记照样被路由的清理正则剥掉（字幕上看不见），parseHandoff 却认不出（handoff 为假）：没有 handoff 事件、没有「转人工」卡片，
+//   用户要找人工什么都等不到，全程零报错
+const HANDOFF_RE = /^\s*\[\s*handoff(?:\s*[:：=]\s*([a-z_]+))?(?:\s*[:：=]\s*([^\]]{0,60}))?\s*\]\s*/i;
+
+/** 句中 / 句尾漏网的转人工标记一律剥掉（不念、不进字幕、不进历史）。与 HANDOFF_RE 认同一批写法；路由只调这一个，别再手写一份 */
+function stripHandoffTags(text) {
+  return String(text || "").replace(/\[\s*handoff[^\]]*\]\s*/gi, "");
+}
 
 function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false } = {}) {
   const who = userName ? `正在咨询的用户叫「${userName}」。` : "";
@@ -576,6 +637,7 @@ module.exports = {
   buildSupportSystemPrompt,
   parseHandoff,
   HANDOFF_RE,
+  stripHandoffTags,
   summarizeTicket,
   categoryFromText,
 };

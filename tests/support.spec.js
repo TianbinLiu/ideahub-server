@@ -178,6 +178,73 @@ describe("POST /api/support/chat", () => {
     expect(mockState.lastMessages[0].content).not.toContain("英文界面叫法");
     expect(mockState.lastMessages[0].content).toContain("默认用中文回复；用户用英文就用英文。");
   });
+
+  // ★ 2026-10-20 生产核对：中文用户顺手追问一句「ok」「QQ」「token」「HD」，原来就被判成英文、提示词说死「这一轮就用英文回答」。
+  //   只有真英文问法（至少两个实词）才说死；判不了的退回那句软话（模型自己看）
+  it("中文对话里追问一句短拉丁词（ok / QQ / token / HD…）：不说死用英文、不带英文界面叫法表；真英文问法照旧", async () => {
+    const { token } = await createUser();
+    const followUp = async (content) => {
+      mockState.script = ["[neutral][face:normal][action:explain] 好的。"];
+      await request(app)
+        .post("/api/support/chat")
+        .set("Authorization", `Bearer ${token}`)
+        .send({
+          messages: [
+            { role: "user", content: "出片一直没结果，钱扣了怎么取回？" },
+            { role: "assistant", content: "到出片页点「取回」就行。" },
+            { role: "user", content },
+          ],
+          lang: "zh",
+        });
+      return mockState.lastMessages[0].content;
+    };
+    for (const q of ["ok", "OK", "QQ", "UID", "APK", "VIP", "token", "HD", "hi", "thx", "2.63", "v2.63"]) {
+      const sys = await followUp(q);
+      expect(sys).not.toContain("英文界面叫法");
+      expect(sys).toContain("默认用中文回复；用户用英文就用英文。");
+    }
+    for (const q of ["how do I undo", "merge failed", "Refund please"]) {
+      const sys = await followUp(q);
+      expect(sys).toContain("【英文界面叫法】");
+      expect(sys).toContain("用户这一问是英文，这一轮就用英文回答。");
+    }
+  });
+
+  // ★ 2026-10-20 生产核对：转人工标记只认半角冒号，模型写成 [handoff=billing] / [handoff：billing] 时标记被剥掉（看不见）、却没有 handoff 事件 ——
+  //   用户要找人工什么都等不到。分隔符与 companion.parseTags 同一个口径；整条路走真的路由（开头攒前缀 → 切句 → 演出标签 → 句首转人工 → 清理）
+  it.each([
+    ["等号、跨 chunk", ["[handoff=bil", "ling] [sad][face=sad][action=comfort] 退款要人工核对，我这边没法直接处理。", " [neutral][face:normal][action:explain] 请点下面的「转人工」。"], "billing", "", "sad"],
+    ["全角冒号", ["[handoff：account] [sad][face:sad][action:comfort] 恢复账号要人工处理。"], "account", "", "sad"],
+    ["方括号里有空格、跨 chunk", ["[ hand", "off = bug ] [sad][face:sad][action:comfort] 这像是程序的问题。"], "bug", "", "sad"],
+    ["等号带理由", ["[handoff=billing=用户要求退款] [sad][face:sad][action:comfort] 退款要人工核对。"], "billing", "用户要求退款", "sad"],
+    ["写在第二句句首", ["[neutral][face=normal][action=explain] 下架申诉我这边处理不了。", " [sad][face=sad][action=comfort] [handoff=content] 请点下面的「转人工」。"], "content", "", "normal"],
+  ])("转人工标记写成别的分隔符（%s）：照样发 handoff 事件，正文不留标记", async (_name, script, category, reason, firstFace) => {
+    const { token } = await createUser();
+    mockState.script = script;
+    const res = await request(app)
+      .post("/api/support/chat")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ messages: [{ role: "user", content: "我要找人工" }] });
+    const events = parseSse(res.text);
+    expect(events.filter((e) => e.event === "handoff").map((e) => e.data)).toEqual([{ category, reason }]);
+    const sentences = events.filter((e) => e.event === "sentence").map((e) => e.data);
+    expect(sentences.length).toBeGreaterThan(0);
+    expect(sentences[0].face).toBe(firstFace);
+    sentences.forEach((s) => expect(s.text).not.toMatch(/handoff|[[\]]/i));
+    expect(events.find((e) => e.event === "done").data).toMatchObject({ handoff: true, category });
+  });
+
+  it("按会话：方括号里带空格的转人工标记也不进历史原文", async () => {
+    const ChatMessage = require("../src/models/ChatMessage");
+    const { token } = await createUser();
+    mockState.script = ["[ handoff=bug] ", "[sad][face=sad][action=none]抱歉，我帮你转人工。"];
+    const events = parseSse((await request(app).post("/api/support/chat").set("Authorization", `Bearer ${token}`).send({ message: "导出一直失败" })).text);
+    const done = events.find((e) => e.event === "done").data;
+    expect(done).toMatchObject({ handoff: true, category: "bug" });
+    const reply = await ChatMessage.findOne({ thread: done.threadId, role: "assistant" }).lean();
+    expect(reply.modelText).not.toMatch(/handoff/i);
+    expect(reply.displayText).toBe("抱歉，我帮你转人工。");
+  });
 });
 
 describe("工单：用户侧", () => {
@@ -464,11 +531,93 @@ describe("support.service 纯函数", () => {
     expect(svc.isEnglishAsk("")).toBe(false);
   });
 
+  // ★ 中文问注销 / 删号 / 账号找回时不喂 §3.6「删掉一段与撤销」（2026-10-20 生产核对：那一节的「恢复 / 找回 / 删除」把它顶到第 2~5 名，
+  //   模型可能把「6 秒内点撤销」说成注销也能撤回）。§2.6 照旧第 1；问删段 / 删草稿的不受影响（下一条）
+  it.each([
+    "注销了还能找回吗",
+    "我想删号",
+    "注销之后还能恢复吗",
+    "注销账号之后还能恢复吗",
+    "注销账号之后",
+    "删号了还能找回吗",
+    "账号删除了还能找回吗",
+    "账号删了能恢复吗",
+    "注销后还能撤回吗",
+    "误注销了怎么恢复",
+    "我要销号",
+    "怎么找回账号",
+  ])("检索：问注销 / 删号 / 找回账号「%s」不喂「删掉一段与撤销」", (q) => {
+    expect(rankOf(svc.selectKnowledge(q), "删掉一段与撤销")).toBe(0);
+  });
+
+  it("检索：注销 / 删号那几问 §2.6 第 1（「我要销号」原来一节都没喂）；按标题认的那一节在知识库里还在", () => {
+    for (const q of ["注销了还能找回吗", "我想删号", "注销之后还能恢复吗", "注销账号之后还能恢复吗", "注销账号之后", "我要销号", "账号删了能恢复吗"]) {
+      expect(rankOf(svc.selectKnowledge(q), "注销账号")).toBe(1);
+    }
+    // 挡的那一节按标题里的一段字认：知识库重新生成改了这个名字，这里先红（不然注销那几问又悄悄喂进去）
+    expect(svc.loadKnowledge().sections.filter((s) => s.title.includes("删掉一段与撤销"))).toHaveLength(1);
+  });
+
+  it("检索：问删段 / 删草稿的照旧（第 1 名不变），上一轮或这一轮说到段 / 草稿时不挡", () => {
+    expect(rankOf(svc.selectKnowledge("我删了一段能撤回吗"), "删掉一段与撤销")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("删错了一段怎么恢复"), "删掉一段与撤销")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("how do I undo deleting a segment"), "删掉一段与撤销")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("草稿删了能恢复吗"), "草稿")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("删了一段能撤回吗\n那注销账号呢"), "删掉一段与撤销")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("注销账号\n那删掉的段呢"), "删掉一段与撤销")).toBeGreaterThanOrEqual(1);
+    expect(rankOf(svc.selectKnowledge("注销前删掉的段能恢复吗"), "删掉一段与撤销")).toBeGreaterThanOrEqual(1);
+  });
+
+  // ★ 在 Google / GitHub 页面上点了取消（§2.10，2026-10-20 起回到 App）：原来「取消」不在那条同义词里，下面头两问 §2.10 只排第 4
+  it.each([
+    "我在谷歌登录页点了取消，现在怎么办",
+    "谷歌登录取消了",
+    "取消了谷歌登录怎么办",
+    "我拒绝了 GitHub 的授权",
+    "Google 那页我点了不同意",
+  ])("检索：「%s」把 §2.10 排进前 3", (q) => {
+    const r = rankOf(svc.selectKnowledge(q), "Google / GitHub 登录没登上");
+    expect(r).toBeGreaterThanOrEqual(1);
+    expect(r).toBeLessThanOrEqual(3);
+  });
+
+  it("检索：与 Google / GitHub 登录无关的「取消」不带 §2.10；买东西 / 装包的取消让开", () => {
+    for (const q of ["取消订阅", "取消合成", "怎么取消关注", "怎么取消自动续费", "取消点赞", "谷歌商店取消订阅", "谷歌商店的会员怎么取消续费"]) {
+      expect(rankOf(svc.selectKnowledge(q), "Google / GitHub 登录没登上")).toBe(0);
+    }
+    expect(rankOf(svc.selectKnowledge("Google Play 上的订阅怎么取消"), "充值订单")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("GitHub 下载到一半取消了"), "下载页")).toBe(1);
+  });
+
+  it("isEnglishAsk：只有真英文问法才算（至少两个实词）；短拉丁词、缩写、版本号不算", () => {
+    for (const q of ["ok", "OK", "QQ", "UID", "APK", "VIP", "token", "HD", "hi", "thx", "2.63", "v2.63", "ok thx", "QQ UID", "token app", "Refund", "好的 ok"]) {
+      expect([q, svc.isEnglishAsk(q)]).toEqual([q, false]);
+    }
+    for (const q of ["how do I undo", "I cancelled the Google sign-in, what now?", "merge failed", "Refund please", "thanks a lot", "where is my draft", "Is there an iOS app?"]) {
+      expect([q, svc.isEnglishAsk(q)]).toEqual([q, true]);
+    }
+  });
+
+  it("检索：短拉丁词那一行照旧走英文表（判英文回复收紧了，检索没跟着收）", () => {
+    // 「HD」这一行照旧补「高清 档位」：中文对话里追问一句 HD，要的正是视频档位那一节
+    expect(rankOf(svc.selectKnowledge("HD"), "视频档位")).toBe(1);
+    expect(svc.selectKnowledge("电影级档位为什么点不动？\nHD")).toContain("视频档位");
+  });
+
   it("parseHandoff / categoryFromText", () => {
     expect(svc.parseHandoff("[handoff:account] 好的")).toMatchObject({ handoff: true, category: "account", text: "好的" });
     expect(svc.parseHandoff("[handoff:banana] 好的").category).toBe("other");
     expect(svc.parseHandoff("[HANDOFF] x").handoff).toBe(true);
     expect(svc.parseHandoff("正常").handoff).toBe(false);
+    // 分隔符与 companion.parseTags 同一个口径：: ： = 都认，两边可以有空格（2026-10-20）
+    expect(svc.parseHandoff("[handoff=billing] 好的")).toMatchObject({ handoff: true, category: "billing", reason: "", text: "好的" });
+    expect(svc.parseHandoff("[handoff：billing] 好的")).toMatchObject({ handoff: true, category: "billing", text: "好的" });
+    expect(svc.parseHandoff("[ handoff : account ] 好的")).toMatchObject({ handoff: true, category: "account", text: "好的" });
+    expect(svc.parseHandoff("[handoff:billing:用户要退款] 好的")).toMatchObject({ category: "billing", reason: "用户要退款", text: "好的" });
+    expect(svc.parseHandoff("[handoff=billing：要退款] 好的")).toMatchObject({ category: "billing", reason: "要退款", text: "好的" });
+    expect(svc.parseHandoff("[handoff:用户要退款] 好的")).toMatchObject({ category: "other", reason: "用户要退款" });
+    expect(svc.parseHandoff("[handoffs] 好的").handoff).toBe(false);
+    expect(svc.stripHandoffTags("好的 [handoff=billing] 请点转人工 [ handoff：bug ]")).toBe("好的 请点转人工 ");
     expect(svc.categoryFromText("我要退款")).toBe("billing");
     expect(svc.categoryFromText("作品被下架了")).toBe("content");
     expect(svc.categoryFromText("打开就闪退")).toBe("bug");

@@ -285,6 +285,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     lang: parsed.data.lang || "zh",
     // 英文界面叫法表看这一轮的原话，不看 lang：App 客服页发的 lang 写死 "zh"（v2.63），只认 lang 的话这张表一次都发不出去。
     // 别直接把 lang 改成 "en"：求助卡（crisisCard）与回复语言那一行也读 lang
+    // 判据见 support.isEnglishAsk：至少两个实词才算英文（2026-10-20 起，中文对话里追问一句「ok」「QQ」「token」不算）
     enNames: support.isEnglishAsk(userTurns[userTurns.length - 1]),
     personaLine: personaPromptLine(setup.persona),
   });
@@ -378,7 +379,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     // 剥掉已知演出标签后再查一次，标记不能念出来也不能进字幕
     const h = support.parseHandoff(p.text);
     if (h.handoff) markHandoff(h.category, h.reason);
-    const text = h.text.replace(/\[handoff[^\]]*\]\s*/gi, "").trim();
+    const text = support.stripHandoffTags(h.text).trim();
     if (!text) return;
     const out = chatSafety.detectHarmfulOutput(text);
     if (out && out.hit) {
@@ -407,7 +408,8 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       return;
     }
     pending += delta;
-    const lower = pending.trimStart().toLowerCase();
+    // 「[ handoff=…]」（方括号里先空一格）也算这个前缀：parseHandoff 认这种写法，这里不等的话开头那句的演出标签会丢
+    const lower = pending.trimStart().toLowerCase().replace(/^\[\s+/, "[");
     const looksLikePrefix = "[handoff".startsWith(lower.slice(0, 8));
     if (looksLikePrefix && !lower.includes("]") && lower.length < 80) return; // 还没写完标记，继续等
     decided = true;
@@ -493,10 +495,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
         thread,
         displayText: text,
         // 转人工标记不进历史：模型看到自己上一轮的 [handoff:x] 容易每句都再标一次
-        modelText: rawParts
-          .join("")
-          .replace(/\s*\[[^\]]*$/, "")
-          .replace(/\[handoff[^\]]*\]\s*/gi, ""),
+        modelText: support.stripHandoffTags(rawParts.join("").replace(/\s*\[[^\]]*$/, "")),
         usage,
         estPrompt,
         aborted: closed || failed,
