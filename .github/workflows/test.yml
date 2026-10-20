@@ -81,7 +81,7 @@ jobs:
     env:
       MONGOMS_VERSION: "6.0.29"
       MONGOMS_DISTRO: "ubuntu-22.04"
-      REDIS_TEST_URL: redis://127.0.0.1:6390
+      REDIS_TEST_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v5
 
