@@ -210,6 +210,39 @@ describe("POST /api/support/chat", () => {
     }
   });
 
+  // ★ 2026-10-20 复核：① 中文用户只贴一个任务号 / 邮箱 / 链接（客服让报的正是这些），原来照样凑出两个「英文词」说死英文；
+  //   ② 反过来，英文用户的短追问（「Why?」「Refund」、贴任务号）在收紧之后退成了软话 —— 跟着上一问走
+  it("只贴任务号 / 邮箱 / 链接：中文会话不说死英文；英文会话里的短追问照旧说死英文", async () => {
+    const { token } = await createUser();
+    const ask = async (first, content) => {
+      mockState.script = ["[neutral][face:normal][action:explain] 好的。"];
+      await request(app)
+        .post("/api/support/chat")
+        .set("Authorization", `Bearer ${token}`)
+        .send({
+          messages: [
+            { role: "user", content: first },
+            { role: "assistant", content: "好的。" },
+            { role: "user", content },
+          ],
+          lang: "zh",
+        });
+      return mockState.lastMessages[0].content;
+    };
+    const pasted = ["cgt-20251020150103-abx9z", "abc123@qq.com", "tliu@gmail.com", "https://ideahubs.org/download", "ideahubs.org", "6712abcdef0123456789abcd", "hhhh hhhh"];
+    for (const q of pasted) {
+      const sys = await ask("出片一直没结果，钱扣了怎么取回？", q);
+      expect([q, sys.includes("英文界面叫法")]).toEqual([q, false]);
+    }
+    for (const q of ["Why?", "Refund", "ok", "Thanks!", ...pasted, "1234567", "👍"]) {
+      const sys = await ask("My video never finished and I was charged. How do I get it back?", q);
+      expect([q, sys.includes("用户这一问是英文，这一轮就用英文回答。")]).toEqual([q, true]);
+    }
+    // 英文问完、这一问换回中文：照中文
+    const zh = await ask("My video never finished and I was charged. How do I get it back?", "那要多久");
+    expect(zh).not.toContain("英文界面叫法");
+  });
+
   // ★ 2026-10-20 生产核对：转人工标记只认半角冒号，模型写成 [handoff=billing] / [handoff：billing] 时标记被剥掉（看不见）、却没有 handoff 事件 ——
   //   用户要找人工什么都等不到。分隔符与 companion.parseTags 同一个口径；整条路走真的路由（开头攒前缀 → 切句 → 演出标签 → 句首转人工 → 清理）
   it.each([
@@ -568,6 +601,15 @@ describe("support.service 纯函数", () => {
     expect(rankOf(svc.selectKnowledge("注销前删掉的段能恢复吗"), "删掉一段与撤销")).toBeGreaterThanOrEqual(1);
   });
 
+  // ★ 2026-10-20 复核：「不拦」原来只认中文的段 / 草稿 —— 中文问完注销、接着用英文问删段，§3.6 一节都不喂（main 上是第 1）
+  it("检索：上一轮问注销、这一轮用英文问删段 / 删草稿，照旧喂「删掉一段与撤销」", () => {
+    expect(rankOf(svc.selectKnowledge("怎么注销账号？\nhow do I undo deleting a segment"), "删掉一段与撤销")).toBe(1);
+    expect(rankOf(svc.selectKnowledge("怎么注销账号？\nI deleted a segment by mistake, can I get it back"), "删掉一段与撤销")).toBeGreaterThanOrEqual(1);
+    expect(rankOf(svc.selectKnowledge("注销账号\nCan I undo deleting a draft?"), "删掉一段与撤销")).toBeGreaterThanOrEqual(1);
+    // 英文那一行与段 / 草稿无关时照旧挡
+    expect(rankOf(svc.selectKnowledge("怎么注销账号？\nhow do I undo"), "删掉一段与撤销")).toBe(0);
+  });
+
   // ★ 在 Google / GitHub 页面上点了取消（§2.10，2026-10-20 起回到 App）：原来「取消」不在那条同义词里，下面头两问 §2.10 只排第 4
   it.each([
     "我在谷歌登录页点了取消，现在怎么办",
@@ -596,6 +638,41 @@ describe("support.service 纯函数", () => {
     for (const q of ["how do I undo", "I cancelled the Google sign-in, what now?", "merge failed", "Refund please", "thanks a lot", "where is my draft", "Is there an iOS app?"]) {
       expect([q, svc.isEnglishAsk(q)]).toEqual([q, true]);
     }
+  });
+
+  it("isEnglishAsk：链接、邮箱、带数字的串（任务号 / id / 版本 / 1080p）整块不算词；笑声不算", () => {
+    const pasted = [
+      "cgt-20251020150103-abx9z",
+      "task id: cgt-20251020150103-qwert",
+      "abc123@qq.com",
+      "tliu@gmail.com",
+      "https://ideahubs.org/download",
+      "ideahubs.org",
+      "www.ideahubs.org/privacy",
+      "6712abcdef0123456789abcd",
+      "hhhh hhhh",
+      "hahaha hahaha",
+      "hehe emmm",
+    ];
+    for (const q of pasted) expect([q, svc.isEnglishAsk(q)]).toEqual([q, false]);
+    for (const q of ["Is 1080p free?", "mp4 file won't play", "v2.63 update failed", "merge failed.", "my email is abc@qq.com, please check", "can't merge"]) {
+      expect([q, svc.isEnglishAsk(q)]).toEqual([q, true]);
+    }
+  });
+
+  it("replyInEnglish：这一问没汉字又判不了时跟着上一问走；中文会话恒为否", () => {
+    const zh = "出片一直没结果，钱扣了怎么取回？";
+    const en = "My video never finished and I was charged. How do I get it back?";
+    for (const q of ["ok", "QQ", "HD", "Refund", "cgt-20251020150103-abx9z", "abc123@qq.com", "1234567", "👍"]) {
+      expect([q, svc.replyInEnglish([zh, q])]).toEqual([q, false]);
+      expect([q, svc.replyInEnglish([en, q])]).toEqual([q, true]);
+      expect([q, svc.replyInEnglish([q])]).toEqual([q, false]);
+    }
+    expect(svc.replyInEnglish([zh, "merge failed"])).toBe(true);
+    expect(svc.replyInEnglish([en, "那要多久"])).toBe(false);
+    expect(svc.replyInEnglish(["ok", "thx"])).toBe(false);
+    expect(svc.replyInEnglish([])).toBe(false);
+    expect(svc.replyInEnglish(undefined)).toBe(false);
   });
 
   it("检索：短拉丁词那一行照旧走英文表（判英文回复收紧了，检索没跟着收）", () => {

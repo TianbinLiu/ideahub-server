@@ -17,7 +17,7 @@
  *   这份清单是从代码事实里逐条核出来的，模型看不到它就会凭常识乱承诺。
  *
  * @exports AGENT_NAME, QUICK_QUESTIONS, loadKnowledge, selectKnowledge, buildSupportSystemPrompt,
- *          isEnglishAsk, parseHandoff, HANDOFF_RE, stripHandoffTags, summarizeTicket, categoryFromText
+ *          isEnglishAsk, replyInEnglish, parseHandoff, HANDOFF_RE, stripHandoffTags, summarizeTicket, categoryFromText
  * @used_in routes/support.routes.js, scripts/evalSupport.js
  */
 const fs = require("fs");
@@ -125,9 +125,18 @@ const NOT_EN_WORDS = new Set(
     .filter(Boolean),
 );
 
+// ★ 不是在说话的那几块整块不看（2026-10-20 复核）：链接、邮箱、带数字的串。客服会让人报任务号 / UID / 邮箱，中文用户常常只贴这一行 ——
+//   方舟任务号「cgt-20251020150103-abx9z」里的 cgt 和 abx、邮箱「abc123@qq.com」里的 abc 和 com、「ideahubs.org/download」都凑得出两个「词」，
+//   原来照样说死英文（main 上也一样，这次一起收）。按空白切块：块里有数字、@、://，或者字母.字母（域名、e.g.）就整块不算；
+//   「failed.」这种句末句点不算字母.字母，「Is 1080p free?」去掉 1080p 还剩两个词
+const NOT_PROSE_CHUNK = /\d|@|:\/\/|[A-Za-z]\.[A-Za-z]/;
+// 笑声 / 语气词的变体（表里只收了 haha / hhh / emm / okk 这几个固定写法）：hhhh、hahaha、hehe、xixi、hmm、emmm、okkk
+const FILLER_RE = /^(?:h{2,}|(?:ha){2,}h?|(?:he){2,}|(?:xi){2,}|h+m+|e+m+|o+k+)$/i;
+
 /**
  * 提示词用：这一问是不是英文（路由拿这一轮的原话判，判出来是英文就在提示词里说死「这一轮用英文回答」并带上英文界面叫法表）。
- * 一个汉字都没有，而且至少有两个「英文词」：两个字母以上、不是全大写（QQ / UID / APK / VIP / HD / OK 是缩写）、不在上面那张表里。
+ * 一个汉字都没有，而且至少有两个「英文词」：两个字母以上、不是全大写（QQ / UID / APK / VIP / HD / OK 是缩写）、不在上面那张表里、不是笑声；
+ *   链接 / 邮箱 / 带数字的串整块不算（见 NOT_PROSE_CHUNK）。路由不直接调它，调的是下面的 replyInEnglish（短追问跟着上一问走）。
  * ★ 与检索的 latinLine 分开（2026-10-20 生产核对）：原来两边共用「没汉字 + 有两个字母」，中文用户追问一句「ok」「QQ」「token」「HD」，
  *   提示词就说死「用户这一问是英文，这一轮就用英文回答」（模型照做就是一整段英文）。真英文问法再短也有两个实词（merge failed / Refund please /
  *   thanks a lot）；只有一个词的（「Refund」「Help」）判不了，退回「默认用中文回复；用户用英文就用英文」那一句、让模型自己看。
@@ -138,8 +147,29 @@ const NOT_EN_WORDS = new Set(
 function isEnglishAsk(text) {
   const t = String(text || "");
   if (!latinLine(t)) return false;
-  const words = (t.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g) || []).filter((w) => w.length >= 2 && w !== w.toUpperCase() && !NOT_EN_WORDS.has(w.toLowerCase()));
+  const prose = t
+    .split(/\s+/)
+    .filter((c) => !NOT_PROSE_CHUNK.test(c))
+    .join(" ");
+  const words = (prose.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g) || []).filter(
+    (w) => w.length >= 2 && w !== w.toUpperCase() && !NOT_EN_WORDS.has(w.toLowerCase()) && !FILLER_RE.test(w),
+  );
   return words.length >= 2;
+}
+
+/**
+ * 路由用：这一轮要不要在提示词里说死「用英文回答」。turns 是用户最近几问（旧 → 新，最后一条是这一问）。
+ * 这一问是真英文 → 是；这一问一个汉字都没有、自己又判不了（「Why?」「Refund」「ok」、任务号、UID、👍）→ 跟着上一问走；其余 → 否。
+ * ★ 为什么要看上一问（2026-10-20 复核）：isEnglishAsk 收紧之后，英文用户的短追问（「Why?」「Thanks!」「Refund?」、贴一个任务号）
+ *   从「说死英文」退成了那句软话，而软话下真模型一问短英文有 1/6 回了整段中文（见 buildSupportSystemPrompt 头上）。
+ *   中文会话里上一问是中文、这一条恒为否 —— 中文用户追问一句「ok」「QQ」照旧不说死（与只看这一问时逐字节相同）
+ */
+function replyInEnglish(turns) {
+  const list = (Array.isArray(turns) ? turns : []).map((x) => String(x || ""));
+  const last = list[list.length - 1] || "";
+  if (isEnglishAsk(last)) return true;
+  if (/[㐀-鿿]/.test(last) || list.length < 2) return false;
+  return isEnglishAsk(list[list.length - 2]);
 }
 
 /** 中文按相邻两字切，英文/数字按整词；全部小写 */
@@ -196,7 +226,9 @@ const ACCOUNT_DELETE_RE = /注销|删号|销号|恢复账号|(删除|删掉|删�
 //   对哪种找回账号都是噪音。英文「Can I recover my deleted account?」早由英文表的排除挡住（「删除 删掉」那条见了 account 不补）。
 // ★ 标题按一段字认、不按编号认：知识库从 app 仓重新生成时编号会挪（测试钉着这一节还在、还认得出）
 const ACCOUNT_RECOVER_RE = /找回(我的|这个)?(账号|帐号)|(账号|帐号)[^，。,.!?！？]{0,6}找回/;
-const SECTION_VETOES = [[new RegExp(`${ACCOUNT_DELETE_RE.source}|${ACCOUNT_RECOVER_RE.source}`), "删掉一段与撤销", /段|草稿/]];
+// ★ 「不拦」也认英文的段 / 草稿（2026-10-20 复核）：中文问完注销、接着用英文问「how do I undo deleting a segment」，只认中文的话
+//   §3.6 一节都不喂（main 上是第 1）。判据只看到中文的注销，英文那一行的段 / 草稿也得看得见
+const SECTION_VETOES = [[new RegExp(`${ACCOUNT_DELETE_RE.source}|${ACCOUNT_RECOVER_RE.source}`), "删掉一段与撤销", /段|草稿|\b(segments?|clips?|drafts?|nodes?)\b/i]];
 
 /** 常见口语 → 知识库用词，补几条同义词让检索更准（不是分类逻辑，只是召回） */
 const SYNONYMS = [
@@ -634,6 +666,7 @@ module.exports = {
   loadKnowledge,
   selectKnowledge,
   isEnglishAsk,
+  replyInEnglish,
   buildSupportSystemPrompt,
   parseHandoff,
   HANDOFF_RE,

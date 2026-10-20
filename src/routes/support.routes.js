@@ -285,8 +285,9 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     lang: parsed.data.lang || "zh",
     // 英文界面叫法表看这一轮的原话，不看 lang：App 客服页发的 lang 写死 "zh"（v2.63），只认 lang 的话这张表一次都发不出去。
     // 别直接把 lang 改成 "en"：求助卡（crisisCard）与回复语言那一行也读 lang
-    // 判据见 support.isEnglishAsk：至少两个实词才算英文（2026-10-20 起，中文对话里追问一句「ok」「QQ」「token」不算）
-    enNames: support.isEnglishAsk(userTurns[userTurns.length - 1]),
+    // 判据见 support.isEnglishAsk：至少两个实词才算英文（2026-10-20 起，中文对话里追问一句「ok」「QQ」「token」、贴一个任务号 / 邮箱不算）；
+    // 没汉字、自己又判不了的短追问（「Why?」「Refund」）跟着上一问走（support.replyInEnglish）—— 英文用户的短追问照旧说死英文
+    enNames: support.replyInEnglish(userTurns),
     personaLine: personaPromptLine(setup.persona),
   });
   // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
