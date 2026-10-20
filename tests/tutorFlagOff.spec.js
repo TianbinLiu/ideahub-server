@@ -42,6 +42,7 @@ describe("docs/06 D1 / D3 的 rg 验法", () => {
       "services/aiClient.js": "opts.model：教学 / 蒸馏两档模型的注释",
       "models/Persona.js": "kind / course / currentDoc / remixOf（S3，判否定）",
       "services/personaKind.js": "列表缺省过滤（S4，唯一实现）",
+      "services/support.service.js": "客服知识检索的英文用词表（tutor / teacher → 「启梦老师」那一节）与英文界面叫法表（QiMeng Tutor）：只是知识库里的词，不 require tutor 代码",
       "schemas/persona.schemas.js": "说明不收 kind（D4）",
       "models/Notification.js": "TUTOR_* 四类通知类型（跨仓枚举服务端先上，D4；写入只在 tutorNotify.service）",
       "routes/persona.routes.js": "评论钩子 onCreated → TUTOR_COMMENT（开关关着不 require 那棵树，D3）",

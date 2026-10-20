@@ -24,8 +24,10 @@ jest.mock("../src/services/aiClient", () => {
     ...actual,
     hasAiKey: () => true,
     aiComplete: async () => ({ text: '```json\n{"subject":"要求退款","summary":"用户认为出片失败应退款；AI 已说明受理后不退。","category":"billing"}\n```', model: "mock" }),
-    aiChatStream: async function* () {
-      const chunks = mockScripts[Math.min(mockState.scriptIndex++, mockScripts.length - 1)];
+    aiChatStream: async function* (messages, opts) {
+      mockState.lastMessages = messages;
+      mockState.lastOpts = opts;
+      const chunks = mockState.script || mockScripts[Math.min(mockState.scriptIndex++, mockScripts.length - 1)];
       for (const c of chunks) {
         await new Promise((resolve) => setTimeout(resolve, 15));
         yield c;
@@ -55,6 +57,9 @@ beforeEach(async () => {
   await mongoose.connection.db.dropDatabase();
   mockSendEmail.mockClear();
   mockState.scriptIndex = 0;
+  mockState.lastMessages = null;
+  mockState.lastOpts = null;
+  mockState.script = null;
 });
 
 async function createUser(role = "user", email) {
@@ -102,6 +107,40 @@ describe("POST /api/support/chat", () => {
     expect(events.find((e) => e.event === "done").data.handoff).toBe(false);
   });
 
+  // ★ 客服这一发关思考（2026-10-20）：DeepSeek 官方 max_tokens 连思维链一起算，700 的上限会被思考吃光、回答截断或一个字都没有；
+  //   只关客服这一条（陪聊那一发不带 thinking，见 companion.spec）
+  it("客服那一发带 thinking:false，上限仍是 700；截断时有日志可查", async () => {
+    const { token } = await createUser();
+    await request(app)
+      .post("/api/support/chat")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ messages: [{ role: "user", content: "出片一直没结果，钱扣了怎么取回？" }] });
+    expect(mockState.lastOpts).toMatchObject({ thinking: false, maxTokens: 700 });
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    mockState.lastOpts.onFinish("length", "deepseek-flash");
+    expect(warn.mock.calls[0][0]).toMatch(/reply cut by max_tokens/);
+    warn.mockRestore();
+  });
+
+  // ★ 关思考后 DeepSeek 更常把标签写成等号（真模型 107 条里 19 条）：标签跨 chunk、句中漏网，正文里都不许留方括号
+  it("模型把标签写成 [face=normal][action=explain]：照样解析、正文不留方括号", async () => {
+    const { token } = await createUser();
+    mockState.script = ["[neutral][face=nor", "mal][action=explain] 过 6 秒提示收起就没入口了。", " [happy][face=happy] 删错了点「撤销」 [action=acknowledge] 就能放回。"];
+    const res = await request(app)
+      .post("/api/support/chat")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ messages: [{ role: "user", content: "删段能撤销吗" }] });
+    const sentences = parseSse(res.text)
+      .filter((e) => e.event === "sentence")
+      .map((e) => e.data);
+    // 正文之后又来一个 "[" 时切句器会在那儿切开（协议规定标签只在句首），所以第三句自带 action
+    expect(sentences.map((s) => s.text)).toEqual(["过 6 秒提示收起就没入口了。", "删错了点「撤销」", "就能放回。"]);
+    expect(sentences[0]).toMatchObject({ emotion: "neutral", face: "normal", action: "explain" });
+    expect(sentences[1]).toMatchObject({ emotion: "happy", face: "happy" });
+    expect(sentences[2]).toMatchObject({ action: "acknowledge" });
+    sentences.forEach((s) => expect(s.text).not.toMatch(/[[\]]/));
+  });
+
   it("转人工：开头 [handoff:billing] 被识别成 handoff 事件且不进正文", async () => {
     const { token } = await createUser();
     mockState.scriptIndex = 1;
@@ -119,6 +158,25 @@ describe("POST /api/support/chat", () => {
     const done = events.find((e) => e.event === "done").data;
     expect(done.handoff).toBe(true);
     expect(done.category).toBe("billing");
+  });
+
+  // ★ App 客服页发的 lang 写死 "zh"（v2.63 SupportPage.tsx）：英文界面叫法表要看这一轮的原话，只认 lang 的话生产上一次都发不出去
+  it("英文问话（lang 仍是 zh）：system 带上英文界面叫法表、回复语言那一行说这一轮用英文；中文问话两样都不变", async () => {
+    const { token } = await createUser();
+    const ask = (content) =>
+      request(app)
+        .post("/api/support/chat")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ messages: [{ role: "user", content }], lang: "zh" });
+    await ask("Where did the Refined image tier go?");
+    const enSystem = mockState.lastMessages[0];
+    expect(enSystem.role).toBe("system");
+    expect(enSystem.content).toContain("【英文界面叫法】");
+    expect(enSystem.content).toContain("Lite（");
+    expect(enSystem.content).toContain("用户这一问是英文，这一轮就用英文回答。");
+    await ask("定妆档去哪了");
+    expect(mockState.lastMessages[0].content).not.toContain("英文界面叫法");
+    expect(mockState.lastMessages[0].content).toContain("默认用中文回复；用户用英文就用英文。");
   });
 });
 
@@ -332,6 +390,78 @@ describe("support.service 纯函数", () => {
     }
     expect(svc.selectKnowledge("Why can't I use HD? Do I need to upgrade?")).toContain("视频档位");
     expect(svc.selectKnowledge("Can I recover my deleted account?")).not.toContain("删掉一段与撤销");
+  });
+
+  // ★ 英文问法 → 知识库用词（EN_GLOSSARY，2026-10-20）：下面这些在没有这张表时一节都排不进前 3（多数一节都没喂进去，
+  //   模型只能凭常驻 FAQ 猜；「Refined 档去哪了」真模型直接答「知识库里没有」并转人工）。问法照英文界面的叫法（en.po）写
+  it.each([
+    ["I want a refund.", "计费与退款"],
+    ["Why was I charged tokens when the generation failed?", "计费与退款"],
+    ["My video never finished generating but I was charged. How do I get it back?", "「取回」= 避免二次付费"],
+    ["How do I delete my account?", "注销账号"],
+    ["I forgot my password.", "密码重置"],
+    ["Where did the Refined image tier go when making cards?", "出图档位"],
+    ["What is the preview draft mode for Cinematic?", "电影级「样片」"],
+    ["Can I log in with WeChat?", "登录方式与注册"],
+    ["How do I block someone?", "封禁 / 黑名单 / 私信"],
+    ["How do I save my video to my phone?", "保存到本地"],
+    ["How do I make my video visible only to me?", "可见性三档"],
+    ["How do I report a video?", "举报与下架"],
+    ["Where are your servers and where is my data stored?", "隐私要点"],
+    ["What's the longest video segment I can generate?", "时长与数量限制"],
+    ["Does chatting with support cost tokens?", "对话与语音的费用"],
+    // 出片档位「草稿」英文界面叫 Lite（en.po），不叫 Draft
+    ["What is the Lite tier?", "视频档位"],
+    ["Is Lite free for free users?", "视频档位"],
+    ["The update popup won't close", "更新机制"],
+    ["How do I zoom in on the canvas?", "工作流画布"],
+  ])("检索（英文）：「%s」把「%s」那一节排进前 3", (q, heading) => {
+    const r = rankOf(svc.selectKnowledge(q), heading);
+    expect(r).toBeGreaterThanOrEqual(1);
+    expect(r).toBeLessThanOrEqual(3);
+  });
+
+  it("检索（英文）：补词不拉偏 —— 删的 / 找回的不是段与草稿时不带「撤销」那一节，找回密码不带「取回」，有汉字的那一行不经过英文表", () => {
+    for (const q of [
+      "How do I delete my comment?",
+      "I deleted a comment by mistake",
+      "Can I recover a deleted comment?",
+      "How do I delete a published video?",
+      "Can I delete my account?",
+    ]) {
+      expect(svc.selectKnowledge(q)).not.toContain("删掉一段与撤销");
+    }
+    expect(svc.selectKnowledge("Can I recover my password?")).not.toContain("「取回」= 避免二次付费");
+    expect(svc.selectKnowledge("Is the Pro version worth it?")).not.toContain("更新机制");
+    // 中文问法夹着英文词：英文表一条都不生效，与把那几个英文词换成无关英文词的结果一字不差
+    expect(svc.selectKnowledge("我想 refund，token 被 charged 了")).toBe(svc.selectKnowledge("我想 zzzz，token 被 qqqqqq 了"));
+  });
+
+  // ★ 英文虚词只从纯英文那一行里剥：第一版在 bigrams() 里两边一起剥，带汉字的问话也被剥，表里的「key」是知识库实词（§4.5「501 没配 key」、
+  //   §4.8「未配 key」），这一问的对的那一节从前 3 掉到第 13（2026-10-20 复核抓到）。现在带汉字的问话与没有这张表时逐字节相同
+  it("检索：英文虚词只从纯英文行里剥 —— 带汉字的问话一个英文词都不剥，纯英文问法多几个虚词结果不变", () => {
+    expect(rankOf(svc.selectKnowledge("出片报错说没配 key 是怎么回事"), "生成失败的典型原因与文案")).toBeGreaterThanOrEqual(1);
+    expect(rankOf(svc.selectKnowledge("出片报错说没配 key 是怎么回事"), "生成失败的典型原因与文案")).toBeLessThanOrEqual(3);
+    expect(svc.selectKnowledge("How do I block someone? is it up to the")).toBe(svc.selectKnowledge("How do I block someone?"));
+  });
+
+  it("提示词：英文界面叫法对照表 —— lang=en 或 enNames（路由按这一轮原话判）时带上，中文一个字都不多；草稿档叫 Lite", () => {
+    const en = svc.buildSupportSystemPrompt({ lang: "en", knowledge: "x" });
+    expect(en).toContain("Recover（取回）");
+    expect(en).toContain("Fast（极速）");
+    expect(en).toContain("Refined（定妆，2.63 撤了）");
+    expect(en).toContain("Lite（出片档位里的「草稿」");
+    expect(en).not.toContain("Draft（");
+    const zhEnTurn = svc.buildSupportSystemPrompt({ lang: "zh", enNames: true, knowledge: "x" });
+    expect(zhEnTurn).toContain("【英文界面叫法】");
+    expect(zhEnTurn).toContain("这一轮就用英文回答");
+    const zh = svc.buildSupportSystemPrompt({ lang: "zh", knowledge: "x" });
+    expect(zh).not.toContain("英文界面叫法");
+    expect(zh).toContain("默认用中文回复；用户用英文就用英文。");
+    expect(svc.isEnglishAsk("Where did the Refined tier go?")).toBe(true);
+    expect(svc.isEnglishAsk("Refined 档去哪了")).toBe(false);
+    expect(svc.isEnglishAsk("2.63？")).toBe(false);
+    expect(svc.isEnglishAsk("")).toBe(false);
   });
 
   it("parseHandoff / categoryFromText", () => {

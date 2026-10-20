@@ -6,6 +6,8 @@ const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const request = require('supertest');
 
+// 记下陪聊那一发的 opts：思考只给客服关（support.routes 传 thinking:false），陪聊不许被顺手关掉
+const mockSeen = { opts: null };
 jest.mock('../src/services/aiClient', () => {
   const actual = jest.requireActual('../src/services/aiClient');
   return {
@@ -14,7 +16,8 @@ jest.mock('../src/services/aiClient', () => {
     // 故意把一句话切得七零八落，模拟真实流式：标签跨 chunk、句号后面跟着下一句的标签。
     // ★ chunk 之间必须真的异步等一下：曾经的 bug 是路由监听了 req 的 'close'（Node 里请求体读完就触发），
     //   同步 yield 的假流测不出来——事件全在 close 之前写完了；线上模型每个 token 都要等，一上线就全丢。
-    aiChatStream: async function* () {
+    aiChatStream: async function* (_messages, opts) {
+      mockSeen.opts = opts;
       const chunks = ['[happy][fa', 'ce:happy][action:wave] 欢迎来到启梦～ ', '[neutral][face:normal][action:explain] 想找灵感可以先逛逛热门创意。', '[shy][face:shy][action:shy]谢谢夸奖…'];
       for (const c of chunks) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -110,6 +113,9 @@ describe('POST /api/companion/chat', () => {
 
     const done = events.find((e) => e.event === 'done');
     expect(done.data.text).toBe('欢迎来到启梦～ 想找灵感可以先逛逛热门创意。 谢谢夸奖…');
+    // 陪聊照供应商默认（不带 thinking）：关思考只是客服那一条的决定
+    expect(mockSeen.opts).toBeTruthy();
+    expect('thinking' in mockSeen.opts).toBe(false);
   });
 });
 
@@ -120,6 +126,17 @@ describe('companion.service 纯函数', () => {
     expect(svc.parseTags('[action:wave][face:tease][excited] 嘿！')).toEqual({ emotion: 'excited', face: 'tease', action: 'wave', text: '嘿！' });
     expect(svc.parseTags('[face:banana][action:fly][zzz] 正文')).toEqual({ emotion: 'neutral', face: 'normal', action: 'none', text: '正文' });
     expect(svc.parseTags('[happy]')).toMatchObject({ text: '' });
+  });
+
+  // ★ DeepSeek V4-Flash 会写成等号（真模型 107 条客服回复里 19 条）：不认的话 "[action=explain]" 上字幕、被 TTS 念出来
+  it('parseTags 也认等号写法：句首解析、句中漏网的一并剥掉；冒号写法结果不变', () => {
+    expect(svc.parseTags('[neutral][face=normal][action=explain] 过 6 秒就没入口了。')).toEqual({ emotion: 'neutral', face: 'normal', action: 'explain', text: '过 6 秒就没入口了。' });
+    expect(svc.parseTags('[tease][face:normal][action = explain] 混着写也行')).toEqual({ emotion: 'tease', face: 'normal', action: 'explain', text: '混着写也行' });
+    expect(svc.parseTags('[happy] 好的 [face=happy] 收到')).toEqual({ emotion: 'happy', face: 'normal', action: 'none', text: '好的 收到' });
+    expect(svc.parseTags('[face=banana][action=fly] 正文')).toEqual({ emotion: 'neutral', face: 'normal', action: 'none', text: '正文' });
+    // 正文里不是演出标签的方括号照旧留着（"=" 只在 face / action 后面才算分隔符）
+    expect(svc.parseTags('[neutral] 参数写成 [name=x] 就行')).toMatchObject({ text: '参数写成 [name=x] 就行' });
+    expect(svc.parseTags('[action:wave][face：tease][excited] 嘿！')).toEqual({ emotion: 'excited', face: 'tease', action: 'wave', text: '嘿！' });
   });
 
   it('createSentenceSplitter 的长度阈值不把句首标签算进去（40 字正常句不该在逗号处被腰斩）', () => {
