@@ -30,7 +30,15 @@
 #     CRUD 与聚合，不靠版本差异；真要对齐生产的 Atlas 版本，得先把 MMS 升到 9+（改依赖，另议）。
 #   - Redis 6.0.16：与生产 `redis-server --version` 相同。没有 Redis 时 rateLimitRedis.spec.js
 #     的三条用例会「跳过」（用例体里 `if (!available) return`，jest 照样记 passed）—— Redis 分支
-#     零覆盖却是绿的。所以这里起一个 service，并在下面单设一步：日志里出现跳过提示就红。
+#     零覆盖却是绿的。所以这里起一个 service，并在下面单设一步：拿到「Redis 真收到了限流器的命令」
+#     这条正面证据才放行（见那一步的注释）。
+#     镜像从 ECR Public 上的 Docker 官方镜像同步源拉（public.ecr.aws/docker/library/redis），不从
+#     Docker Hub 匿名拉：Docker Hub 对匿名拉取按 IP 计数（2026-10-19 读到的响应头是
+#     `ratelimit-limit: 100;w=3600`），GitHub 托管 runner 的出口 IP 是很多人共用的 —— 设成 required
+#     之后，这会是一个与代码无关、偶尔会红的外部依赖。ECR Public 对匿名拉取限的是每秒 1 次、每月
+#     500GB 流量，不按小时数次数（AWS 文档 public-service-quotas）。两边 6.0.16-alpine 的
+#     manifest list 摘要逐字相同（10-19 核过：sha256:0f0e2fa71653709fee51ab932ff6a66a2afe5d1b12ccd830bf9090f040e1291f），
+#     是同一个镜像。
 
 name: test
 
@@ -40,9 +48,13 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# PR 上连续 push 只留最后一轮；main 上的每一轮都跑完（每个进 main 的提交都要有自己的结论）
+# PR 上连续 push 只留最后一轮（按 PR 的 ref 分组，新的一轮取消旧的）；进 main 的每个提交都要有
+# 自己的结论，所以 push 按提交的 sha 各自成组，谁也不取消谁（几个提交前后脚进 main 就并排跑）。
+# ⚠ 别把 push 也写回按 ref 分组：concurrency 缺省一个组里只留一轮在等，同组新排进来的会把**等待中**
+#   的那一轮取消（cancel-in-progress: false 只保证不打断**正在跑**的）—— 连着合进两三个 PR 时，
+#   中间那个提交就拿不到 test 结论，以后若让部署用 workflow_run 等 test 绿，那一次部署也不会触发。
 concurrency:
-  group: test-${{ github.ref }}
+  group: test-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -55,7 +67,8 @@ jobs:
     timeout-minutes: 30
     services:
       redis:
-        image: redis:6.0.16-alpine
+        # 不从 Docker Hub 匿名拉，理由见文件头「Redis 6.0.16」那一条
+        image: public.ecr.aws/docker/library/redis:6.0.16-alpine
         ports:
           - 6379:6379
         # 等 Redis 真能回 PONG 再开跑：容器起来了但还没监听的那几百毫秒里，探测会判「不可用」
@@ -115,14 +128,55 @@ jobs:
         shell: bash
         run: npm test -- --ci --json --outputFile=jest-results.json 2>&1 | tee jest.log
 
+      # 光看 jest 绿不够：连不上 Redis 时 rateLimitRedis 的三条用例空跑、照样记 passed。这一步要拿到
+      # **正面**证据才放行，下面任何一条不成立都红（几条一起报，不在第一条就停）：
+      #   ① jest.log 与 jest-results.json 都在。npm ci / mongod 自检失败时 jest 根本没跑 —— 读不到就判红
+      #      并说清。原来的写法在这种时候 grep 读不到文件、if 不成立，反而打出一句「连上了」的假话。
+      #   ② 结果里有 rateLimitRedis.spec.js 这个套件、用例全 passed、一条都没跳过。
+      #   ③ Redis 那一端真的收到过限流器的 EVAL（src/config/redis.js 的 INCR_SCRIPT —— 那就是 Redis 分支
+      #      本身）；空跑时 Redis 只收到健康检查的 PING。这一条不靠 spec 里那句提示的措辞：有人改了
+      #      console.warn 的字，③ 照样拦得住。限流器哪天不走 EVAL 了，这里会红，照着改判据就是。
+      #   ④ 原来那道反面检查留着：日志里出现跳过提示就红（报出来的原因最直接）。
       - name: Redis 分支真的跑了
         if: success() || failure()
         shell: bash
+        env:
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
         run: |
-          if grep -qF "[跳过] Redis 限流集成测试" jest.log; then
-            echo "::error file=tests/rateLimitRedis.spec.js::Redis 没连上，rateLimitRedis 的三条用例只是空跑（记作 passed、Redis 分支零覆盖）"
+          if [ ! -f jest.log ] || [ ! -f jest-results.json ]; then
+            echo "::error::没有 jest.log / jest-results.json：jest 没跑起来（多半是前面的 npm ci 或 mongod 自检失败了），Redis 分支有没有覆盖无从判断 —— 先看上面失败的那一步"
             exit 1
           fi
+          fail=0
+          node - <<'EOF' || fail=1
+          const r = require("./jest-results.json");
+          const s = r.testResults.find((t) => /[\\/]tests[\\/]rateLimitRedis\.spec\.js$/.test(t.name));
+          if (!s) {
+            console.log("::error::jest 结果里没有 tests/rateLimitRedis.spec.js 这个套件（删了 / 改名了 / 被排除了？）");
+            process.exit(1);
+          }
+          const n = (st) => s.assertionResults.filter((a) => a.status === st).length;
+          const notRun = s.assertionResults.length - n("passed") - n("failed");
+          if (s.status !== "passed" || n("passed") === 0 || notRun > 0) {
+            console.log(`::error file=tests/rateLimitRedis.spec.js::rateLimitRedis 套件不是全绿：status=${s.status}，passed ${n("passed")}、failed ${n("failed")}、没跑 ${notRun}`);
+            process.exit(1);
+          }
+          console.log(`rateLimitRedis.spec.js：${n("passed")} 条 passed`);
+          EOF
+          stats=$(docker exec "$REDIS_CONTAINER" redis-cli INFO commandstats | tr -d '\r') || stats=""
+          evals=$(printf '%s\n' "$stats" | sed -nE 's/^cmdstat_(eval|evalsha):calls=([0-9]+).*/\2/p' | awk '{ s += $1 } END { print s + 0 }')
+          if [ "$evals" -lt 1 ]; then
+            echo "::error file=tests/rateLimitRedis.spec.js::Redis 一条 EVAL 都没收到 —— 限流器的 Redis 分支没跑到。Redis 那一端的命令统计如下："
+            printf '%s\n' "$stats" | grep '^cmdstat_' || echo "（读不到命令统计：docker exec 失败？）"
+            fail=1
+          else
+            echo "Redis 收到限流器的 EVAL ${evals} 次"
+          fi
+          if grep -qF "[跳过] Redis 限流集成测试" jest.log; then
+            echo "::error file=tests/rateLimitRedis.spec.js::Redis 没连上，rateLimitRedis 的三条用例只是空跑（记作 passed、Redis 分支零覆盖）"
+            fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
           echo "rateLimitRedis.spec.js 连上了 ${REDIS_TEST_URL}"
 
       - name: 汇总
