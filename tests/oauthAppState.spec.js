@@ -3,14 +3,17 @@
 //
 // ★ 这份盯的是一条「松了就登错号、且零报错」的不变量：回 App 的深链 ideahub://oauth?token=… 手机上任何一个 App 都发得出，
 //   App 只认带着自己那份 state 回来的。所以要钉死：
-//     ① 发起那一跳把合形状的 state 签进我们的 OAuth state（app 字段），不合的当没带 —— 2.63 及更早的 App 一个都不带，不能 400；
+//     ① 发起那一跳把合形状的 state 签进我们的 OAuth state（app 字段），不合的当没带 —— 2.62 及更早的 App 一个都不带（2.63 起才带），不能 400；
 //     ② 成功 / 失败两种回跳都把它原样回带（state=），网页落点与 App 深链落点都要；
 //     ③ 签名对不上的 state 一个字都不回带（我们没法替它作保）；没带的也不多出一个空的 state=；
 //     ④ 绑定流（/oauth/link/start → /oauth/*/link → callback）不受影响；
-//     ⑤ passport 自己的 failureRedirect（/api/auth/oauth/fail）那一跳带不了 —— App 按「不是我发起的」丢掉，这是对的失败方向。
+//     ⑤ provider 拒了（passport 的 fail 那一支）：App 发起的回 App 并回带（2026-10-19 起，routes 的 failBack；原来走写死的
+//       failureRedirect 落在官网、App 什么都收不到），网页发起的照旧经 /api/auth/oauth/fail 落到官网。
+//       各种失败（过期 state、伪造签名、provider 报别的错、换 token 失败）用真 passport 逐条钉在 oauthFailBack.spec.js。
 //
 // passport 整个 mock 掉：真 passport 要去 provider 换 token，这里只需要它做的两件事 ——
-//   发起那一跳带着 options.state 302 去 provider；回调那一跳把 provider 回来的人挂到 req.user 上（或走 failureRedirect）。
+//   发起那一跳带着 options.state 302 去 provider；回调那一跳（routes 的 oauthCallback 用 passport 的自定义回调写法）
+//   把 provider 交回来的人交给回调（或交 false = provider 拒了）。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -21,18 +24,17 @@ jest.mock("passport", () => {
     initialize: () => (_req, _res, next) => next(),
     /** 每次 passport.authenticate(strategy, options) 记一笔；发起那一跳签好的 state 从这里读 */
     calls: [],
-    /** 回调那一跳 provider 交回来的人（config/passport 的形状：{ provider, profile }）；null = provider 拒了 → failureRedirect */
+    /** 回调那一跳 provider 交回来的人（config/passport 的形状：{ provider, profile }）；null = provider 拒了 → 回调收到 false */
     user: null,
-    authenticate(strategy, options = {}) {
+    authenticate(strategy, options = {}, callback) {
       return (req, res, next) => {
         mock.calls.push({ strategy, options });
-        if (!("failureRedirect" in options)) {
-          // 发起：真 passport 会 302 去 provider 的授权页，state 在它的查询串里
+        if (!callback) {
+          // 发起（/oauth/:provider 与 /oauth/:provider/link 都不带回调）：真 passport 会 302 去 provider 的授权页，state 在它的查询串里
           return res.redirect(`https://provider.test/authorize?state=${encodeURIComponent(options.state || "")}`);
         }
-        if (!mock.user) return res.redirect(options.failureRedirect);
-        req.user = mock.user;
-        return next();
+        // 回调：与真 passport 的自定义回调同形 —— 成功 (null, user, info)，fail (null, false, challenge)
+        return mock.user ? callback(null, mock.user, {}) : callback(null, false, { message: "denied" });
       };
     },
   };
@@ -209,10 +211,21 @@ describe("④ 绑定流不受影响", () => {
   });
 });
 
-describe("⑤ passport 自己的 failureRedirect 带不了 state", () => {
-  test("provider 拒了 → /api/auth/oauth/fail → 回跳只有 error=，没有 state=（App 按「不是我发起的」丢掉）", async () => {
+describe("⑤ provider 拒了：App 发起的回 App 并回带，网页发起的照旧经 /api/auth/oauth/fail", () => {
+  test("App 发起 → ideahub://oauth?error=…&state=…（2026-10-19 起；原来落在官网、不回带）", async () => {
     passport.user = null;
-    const first = await callback("google", jwtUtil.signOauthState({ next: "ideahub://oauth", provider: "google", app: APP_STATE })).expect(302);
+    const res = await callback("google", jwtUtil.signOauthState({ next: "ideahub://oauth", provider: "google", app: APP_STATE })).expect(302);
+    expect(res.headers.location).toMatch(/^ideahub:\/\/oauth\?/);
+    const u = location(res);
+    expect(u.searchParams.get("error")).toBe("oauth_failed");
+    expect(u.searchParams.get("message")).toBe("google login failed");
+    expect(u.searchParams.get("state")).toBe(APP_STATE);
+    expect(u.searchParams.has("token")).toBe(false);
+  });
+
+  test("网页发起 → /api/auth/oauth/fail → 回跳只有 error=，没有 state=（与改之前一样）", async () => {
+    passport.user = null;
+    const first = await callback("google", jwtUtil.signOauthState({ next: "/me", provider: "google", app: APP_STATE })).expect(302);
     expect(first.headers.location).toBe("/api/auth/oauth/fail?provider=google");
     // 就算有人往 fail 后面拼一个 state=，它没签过名，照样不回带
     const res = await request(app).get(`/api/auth/oauth/fail?provider=google&state=${APP_STATE}`).expect(302);
