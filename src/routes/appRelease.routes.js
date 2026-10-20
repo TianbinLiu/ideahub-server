@@ -194,9 +194,8 @@ router.get("/file/:name", (req, res) => {
   //   Cloudflare 按整条 URL 认缓存（免费版不能设成忽略查询串），而 Express 5 的路由默认不分
   //   大小写、也不严格认末尾斜杠、`:name` 还会先解码 —— 于是 `…apk?随便什么`、`/API/app/file/…`、
   //   `/api/App/File/…`、`…apk/`、`…%61pk` 在这里都会发出同一个文件，在 CF 那里却各是一个缓存键：
-  //   每换一种写法就是一次 MISS、源站整包发一遍 72MB（末尾带斜杠的那种不以 .apk 结尾，缓存规则
-  //   罩不住就是每一次都回源）。源站公网出口按固定带宽时这只是慢；改成按使用流量计费之后就是
-  //   按 GB 付钱的放大器。所以拿**原始请求行**（`req.originalUrl`：没解码、带查询串、保留大小写
+  //   每换一种写法就是每个机房各一次 MISS、源站整包发一遍 72MB。源站公网出口按固定带宽时这只是慢；
+  //   改成按使用流量计费之后就是按 GB 付钱的放大器。所以拿**原始请求行**（`req.originalUrl`：没解码、带查询串、保留大小写
   //   与末尾斜杠）与正名逐字节比，不一样就 301 —— 回的只有几百字节，跟过去的正名命中边缘那一份。
   //   合法客户端（App 自更新、官网 /api/app/download 的 302、发版脚本的整包核对）一直打的就是正名。
   //   ⚠ 前缀写死成 FILE_PATH_PREFIX，与 app.js 的挂载点 `app.use("/api/app", …)` 同生同灭；
@@ -208,7 +207,10 @@ router.get("/file/:name", (req, res) => {
   if (req.originalUrl !== canon) {
     // 不用 res.redirect：它做内容协商、会加 `Vary: Accept`（带 Vary 的 CF 不缓存）并写一段正文
     res.removeHeader("Vary");
-    res.set("Cache-Control", "public, max-age=86400");
+    // ★ 301 本身不进缓存（no-store）：要是哪天 zone 开着「Normalize incoming URLs」、对源站又关着，CF 会把 `…%61pk`
+    //   这类写法规范化成正名的缓存键，而源站收到的是原样请求行 —— 这条 301 就会存进**正名**的缓存键，正名 301 到自己、
+    //   一存一天，App 自更新报重定向太多（10-19 复核）。不缓存的代价只是变体每次都回源拿一个几百字节的 301，没有包本体。
+    res.set("Cache-Control", "no-store");
     res.status(301).location(canon).end();
     return;
   }

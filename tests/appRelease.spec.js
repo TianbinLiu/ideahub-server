@@ -227,6 +227,8 @@ describe("安装包镜像的可缓存性", () => {
         const res = await request(app)[method](url).set("Origin", "https://example.com");
         // 把 url 带进断言：哪一种写法漏了，失败信息里直接看得见
         expect([method, url, res.status, res.headers.location]).toEqual([method, url, 301, CANON]);
+        // 301 不进缓存：存进正名缓存键就是正名跳到自己（见路由里的 ★）
+        expect(res.headers["cache-control"]).toBe("no-store");
         expect(res.headers.vary).toBeUndefined();
         expect(Number(res.headers["content-length"] || 0)).toBeLessThan(1024);
       }
