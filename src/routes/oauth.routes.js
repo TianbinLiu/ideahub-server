@@ -295,6 +295,9 @@ function redirectStateFail(req, res, provider) {
  * ★ 只认这**一个**：构造器恰是 Error、name 是 "Error"、message 逐字相等。不放宽成「所有裸 Error」—— 我们自己代码里出来的
  *   裸 Error（verify 回调、取资料里的 bug）照旧整份带堆栈（middleware/error.js 的 ★★「500 必须落堆栈」）。
  *   升级 passport-oauth2 时重核这句原话：改了措辞，它只会退回「意外错误」那一支（多一份堆栈），不会被吞掉。
+ * ⚠ 同一句话也是**我们自己配错了**的样子：GITHUB_CLIENT_SECRET 轮换错了 / 回调地址对不上时，GitHub 同样回 200 +
+ *   `incorrect_client_credentials` / `redirect_uri_mismatch`，也落到这一行。所以「`Error no_access_token` 偶尔一条」是有人瞎打，
+ *   「每一次 GitHub 登录都是它」是故障 —— 排障时别把一串这种行当噪音略过（原来的堆栈也只指向 strategy.js 这一行，没丢信息）。
  */
 const NO_ACCESS_TOKEN_MESSAGE = "Failed to obtain access token";
 function isNoAccessTokenError(err) {
