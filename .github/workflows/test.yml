@@ -32,13 +32,14 @@
 #     的三条用例会「跳过」（用例体里 `if (!available) return`，jest 照样记 passed）—— Redis 分支
 #     零覆盖却是绿的。所以这里起一个 service，并在下面单设一步：拿到「Redis 真收到了限流器的命令」
 #     这条正面证据才放行（见那一步的注释）。
-#     镜像从 ECR Public 上的 Docker 官方镜像同步源拉（public.ecr.aws/docker/library/redis），不从
-#     Docker Hub 匿名拉：Docker Hub 对匿名拉取按 IP 计数（2026-10-19 读到的响应头是
-#     `ratelimit-limit: 100;w=3600`），GitHub 托管 runner 的出口 IP 是很多人共用的 —— 设成 required
-#     之后，这会是一个与代码无关、偶尔会红的外部依赖。ECR Public 对匿名拉取限的是每秒 1 次、每月
-#     500GB 流量，不按小时数次数（AWS 文档 public-service-quotas）。两边 6.0.16-alpine 的
-#     manifest list 摘要逐字相同（10-19 核过：sha256:0f0e2fa71653709fee51ab932ff6a66a2afe5d1b12ccd830bf9090f040e1291f），
-#     是同一个镜像。
+#     镜像就从 Docker Hub 匿名拉，**别换成 public.ecr.aws 的同步源**（2026-10-19 换过一次、当场红了）：
+#     - GitHub 官方文档（run-jobs-in-a-container）写明 GitHub 托管 runner 按 GitHub 与 Docker 的协议
+#       不受 Docker Hub 拉取限额约束；PR #121 前三轮从 Docker Hub 拉都是几秒拉完。
+#     - ECR Public 对匿名拉取按来源 IP 记每月 500GB 流量，而托管 runner 的出口 IP 是全世界共用的：
+#       run 39350579062 拉 public.ecr.aws/docker/library/redis:6.0.16-alpine 连着三次
+#       `toomanyrequests: Data limit exceeded`，job 在起容器那一步就死了。
+#     （两边 6.0.16-alpine 的 manifest list 摘要逐字相同：sha256:0f0e2fa7…e1291f，镜像本身没区别。）
+#     要是哪天改用自托管 runner，这条协议就不管用了 —— 那时再考虑 docker login 或自己的镜像源。
 
 name: test
 
@@ -67,8 +68,8 @@ jobs:
     timeout-minutes: 30
     services:
       redis:
-        # 不从 Docker Hub 匿名拉，理由见文件头「Redis 6.0.16」那一条
-        image: public.ecr.aws/docker/library/redis:6.0.16-alpine
+        # 从 Docker Hub 拉、不换镜像源，理由见文件头「Redis 6.0.16」那一条
+        image: redis:6.0.16-alpine
         ports:
           - 6379:6379
         # 等 Redis 真能回 PONG 再开跑：容器起来了但还没监听的那几百毫秒里，探测会判「不可用」
