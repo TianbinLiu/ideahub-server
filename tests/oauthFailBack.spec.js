@@ -16,7 +16,11 @@
 //   E  next 被改成外域 / 深链的近似写法 → 不跟着走（回程目标只经 safeNextPath + isAppTarget）；
 //   F  access_denied 以外的 provider 错误、换 token / 取资料失败 → 不再 5xx，provider 的原话不进 URL；
 //   G  成功与起跳不变（真 passport 对照）；
-//   H  safeNextPath 的控制字符闸（字面 NUL / DEL 字节改成 \u 转义之后）语义不变。
+//   H  safeNextPath 的控制字符闸（字面 NUL / DEL 字节改成 \u 转义之后）语义不变；
+//   I  换 token 回了 2xx 却没有 access_token（GitHub 对坏 code 的回法，passport-oauth2 交出一个裸 Error）→ 只记一行 warn、
+//      不落堆栈，回程不变；别的裸 Error 照旧整份落 console.error（2026-10-20，生产验证 #119 时打出来的）；
+//   J  签进 state 的 provider 与回调那一家对不上 → 当不是我们的：失败落网页不回带、成功不登录不绑定；同一家与没写 provider 的照旧
+//      （2026-10-20，纵深防御）。
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 const request = require("supertest");
@@ -404,5 +408,139 @@ describe("H · safeNextPath 的控制字符闸（字面 NUL / DEL 字节改成 \
       const st = new URL(res.headers.location).searchParams.get("state");
       expect(jwtUtil.verifyOauthState(st).next).toBe(want);
     }
+  });
+});
+
+describe("I · 换 token 回了 2xx 却没有 access_token（GitHub 对坏 / 用过的 code 就这么回）→ 只记一行、不落堆栈", () => {
+  // GitHub 真实的回法：HTTP 200，body 里是 error 而没有 access_token。node-oauth 照 2xx 当成功、交出 accessToken = undefined，
+  // passport-oauth2 1.8.0（lib/strategy.js 第 178 行）于是交出一个裸的 new Error('Failed to obtain access token')。
+  const badCode = (done) =>
+    done(null, undefined, undefined, {
+      error: "bad_verification_code",
+      error_description: "The code passed is incorrect or expired.",
+      error_uri: "https://docs.github.com/apps/troubleshooting-oauth-app-access-token-request-errors",
+    });
+  let errSpy;
+  beforeEach(() => {
+    errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => errSpy.mockRestore());
+
+  /** 恰好一次 console.warn、只有一个参数（一行字，后面没跟 Error 对象）、没有换行 / 堆栈；console.error 一次都没调 */
+  function expectOneLine(provider) {
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]).toHaveLength(1);
+    const line = warn.mock.calls[0][0];
+    expect(typeof line).toBe("string");
+    expect(line).toMatch(new RegExp(`^\\[oauth\\] ${provider} .*: Error no_access_token -$`));
+    expect(line).not.toMatch(/[\r\n]|\bat |strategy\.js/);
+    expect(errSpy).not.toHaveBeenCalled();
+  }
+
+  test("github · App 发起 → 回 App 带 state（与改之前一样）、不建号；日志里没有 provider 的原话、code、state", async () => {
+    tokenStub = badCode;
+    const st = await startState("github", APP_TARGET, APP_STATE);
+    expectAppFail(await withCode("github", st), "github login failed");
+    expectOneLine("github");
+    expect(await User.countDocuments({})).toBe(0);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const s of ["bad_verification_code", "incorrect", "c0de-from-provider", st, APP_STATE]) expect(logged).not.toContain(s);
+  });
+
+  test("github · 网页发起 → 照旧 302 /api/auth/oauth/fail?provider=github", async () => {
+    tokenStub = badCode;
+    const st = await startState("github", "/me", APP_STATE);
+    const res = await withCode("github", st).expect(302);
+    expect(res.headers.location).toBe(webFail("github"));
+    expectOneLine("github");
+  });
+
+  test("google 碰上同一种回法也一样（认的是 passport-oauth2 的这一句，不认是哪一家）", async () => {
+    tokenStub = badCode;
+    const st = await startState("google", APP_TARGET, APP_STATE);
+    expectAppFail(await withCode("google", st), "google login failed");
+    expectOneLine("google");
+  });
+
+  test.each([
+    ["别的话的裸 Error", () => new Error("profile fetch failed")],
+    ["同一句话多一个空格", () => new Error("Failed to obtain access token ")],
+    ["同一句话、但是 TypeError", () => new TypeError("Failed to obtain access token")],
+    ["同一句话、Error 的子类（name 也是 \"Error\"）", () => new (class extends Error {})("Failed to obtain access token")],
+  ])("只认那一个：%s → 照旧整份（带堆栈）落 console.error、不记 warn，回程不变", async (_label, make) => {
+    profileStub = (_name, done) => done(make());
+    const st = await startState("github", APP_TARGET, APP_STATE);
+    expectAppFail(await withCode("github", st), "github login failed");
+    const call = errSpy.mock.calls.find((c) => String(c[0]).startsWith("[oauth] github"));
+    expect(call).toBeTruthy();
+    expect(call[1]).toBeInstanceOf(Error);
+    expect(call[1].stack).toBeTruthy();
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("J · 签进 state 的 provider 与回调那一家对不上 → 当不是我们的（纵深防御）", () => {
+  const other = { google: "github", github: "google" };
+  const stateFail = `${WEB}/oauth/callback?next=%2F&error=oauth_failed&message=Invalid+or+expired+OAuth+state`;
+
+  test.each([["google"], ["github"]])("%s 起跳签的 App state 拿到另一家的回调上 + 取消授权 → 落网页、不回带", async (signedFor) => {
+    const st = await startState(signedFor, APP_TARGET, APP_STATE);
+    const to = other[signedFor];
+    const res = await denied(to, st).expect(302);
+    expect(res.headers.location).toBe(webFail(to));
+  });
+
+  test("provider 报别的错（server_error）、换 token 失败 → 也落网页、不回带", async () => {
+    const st = await startState("google", APP_TARGET, APP_STATE);
+    const a = await cb("github", { error: "server_error", state: st }).expect(302);
+    expect(a.headers.location).toBe(webFail("github"));
+    tokenStub = (done) => done({ statusCode: 400, data: JSON.stringify({ error: "invalid_grant" }) });
+    const b = await withCode("github", st).expect(302);
+    expect(b.headers.location).toBe(webFail("github"));
+  });
+
+  test("过期的、签给 Google 的 App state 拿到 GitHub 回调（取消 / 带 code）→ 落网页、不回带、不建号", async () => {
+    const st = expiredState({ next: APP_TARGET, provider: "google", app: APP_STATE });
+    expect((await denied("github", st).expect(302)).headers.location).toBe(webFail("github"));
+    expect((await withCode("github", st).expect(302)).headers.location).toBe(stateFail);
+    expect(await User.countDocuments({})).toBe(0);
+  });
+
+  test.each([["google"], ["github"]])("%s 签的 App state + 带 code 打另一家的回调 → 不登录、不建号，落官网 next=/、不回带", async (signedFor) => {
+    const st = await startState(signedFor, APP_TARGET, APP_STATE);
+    const res = await withCode(other[signedFor], st).expect(302);
+    expect(res.headers.location).toBe(stateFail);
+    expect(await User.countDocuments({})).toBe(0);
+  });
+
+  test("签给 Google 的绑定票拿到 GitHub 回调 + code → 不绑 GitHub", async () => {
+    const user = await User.create({ username: "carol", email: "carol@example.com", role: "user", passwordHash: "hashed" });
+    const ticket = jwtUtil.signOauthState({ mode: "link", provider: "google", next: "/me", linkUserId: String(user._id) });
+    const res = await withCode("github", ticket).expect(302);
+    expect(res.headers.location).toBe(stateFail);
+    expect((await User.findById(user._id).lean()).providers?.github || "").toBe("");
+    expect(await User.countDocuments({})).toBe(1);
+  });
+
+  test.each([["google"], ["github"]])("对照 · 同一家签的照旧：%s 取消授权回 App 带 state，带 code 登录回 App 带 token + state", async (p) => {
+    const st = await startState(p, APP_TARGET, APP_STATE);
+    expectAppFail(await denied(p, st), `${p} login failed`);
+    const ok = await withCode(p, st).expect(302);
+    expect(ok.headers.location).toMatch(/^ideahub:\/\/oauth\?/);
+    const u = new URL(ok.headers.location);
+    expect(u.searchParams.get("token")).toBeTruthy();
+    expect(u.searchParams.get("state")).toBe(APP_STATE);
+  });
+
+  test.each([["google"], ["github"]])("对照 · 没写 provider 的 state 照旧认（缺省 = 认）：%s", async (p) => {
+    const st = jwtUtil.signOauthState({ next: APP_TARGET, app: APP_STATE });
+    expect(jwtUtil.verifyOauthState(st).provider).toBeUndefined();
+    expectAppFail(await denied(p, st), `${p} login failed`);
+    expectAppFail(await denied(p, expiredState({ next: APP_TARGET, app: APP_STATE })), `${p} login failed`);
+    const ok = await withCode(p, st).expect(302);
+    expect(ok.headers.location).toMatch(/^ideahub:\/\/oauth\?/);
+    const u = new URL(ok.headers.location);
+    expect(u.searchParams.get("token")).toBeTruthy();
+    expect(u.searchParams.get("state")).toBe(APP_STATE);
   });
 });
