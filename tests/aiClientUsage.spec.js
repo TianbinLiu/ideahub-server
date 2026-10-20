@@ -101,6 +101,52 @@ describe('aiChatStream 用量', () => {
   });
 });
 
+// ★ 按调用关思考（客服用，2026-10-20）：DeepSeek 官方 max_tokens 连思维链一起算，客服 700 的上限会被思考吃光；
+//   只给传了 thinking:false 的那一发带字段，别的调用一律不带 —— 全站关要走 AI_EXTRA_BODY，那会连陪聊 / 老师一起关
+describe('aiChatStream 按调用关思考', () => {
+  const ok = () => streamOf([{ choices: [{ delta: { content: 'ok' } }] }]);
+
+  it('thinking:false → 请求带 {"thinking":{"type":"disabled"}}；不传 / 传 true → 不带', async () => {
+    mockCreate.mockResolvedValueOnce(ok()).mockResolvedValueOnce(ok()).mockResolvedValueOnce(ok());
+    await drain(aiChatStream([], { thinking: false }));
+    await drain(aiChatStream([]));
+    await drain(aiChatStream([], { thinking: true }));
+    expect(mockCreate.mock.calls[0][0].thinking).toEqual({ type: 'disabled' });
+    expect('thinking' in mockCreate.mock.calls[1][0]).toBe(false);
+    expect('thinking' in mockCreate.mock.calls[2][0]).toBe(false);
+  });
+
+  it('按调用的 thinking:false 盖过 AI_EXTRA_BODY 里的同名字段，别的字段照样并进去', async () => {
+    process.env.AI_EXTRA_BODY = JSON.stringify({ thinking: { type: 'enabled' }, foo: 1 });
+    mockCreate.mockResolvedValueOnce(ok());
+    await drain(aiChatStream([], { thinking: false }));
+    expect(mockCreate.mock.calls[0][0]).toMatchObject({ thinking: { type: 'disabled' }, foo: 1 });
+  });
+
+  it('端点不认 thinking（400 点了名）→ 去掉再发一次并 warn；与另外两种退让叠加最多发四次', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockCreate.mockRejectedValueOnce(badRequest('Unrecognized request argument supplied: thinking'));
+    mockCreate.mockRejectedValueOnce(badRequest('stream_options is not supported'));
+    mockCreate.mockRejectedValueOnce(badRequest("Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead."));
+    mockCreate.mockResolvedValueOnce(ok());
+    expect(await drain(aiChatStream([], { thinking: false, maxTokens: 70 }))).toEqual(['ok']);
+    expect(mockCreate).toHaveBeenCalledTimes(4);
+    const last = mockCreate.mock.calls[3][0];
+    expect('thinking' in last).toBe(false);
+    expect(last.stream_options).toBeUndefined();
+    expect(last.max_completion_tokens).toBe(70);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it('没要关思考时，报错里提到 thinking 的 400（AI_EXTRA_BODY 配错）照原样抛，不替运维悄悄去掉', async () => {
+    process.env.AI_EXTRA_BODY = JSON.stringify({ thinking: { type: 'disabled' } });
+    mockCreate.mockRejectedValueOnce(badRequest('Unrecognized request argument supplied: thinking'));
+    await expect(drain(aiChatStream([]))).rejects.toThrow('thinking');
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('aiComplete 用量', () => {
   it('返回 { text, model, usage }；maxTokens 覆盖默认', async () => {
     mockCreate.mockResolvedValueOnce({ model: 'm2', choices: [{ message: { content: '{}' } }], usage: { prompt_tokens: 9, completion_tokens: 1 } });

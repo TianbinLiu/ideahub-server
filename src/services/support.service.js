@@ -92,18 +92,69 @@ function loadKnowledge() {
   return cache;
 }
 
+// 英文虚词：只从**一个汉字都没有**的那几行问话里剥（selectKnowledge 里），知识库正文与带汉字的问话一个词都不剥。
+// 知识库里零星有几句英文界面原文（§4.4b 的「Voiceover is free, up to … per account per day」等），英文问法里的 is / to / up / per
+// 会凭它们给这几节白加分（2026-10-20 量的：181 句英文问法里 §4.4b 被喂进去 68 次，只去掉虚词就降到 18 次，剩下的多是真在问
+// 对话 / 语音价钱的）。
+// ★ 别挪回 bigrams() 里两边一起剥（第一版就是那么写的，复核抓到）：那样带汉字的问话也被剥，表里一旦混进知识库的实词就悄悄改了
+//   中文检索 ——「出片报错说没配 key 是怎么回事」原来 §4.8 排第 2，剥了之后 §4.5 / §4.8 最好的一节也只排第 13（「501 没配 key」「未配 key」）。只剥纯英文行，
+//   带汉字的问话检索结果与没有这张表时逐字节相同（2026-10-20 拿 158 句带汉字的问法 × 往里插英文词的 12,008 个变体比过；
+//   测试钉着 key 这一问与「纯英文多几个虚词结果不变」）。
+// ★ key 不进表：知识库里出现它的只有「没配 key」那两节（§4.5 / §4.8），英文问「no API key」要的正是它们
+const EN_STOPWORDS = new Set(
+  ("a an the is am are was were be been being do does did done can could will would shall should may might must " +
+    "to of in on at by for with from into onto about as up out off over than then so if or and but not " +
+    "i me my mine you your yours we us our it its this that these those there here what which who whom whose how why where when " +
+    "have has had get gets got getting just any some all more much many very really also still again one way please thanks thank " +
+    "new start create type run head false true per")
+    .split(/\s+/)
+    .filter(Boolean),
+);
+
+/** 这一行（这一句）是不是英文问法：一个汉字都没有、而且有连着两个以上的字母。检索的英文表 / 虚词与提示词的英文叫法表共用这一个判据 */
+function isEnglishAsk(text) {
+  const t = String(text || "");
+  return !/[㐀-鿿]/.test(t) && /[a-z]{2,}/i.test(t);
+}
+
 /** 中文按相邻两字切，英文/数字按整词；全部小写 */
 function bigrams(text) {
   const out = [];
   const cleaned = String(text || "").toLowerCase();
   // 「app」不当词：标题里带「App」的四节（10.4 / 11 / 12 / 4.10）会凭它白拿标题加分，问话里一出现 app 就占掉前 5 的位置
-  for (const word of cleaned.match(/[a-z0-9_@.]{2,}/g) || []) if (word !== "app") out.push(word);
+  for (const word of cleaned.match(/[a-z0-9_@.]{2,}/g) || []) {
+    if (word === "app") continue;
+    out.push(word);
+    // ★ 版本号「v2.63」整个是一个词，而用户多半只写「2.63」：2026-10-19 量的，58b934c 那份副本的 §9.2 标题只写了
+    //   「当前版 v2.63」，「2.63 更新了什么」拿不到标题加分、掉到第 10。v + 数字.数字… 这一种形状另外再出一个去掉 v 的词
+    //   （句末的英文句点不算进去），两种写法都对得上；只认这个形状，别的带点的词（support@ideahubs.org、1.25…）一个都不拆
+    const ver = /^v(\d+(?:\.\d+)+)\.*$/.exec(word);
+    if (ver) out.push(ver[1]);
+  }
   const han = cleaned.replace(/[^㐀-鿿]/g, " ");
   for (const run of han.split(/\s+/)) {
     for (let i = 0; i + 1 < run.length; i += 1) out.push(run.slice(i, i + 2));
   }
   return out;
 }
+
+// 剪辑页的「合成」（§3.8；2.62 及更早叫「合并」、主键叫「下一步」）。下面两条同义词共用这一个判据：剪辑页那条拿它加词，
+// 「失败 → 敏感词」那条拿它让开 —— 两处各写一份的话，一处放宽、一处没跟，「剪辑页合成失败」又会被顶成 §4.8，或者反过来
+// 把 AI 出片失败的问法也让掉（2026-10-19 复核抓到的就是后一种：那条原来写成「这一行有合成 / 合并二字就让开」，
+// 「AI 合成视频失败了扣 token 吗」的 §4.8 掉出前 5、而剪辑页这条又没触发，两边都没带上）。
+// ★ 语音合成 / 配音 / 合成预览图 / 挂卡合成 / 账号合并都不是这件事。
+// ★ 「视频合成」「AI 合成」不算：用户嘴里多半是 AI 出片（「视频合成要多少钱」「视频合成失败了扣钱吗」）。原来算进来时，
+//   「视频合成要多少钱」喂进去的只剩 §3.8（合成在本机做、不花 token），4.2 / 4.4 两节价钱都被挤掉 —— 往「不要钱」那边说错。
+//   「视频合并」照旧算（AI 出片没有「合并」这个说法）
+const CUT_MERGE_RE = /^(?!.*(语音|声音|配音|朗读|音色|预览图|挂卡|账号|帐号)).*(剪辑.{0,8}(合成|合并)|((?<!视频\s?|[Aa][Ii]\s?)合成|合并)(并去发布|失败|不了|不出|中|卡|取消|一直|好|完|要|花|扣|收费)|取消合成|成片.{0,4}(合成|合并)|(片段|几段|两段|多段).{0,4}(合并|合成)|视频.{0,4}合并|下一步.{0,6}(去哪|不见|没了|找不到|改名|变成))/;
+
+// 「失败」这一支把 §4.8（AI 出片被拒、敏感词）顶上来。让开两种：登录失败 / 登不进（那是 2.x 登录那几节），以及这一行
+// 命中 CUT_MERGE_RE 的剪辑页合成失败（§3.8 讲的是临时链接 403、取消、BUSY；2026-10-19 量的：不让开的话「剪辑页合成失败怎么办」
+// 第 1 名是 §4.8）。带「敏感 / 拒绝 / 400 / 审核」的照旧算。
+// ★ 由正则字面量的 .source 拼出来，不手抄剪辑页那条（同一条规则的第二处实现）；CUT_MERGE_RE 没有标志位，拼进来不丢东西。
+//   它以 ^ 开头、整体是一个序列，放进行首的否定前瞻里就是「这一行整行命中它」
+const LOGIN_FAIL_GUARD = /^(?!.*(登录|登陆)(了|还是|一直|总是|老是|又|就|时|的时候|，|,){0,3}(提示)?失败)(?!.*登不进)/;
+const FAIL_SENSITIVE_RE = new RegExp(`${/敏感|拒绝|400|审核/.source}|${LOGIN_FAIL_GUARD.source}(?!(?:${CUT_MERGE_RE.source}))${/.*失败/.source}`);
 
 /** 常见口语 → 知识库用词，补几条同义词让检索更准（不是分类逻辑，只是召回） */
 const SYNONYMS = [
@@ -127,6 +178,9 @@ const SYNONYMS = [
   [/极速|草稿档|高清|电影级|档位|会员档|免费版.{0,4}(能用|只能)|免费(用户|账号|的人)|没(付|充)过?钱|哪些档|什么档/i, "档位 免费版 付过钱 极速 高清 电影级 会员档 480p"],
   [/^(?!.*(草稿箱|草稿库|存.{0,2}草稿|草稿.{0,6}存(?!在)|丢|不见|没了|找回|换手机|换了手机|卸载|重装|同步|保存|存几|几条|20条|打开))(?:.*(草稿(?!箱|库).{0,8}(分辨率|画质|清晰|糊|多少钱|价|便宜|贵|token|能用|可以用|480|几秒|多长|模型|收费|要钱|免费|花|扣|费|一段|出片)|(免费|只能|能用|可以用).{0,6}草稿(?!箱|库)|草稿和(高清|极速|标准|电影级)|(高清|极速|标准|电影级)和草稿))/i, "档位 免费版 付过钱 极速 高清 电影级 会员档 480p"],
   [/样片|定稿|1080/i, "样片 定稿 1080p 480p 电影级"],
+  // 出图档「定妆」2.63 撤了（§4.3）：「定妆档怎么没了」只靠正文里一个「定妆」，§4.3 排第 5（2026-10-19 量的）。
+  // ★ 「主角定妆 · 多镜头」是一种做法的名字、还在，不加词
+  [/(?<!主角)定妆/, "出图档位 速写 精绘"],
   [/充值|买|订阅|套餐|付费|支付/, "充值 套餐 支付渠道 订单"],
   [/苹果|iphone|ios|ipad/i, "iOS 安卓安装包 下载页"],
   // 「去升级 / 升级套餐 / 升级会员」是买套餐，不是装新版
@@ -136,6 +190,14 @@ const SYNONYMS = [
   [/改名|用户名|昵称|头像/, "昵称 用户名 username displayName 头像"],
   // 「token / 余额 / 钱不见了」不是草稿箱
   [/草稿(?!档)|(?<!(token|余额|钱|额度).{0,4})(丢了|不见了)|换手机/i, "草稿 草稿箱 IndexedDB 本机 卸载 换设备 20 条"],
+  // 2.63 删段 / 删草稿 6 秒内能「撤销」（§3.6 / §3.2 用的词是「撤销」），用户说的是撤回 / 找回 / 恢复 / 还原 / 放回。
+  // ★ 只认「删」领着的（或「误删 / 删错」本身）：注销、删号、账号、作品、评论、卡片…删了能不能恢复是别的事，那些没有 6 秒撤销；
+  //   剪辑页的片段删了是「＋ 段N」加回来，也不是这一条。只加「撤销」一个词：段还是草稿由原话自己分（加「删掉一段」的话
+  //   「删草稿能撤销吗」第 1 名会变成 §3.6；加「轻提示」会把 §2.10 也拉进来）。2026-10-19 拿 11 句正例、12 句反例逐句跑过，
+  //   检索结果钉在 tests/support.spec.js
+  [/^(?!.*(注销|删号|账号|帐号|作品|评论|弹幕|私信|卡片|卡组|人物卡|模板|视频|消息|好友|关注|剪辑|头像|昵称|简介|封面)).*(删[^，。,.!?！？]{0,8}(撤回|撤销|撤消|恢复|找回|还原|放回|反悔)|(撤回|撤销|撤消|恢复|找回|还原|放回)[^，。,.!?！？]{0,6}删|误删|删错)/, "撤销"],
+  // 2.63 工作流画布右上角的缩放键（§3.7）。★ 要有「画布 / 工作流 / 段卡」在场：视频全屏、看图放大、字幕字号、头像裁剪都不是这一节
+  [/(画布|工作流|段卡).{0,10}(放大|缩小|缩放|太小|太大|看不清|看不全|看全|找不到|挤|1:1|原来大小|原大小)|(放大|缩小|缩放).{0,6}(画布|工作流)/, "工作流画布 放大 缩小 缩放"],
   // 「出的视频没声音」是档位不出环境音，不是铸卡师的中文语音包
   [/(视频|片子|成片|出片|出的片|生成的).{0,6}(没声音|没有声音|无声|静音|没声)/, "环境音 档位 极速 标准 草稿 高清 无声 白模"],
   [/(?<!(视频|片子|成片|出片).{0,6})没声音|不出声|语音|音色/, "语音 TTS 中文语音包 音色"],
@@ -150,9 +212,148 @@ const SYNONYMS = [
   [/下架|举报|申诉|封禁|封号/, "下架 举报 封禁 管理员 处置"],
   [/隐私|数据|服务器在哪|香港/, "隐私 服务器 香港 第三方 保留"],
   [/(qq|微信|手机号?|邮箱).{0,4}(登录|登陆)|(登录|登陆)(了|还是|一直|总是|老是|又|就|时|的时候|，|,){0,3}(提示)?(失败|不了|不上|不进去)|登不进|进不去账号/i, "登录方式 QQ 微信 手机号 邮箱 登录 验证码"],
-  [/敏感|^(?!.*(登录|登陆)(了|还是|一直|总是|老是|又|就|时|的时候|，|,){0,3}(提示)?失败)(?!.*登不进).*失败|拒绝|400|审核/, "敏感词 400 失败 InputTextSensitiveContentDetected"],
+  // 2.63 Google / GitHub 从浏览器回 App 的核对（§2.10：「忽略了一条不是本机发起的登录链接」「登录链接过期了」）。
+  // ★ 必须带「登录链接」或 Google / GitHub / 本机发起：光说「登录过期了」多半是登录状态过期（App 说「登录状态过期了 /
+  //   登录已过期，请重新登录」，401），不是这一节；「分享链接 / 下载链接过期」也不是
+  [/(登录|登陆|授权)链接|本机发起|(google|谷歌|github)[^，。,.!?！？]{0,12}(回来|回到|回不|跳回|没反应|过期|忽略|卡住|停在)/i, "Google GitHub 登录链接 忽略 过期 本机发起"],
+  // 剪辑页的「合成」：判据在上面的 CUT_MERGE_RE（与下一条共用）
+  [CUT_MERGE_RE, "剪辑页 合成 合并"],
+  // 「失败 → 敏感词」：让开登录失败与剪辑页合成失败，判据见上面的 FAIL_SENSITIVE_RE
+  [FAIL_SENSITIVE_RE, "敏感词 400 失败 InputTextSensitiveContentDetected"],
   [/无缝|衔接|圈选|不按我/, "无缝 软引导 圈选 承接段"],
   [/客服|人工|联系|邮箱|投诉/, "客服 support@ideahubs.org 人工"],
+  // ── 英文问法（2026-10-19）：知识库是中文、英文按整词比，「Can I undo deleting a segment?」「How do I update the app?」
+  //    一节都打不中，只能在这里把意思换成知识库的用词。只收 2.63 这几件；每条都要动作 + 对象两个意思同时在场，
+  //    单个常见词（update / delete / link / merge）不加词，免得把无关的英文问法拉偏
+  // 删了能不能撤销：「撤销」+ 删的是什么（草稿 → §3.2，其余按段 → §3.6）。账号 / 作品 / 评论 / 卡片删了不是这件事
+  [/^(?!.*\b(accounts?|works?|posts?|videos?|comments?|cards?|decks?)\b)(?=.*\b(undo|undelete|restore|recover|get\s+(it|them)\s+back|bring\s+(it|them)\s+back)\b)(?=.*\b(un)?(delet|remov)\w*).*\bdrafts?\b/i, "撤销 删草稿 草稿箱"],
+  [/^(?!.*\b(accounts?|works?|posts?|videos?|comments?|cards?|decks?|drafts?)\b)(?=.*\b(undo|undelete|restore|recover|get\s+(it|them)\s+back|bring\s+(it|them)\s+back)\b)(?=.*\b(un)?(delet|remov)\w*)/i, "撤销 删掉一段"],
+  [/\b(zoom|pinch|scale)\w*\b.{0,40}\b(canvas|workflow|nodes?)\b|\b(canvas|workflow)\b.{0,40}\b(zoom\w*|pinch\w*|too\s+small|tiny|bigger|larger|fit)\b/i, "工作流画布 放大 缩小 缩放"],
+  // 装新版（§7.2）：update / upgrade 要与「App / 版本 / 最新」这个对象同时在场；「被强制 / 必须更新」只认 update
+  // （Will I be forced to update?）；「版本 / 更新 + 是不是强制的」也算（Is version 2.63 forced? / Is the update mandatory?）。★ 光说 upgrade 多半是买套餐：App 英文界面里会员档那颗「去升级」
+  // 就是 "Upgrade"（app 仓 en.po），与上面中文那条「去升级 / 升级套餐」让开是同一个口径 ——「Do I need to upgrade?」
+  // 「I want to upgrade to premium to use HD」原来第 1 名是 §7.2、把 §4.2 视频档位挤掉了（2026-10-19 复核抓到）。
+  // 句子里说的是昵称 / 资料 / 付款方式 / 套餐 / 会员 / 余额 / 画质档位这些的，整句不算
+  [/^(?!.*\b(nicknames?|names?|usernames?|profiles?|avatars?|bios?|emails?|passwords?|phones?|payments?|cards?|drafts?|captions?|plans?|subscriptions?|tiers?|memberships?|members?|premium|pro|vip|accounts?|balances?|wallets?|tokens?|credits?|prices?|pricing|hd|cinema)\b)(?:.*\b(updat|upgrad)(e|es|ed|ing)\b.*\b(app|apps|application|version|versions|apk|build|release|latest|newest)\b|.*\b(app|apps|application|version|versions|apk|build|release|latest|newest)\b.*\b(updat|upgrad)(e|es|ed|ing)\b|.*\b(forced?|forcing|mandatory|required|must|have\s+to|has\s+to|keeps?\s+(asking|telling|prompting))\b.{0,30}\bupdat(e|es|ed|ing)\b|.*\b(version|updat(e|es|ed|ing)|v?\d+\.\d+)\b.{0,30}\b(forced|mandatory|required|compulsory)\b)/i, "更新机制 检查更新 必须更新 新版本"],
+  [/\bwhat'?s\s+new\b|\bchangelog\b|\brelease\s+notes?\b|\b(new|latest|current)\s+version\b/i, "最新版本 当前版 更新"],
+  [/\b(sign[\s-]?in|log[\s-]?in|login)\b.{0,12}\blinks?\b|\b(google|github)\b.{0,40}\b(sign[\s-]?in|log[\s-]?in|login)\b.{0,40}\b(back|return\w*|stuck|nothing|expired|ignored)\b/i, "Google GitHub 登录链接 忽略 过期 本机发起"],
+  [/^(?!.*\baccounts?\b).*(\bmerg\w*\b.{0,40}\b(fail\w*|error|cancel\w*|stuck|slow|cost|free)\b|\b(fail\w*|error|cancel\w*|can'?t)\b.{0,40}\bmerg\w*\b|\bmerge\s*&\s*go\b)/i, "剪辑页 合成 合并"],
+];
+
+// ── 英文问法 → 知识库用词（2026-10-20）────────────────────────────────
+// 知识库是中文的，英文问法按整词比只打得中零星几个英文词（token / Google / UID…），50 句常见英文问法只有 23 句能把对的那一节
+// 排进前 3、真的喂给模型（中文同一批 48 句）。这里按「英文词 → 知识库里那个中文词」补词，只对**一个汉字都没有**的那一行生效：
+// 中文问法（哪怕夹着 token / App / Google）一行都不经过这张表，检索结果逐字节不变。
+// ★ 补的是知识库原文里的词（多数取小节标题里的说法），不是意译；英文界面的叫法照 app 仓 en.po（Cinematic / Refined / Card smith /
+//   Remake / Recover / Undo…），用户照着屏幕上的英文问。
+// ★ 一条只认一个意思：「plan」是套餐、「update」交给上面那条动作 + 对象的规则。「draft」在英文界面里是草稿箱（Drafts）与
+//   电影级的样片（preview draft）；出片档位「草稿」英文叫 **Lite**，不叫 Draft（v2.62 / v2.63 en.po 都是），各走各的那一条。
+//   别把整句意思写进来（那是上面 SYNONYMS 的事），也别给太泛的词（video / app / use）补词。
+// ★ 为什么不先请模型把问题译成中文再检索：每句英文问话多一次对话、首句跟着晚。2026-10-20 在方舟上拿同一个模型
+//   （deepseek-v4-flash）量的：关思考约 1.9 秒 / 约 ¥0.0004 一问，默认思考（生产没关）4.4~6.1 秒 / 约 ¥0.003~0.005 一问；
+//   而且译出来的话照样未必是知识库的用词（「My clips don't line up」译成「对不齐」，「衔接 / 无缝」那两节一样排不上）。
+//   这张表零成本、零延迟、能在测试里逐句钉住。量法与结果：50 句英文问法 23 → 49 句排进前 3；另写的三批 52 / 38 / 31 句
+//   26 → 51、14 → 38、10 → 28（最后一批在调表之前先跑过一次是 19）；复核另写的 37 句 18 → 32（Lite / 画布 / 更新弹层三条是
+//   照着它补的，不算盲测）。带汉字的问话一行都不经过这张表：158 句 × 插英文词的 12,008 个变体，检索结果与没有这张表时逐字节相同。
+const EN_GLOSSARY = [
+  // 钱
+  // 这两条补的词与中文「退钱 / 扣钱」那两条同义词一样（钱的问法要的是 §4.5 / §4.6，光补「退款」「扣费」排不上去）
+  [/\brefund\w*|\b(money|tokens?|credits?)\s+back\b|\breimburs\w*|\b(tokens?|money|credits?)\b.{0,25}\breturn(ed)?\b|\breturn\w*\s+(my\s+|the\s+)?(tokens?|money|credits?)\b/i, "计费 退款 退回 受理 原样退回 自动退回 不退"],
+  [/\b(charg|deduct|bill)\w*|\bpaid\b|\bspent\b/i, "计费 退款 先扣钱 受理 自动退回 不退 取回"],
+  [/\bcosts?\b|\bcosting\b|\bprices?\b|\bpricing\b|\bfees?\b|\bhow\s+much\b|\bexpensive\b|\bcheap\w*/i, "多少钱 价格"],
+  [/\bfree\b/i, "免费"],
+  [/\bplans?\b|\bsubscri\w*|\bmembership\b|\bpremium\b/i, "套餐"],
+  [/\b(standard|pro|professional)\s+(plan|package|subscription|membership)s?\b/i, "标准套餐 专业套餐"],
+  [/\btop[\s-]?up\w*|\brecharg\w*|\b(buy|purchas)\w*|\bpay(ing|ment|ments)?\b/i, "充值 支付"],
+  [/\bwallet\b|\bbalance\b/i, "钱包 余额"],
+  [/\bcash\s*(it\s+)?out\b|\bwithdraw\w*|\bcash\b|\bredeem\w*/i, "提现 现金"],
+  [/\bdaily\b|\b(each|every|per|a)\s+day\b/i, "每天"],
+  [/\bquota\b|\ballowance\b|\bcredits?\b|\blimit\w*/i, "额度"],
+  // 出片
+  [/\bgenerat\w*|\brender\w*/i, "出片 生成"],
+  [/\bfail\w*|\berrors?\b|\bdidn'?t\s+work\b/i, "失败"],
+  [/\bstuck\b|\bnever\s+(finish|complet|came|arriv)\w*|\bno\s+result\w*|\bstill\s+(processing|generating|waiting|loading)\b|\btak\w+\s+(so|too)\s+long\b|\bpending\b|\bspinn\w*|\bkeeps?\s+(loading|spinning|going)\b|\bnever\s+(appear|show)\w*/i, "没结果 取回 凭据 二次付费"],
+  // 出片中途关掉 App / 切走：任务照跑，回来用「取回」（§4.6）
+  [/\b(close|quit|leave|exit|kill)\w*\s+(the\s+)?app\b.{0,40}\b(generat|render)\w*|\b(generat|render)\w*.{0,40}\b(close|quit|leave|exit|kill)\w*\s+(the\s+)?app\b/i, "取回 凭据 离开"],
+  // 「取回」是领出片结果（§4.6）；找回密码 / 账号 / 评论不是
+  [/^(?!.*\b(accounts?|passwords?|comments?|drafts?|usernames?)\b).*(\brecover\w*|\bretriev\w*|\bget\s+(it|them|this|that|my\s+(video|clip|segment)s?)\s+back\b)/i, "取回 凭据"],
+  // 成片留多久（方舟档 24 小时）
+  [/\bhow\s+long\b.{0,25}\b(kept|stored|saved|available|valid|last)\b|\b(videos?|clips?|results?)\b.{0,20}\bexpir\w*/i, "保留 24 小时 取回 过期"],
+  [/\btiers?\b|\bquality\b|\bresolution\b/i, "档位"],
+  // 档名（照 en.po）带上「档位」：「How many tokens does one HD video take」只靠「高清」一个词，压不过满篇 token 的钱包那几节
+  [/\bcinematic\b|\bcinema\b/i, "电影级 档位"],
+  [/\bhd\b|\b720p\b/i, "高清 档位"],
+  // 出片档位「草稿」（2.0 mini 480p）在英文界面叫 Lite（en.po 那一条的 msgctxt 写明了「不是草稿箱的草稿，也不是电影级的样片」）
+  [/\blite\b/i, "草稿 档位 480p"],
+  [/\bpreview\s+drafts?\b|\bsample\s+(mode|clip|video)s?\b/i, "样片 定稿"],
+  [/\blongest\b|\bmax(imum)?\s+(length|duration|seconds?)\b|\bhow\s+long\s+can\b|\bduration\b/i, "时长 最长"],
+  [/\bseamless\w*|\b(connect|transition|continu)\w*|\b(match|line)\s+up\b|\bjump\w*\s+between\b|\b(characters?|faces?|people|person)\b.{0,20}\b(look|looks|looked)\s+different\b|\binconsisten\w*/i, "衔接 无缝 承接"],
+  // ★ 不认 muted：首页视频静音自动播放（点一下开声）不是这两件事
+  [/\bno\s+(sound|audio)\b|\bsilent\b|\bwithout\s+(sound|audio)\b|\bcan'?t\s+hear\b/i, "没声音 无声"],
+  // 出的片子没声音是档位不出环境音（§4.2），不是铸卡师的中文语音包 —— 与中文那条同一个分法
+  [/\b(videos?|clips?|generated|output|results?|segments?)\b.{0,30}(\bno\s+(sound|audio)\b|\bsilent\b|\bwithout\s+(sound|audio)\b)/i, "环境音 档位 无声 白模"],
+  [/\bcard\s*smith\b/i, "铸卡师"],
+  [/\bvoice[\s-]?overs?\b|\bnarrat\w*/i, "配音 旁白"],
+  // 试听音色（§4.4b：点一次扣一次）
+  [/\bvoice\s+(preview|sample|demo)s?\b|\b(preview|try|test)\w*\s+(a\s+|the\s+)?voices?\b/i, "试听 858 声音面板"],
+  [/\bchat\w*|\btalk\w*\s+(to|with)\s+(you|support|the\s+bot)\b|\b(customer\s+)?support\b|\bassistant\b|\bask(ing)?\s+(you|questions)\b/i, "客服 对话"],
+  // 问客服 / 数字人自己收不收钱（§4.4b）：与中文「客服 … 钱」那条补同一批词
+  [/^(?=.*(\bchat\w*|\btalk\w*\s+(to|with)\s+(you|support)\b|\bsupport\b|\bassistant\b|\bask(ing)?\s+(you|questions)\b|\bcompanion\b))(?=.*(\bcosts?\b|\btokens?\b|\bcharg\w*|\bfree\b|\bpay\w*|\bprice\w*|\buse\s+up\b))/i, "AI 客服 数字人陪聊 对话 400 语音合成 按字符 每日上限"],
+  [/\bcards?\b/i, "卡片 铸卡"],
+  [/\brefined\b/i, "定妆 出图档位"],
+  [/\bsketch\b/i, "速写 出图档位"],
+  [/\bimage\s+tiers?\b/i, "出图档位"],
+  [/\btemplates?\b/i, "模板"],
+  // 剪辑、草稿、发布
+  [/\bmerg\w*|\bcombin\w*|\bexport\w*/i, "合成 合并"],
+  [/\beditor\b|\bedit(ing)?\s+(page|screen)\b|\bcut\s+page\b/i, "剪辑页"],
+  // 工作流画布的放大 / 缩小 / 1:1（§3.7，2.63 新加的三颗键）
+  [/\bcanvas\b|\bzoom\w*/i, "画布 放大 缩小"],
+  [/\bdrafts?\b|\bunfinished\b|\bwork[\s-]in[\s-]progress\b/i, "草稿"],
+  [/\bundo\b/i, "撤销"],
+  // 删的是账号 / 作品 / 评论 / 卡片…时不补：那几样删了没有 6 秒撤销，补了会把 §3.6「删掉一段与撤销」拉进来（与中文「撤回 → 撤销」那条同一张排除表）
+  [/^(?!.*\b(accounts?|works?|posts?|videos?|comments?|danmaku|messages?|cards?|decks?|templates?|avatars?|nicknames?|profiles?|followers?)\b).*\b(delet|remov|eras)\w*/i, "删除 删掉"],
+  [/\bpublish\w*|\bpost(ed|ing)?\b/i, "发布 作品"],
+  [/\bremake\b|\bchange\s+the\s+(content|video)\b|\breplace\s+the\s+video\b/i, "回炉重做 换内容"],
+  [/\bsave\w*\s+(\w+\s+){0,5}(phone|device|gallery|album|camera\s+roll)\b|\bdownload\w*\s+(my\s+)?(own\s+)?(video|work|clip)s?\b/i, "保存到本地"],
+  [/\bprivate\b|\bpublic\b|\bonly\s+me\b|\bvisib\w*|\bhide\b|\bunlisted\b/i, "可见性 仅自己可见"],
+  [/\baigc\b|\bai[\s-]+(generated\s+)?(labels?|tags?|marks?|badges?)\b|\bwatermark\w*/i, "AIGC 标识"],
+  [/\breport\w*/i, "举报"],
+  [/\bshar(e|es|ed|ing)\b/i, "分享"],
+  [/\btaken\s+down\b|\btakedown\b|\bremoved\s+by\b|\bappeal\w*|\bbanned\b|\b(videos?|works?|posts?|clips?)\b.{0,20}\b(removed|hidden|disappeared)\b/i, "下架 申诉"],
+  [/\bcache\b|\bstorage\b|\bspace\b/i, "缓存 存储 清理"],
+  // 账号
+  [/\baccounts?\b/i, "账号"],
+  [/\b(delete|close|deactivat\w*|cancel)\s+(my\s+)?account\b|\baccount\s+(deletion|deactivation)\b/i, "注销"],
+  [/\brestor\w*|\breactivat\w*|\bundelete\b/i, "恢复"],
+  [/\bpasswords?\b/i, "密码"],
+  [/\bforg[oe]t\w*|\breset\w*/i, "忘记 重置"],
+  // username 本来就是知识库里的词（§2.5）；再补「用户名」反而被「用户」二字摊薄到别的长节上。只把两种写法并成一个
+  [/\buser\s+name\b/i, "username"],
+  [/\bnicknames?\b|\bdisplay\s+name\b/i, "昵称"],
+  [/\bbio\b|\bself[\s-]intro\w*/i, "简介 昵称"],
+  [/\bavatar\w*|\bprofile\s+(picture|photo)\b/i, "头像"],
+  [/\blog\s*-?in\b|\blog(ged|ging)?\s+in\b|\bsign(ed|ing)?[\s-]?in\b/i, "登录"],
+  [/\bsign(ed|ing)?[\s-]?up\b|\bregist\w*/i, "注册"],
+  [/\bwechat\b|\bweixin\b/i, "微信 登录方式"],
+  [/\bphone\s+numbers?\b|\bmobile\s+numbers?\b|\bsms\b/i, "手机号 登录方式"],
+  [/\bemails?\b/i, "邮箱"],
+  [/\blog(ged|s|ging)?\s+(me\s+)?out\b|\bkick\w*\s+out\b|\bsign(ed|s)?\s+(me\s+)?out\b/i, "登出 登录态"],
+  [/\b(un)?block\w*/i, "拉黑"],
+  [/\binstall\w*/i, "安装 卸载"],
+  [/\bapple\b|\bmac\s*os\b/i, "iOS 安卓安装包 下载页"],
+  // 「哪一版 / 版本号」：§7.2 / §9.2（「update」那条动作 + 对象的规则管不到只问版本号的）
+  //   ★ 「Pro version / premium version」说的是套餐，与上面 update 那条的排除同一个口径
+  [/^(?!.*\b(plans?|pro|premium|tiers?|subscriptions?|memberships?|vip)\b).*(\bversions?\b|\breleases?\b|\bchangelog\b)/i, "版本 更新"],
+  // 更新弹层关不掉 = 强制更新（§7.2）；上面 SYNONYMS 里 update 那条要「App / 版本 / 最新」这个对象在场，「The update popup won't close」够不着
+  [/\bupdat\w*.{0,30}\b(pop-?up|dialog|won'?t\s+close|can'?t\s+close|forced|mandatory|required)\b|\b(pop-?up|dialog)\b.{0,30}\bupdat\w*/i, "必须更新 强制更新 关不掉"],
+  [/\bages?\b|\bminors?\b|\bunder\s*1[0-8]\b|\bchildren\b|\bkids?\b/i, "年龄 未成年"],
+  [/\bservers?\b|\bdata\b|\bprivacy\b/i, "服务器 隐私"],
+  [/\btutor\b|\bteacher\b|\bcourses?\b|\blessons?\b/i, "启梦老师 课程"],
+  [/\bnotifications?\b/i, "通知"],
+  [/\bhuman\b|\b(real|live)\s+(person|agent)\b/i, "人工"],
+  [/\bcomments?\b/i, "评论"],
+  [/\bdanmaku\b|\bbullet\s+comments?\b/i, "弹幕"],
 ];
 
 /**
@@ -169,9 +370,15 @@ function selectKnowledge(query, { maxChars = 8000, topK = 5 } = {}) {
   //   按行判才看得到这一轮（不按行的话 . 过不了换行，只看得到上一轮）
   const q0 = String(query || "");
   const lines = q0.split("\n");
-  let q = q0;
-  for (const [re, extra] of SYNONYMS) if (lines.some((l) => re.test(l))) q += " " + extra;
-  const qGrams = new Set(bigrams(q));
+  let extras = "";
+  for (const [re, extra] of SYNONYMS) if (lines.some((l) => re.test(l))) extras += " " + extra;
+  // 英文问法：只认一个汉字都没有的那一行（见 EN_GLOSSARY 头上）；英文虚词也只从这几行里剥（见 EN_STOPWORDS 头上）
+  const enLines = lines.filter(isEnglishAsk);
+  for (const [re, extra] of EN_GLOSSARY) if (enLines.some((l) => re.test(l))) extras += " " + extra;
+  const qGrams = new Set([
+    ...bigrams(lines.filter((l) => !isEnglishAsk(l)).join("\n") + extras),
+    ...bigrams(enLines.join("\n")).filter((w) => !EN_STOPWORDS.has(w)),
+  ]);
   const scored = kb.sections
     // 只有一行标题的章节（「## 4. AI 生成与费用」这种）没有内容，却照样吃标题加分、占前 5 的位置
     .filter((s) => !s.always && s.lines.slice(1).some((l) => l.trim() && l.trim() !== "---"))
@@ -221,7 +428,7 @@ const CANONICAL_FAQ = [
   "密码：服务器只存哈希，看不到也找不回原密码，只能在登录页「忘记密码？」走邮箱验证码重置。用户名（@句柄）注册后不能改，能改的是昵称/头像/简介（设置 → 编辑资料）。",
   "草稿箱（没做完的工程）只存在这台设备本机（IndexedDB），不跨设备同步，卸载/换手机就没了，上限 20 条（同一台手机按账号分开、各算各的）；简约模式不进草稿库。已发布作品可以在编辑页改标题/分类/简介/标签/封面/可见性；要换成片内容用编辑页的「🛠 回炉重做」（链接、播放、点赞、评论都保留，原有弹幕会被清空；只限 2026-09-07 之后发布、留存了工坊工程的作品，按分集收费的、下架期间的、还在上传的不行）。",
   "铸卡师嘴动没声音：先看声音开关是不是关了（铸卡师对话框上显示 🔇；在客服页或上课页关掉的也算，是同一个开关）；再看 token 余额或当天用量是不是到了上限（这时云端语音不出声，会退回系统自带的语音）；都不是，才是系统没装中文语音包（装完要完全退出再开）。",
-  "出的视频没声音：极速、标准、真人档出片本身不生成环境音（免费版默认的「极速」就是无声的），草稿、高清、电影级带 AI 环境音；白模模板段出片本身无声，回看和合并时用的是模板原声。这和铸卡师不出声（声音开关 / 余额 / 中文语音包）是两回事。",
+  "出的视频没声音：极速、标准、真人档出片本身不生成环境音（免费版默认的「极速」就是无声的），草稿、高清、电影级带 AI 环境音；白模模板段出片本身无声，回看和合成时用的是模板原声。这和铸卡师不出声（声音开关 / 余额 / 中文语音包）是两回事。",
   "问 AI 客服、和数字人聊天、工坊里和铸卡师打字聊天、做人格时「试聊」都花 token：每问一轮扣 400（客服 / 陪聊 / 试聊一个字都没回出来的那一轮退回）；开着声音时，每一句送去合成语音的文字按字符另扣 33（标点、空格也算，包括点一下看板娘她说的那句）。客服页、上课页右上角的 🔊 和铸卡师对话框的声音键是同一个开关，关掉只省自动念出来的那部分；以上都算进每日上限。设置页 / 声音面板的试听、剪辑页配音（含一键成片的「用完就配音」、在「💬 说一句」里让它配音）不受这个开关管：试听点一次扣一次；剪辑页配音在 2.62 及以前按句扣（几段就几句，念不完重合成的那次另扣，也算进每日上限），看得见剪辑页按钮下「配音免费，每个账号每天 1000 字」那行小字（英文界面是「Voiceover is free, up to 1000 characters per account per day」）的新版免费、不算进每日上限、每个账号每天 1,000 个字符（UTC 0 点重置，不转成扣钱；说「今天的免费配音用完了」也可能只是剩下的字不够这一句，短一点的还配得上）。启梦老师上课：每问一次约 400，自动或手动「整理」每次约 600（每满 8 问、自检通过、30 分钟没动静时会自动整理），按钮上都不标价。",
   "段与段衔接是软引导（参考图 + 提示词点名），不能保证无缝；圈选改帧也是软引导，不能保证一定按圈的改。",
   "服务器在中国香港（阿里云），数据库 MongoDB Atlas；隐私政策在官网 ideahubs.org/privacy 和 App 设置页。联系邮箱 support@ideahubs.org。",
@@ -230,13 +437,32 @@ const CANONICAL_FAQ = [
 // ── 提示词 ───────────────────────────────────────────────────────────
 const HANDOFF_RE = /^\s*\[handoff(?::([a-z_]+))?(?::([^\]]{0,60}))?\]\s*/i;
 
-function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "" } = {}) {
+function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false } = {}) {
   const who = userName ? `正在咨询的用户叫「${userName}」。` : "";
-  const langLine = lang === "en" ? "Reply in English unless the user writes Chinese." : "默认用中文回复；用户用英文就用英文。";
+  // enNames（这一轮原话是英文）而 lang 不是 en 时把话说死：App 发的 lang 恒为 zh，「用户用英文就用英文」这句在 2026-10-20 的真模型复跑里
+  // 一问短英文（「I want a refund.」）有一次回了整段中文（6 发里 1 发）
+  const langLine =
+    lang === "en"
+      ? "Reply in English unless the user writes Chinese."
+      : enNames
+        ? "默认用中文回复；用户这一问是英文，这一轮就用英文回答。"
+        : "默认用中文回复；用户用英文就用英文。";
+  // ★ 英文界面的叫法（照 app 仓 src/locales/en.po，v2.62 / v2.63 两版 2026-10-20 逐条核对；Refined 只在 v2.62 及更早）：知识库是中文的，
+  //   模型回英文时会自己意译界面上的名字 —— 真模型实测把「极速」说成 Quick / Speed、「白模」说成 White-model、「取回」说成 Retrieve、
+  //   「注销账号」说成 Delete account，「Refined 档去哪了」认不出就是「定妆」、直接转人工（2026-10-20，deepseek-v4-flash）。
+  //   用户照着说的名字在屏幕上找不到。出片档位「草稿」英文叫 Lite（不是 Draft：Draft 是模板货架的状态角标，Drafts 是草稿箱）。
+  // ★★ 什么时候带：lang === "en"，**或者**调用方判出这一问是英文（enNames，路由拿 isEnglishAsk 判这一轮的原话）。
+  //   只认 lang 的话这张表在生产上一次都发不出去：App 的客服页发的 lang 写死 "zh"（app 仓 SupportPage.tsx，v2.63 也是），
+  //   官网不调这个接口（2026-10-20 复核抓到）。中文问话一个字都不多（测试钉着）；en.po 改了名字这里要跟着改
+  const enNamesLine =
+    lang === "en" || enNames
+      ? "【英文界面叫法】用英文回答时，界面上的名字照这张表原样说（括号里是知识库里的中文名）：Fast（极速）、Standard（标准）、Lite（出片档位里的「草稿」，480p）、HD（高清）、Cinematic（电影级）、Real-person（真人档）、preview draft / finalize（样片 / 定稿）、Blockout（白模）；出图档 Sketch（速写）、Master（精绘）、Refined（定妆，2.63 撤了）；Card smith（铸卡师）；Recover（取回）、Undo（撤销）、Drafts（草稿箱）、Remake（回炉重做）、Merge & go to publish（合成并去发布）、Cancel merge（取消合成）、Save to device（保存到本地）；Public / Anyone with the link / Only me（公开 / 凭链接可见 / 仅自己可见）；Settings（设置）、Me（「我的」页）、Top up / Plans（充值 / 套餐）、Standard plan / Pro plan（标准套餐 / 专业套餐）、Deactivate account（注销账号）、Log out（退出登录）、Forgot password?（忘记密码？）、Edit profile（编辑资料）、Check for updates / Update now / Later（检查更新 / 立即更新 / 以后再说）；Workflow（工作流）、Workshop（工坊）、One-tap finish（一键成片）、QiMeng Tutor（启梦老师）。表里没有的名字照知识库原文的意思说，别自己起一个像按钮名的英文名。知识库里的「草稿」有两个意思：出片档位英文叫 Lite（例：「草稿、高清、电影级带 AI 环境音」说成「Lite, HD and Cinematic include AI ambient sound」），草稿箱英文叫 Drafts；英文回答里不要单独用 Draft 这个词。"
+      : null;
   return [
     `你是「${name}」，启梦 App（安卓端，包名 com.ideahub.branchvideo；官网叫「启梦创作」）的官方 AI 客服，形象是官网首页的看板娘：银白长发带薄荷绿挑染的少女，亲切、专业、不卖萌过头。`,
     who,
     langLine,
+    enNamesLine,
     "【依据】只根据下面「知识库」里的事实回答；知识库里没有的功能、价格、时限、政策一律说「这个我不确定，需要人工核实」，并按下面【转人工】第 5 条处理（回复开头写 [handoff:other]，告诉用户怎么提交），绝不编造。",
     "【禁止承诺】知识库末尾的「客服禁止承诺的事项」是红线：涉及其中任何一条，只能如实说明现状，不能答应、不能暗示以后会有。",
     "【表达】口语、直接、先给结论再给一步步的操作；每次回复 2～5 句，每句不超过 40 字；不用 Markdown 标记、不用列表符号、不用表情符号。涉及钱和时限的数字要和知识库一字不差。",
@@ -346,6 +572,7 @@ module.exports = {
   QUICK_QUESTIONS,
   loadKnowledge,
   selectKnowledge,
+  isEnglishAsk,
   buildSupportSystemPrompt,
   parseHandoff,
   HANDOFF_RE,

@@ -137,7 +137,12 @@ function parseTags(sentence) {
   let face = "normal";
   let action = "none";
   // 逐个吃掉句首的 [xxx] / [face:xxx] / [action:xxx]
-  const TAG = /^\s*\[\s*(?:(face|action)\s*[:：]\s*)?([a-zA-Z_]+)\s*\]/;
+  // ★ 分隔符也认 "="（2026-10-20）：DeepSeek V4-Flash 会把标签写成 [face=normal] / [action=explain]，
+  //   只认冒号时那段方括号原样留在正文里 —— 字幕上看得见、TTS 照念。拿 107 条真模型客服回复（方舟上的同家族
+  //   deepseek-v4-flash）走真的切句 + 解析回放：19 条这么写、41 句残留；认等号之后 0 句，其余 88 条与只认冒号时
+  //   逐句逐字段相同。陪聊（streamCompanionReply）、人格试聊、客服三条链路共用这里。
+  //   与下面那条清理正则是同一个口径，改一处要两处一起改
+  const TAG = /^\s*\[\s*(?:(face|action)\s*[:：=]\s*)?([a-zA-Z_]+)\s*\]/;
   for (;;) {
     const m = TAG.exec(rest);
     if (!m) break;
@@ -156,7 +161,7 @@ function parseTags(sentence) {
     rest = rest.slice(m[0].length);
   }
   // 句中/句尾漏网的方括号标签一律剥掉，绝不念给用户听
-  const text = rest.replace(/\[\s*(?:face|action)?\s*[:：]?\s*[a-zA-Z_]+\s*\]/g, "").replace(/\s+/g, " ").trim();
+  const text = rest.replace(/\[\s*(?:face|action)?\s*[:：=]?\s*[a-zA-Z_]+\s*\]/g, "").replace(/\s+/g, " ").trim();
   return { emotion, face, action, text };
 }
 

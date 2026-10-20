@@ -283,6 +283,9 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     userName: req.user.displayName || req.user.username || "",
     knowledge,
     lang: parsed.data.lang || "zh",
+    // 英文界面叫法表看这一轮的原话，不看 lang：App 客服页发的 lang 写死 "zh"（v2.63），只认 lang 的话这张表一次都发不出去。
+    // 别直接把 lang 改成 "en"：求助卡（crisisCard）与回复语言那一行也读 lang
+    enNames: support.isEnglishAsk(userTurns[userTurns.length - 1]),
     personaLine: personaPromptLine(setup.persona),
   });
   // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
@@ -425,9 +428,22 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     const stream = aiChatStream(messages, {
       maxTokens: MAX_REPLY_TOKENS,
       temperature: 0.3,
+      // ★★ 客服这一发关思考（2026-10-20，只关这一条；陪聊 / 老师 / 工单归纳照旧，所以不用全站 AI_EXTRA_BODY）：
+      //   ① 生产走 DeepSeek 官方 deepseek-v4-flash，思考默认开，而它的 max_tokens **连思维链一起算**
+      //      （生产接口实测：max_tokens 8 → reasoning 8、finish=length、正文为空）。方舟上同家族模型带真客服提示词的
+      //      88 发里，思维链 + 回答超过 700 的 38 发（中文问 2/17、英文问 36/71），光思维链就 ≥ 700 的 28 发 ——
+      //      放到生产上就是回答被拦腰截断，或者一个字都没有（没字就走下面的退款，用户只看到客服没说话）；
+      //   ② 首句慢：同一批开思考 p50 5.0 秒 / p90 11.7 秒 / 最慢 73 秒，关掉 p50 1.8 秒 / 最慢 3.6 秒；
+      //   ③ 思考模式下 temperature 不生效（DeepSeek 文档），关掉之后上面那个 0.3 才真起作用。
+      //   关思考后模型更爱把标签写成 [action=explain]（同批 26% 对 18%），companion.parseTags 已认等号，两件要一起上。
+      thinking: false,
       signal: abort.signal,
       onUsage: (u) => {
         usage = u;
+      },
+      // 被 max_tokens 截断要在日志里看得见：原来没有任何地方记，生产上截了多少只能猜
+      onFinish: (fin, m) => {
+        if (fin === "length") console.warn(`[support] reply cut by max_tokens (${MAX_REPLY_TOKENS}, ${m})`);
       },
     });
     for await (const delta of stream) {
