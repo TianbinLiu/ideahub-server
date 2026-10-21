@@ -453,6 +453,9 @@ describe("support.service 纯函数", () => {
     ["定妆档怎么没了", "出图档位"],
     ["11 月 24 日之后速写还能用吗", "出图档位"],
     ["What's new in version 2.63?", "最新版本：当前版 2.63"],
+    // 输入法吞掉空格的写法（2026-10-20 主人手机上实测打出来的就是这一句）
+    ["What Is New In Version2.63", "最新版本：当前版 2.63"],
+    ["ver2.63 what changed", "最新版本：当前版 2.63"],
     ["Can I undo deleting a segment?", "删掉一段与撤销"],
     ["How do I zoom in on the workflow canvas?", "工作流画布：放大 / 缩小"],
     ["How do I update the app?", "更新机制"],
