@@ -738,8 +738,9 @@ describe('POST /api/support/chat 按会话', () => {
     await chat('/api/support/chat', token, { message: '那要多久', threadId });
     const sent = mockAi.calls[1];
     expect(sent.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['怎么导出视频', '那要多久']);
-    // 只有「怎么导出视频\n那要多久」才检索得到这一节；单看「那要多久」召回的是别的
-    expect(sent[0].content).toContain('4.2 视频档位');
+    // 只有「怎么导出视频\n那要多久」才检索得到这一节；单看「那要多久」召回的是别的（§1.6 / §9.3）。
+    // ★ 2026-10-21 起「导出视频」由保存到本地那条同义词领去 §6.7（原来这一问喂的是 §4.2 视频档位，那是碰巧：问的并不是档位）
+    expect(sent[0].content).toContain('6.7 保存到本地');
   });
 });
 
