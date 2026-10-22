@@ -88,7 +88,13 @@ function loadKnowledge() {
   // 逆文档频率：出现在很多节里的二元组（「用户」「服务」…）不该有分量
   const df = new Map();
   for (const s of merged) for (const g of new Set(s.grams)) df.set(g, (df.get(g) || 0) + 1);
-  cache = { sections: merged, df, total: merged.length };
+  // 当前版本号从 §9.2 的标题里读（「最新版本：当前版 2.64（v2.64）…」），§9.3 收的最早一版从它的标题里读（「2.58 ~ 2.63 各版更新」），
+  // 版本问法靠这两个数分去哪一节（见 versionExtras）
+  const latest = merged.find((s) => /^9\.2\s/.test(s.title));
+  const cur = latest && /当前版\s*v?(\d+\.\d+)/.exec(latest.title);
+  const older = merged.find((s) => /^9\.3\s/.test(s.title));
+  const floor = older && /^9\.3\s+(\d+\.\d+)\s*~/.exec(older.title);
+  cache = { sections: merged, df, total: merged.length, currentVersion: cur ? cur[1] : null, olderFloor: floor ? floor[1] : null };
   return cache;
 }
 
@@ -287,6 +293,48 @@ const SYNONYMS = [
   [/(铸|炼|做|画)卡(?!师|通)|卡面|卡片.{0,4}(生成|失败|没画)/, "铸卡 卡面 原图 顶上 可能已经扣了 自己传图做卡片"],
   [/回炉|改内容|换内容|重新剪|改成片|发布.{0,6}(改|换)/, "回炉重做 换内容 编辑页 工坊工程 弹幕 版次"],
   [/下架|举报|申诉|封禁|封号/, "下架 举报 封禁 管理员 处置"],
+  // ── 2.64（2026-10-21）新加的几处：问法里的词知识库正文多半也有，但新小节都写着「2.64 起」，一个「2.64」就把它们一起抬上来，
+  //    短的 §1.9 常把真正该答的那一节挤到第 6、7 名（10-21 拿 62 句探针量的）。每条都只补那一节标题 / 正文里的原词
+  // 拉黑（§2.9）：主页上拉黑是 2.64 新加的，「怎么在主页拉黑」§2.9 原来排第 6。
+  // ★「屏蔽弹幕」是关掉弹幕显示（§6.4 的总开关），不是拉黑人 —— 不让开的话 §6.4 整个掉出去（10-21 复核量的）；「屏蔽这个人的弹幕」照旧算拉黑
+  // ★「提示词 / 出片被屏蔽」是内容审核（§4.8 敏感词），没点到人的时候让开（10-21 第二轮复核）；补一个 §2.9 标题里的「黑名单」，
+  //   免得短的 §1.9 凭「拉黑」排到它前面
+  [/拉黑|黑名单|^(?!(?!.*(这个人|那个人|(?<!其)他|她|用户|作者|某人|别人|对方)).*(敏感|违禁|违规|审核|词|出片|生成|推演|铸卡|要求|描述)).*屏蔽(?!.{0,3}弹幕)/, "拉黑 双向 已拉黑的人 不是举报 黑名单"],
+  // 关掉弹幕显示（§6.4，2.64 写进知识库的那颗总开关）。「弹幕能关吗 / 关了 / 关不掉」都要认，「关注 / 关于 / 关系」不是
+  [/(关|屏蔽|隐藏|不看|不想看|挡|看不到|看不见).{0,4}弹幕|弹幕.{0,6}(关(?!注|于|系)|挡住?|太多|隐藏|不见了|没了|消失)/, "弹幕 开关 关闭弹幕显示"],
+  // 发弹幕失败（§6.4：上限 40 字、走服务端、不做乐观插入）—— §6.4 加了开关那一条变长之后，这一问它掉出过前 5
+  [/弹幕.{0,6}(发不|发送失败|没发出|失败)|发.{0,2}弹幕.{0,6}(失败|不了|没反应|没显示)/, "弹幕上限 40 字 走服务端 不做乐观插入 发弹幕"],
+  // 倍速 / 快进（§1.6）：「更新到 2.64 后倍速在哪」里的版本号把 §9.2 / §7.4 这些带「2.64」的节抬上来，§1.6 落到第 4
+  [/倍速|快进/, "倍速 首页 长按菜单 更多操作"],
+  // 清屏 / 转屏观看（§1.6）：「清屏观看怎么退出」的「退出」会把退出登录那一节顶到第一
+  [/清屏|转屏观看/, "清屏观看 收起按钮和文字 缩小键 按返回"],
+  // 没登录点「+」关注（§1.6）：原来一节都排不上（第 7）
+  [/(没|不|未)登录.{0,8}关注|关注.{0,8}(没|不|未)登录/, "没登录也能点「+」关注 首页 头像"],
+  // 更新后「我的卡片 / 卡组 / 模板 / 3D 工坊入口不见了」：挪进了创意工坊的「我的仓库」（§1.7）；「更新后我的卡片不见了」§1.7 原来只排第 5。
+  // ★ 只让开声音那几个词与「取回」：「模板原声没了」是白模成片无声（§3.8 / §4.2），「取回的卡片」是出片的取回卡；
+  //   删 / 下架不让开 ——「更新后卡片都没了，是不是被删了」正是这一条要接住的问法（10-21 复核）
+  [/^(?!.*(声音|原声|音轨|配乐|音乐|配音|取回))(?:.*(卡片|卡组|模板|3D ?工坊|从市场添加).{0,8}(不见|没了|找不到|消失|去哪)|.*(找不到|不见了).{0,6}(卡片|卡组|模板|3D ?工坊))/i, "我的仓库 不见了 创意工坊"],
+  // 模板 / 白模成片没声音（§3.8：「选的那条音轨本身没有声音（多半是白模模板的原片…）」）：§3.9 标题里的「模板的」把 §3.8 挤出过前 5。
+  // ★ 语音合成、数字人、老师、配音这些「合成的声音」让开
+  [/^(?!.*(样本|数字人|老师|铸卡师|配音|语音|混音|音色|试听|客服|看板娘)).*(模板|白模|原片|合成(?!器)).{0,10}(原声|声音|配乐|音乐|音轨|哑|无声)/, "剪辑页合成 音轨 模板原声 白模 无声"],
+  // 对话正反打 / 九宫格那张图上的 ⚠（§4.3b）。★ 要有图 / 格子 / 机位这类上下文：App 里 ⚠ 到处都是（个人页待上传横幅、发布页渐变回退、
+  //   做模板的真人面孔提示、档位提示），光认 ⚠ 会把满是「不退」的 §4.3b 顶到每一问的第一名（10-21 复核量的）
+  [/(九宫格|正反打|机位|格子|这一格|这一张|过肩|双人镜头|分镜|图片?|画面).{0,12}(感叹号|⚠|警告)|(感叹号|⚠|警告(标|图标|符号)).{0,12}(九宫格|正反打|机位|格子|这一格|这一张|过肩|双人镜头|分镜|画面里|拼图|同一个人)|没核对上/, "⚠ AI 看一遍 机位 九宫格"],
+  // 草稿那格的锁变成了笔（§1.9）：「草稿上的锁不见了 / 草稿的锁变成笔了」原来一节都排不上 §1.9。
+  // ★ 只认「图标变了」的说法：「那笔钱 / 这笔 token」的笔是量词，「段锁着 / 锁住 / 解锁 / 锁屏」的锁是别的事
+  [/(?<!解)锁(?![着住定屏])(的?图标)?.{0,3}(不见|没了|没有了|消失|变成|换成|成了)|(没有|没|不见|少了)(那把|小)?锁(?![着住定屏])|(变成|换成|成了)(一支|一只|一个|个)?笔(?![钱账费款单])|(一支|一只)笔|笔(形|的)?图标|草稿.{0,10}铅笔(?![素画风])|铅笔(?![素画风]).{0,10}草稿/, "草稿 笔形图标 未发布 仅自己可见"],
+  // 「修这一段」的钱（§4.4d）：只改几秒也按整段计价，原来「修这一段要多少钱」「只改其中几秒会便宜吗」一节都排不上 §4.4d
+  [/修这一段|重拍这一段|只改(其中|中间)?(几|[0-9０-９一二两三四五六七八九十]+)秒/, "片段重拍 计价 整段"],
+  // 保存到本地（§6.7）：§4.4d 原来的标题带「视频」时把它挤掉过；要以作品 / 视频为对象，装 App、更新、草稿、卡片、模板让开
+  [/^(?!.*(安装包|apk|app|启梦|新版|更新|草稿|卡片|模板))(?:.*(视频|作品|成片|片子)[^，。,.!?！？]{0,8}(下载|保存|存到|存进|导出)|.*(下载|保存|导出)[^，。,.!?！？]{0,6}(视频|作品|成片|片子)|.*(视频|作品|成片|片子)[^，。,.!?！？]{0,8}(相册|图库))/i, "保存到本地"],
+  // 装新版（§7.2）：「我手机上是 2.61，怎么更新到 2.64」原来 §7.2 一节都没喂进去 —— 版本号把 §9.2 / §9.3 这些长节抬了上来。
+  // ★ 要有版本 / App 这个对象在场；改头像 / 昵称 / 作品内容、升级套餐 / 档位、问「更新了什么」的都让开。
+  // ★ 「更新到 2.64 之后 X 在哪 / X 不好用」「更新了 2.64，X 怎么用」是发版后最常见的问法，问的是 X、不是怎么更新 ——
+  //   第一版这条一律把 §7.2 / §7.3 顶上去，§1.6、§2.3 这些真要答的节被挤掉（10-21 第二轮复核量的）。所以「更新之后 / 以后」、
+  //   整行只是「我更新了」、以及「更新了 / 更新完 X，」后面接的不是更新这件事的，都让开（「更新不了」不算过去时）
+  [/^(?!.*(头像|昵称|简介|资料|作品|内容|模板|卡片|卡组|草稿|套餐|会员|密码|手机号|邮箱|高清|电影级|极速|真人档|档位|付费|专业版))(?!.*更新(了|的)?(什么|啥|哪些|内容|说明|日志))(?!.*(更新|升级)[^，。,;；？?！!\n]{0,12}(之后|以后|后))(?!\s*我?(刚刚?|已经|已|才)?(更新|升级)了?(到|成)?\s*(app|启梦|新版本?|最新版本?|最新的?|v?\d+\.\d{2})(版本?)?了?\s*[。.!！~～]?\s*$)(?!.*(更新|升级)(?:(?!不了)[^，。,;；？?！!\n]){0,10}(?<!不)了[^，。,;；？?！!\n]{0,8}[，,；;。](?!.*(更新|升级|提示|弹|安装|下载|装)))(?=.*(\d+\.\d{2}|版本|新版|最新|app|启梦|安装包|安全)).*(更新|升级)/i, "更新机制 立即更新 官网下载页"],
+  // AI 客服用哪种语言回答（§7 那一行，2.64 起跟着界面语言）。★ 老师 / 数字人 / 视频里人物的台词让开
+  [/^(?!.*(老师|数字人|台词|视频|人物|配音)).*((客服|小梦).{0,12}(英文|中文|语言|English)|(英文|中文|语言).{0,8}(回答|回复))/i, "AI 客服 问小梦 用哪种语言回答 界面语言"],
   [/隐私|数据|服务器在哪|香港/, "隐私 服务器 香港 第三方 保留"],
   [/(qq|微信|手机号?|邮箱).{0,4}(登录|登陆)|(登录|登陆)(了|还是|一直|总是|老是|又|就|时|的时候|，|,){0,3}(提示)?(失败|不了|不上|不进去)|登不进|进不去账号/i, "登录方式 QQ 微信 手机号 邮箱 登录 验证码"],
   // 2.63 Google / GitHub 从浏览器回 App 的核对（§2.10：「忽略了一条不是本机发起的登录链接」「登录链接过期了」）。
@@ -422,7 +470,10 @@ const EN_GLOSSARY = [
   [/\bphone\s+numbers?\b|\bmobile\s+numbers?\b|\bsms\b/i, "手机号 登录方式"],
   [/\bemails?\b/i, "邮箱"],
   [/\blog(ged|s|ging)?\s+(me\s+)?out\b|\bkick\w*\s+out\b|\bsign(ed|s)?\s+(me\s+)?out\b/i, "登出 登录态"],
-  [/\b(un)?block\w*/i, "拉黑"],
+  // 补的词与中文「拉黑」那条同义词一样（2.64 起主页上也能拉黑，§1.9 很短、光一个「拉黑」会把它排在 §2.9 前面）；
+  // 「block danmaku / bullet comments」是关掉弹幕显示（下面 2.64 那一组另有一条），这里让开
+  //   点到人（user / someone / him…）的照样是拉黑：「block a user who spams danmaku」（与中文「屏蔽这个人的弹幕」同一个口径）
+  [/(?:^(?!.*\b(danmaku|bullet\s+comments?)\b)|^(?=.*\b(users?|someone|somebody|people|persons?|guys?|him|her|them|accounts?|creators?|authors?|trolls?|spammers?)\b)).*\b(un)?block\w*/i, "拉黑 双向 已拉黑的人 不是举报 黑名单"],
   [/\binstall\w*/i, "安装 卸载"],
   [/\bapple\b|\bmac\s*os\b/i, "iOS 安卓安装包 下载页"],
   // 「哪一版 / 版本号」：§7.2 / §9.2（「update」那条动作 + 对象的规则管不到只问版本号的）
@@ -437,6 +488,42 @@ const EN_GLOSSARY = [
   [/\bhuman\b|\b(real|live)\s+(person|agent)\b/i, "人工"],
   [/\bcomments?\b/i, "评论"],
   [/\bdanmaku\b|\bbullet\s+comments?\b/i, "弹幕"],
+  // ── 2.64（2026-10-21）：照 app 仓 en.po 的叫法（Playback speed / More options / Clear screen / My Library / Workshop…），
+  //    同一批 62 句探针里 9 句英文有 7 句一节都没排上
+  [/\bplayback\s+speed\b|\bspeed\s+up\b|\b[0-9.]+\s*x\s+speed\b|\b2x\b|\bfast[\s-]?forward\w*|\bslow[\s-]?motion\b/i, "倍速 快进"],
+  [/\b(long[\s-]?press|press\s+and\s+hold|hold\s+(down|the\s+screen))\b|\bmore\s+options\b/i, "按住 长按 更多操作"],
+  [/\bclear[\s-]?screen\b|\bimmersive\b/i, "清屏观看"],
+  [/\bnot\s+interested\b/i, "不感兴趣"],
+  [/\bdouble[\s-]?tap\w*/i, "双击 点赞"],
+  [/\bhome\s+(feed|page|screen)\b|\bfor\s+you\b/i, "首页"],
+  [/\bsearch\s+(history|records?)\b|\brecent\s+searches\b|\bpast\s+searches\b/i, "搜索历史 清空"],
+  [/\brecently\s+popular\b|\btrending\b/i, "近期热播"],
+  [/\bmy\s+library\b|\bworkshop\b|\b3d\s+studio\b/i, "创意工坊 我的仓库"],
+  // 更新之后「我的卡片 / 卡组 / 模板不见了」：东西挪进了「我的仓库」（§1.7）；模板的声音没了、取回的卡不是这件事（与中文那条同一个让法）
+  [/^(?!.*\b(audio|sound|voice|music|soundtrack|recover\w*)\b)(?:.*\b(cards?|decks?|templates?)\b.{0,30}\b(disappear\w*|gone|missing|vanish\w*)\b|.*\bcan'?t\s+find\s+(my\s+)?(cards?|decks?|templates?)\b)/i, "我的仓库 不见了"],
+  // 「extend my subscription / plan / trial」是套餐，不是往后延长
+  [/^(?!.*\b(subscri\w*|plans?|memberships?|trials?|premium|vip)\b).*\bextend\w*/i, "往后延长 延长"],
+  [/\bminimum\s+(usage|billed|billing|charge)\b/i, "最低用量"],
+  // 2.64 修的安全漏洞（§7.2）：只认漏洞 / 补丁 / 更新的说法。★ 光一个 security / hacked 多半是在说自己的账号 ——
+  //   原来「My account was hacked」被领去 §7.2 的漏洞那一条、§2.3 密码重置掉了出去，还会诱导模型把账号被盗和漏洞扯到一起（12b 禁止的）
+  [/\bvulnerab\w*|\bexploit\w*|\bsecurity\s+(updates?|fix(es)?|patch(es)?|issues?|holes?|flaws?|bugs?|problems?|risks?|releases?)\b|\b(updates?|fix(es)?|patch(es)?|releases?|versions?|v?\d+\.\d+)\b.{0,20}\bsecurity\b/i, "安全更新 高危安全漏洞 尽快更新"],
+  [/\bhack(ed|ing|ers?)?\b|\bcompromised\b|\bstolen\b/i, "密码重置 忘记密码 账号被盗 转人工"],
+  // 关掉弹幕显示（§6.4 的总开关）；「block danmaku」是这个，不是拉黑人（下面 block 那条让开它）
+  [/\b(turn\s+off|hide|disable|block|stop|too\s+many)\b.{0,20}\b(danmaku|bullet\s+comments?)\b|\b(danmaku|bullet\s+comments?)\b.{0,20}\b(off|hide|disable|block)\b/i, "弹幕 开关 关闭弹幕显示"],
+  // en.po 里 2.64 那几样的英文叫法（Remix / + Add / Shot / reverse shot / Storyboard grid / Fix this segment / Reshoot）
+  // ★ 不补「简介」：它是 §2.5（昵称 / 简介 / 头像）标题里的词，会把改资料那一节拉进每一问 remix
+  [/^(?!.*\b(rewards?|earn\w*|bonus)\b).*\bremix\w*/i, "做同款 铺这一下不花钱 首页"],
+  [/\bremix\w*.{0,40}\b(rewards?|earn\w*|bonus)\b|\b(rewards?|earn\w*|bonus)\b.{0,40}\bremix\w*/i, "同款奖励 通知"],
+  [/^(?!.*\b(voice|persona|personas|model|models|live2d|avatar|teacher|tutor|template|templates|scheme)\s+market).*(\b(cards?|decks?|workflows?)\b.{0,40}\bmarket(place)?\b|\bmarket(place)?\b.{0,40}\b(cards?|decks?|workflows?)\b|\+\s*add\b)/i, "创意工坊 市场 ＋ 添加 不花钱"],
+  [/\breverse[\s-]?shots?\b|\bover[\s-]the[\s-]shoulder\b|\bcamera\s+angles?\b/i, "对话正反打 机位 过肩 AI 看一遍"],
+  [/\bstoryboard\s+grid\b|\bgrid\s+panels?\b/i, "九宫格分镜 每格 AI 看一遍"],
+  [/\bre-?shoot\w*|\bfix\s+this\s+segment\b/i, "片段重拍 修这一段 计价"],
+  // 检查更新 / 下载更新失败（§7.4）：2.64 起这些话按界面语言说，英文界面的用户会把英文原话贴进来。只认 en.po 里那几句的说法
+  [/\bcheck\w*\s+for\s+updates?\b|\b(update|version)\s+manifest\b|\bdownload\s+server\b|\bfailed\s+verification\b|\bsystem\s+installer\b|\binstall\s+unknown\s+apps\b|\balready\s+downloaded\b.{0,40}\bresume\b|\bthis\s+version'?s\s+package\b|\b(couldn'?t|can'?t|cannot|unable\s+to)\s+write\s+to\s+(your\s+|my\s+|the\s+)?phone'?s?\s+storage\b|\bthe\s+download\s+(timed?\s*out|didn'?t\s+finish)\b|\bconnection\s+dropped\s+during\s+the\s+download\b/i, "检查更新 更新失败 下载 校验不通过 手机存储写不进去 重试"],
+  [/^(?!.*\b(nicknames?|names?|usernames?|profiles?|avatars?|bios?|emails?|passwords?|payments?|cards?|decks?|drafts?|captions?|plans?|subscriptions?|tiers?|memberships?|accounts?|balances?|wallets?|tokens?|templates?|videos?|works?|posts?|settings?)\b).*\bupdat\w*\b.{0,40}\b(fail\w*|errors?|stuck|won'?t\s+(download|install|finish))\b/i, "检查更新 更新失败 下载 校验不通过 重试"],
+  // AI 客服用哪种语言回答（§7，2.64 起跟着界面语言）。★ 老师 / 视频里的人物 / 数字人让开
+  //   名词那一支（「Why is customer service in Chinese」）只认客服 / 机器人这类名词形式，不认动词 support（「Does Seedance support Chinese」）
+  [/^(?!.*\b(tutors?|teachers?|characters?|videos?|voice\w*|digital\s+humans?|avatars?|dialogue)\b).*(\b(customer\s+service|help\s*desk|xiao\s?meng|chat\s*bot|support\s+(bot|agent|team|chat|staff)|(the|this|ai|your)\s+(support|bot|assistant))\b(?!\s+(supports?|on|in\s+the\s+(canvas|workflow|workshop))\b)[^.?!]{0,40}\b(chinese|english)\b|\b(reply|replies|replying|answer\w*|respond\w*|talk\w*|speak\w*)\b.{0,40}\b(chinese|english|language)\b|\b(chinese|english|language)\b.{0,40}\b(reply|replies|answer\w*|respond\w*)\b)/i, "AI 客服 问小梦 用哪种语言回答 界面语言"],
 ];
 
 /**
@@ -445,6 +532,44 @@ const EN_GLOSSARY = [
  * ★ maxChars 8000（原 7000）：2.62 的钱相关小节（4.4 / 4.5 / 4.6）写长了，32 句钱的问法里 7000 有 9 句会把一节
  *   该有的钱相关小节挤掉，8000 是 4 句（9000 是 3 句，再往上收益很小）。2026-10-08 量的。
  */
+/**
+ * 问话里点了 App 的版本号时补词（2026-10-21，2.64 发版时加的）：点的是当前版 → §9.2「最新版本 当前版」；比它早的 →
+ * §9.3 / §9.4「各版更新 更早的版本」；比它新的（还没发）不补。
+ * ★ 当前版从知识库 §9.2 的标题里读（loadKnowledge 的 currentVersion），不写死：每发一版只改知识库，这里自己跟着变。
+ *   写死成 2.64 的话，下一版发布之后「2.64 更新了什么」会被领去当前版那一节，而那一节已经换成下一版了。
+ * ★ 为什么要有它：2.64 的 §9.2 写 2.64，2.63 那些挪进了 §9.3；「2.63 更新了什么」只剩「更新」二字可比，§7.2 / §7.4 的标题
+ *   （更新机制 / 检查更新）加分比 §9.3 多，§9.3 掉到第 4（10-21 量的）。
+ * ★ 只认「主版本号与当前版相同 + 两位小版本号」的形状（2.63 / v2.63 / Version2.63）：「1.5 倍」「2.5 秒」「13.7k」都不是版本号；
+ *   后面紧跟金额 / 时长单位的（「扣了我 2.50 元」）也不是。
+ * ★ 只在这一行问的就是那一版（问更新了什么 / 新功能 / 区别…，或者整行除了版本号就是「的 / 吗」这类虚字）时才补：
+ *   「我是 2.62，九宫格一张多少钱」里的版本号是随口报的，补了会把两节几千字的更新记录塞进 8000 字的预算、挤掉真正要答的那一节
+ *   （10-21 复核量的；客服自己就会先问用户是哪一版）。
+ * ★ 比当前版早的只补它所在的那一节：§9.3 收的最早一版从它的标题里读（olderFloor），更早的去 §9.4 —— 两节一起补就是 7 千字
+ */
+const VERSION_ASK_RE = /更新了?(什么|啥|哪些)|新功能|新增|新加|加了|撤了|去掉了|(有|加|改|变)了?(什么|啥|哪些)|变化|区别|不一样|是什么|介绍|更新(内容|说明|日志)|版本说明|\bwhat'?s\s+new\b|\bchangelog\b|\brelease\s+notes?\b|\bwhat\s+(changed|is\s+new)\b|\bnew\s+in\b|\bchanges?\b|\babout\b|\bdiff\w*|\bwhat\s+did\b|\bnotes?\b/i;
+const VERSION_NUM_RE = /(?<![\d.])(\d+)\.(\d{2})(?![\d])/g;
+function versionExtras(lines, current, olderFloor) {
+  if (!current) return "";
+  const [curMajor, curMinor] = current.split(".").map(Number);
+  const floorMinor = olderFloor ? Number(olderFloor.split(".")[1]) : 0;
+  let extra = "";
+  for (const raw of lines) {
+    const l = String(raw);
+    const rest = l.replace(VERSION_NUM_RE, "").replace(/\b(v|ver|version)\b|版本号?|新版|[的是吗呢啊了？?！!。.,，、\s]/gi, "");
+    if (!VERSION_ASK_RE.test(l) && rest.length > 0) continue;
+    for (const m of l.matchAll(VERSION_NUM_RE)) {
+      if (Number(m[1]) !== curMajor) continue;
+      const after = l.slice(m.index + m[0].length);
+      const before = l.slice(0, m.index);
+      if (/^\s*(元|块|万|千|秒|倍|[kK%]|tokens?\b)/i.test(after) || /[¥￥$]\s*$/.test(before)) continue;
+      const minor = Number(m[2]);
+      if (minor === curMinor) extra += " 最新版本 当前版";
+      else if (minor < curMinor) extra += minor >= floorMinor ? " 各版更新" : " 更早的版本";
+    }
+  }
+  return extra;
+}
+
 function selectKnowledge(query, { maxChars = 8000, topK = 5 } = {}) {
   const kb = loadKnowledge();
   if (!kb.sections.length) return "";
@@ -455,6 +580,7 @@ function selectKnowledge(query, { maxChars = 8000, topK = 5 } = {}) {
   const lines = q0.split("\n");
   let extras = "";
   for (const [re, extra] of SYNONYMS) if (lines.some((l) => re.test(l))) extras += " " + extra;
+  extras += versionExtras(lines, kb.currentVersion, kb.olderFloor);
   // 英文问法：只认一个汉字都没有的那一行（见 EN_GLOSSARY 头上）；英文虚词也只从这几行里剥（见 EN_STOPWORDS 头上）
   const enLines = lines.filter(latinLine);
   for (const [re, extra] of EN_GLOSSARY) if (enLines.some((l) => re.test(l))) extras += " " + extra;
@@ -509,7 +635,7 @@ const CANONICAL_FAQ = [
   "免费版（没付过钱）只能用「极速」「草稿」两档出片；标准、高清、电影级、真人档、白模模板这些要付过钱（开通任意付费套餐，或充值过任意一次）才能用，免费版在 2.62 里能看见这些档但点不动（这是默认规则；运维可以临时放开，以 App 里档位点不点得动为准，点得动就能用，不用为此付费）。旧版 App（档位里没有「草稿」）里，免费用户的标准、高清、真人档还点得动（电影级和白模模板是灰的），推演和补画的设定帧会照常扣钱，到出视频那一步才被服务器拒，所以先更新到 2.62 再出片。「极速」「标准」2026-11-24 停用，之后免费版只剩「草稿」；档位里没有「草稿」的是旧版 App，要先更新。",
   "「草稿」有两个意思：一是 2.62 新加的出片档位（和「高清」同一个模型，480p，免费版也能用，但照样按秒扣 token：5 秒约 77,004，比高清便宜；单段 4~15 秒）；二是草稿箱（没做完的工程，只存在本机，最多 20 条）。用户问画质、价钱、能不能用、能出多长时说的是档位，问丢了、存不住、换手机时说的是草稿箱。存草稿、草稿箱本身不花 token（只存在这台设备上）；花钱的是出片，「草稿」档出片照样按秒扣。",
   "没有 iOS 版，只有安卓安装包（官网 ideahubs.org/download）；也不在应用商店，别承诺上架时间。",
-  "安装提示「应用未安装」：多半是手机上还留着签名不同的旧测试版，要先卸载旧版再装。卸载会清掉这台手机上的草稿箱（没做完的工程，含已经花钱出好的段），旧版里有没做完的先做完发布，再卸载。更新失败不要建议清缓存/重装，等新版本号。",
+  "安装提示「应用未安装」：多半是手机上还留着签名不同的旧测试版，要先卸载旧版再装。卸载会清掉这台手机上的草稿箱（没做完的工程，含已经花钱出好的段），旧版里有没做完的先做完发布，再卸载。更新失败照屏幕上那句原因处理：网络问题（超时、断网、没下完）换个网络点「重试」，已经下好的会接着下；存储写不进去先腾空间；拉不起安装器、或应用内一直更新不成的，去官网下载页 ideahubs.org/download 下载、直接覆盖安装；不要建议清缓存或卸载重装。只有提示「这个地址上没有这一版的包」或同一个包反复校验不通过时，才是等新版本号 / 转人工。",
   "注销账号：设置页「退出登录」下方小字「注销账号」，需原样输入用户名确认；注销是软删除，数据不会立刻抹除，恢复或彻底删除数据要发邮件到 support@ideahubs.org 由管理员处理，不能自助恢复。",
   "密码：服务器只存哈希，看不到也找不回原密码，只能在登录页「忘记密码？」走邮箱验证码重置。用户名（@句柄）注册后不能改，能改的是昵称/头像/简介（设置 → 编辑资料）。",
   "草稿箱（没做完的工程）只存在这台设备本机（IndexedDB），不跨设备同步，卸载/换手机就没了，上限 20 条（同一台手机按账号分开、各算各的）；简约模式不进草稿库。已发布作品可以在编辑页改标题/分类/简介/标签/封面/可见性；要换成片内容用编辑页的「🛠 回炉重做」（链接、播放、点赞、评论都保留，原有弹幕会被清空；只限 2026-09-07 之后发布、留存了工坊工程的作品，按分集收费的、下架期间的、还在上传的不行）。",

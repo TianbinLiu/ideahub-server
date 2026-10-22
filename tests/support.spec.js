@@ -437,10 +437,12 @@ describe("support.service 纯函数", () => {
 
   // ★ 2026-10-19 发版后验证查出来的：2.63 的这几件，单句问法要把对的那一节排进前 3、而且真的喂进去（没被 8000 字挤掉）。
   //   问法照用户的说法写（撤回 / 找回、合并、v2.63、英文），不是照知识库的用词写
+  // ★ 2.64 发版（2026-10-21）之后，2.63 的那些挪进了 §9.3「2.58 ~ 2.63 各版更新」，§9.2 换成 2.64：问 2.63 的要落在 §9.3，
+  //   问「最新版本」的落在 §9.2（版本号怎么分节见 support.service 的 versionExtras）
   it.each([
-    ["2.63 更新了什么", "最新版本：当前版 2.63"],
-    ["v2.63 有什么新功能", "最新版本：当前版 2.63"],
-    ["最新版本有什么变化", "最新版本：当前版 2.63"],
+    ["2.63 更新了什么", "2.58 ~ 2.63 各版更新"],
+    ["v2.63 有什么新功能", "2.58 ~ 2.63 各版更新"],
+    ["最新版本有什么变化", "最新版本：当前版 2.64"],
     ["删了一段能撤回吗", "删掉一段与撤销"],
     ["删掉的段能找回来吗", "删掉一段与撤销"],
     ["删草稿能撤销吗", "草稿"],
@@ -452,10 +454,10 @@ describe("support.service 纯函数", () => {
     ["以后会强制更新吗", "更新机制"],
     ["定妆档怎么没了", "出图档位"],
     ["11 月 24 日之后速写还能用吗", "出图档位"],
-    ["What's new in version 2.63?", "最新版本：当前版 2.63"],
+    ["What's new in version 2.63?", "2.58 ~ 2.63 各版更新"],
     // 输入法吞掉空格的写法（2026-10-20 主人手机上实测打出来的就是这一句）
-    ["What Is New In Version2.63", "最新版本：当前版 2.63"],
-    ["ver2.63 what changed", "最新版本：当前版 2.63"],
+    ["What Is New In Version2.63", "2.58 ~ 2.63 各版更新"],
+    ["ver2.63 what changed", "2.58 ~ 2.63 各版更新"],
     ["Can I undo deleting a segment?", "删掉一段与撤销"],
     ["How do I zoom in on the workflow canvas?", "工作流画布：放大 / 缩小"],
     ["How do I update the app?", "更新机制"],
@@ -475,6 +477,146 @@ describe("support.service 纯函数", () => {
     expect(svc.selectKnowledge("AI 合成视频失败了扣 token 吗")).toContain("生成失败的典型原因");
     expect(svc.selectKnowledge("视频合成失败了扣钱吗")).toContain("生成失败的典型原因");
     expect(svc.selectKnowledge("视频合成要多少钱")).toContain("视频档位");
+  });
+
+  // ★ 2.64（2026-10-21）知识库新加的几节：单句问法要把对的那一节排进前 3、真的喂进去。问法照用户的说法写；
+  //   同一批 62 句探针（中英）全过才合的，这里钉其中有代表性的，新同义词那几条每条至少一句
+  it.each([
+    ["2.64 更新了什么", "最新版本：当前版 2.64"],
+    ["What's new in version 2.64?", "最新版本：当前版 2.64"],
+    ["这次更新要不要装，是不是安全更新", "更新机制"],
+    ["首页怎么调倍速", "首页：长按菜单"],
+    ["长按视频弹出来的菜单是什么", "首页：长按菜单"],
+    ["双击点赞视频就停了", "首页：长按菜单"],
+    ["没登录能关注作者吗", "首页：长按菜单"],
+    ["搜索历史怎么删", "分区页：搜索"],
+    ["近期热播是全站热榜吗", "分区页：搜索"],
+    ["更新后我的卡片不见了", "创意工坊：市场与仓库"],
+    ["3D 工坊入口去哪了", "创意工坊：市场与仓库"],
+    ["怎么做自己的视频模板", "做模板的入口卡"],
+    ["免费用户能做模板吗", "做模板的入口卡"],
+    ["草稿的图标怎么变成笔了", "个人页：笔形图标"],
+    ["怎么在主页拉黑一个人", "封禁 / 黑名单"],
+    ["谷歌登录回来提示邮箱已经用别的方式注册过了", "Google / GitHub 登录没登上"],
+    ["对话正反打每张多少钱", "九宫格分镜 / 对话正反打"],
+    ["机位上有个感叹号是什么意思", "九宫格分镜 / 对话正反打"],
+    ["往后延长怎么算钱", "片段重拍 / 往后延长 / 示例片的计价"],
+    ["检查更新失败：连接超时", "检查更新 / 更新弹层的各种说法"],
+    ["How do I change playback speed on the home feed?", "首页：长按菜单"],
+    ["How do I clear my search history?", "分区页：搜索"],
+    ["My cards disappeared after the update", "创意工坊：市场与仓库"],
+    ["Where is My Library?", "创意工坊：市场与仓库"],
+    ["How do I block someone from their profile?", "封禁 / 黑名单"],
+    ["Why is the extend price higher now?", "片段重拍 / 往后延长 / 示例片的计价"],
+    ["Is 2.64 a security update? Should I update?", "更新机制"],
+  ])("检索（2.64）：「%s」把「%s」那一节排进前 3", (q, heading) => {
+    const r = rankOf(svc.selectKnowledge(q), heading);
+    expect(r).toBeGreaterThanOrEqual(1);
+    expect(r).toBeLessThanOrEqual(3);
+  });
+
+  it("检索：版本号按当前版分节 —— 当前版从 §9.2 标题里读，问当前版落 §9.2、问更早的落「各版更新」", () => {
+    const v = svc.loadKnowledge().currentVersion;
+    expect(v).toMatch(/^\d+\.\d{2}$/);
+    const [major, minor] = v.split(".");
+    expect(rankOf(svc.selectKnowledge(`${v} 更新了什么`), "最新版本：当前版")).toBe(1);
+    const prev = `${major}.${String(Number(minor) - 1).padStart(2, "0")}`;
+    expect(rankOf(svc.selectKnowledge(`${prev} 更新了什么`), `2.58 ~ ${prev} 各版更新`)).toBe(1);
+  });
+
+  // 10-21 复核抓到的（每条都是先在探针上量到错、改了规则再钉住）
+  it.each([
+    // 装新版：版本号把更新记录抬上来时，§7.2 不能掉出去
+    ["我手机上是 2.61，怎么更新到 2.64", "更新机制"],
+    ["2.64怎么更新", "更新机制"],
+    // 版本号只在「问的就是这一版」时才领去更新记录
+    ["2.62 更新了什么", "2.58 ~ 2.63 各版更新"],
+    ["2.64 新增了啥", "最新版本：当前版 2.64"],
+    // 关弹幕不是拉黑
+    ["怎么屏蔽弹幕", "互动与防刷"],
+    ["弹幕太多了怎么关掉", "互动与防刷"],
+    ["How do I turn off danmaku?", "互动与防刷"],
+    // 保存到本地（§4.4d 的标题原来带「视频」，把 §6.7 挤掉过）
+    ["怎么把视频下载到相册", "保存到本地"],
+    ["怎么下载我的视频", "保存到本地"],
+    // 修这一段的钱、草稿的笔、客服语言
+    ["修这一段要多少钱", "片段重拍 / 往后延长 / 示例片的计价"],
+    ["只改其中几秒会便宜吗", "片段重拍 / 往后延长 / 示例片的计价"],
+    ["草稿上的锁不见了", "个人页：笔形图标"],
+    ["草稿的锁变成笔了", "个人页：笔形图标"],
+    ["客服能不能说英文", "设置页"],
+    ["Why does support reply in Chinese?", "设置页"],
+    // en.po 里的英文叫法与更新失败的英文原话
+    ["Is Remix free?", "首页：长按菜单"],
+    ["Is adding cards from the market free?", "创意工坊：市场与仓库"],
+    ["the over-the-shoulder shot has an extra person", "九宫格分镜 / 对话正反打"],
+    ["How much does a reshoot cost", "片段重拍 / 往后延长 / 示例片的计价"],
+    ["Couldn't check for updates", "检查更新 / 更新弹层的各种说法"],
+    ["The update keeps failing", "检查更新 / 更新弹层的各种说法"],
+    // 账号被盗去密码重置，不去 2.64 的漏洞那一条
+    ["My account was hacked, what should I do?", "密码重置"],
+    ["Is my data safe after the security vulnerability?", "更新机制"],
+    // 广场 = 创意工坊市场；「更新后卡片没了，是不是被删了」照旧去我的仓库
+    ["卡片广场在哪", "创意工坊：市场与仓库"],
+    ["更新以后卡片都没了，是不是被删除了", "创意工坊：市场与仓库"],
+    // 第二轮复核（10-21）：发版后最常见的「更新之后 X 在哪」问的是 X；弹幕的几种说法；模板成片没声音；铅笔；客服语言的名词说法
+    ["更新到2.64后倍速在哪", "首页：长按菜单"],
+    ["2.64更新了，倍速在哪", "首页：长按菜单"],
+    ["我已经更新到2.64了，怎么还提示更新", "更新机制"],
+    ["能不能把弹幕关了", "互动与防刷"],
+    ["弹幕可以关吗", "互动与防刷"],
+    ["弹幕发不出去", "互动与防刷"],
+    ["模板的原声不见了", "剪辑页合成：报错"],
+    ["模板的音乐没了", "剪辑页合成：报错"],
+    ["草稿怎么变成铅笔了", "个人页：笔形图标"],
+    ["Why is customer service in Chinese", "设置页"],
+    ["Block a user who spams bullet comments", "封禁 / 黑名单"],
+    ["怎么拉黑一个人", "封禁 / 黑名单"],
+  ])("检索（2.64 复核）：「%s」把「%s」那一节排进前 3", (q, heading) => {
+    const r = rankOf(svc.selectKnowledge(q), heading);
+    expect(r).toBeGreaterThanOrEqual(1);
+    expect(r).toBeLessThanOrEqual(3);
+  });
+
+  it("检索（2.64）：新加的同义词不拉偏无关问法", () => {
+    // 「extend my subscription」是套餐，不是往后延长
+    expect(svc.selectKnowledge("How do I extend my subscription?")).not.toContain("片段重拍 / 往后延长 / 示例片的计价");
+    // 模板的声音没了是白模成片无声，不是卡片挪进了我的仓库
+    expect(svc.selectKnowledge("合成之后模板的声音没了")).not.toContain("创意工坊：市场与仓库");
+    expect(svc.selectKnowledge("白模模板出的片子，模板原声没了")).toContain("剪辑页合成：报错");
+    // App 里到处是 ⚠：不是九宫格 / 对话正反打的那几张图就别领去 §4.3b
+    expect(rankOf(svc.selectKnowledge("更新提示里有个感叹号"), "九宫格分镜 / 对话正反打")).not.toBe(1);
+    expect(rankOf(svc.selectKnowledge("发布页每段旁边都写着⚠渐变回退"), "九宫格分镜 / 对话正反打")).toBe(0);
+    // 随口报的版本号不该把更新记录塞进预算
+    expect(svc.selectKnowledge("我是2.63，九宫格一张多少钱")).toContain("九宫格分镜 / 对话正反打");
+    expect(svc.selectKnowledge("扣了我 2.50 元")).not.toContain("2.58 ~ 2.63 各版更新");
+    // 屏蔽某个人仍是拉黑；改头像不是装新版
+    expect(rankOf(svc.selectKnowledge("怎么屏蔽这个人"), "封禁 / 黑名单")).toBeGreaterThanOrEqual(1);
+    expect(rankOf(svc.selectKnowledge("怎么更新头像"), "更新机制")).not.toBe(1);
+    // 装 App 的下载不是保存到本地
+    expect(rankOf(svc.selectKnowledge("怎么把启梦下载到手机"), "下载页")).toBe(1);
+    // 草稿里那笔钱不是图标
+    expect(svc.selectKnowledge("草稿里那笔钱扣了吗")).not.toContain("个人页：笔形图标");
+    // 别的市场（人格 / 声音）不是创意工坊
+    expect(svc.selectKnowledge("Is the persona market free?")).not.toContain("创意工坊：市场与仓库");
+    // 老师 / 视频人物说英文不是客服语言
+    expect(rankOf(svc.selectKnowledge("启梦老师能用英文回答吗"), "设置页")).not.toBe(1);
+    // 改昵称失败不是更新失败
+    expect(svc.selectKnowledge("I tried to update my nickname but it failed")).not.toContain("检查更新 / 更新弹层的各种说法");
+    // 第二轮复核（10-21）
+    // 升级档位不是装新版；更新之后登录不上问的是登录
+    expect(svc.selectKnowledge("app里怎么升级电影级")).toContain("视频档位");
+    expect(svc.selectKnowledge("更新到最新版后登录不上了")).toContain("密码重置");
+    // 提示词被屏蔽是内容审核，不是拉黑
+    expect(svc.selectKnowledge("提示词被屏蔽了怎么办")).toContain("生成失败的典型原因与文案");
+    // 语音合成的声音不是模板原声
+    expect(rankOf(svc.selectKnowledge("语音合成没有声音怎么办"), "剪辑页合成：报错")).not.toBe(1);
+    // 铅笔画风不是草稿的图标
+    expect(svc.selectKnowledge("画风怎么变成铅笔素描")).not.toContain("个人页：笔形图标");
+    // 动词 support 不是客服语言
+    expect(rankOf(svc.selectKnowledge("Does Seedance support Chinese prompts?"), "设置页")).not.toBe(1);
+    // remix 不该把改资料那一节拉进来
+    expect(svc.selectKnowledge("How do I remix a video?")).not.toContain("昵称 / 简介 / 头像");
   });
 
   it("检索（2.63）：新加的同义词不拉偏无关问法", () => {
