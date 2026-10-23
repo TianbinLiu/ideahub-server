@@ -1,6 +1,6 @@
 Deployment notes — IdeaHub (ECS / Cloudflare / CI)
 
-Last updated: 2026-04-10
+Last updated: 2026-09-19
 
 Purpose
 - Centralize recent operational facts for ECS deployment so an engineer or an AI agent reading the repo can quickly find where runtime artifacts and deployment automation live.
@@ -61,7 +61,61 @@ Runtime
 - Backend listens on: http://localhost:4000
 - Nginx serves ideahubs.org/www.ideahubs.org from /var/www/ideahub-client-dist
 - Nginx acts as reverse proxy for api.ideahubs.org → 127.0.0.1:4000
-- Logs: pm2 logs ideahub-server ; nginx logs in /var/log/nginx/
+- Logs: pm2 logs ideahub-server ; nginx logs in /var/log/nginx/ ; rotation: see "Log rotation" below
+
+Log rotation (since 2026-09-19)
+- pm2 日志（`~/.pm2/logs/*.log` 与 `~/.pm2/pm2.log`）由 pm2 模块 **pm2-logrotate 3.0.0** 负责，
+  装在 **deploy 用户的 pm2** 下（代码 `~/.pm2/modules/pm2-logrotate`，配置 `~/.pm2/module_conf.json`）。
+  - 配置：`max_size 20M`（每 30s 检查一次，超了立刻切）、`rotateInterval '0 0 * * *'`
+    （每天 00:00 CST 不论大小都切，空文件除外）、`retain 14`、`compress true`。
+    ⚠ `retain` 是「每个日志保留的份数」不是天数：日志暴涨时 14 份可能撑不到 14 天。
+  - 切出来的文件与原文件同目录：`ideahub-server-error__YYYY-MM-DD_HH-mm-ss.log.gz`。
+  - 查看 / 修改：`pm2 conf pm2-logrotate`；`pm2 set pm2-logrotate:<key> <value>`
+    （只重启这个模块，不碰 ideahub-server）。重装 / 升级 `pm2 install pm2-logrotate`（配置保留），
+    卸载 `pm2 uninstall pm2-logrotate`。注意它的依赖写的是 `pm2: latest` / `pmx: latest`，重装拉当天最新版。
+  - 实现是「复制 → 原地 truncate」：不改名、不发信号、不调 `reloadLogs`、不重启任何进程。
+    代价：复制结束到 truncate 之间（毫秒级）写入的行会丢。
+- **与 deploy.sh 的零停机 reload 无交互**（上线前核对过，上线后 ideahub-server 的 pid / ↺ 均未变）：
+  - `pm2 reload ecosystem.config.js` 只作用于 ecosystem 里声明的 app，模块不在其中（`pm2 reload all` 也跳过模块）。
+  - `pm2 save` 不把模块写进 `dump.pm2`；开机时 pm2 daemon 从 `~/.pm2/modules` 自己拉起模块
+    （`pm2-deploy.service` → resurrect）。
+  - pm2 daemon 以追加模式写日志，truncate 后的写入从文件头开始，reload 期间发生切割也不会产生空洞文件。
+  - 唯一可见变化：`pm2 ls` 多出一个 Module 区块（deploy.sh 失败分支写进 deploy.log 的 `pm2 list` 同样会带上）。
+  - 内存：模块常驻约 65 MB（本机 1.6 GB、无 swap）。
+- `/var/log/ideahub/deploy.log`：deploy 没有免密 sudo，所以不走 `/etc/logrotate.d`，
+  而是 **deploy 用户自己的 cron 跑用户级 logrotate**：
+  - 配置 `~/.config/logrotate/ideahub.conf`：monthly、maxsize 10M、rotate 12、compress + delaycompress、
+    missingok、notifempty、create 0664。
+  - 状态文件 `~/.local/state/logrotate/status`；cron 输出 `~/.local/state/logrotate/cron.log`（成功时为空）。
+  - cron：`30 3 * * * /usr/sbin/logrotate -s /home/deploy/.local/state/logrotate/status /home/deploy/.config/logrotate/ideahub.conf >> /home/deploy/.local/state/logrotate/cron.log 2>&1`
+  - 用「改名 + 新建」而不是 copytruncate 是安全的：deploy.sh 每一行都用 `>>` 重新打开日志，不长期持有句柄。
+  - 演练（只打印不动文件）：`logrotate -d -s ~/.local/state/logrotate/status ~/.config/logrotate/ideahub.conf`
+- 历史归档：上线前的 error log（116 MiB / 65 万行，2026-04-10 ~ 2026-09-09；绝大多数是 main 上已修掉的
+  Mongoose `new` 选项弃用警告，末尾是 Live2D 模型包 401/502、ark-transfer 403 等真实事件）已归档到
+  `~/log-archive/ideahub-server-error.upto-2026-09-09.log.gz`（1.9 MB；sha256 校验与原文件逐字节一致后才原地清空原文件）。
+  单独目录，pm2-logrotate 的 retain 清理碰不到。查阅：
+  `zcat ~/log-archive/ideahub-server-error.upto-2026-09-09.log.gz | grep -v -e MONGOOSE -e trace-warnings | less`
+
+Access model for remote ops (humans & AI agents)
+- 入口：`ssh deploy@8.217.8.225`（密钥登录，BatchMode 可用；私钥不入库）。
+- deploy 用户**无需额外授权**就能做：pm2（**只用 deploy 的 pm2**，`PM2_HOME=/home/deploy/.pm2`；
+  root 的 pm2 会另起一个空的 God daemon）、跑 deploy.sh、读写 `~/.pm2/logs` 与 `/var/log/ideahub`、
+  deploy 自己的 crontab。`/var/www/ideahub-server` 也可读，但它是 `git reset --hard origin/main` 的工作树，
+  改动必须走 PR —— 直接改会在下次部署被抹掉。
+- deploy **没有免密 sudo**。需要 root 的：`/etc/*`（nginx 配置、`/etc/logrotate.d`、sudoers）、
+  用 `systemctl` 管系统服务、`apt`、certbot。目前由人工在阿里云控制台操作：
+  ECS 实例 → 远程连接 → Workbench（以 root 登录）。安全组同样只能在控制台改。
+- 若要让 agent 直接做某一类 root 操作：按需在 `/etc/sudoers.d/` 加**精确到参数**的 NOPASSWD 条目。例：
+  1. Workbench 以 root 登录，`visudo -f /etc/sudoers.d/deploy-nginx`，写入
+     `deploy ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx`
+     （visudo 保存时做语法校验；报错时选 `e` 重新编辑或 `x` 放弃，**别选 `Q` 强存**——坏的 sudoers 会让 sudo 整体失效）；
+  2. `chmod 440 /etc/sudoers.d/deploy-nginx`；
+  3. 以 deploy 验证：`sudo -n /usr/sbin/nginx -t`；
+  4. 在本节记下新增了哪条、为什么。
+  ⚠ 不要给 `deploy ALL=(ALL) NOPASSWD: ALL`：GitHub Actions 也用 `DEPLOY_SSH_KEY` 以 deploy 身份登录，
+  全量 sudo 等于「CI 被攻破 = 服务器 root 被拿走」。也不要放行能逃逸成 root shell 的命令：会调分页器 /
+  编辑器的（`journalctl`、`systemctl status`、`less`、`vi`），以及能写 `/etc/logrotate.d`、`/etc/cron.d` 的
+  （这两处的配置本身就能以 root 执行任意命令）。
 
 GitHub Actions & deployment automation
 - Server workflow file: server/.github/workflows/deploy.yml
@@ -151,6 +205,10 @@ Change log
     安全组两条规则必须**一起刷**（同一份清单的两份拷贝，安全组无法代码收口）。
   - certbot 不受影响：authenticator=nginx 的 http-01 验证按域名解析到 CF 边缘再回源，来源
     属于 CF 网段（08-08 已在橙云状态下续期成功为证）。
+- 2026-09-19: 上线日志轮转（见上文「Log rotation」）。起因：`ideahub-server-error.log` 无轮转已涨到 116 MiB
+  （磁盘 40G 只用 17%，不紧急）。pm2 日志交给 pm2-logrotate（deploy 用户的 pm2），deploy.log 交给 deploy
+  用户 cron 跑的用户级 logrotate（deploy 无免密 sudo）；旧 error log 校验后归档到 `~/log-archive/`。
+  同时补了「Access model for remote ops」一节。
 
 ---
 
