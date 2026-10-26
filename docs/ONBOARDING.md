@@ -45,6 +45,10 @@ cp .env.example .env
 `MINIMAX_FAIL_REFUND`（可选）：真人档（MiniMax）受理之后报 Fail 时退不退钱，缺省退；写 `off` 关掉。
 方舟那边的失败退款没有开关（方舟只对成功的视频计费）。规则见 `docs/api-contract.md`「扣费」与「失败退款」。
 
+`VIDEO_REGION_GATE`（可选）：出片地区门禁（海外不给 Seedance、MiniMax 只准国际站；受全面制裁的四国都不给），`off` / `observe` / `on`，缺省 `observe`（只记日志不拦，`/api/video/zone` 也照常全报）；写了认不出的值生产拒绝启动。**切 `on` 之前有五件要做完，完整清单在 `docs/api-contract.md`「出片地区」→「切 on 之前」**（`.env.example` 那一节是同一张单子），这里只列名目、别只照这几行做：① 用 App 发版脚本的 `--min-version-code` 把旁加载包的强制更新门槛抬到认得地区拒绝的那一版；② 确认 `/api/minimax/health` 的 `region` 是 `intl`；③ 核地区判得对 —— 当面核 `cf-ipcountry` 伪造不了，并做完源站那一道加固（细节在运维的私有笔记），这一步决定门禁能不能被绕开；④ 主人定已经付过钱的片子上的后续出片（样片第二步、片段重拍、往后延长）豁不豁免；⑤ 主人定海外免费用户怎么办（切下去之后他们一档视频都没有）。
+`VIDEO_ZONE_FORCE`（只给本机开发）：把每个请求的出片地区钉成 `cn` / `intl` / `blocked`，在美国测境内、在国内测海外；**生产配了它拒绝启动**。
+规则见 `src/config/videoRegion.js` 文件头；端点形状、被拦时的回包、等主人拍板的几件见 `docs/api-contract.md`「出片地区」。
+
 ⚠️ `.env` 已被 gitignore，**永远不要提交**，也不要把值贴进聊天或文档。
 生产密钥一律在服务器上用 `openssl rand -base64 48` 生成。
 

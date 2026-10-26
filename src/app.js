@@ -138,6 +138,9 @@ app.use("/api/app", require("./routes/appRelease.routes"));
 // App 自报的客户端事件（白屏 / 更新失败 / IndexedDB 丢数据 …）：免登录、按 IP 限流、**只进日志**（理由见文件头）。
 // 挂在 /api/app 旁边：都是「登录之前就要能打」的 App 基础设施；App 先探 /api/ark/health 的 clientEvents 能力位再发
 app.use("/api/client-events", require("./routes/clientEvents.routes"));
+// 出片地区（2026-10-26）：GET /api/video/zone —— 这次请求按哪个地区算、这台服务器在这个地区给得出哪几家视频供应商。
+// 免登录（开机就要决定摆哪几档，在登录之前）、no-store；App 先看 /api/ark/health 的 videoZone 能力位再来问
+app.use("/api/video", require("./routes/videoZone.routes"));
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/feed", require("./routes/feed.routes"));

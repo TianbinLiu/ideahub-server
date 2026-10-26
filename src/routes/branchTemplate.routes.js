@@ -53,7 +53,9 @@ const {
   buildOutFrameUrl,
   OUT_FRAME_W_ROSTER,
 } = require("../utils/templateVideoAsset");
-const { callArk, chargedArkCall, T_CREATE, setWalletHeaders } = require("../services/arkGateway.service");
+const { callArk, chargedArkCall, regionGate, T_CREATE, setWalletHeaders } = require("../services/arkGateway.service");
+// 地区拒绝话后面补一句钱上的实情：拒绝话的格式（英文 / 中文一行）只有 videoRegion 知道，补话只经它
+const { withDenialNote } = require("../config/videoRegion");
 // 受理之后失败的退款：唯一实现（白模化 r2v 受理时记账、取回时看见 failed 就结账，见 ⑥ 与 finish）
 const taskRefund = require("../services/taskRefund.service");
 const blockout = require("../services/blockoutize.service");
@@ -528,6 +530,11 @@ const BOX_TIMEOUT_MS = 60_000;
  *   免得三处各写一句、改一处漏两处（2026-08-15 对抗审查 #4/#9 的起因就是各写各的）。
  */
 const VISION_BILLED_NOTE = "看画面那一步的费用已经产生、无法退回";
+/**
+ * 同一句话的英文（只有地区门禁拒在 ⑥ 那一处用：那句拒绝话是中英双语，英文那半也得知道看帧这笔花了）。
+ * ★ 与上面那句同一个意思，改一句就改另一句。不许有 ASCII 双引号 / 反斜杠（videoRegion.withDenialNote 会抛）。
+ */
+const VISION_BILLED_NOTE_EN = "The frame check that ran first was charged and cannot be refunded.";
 
 // ★ 限流比建模板更严：一发要打 1 次 Cloudinary Admin API（免费档全局 500 次/小时）、
 //   3~8 次抽帧（帧数按时长算或由用户自选，见 blockout.visionFrameTimes）、1 次 chat、1 次 r2v，
@@ -615,6 +622,16 @@ router.post(
         console.error(`[blockoutize] ${BLOCKOUT_MODEL} 不在 VIDEO_MULT_R2V 价目表里，白模化整条不可用`);
         return fail(res, 503, "白模功能暂时不可用（服务端价目未就绪），本次没有扣费，请稍后再试。", { billed: false });
       }
+      // ★★ 出片地区门禁前置（2026-10-26）：与下面的套餐预检同一个理由 —— 排在**任何一次付费调用之前**。
+      //   门禁挂在 chargedArkCall 上只管那一发本身，而这条路先花一发看帧（⑤，豆包 chat，地区门禁不管对话）、
+      //   再发 Seedance 2.5（⑥）：只靠那一处的话，海外用户先被扣掉看帧那笔钱、再在 r2v 那一步吃 403 ——
+      //   而 403 那句话说的是「没有扣费」。这里拦下就一发都不出网（连 Cloudinary 都不问）。
+      // ★ 执行（off 不判 / observe 只记 would-deny / on 回 403 + billed:false）只在 arkGateway.regionGate 一处，回包形状与
+      //   /api/ark 被拦时逐字相同；⑥ 那一发经 chargedArkCall 还会再过同一道门，结论按请求记着、与这里相同，would-deny 也不重记。
+      // ★ 排在套餐预检**之前**、管理员不豁免：理由同 chargedArkCall 里那一段（地区不给时付钱也没用；这是地区政策不是计费）。
+      // r2v 记号与下面套餐预检的同一个：只用来挑拒绝话（白模化在 MiniMax 上没有对应做法，不指人去换），不影响拦不拦
+      const regionBlock = regionGate({ req, user: req.user, kind: "task", model: BLOCKOUT_MODEL, at: "blockoutize", r2v: { kind: "blockout" } });
+      if (regionBlock) return res.status(regionBlock.status).json(regionBlock.body);
       const w0 = await wallet.getWallet(req.user._id);
       // ★ 管理员免单那一路要跳过套餐门禁 —— 判据只有 utils/roles 一处，
       //   与 services/arkGateway 里那一段逐字同理：那道门守的是"钱"，
@@ -701,8 +718,12 @@ router.post(
       //   报计划数就会出现"报价 3 帧、实际只看了 1 帧、却按 3 帧对上账"，把一次降级藏起来。
       const visionFrames = images.length;
 
+      // ★ 这一发是**豆包 chat**（VISION_MODEL，kind "chat"），不是 Seedance —— 出片地区门禁不管对话（范围等主人拍板，
+      //   见 config/videoRegion 文件头 ①），所以海外的拦截只能靠上面那道预检排在它之前。
       const visionOut = await chargedArkCall({
         user: req.user,
+        // 地区从请求现算（arkGateway.regionGate）。对话今天不归门禁管；照传，判据扩到对话那天不用回来补
+        req,
         // ★ 服务端自己发起的调用：白名单收成**恰好一个** model（比代理那份更严）。
         //   model 不是用户可控的，写成 `() => true` 也不会被利用，但那样一来
         //   "这次调用打的是哪个模型"就没有任何代码表达了。
@@ -761,8 +782,11 @@ router.post(
       }
 
       // ── ⑥ 点名：发 r2v edit（这一发是真实付费出片）──────────────────
+      // ★ 这条路上**唯一**一发 Seedance（BLOCKOUT_MODEL = 2.5，kind "task"）：chargedArkCall 里的地区门禁会再判一遍，
+      //   地区结论与看帧之前那道预检相同（regionGate 按请求记着）；门禁档位每次现读 —— 两次之间被拨到 on 的那个窗口见下面 region 那一支。
       const taskOut = await chargedArkCall({
         user: req.user,
+        req,
         modelAllowed: (m) => m === BLOCKOUT_MODEL,
         kind: "task",
         path: "/contents/generations/tasks",
@@ -780,6 +804,11 @@ router.post(
           ratio: "adaptive",
           resolution: "720p",
           watermark: false,
+          // ★ 不出声，显式写出来（2026-10-26）：与 App 的 BLOCKOUT_TASK（app 仓 ai/arkClient.ts，同一个模型、同一个 edit 子任务）
+          //   同一个值 —— edit 会把参考视频里的歌一起复刻，带歌的素材会被方舟在输出端整发拒，片子出不来。
+          //   线上 7 个已发布的白模模板实测都没有音轨，这一行是把一直以来隐含的行为钉死，不跟着方舟的缺省值走。
+          //   出声与否不进价（config/tokens.VIDEO_AUDIO 头上：有声无声同价），edit 路上方舟认这个参数（同一处 2026-08-15 实测）。
+          generate_audio: false,
         },
         // ★ 计价输入时长 = **服务端自己拼 URL 时用的那个 durSec**，不是客户端报的数。
         //   公式仍只在 config/tokens.r2vTokens 一处（这里只把结论递进去）。
@@ -791,9 +820,22 @@ router.post(
       //   那条（同样发生在看帧之后）标的是 true —— 两条自相矛盾，客户端照 false 会告诉
       //   用户"一分钱没动"，用户按虚高的余额再开一发，第二次照样被扣看帧那笔钱。
       if (!taskOut.ok) {
+        if (taskOut.reason === "region") {
+          // ★ 地区门禁拒在这一发，而看帧之前那道预检放行了：两次之间有人把 VIDEO_REGION_GATE 从 observe（或 off）拨到了 on ——
+          //   地区按请求记着，gate 每次现读，看帧那一发要好几秒，这个窗口是真的（2026-10-26 最终审核）。
+          //   拒绝话（双语一行、code REGION_UNAVAILABLE）原样留着，钱上的实情两种语言各补一句（经 videoRegion.withDenialNote，
+          //   不在这里拼：拒绝话的格式只有那一处知道）。那句「没受理、没扣费」说的是视频那一发，补的这句说看帧那一笔。
+          return res.status(taskOut.status).json({
+            ...taskOut.body,
+            message: withDenialNote(taskOut.body.message, { en: VISION_BILLED_NOTE_EN, zh: `不过${VISION_BILLED_NOTE}。` }),
+            billed: true,
+            visionFrames,
+          });
+        }
         // r2v 那一笔连发都没发出去（套餐门禁 / 余额不足 / 不在册）：它一分钱没动，
         // 但看帧那一笔已经花了。把服务层的整句理由原样留着，后面缀上钱的实情。
-        const why = String(taskOut.body?.message || "白模出片这一步没能开始");
+        // ★ 理由多半自带句末标点（套餐门禁那句以「即可使用。」收尾）：先摘掉再接「。」，不然接出「。。」
+        const why = String(taskOut.body?.message || "白模出片这一步没能开始").replace(/[。.!！]+$/u, "");
         return res.status(taskOut.status).json({
           ...taskOut.body,
           message: `${why}。出片那一笔一分钱没动，但${VISION_BILLED_NOTE}。`,
@@ -1678,9 +1720,12 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       console.warn(`[branchTemplate] detect-roles 读不到资源版本 ${publicId}`);
     }
 
+    // ★ 认人这条路上只有**豆包 chat**（VISION_MODEL，kind "chat"：认人 + 量框），一发 Seedance 都没有 ——
+    //   出片地区门禁今天不管它（对话不拦，范围等主人拍板）。req 照传：判据扩到对话那天不用回来补。
     const send = (body, timeoutMs) =>
       chargedArkCall({
         user: req.user,
+        req,
         modelAllowed: (m) => m === VISION_MODEL,
         kind: "chat",
         path: "/chat/completions",

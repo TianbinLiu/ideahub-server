@@ -155,6 +155,9 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
         }
       },
       refundTag: "minimax_refund",
+      // 出片地区门禁（arkGateway.regionGate）：海外只准 MiniMax 国际站、受全面制裁的地区一家都不给 ——
+      // 这台服务器走中国站时海外的真人档在门禁 on 时被拦（403 REGION_UNAVAILABLE，不扣钱）。轮询（GET /video/:taskId）不拦
+      req,
     });
 
     if (!out.ok) {
