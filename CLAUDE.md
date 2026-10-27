@@ -54,6 +54,7 @@ npm run check:config      # 配置自检；生产环境弱密钥、配了 VIDEO_
 | 用 root 跑 `pm2 reload` | 起出第二份重复服务 | 该命令在进程不存在时会新建。只用 deploy 用户 |
 | 工作区里有仓库的嵌套副本 | `npm test` 结果时好时坏 | jest 已用 `roots` 限定只跑 `tests/`；副本是同事的 WIP，不要删 |
 | 把本机 `.env` 里的 `VIDEO_ZONE_FORCE` 带到生产 | 部署时配置自检失败、服务起不来 | 刻意的：它把每个请求的出片地区钉死，写 `cn` 就是对海外放开 Seedance。只给本机开发用，生产删掉 |
+| 以为配了 MiniMax 就有海外的「草稿 / 高清 / 电影级」（MiniMax H3） | `/api/ark/health` 的 `minimaxV2` 是 false，App 不摆 H3 三档，`POST /api/minimax/v2/video` 回 501 `MINIMAX_V2_OFF` | H3（V2）只在 MiniMax 走国际站时开，没有单独的开关：要配 `MINIMAX_INTL_API_KEY`，两把都配时写 `MINIMAX_REGION=intl`（写 `cn` 或只配中国站的 key 都没有 H3）。见 `docs/api-contract.md`「MiniMax H3（V2）出片」 |
 | 以为出片地区门禁上线就在拦 | 海外照样能用 Seedance 出片，日志里只有 `[region] would-deny` | `VIDEO_REGION_GATE` 缺省 `observe`，只记不拦；`on` 才拦，`off` 完全不管。什么时候切 `on` 等主人拍板，见 `docs/api-contract.md`「出片地区」 |
 
 ## 约定

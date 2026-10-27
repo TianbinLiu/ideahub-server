@@ -177,8 +177,9 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
   // ★ 1.0 两档 2026-11-24 13:00（北京时间）起停用（tokens.RETIRED_MODELS_AT）：过了那一刻免费档只剩「草稿」、
   //   1.0 的新任务一律 400 MODEL_RETIRED。凡是碰到 1.0 或免费档清单的断言都按「此刻」说话 —— 写死「极速」的话，
   //   这些用例会在那一天集体变红，而代码一个字没动。停用之后的行为另有专门的用例（拨钟验，见参数钉子那一组末尾）。
-  const { isRetired, freeVideoTiers } = require("../src/config/tokens");
-  const freeLabels = () => freeVideoTiers().map((t) => t.label);
+  // ★ 档名清单走 freeVideoLabels（去重）：2026-10-26 起 MiniMax H3-Lite 也叫「草稿」，直接 map(label) 会是「草稿」「草稿」
+  const { isRetired, freeVideoLabels } = require("../src/config/tokens");
+  const freeLabels = () => freeVideoLabels();
   const taskBody = { model: SEEDANCE_2_5, duration: 5, content: [] };
   const post = (body, t = token) =>
     request(app).post("/api/ark/contents/generations/tasks").set({ Authorization: `Bearer ${t}` }).send(body);
@@ -279,7 +280,7 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
   });
 
   describe("videoPlanDenial（判据本身，纯函数）", () => {
-    const { videoPlanDenial, isPaidUser, freeVideoTiers, RETIRED_MODELS_AT } = require("../src/config/tokens");
+    const { videoPlanDenial, isPaidUser, freeVideoTiers, freeVideoLabels, RETIRED_MODELS_AT } = require("../src/config/tokens");
     const free = (o) => videoPlanDenial({ paid: false, ...o });
 
     test("免费档只认 (模型, 分辨率) 两个都对上、且是普通片", () => {
@@ -319,8 +320,10 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
 
     test("停用时刻一到，免费档清单自动只剩「草稿」（拒绝那句话与 allowed 跟着变）", () => {
       const at = Date.parse(RETIRED_MODELS_AT[FAST]);
-      expect(freeVideoTiers(at - 1).map((t) => t.label)).toEqual(["极速", "草稿"]);
-      expect(freeVideoTiers(at).map((t) => t.label)).toEqual(["草稿"]);
+      // 档名去重（Seedance 草稿与 MiniMax H3-Lite 草稿同名）；清单本身按 (模型, 分辨率) 列全
+      expect(freeVideoLabels(at - 1)).toEqual(["极速", "草稿"]);
+      expect(freeVideoLabels(at)).toEqual(["草稿"]);
+      expect(freeVideoTiers(at).map((t) => `${t.model}@${t.resolution}`)).toEqual([`${MINI}@480p`, "MiniMax-H3-Lite@480P"]);
       const after = free({ kind: "task", model: FAST, resolution: "720p", now: at });
       expect(after.allowed).toEqual(["草稿"]);
       expect(after.message).toMatch(/「草稿」/);
@@ -329,6 +332,17 @@ describe("免费档门禁：没付过钱只能用「极速」「草稿」出普�
     });
   });
 });
+
+// 抄自 app 仓档位表里 MiniMax H3 那三行（出片按地区下发的 P2b：草稿 / 高清 / 电影级在 MiniMax 上的对标，2026-10-26 定）。
+// 为什么抄不 fs 读：同下面「跨仓档位表一致性」开头那段。这三行是**契约**：App 的档位表照它写（secCost / 上游分辨率 /
+// 时长窗口 / 最多几张图 / 免不免费），App 自己的构建检查再抄一份服务端的 MINIMAX_SEC_COST 反过来比。
+// ★ upstreamResolution 是发给 MiniMax 的原样写法（大写 P）：价目表的键、免费档清单、/health 的 freeVideo 都按它认。
+//   App 档位行里另有一格小写的 resolution（480p / 720p，只为「每行都写」，不发出去），**不参与**任何比对。
+const APP_MM_TIERS = [
+  { id: "draft-mm", family: "draft", model: "MiniMax-H3-Lite", upstreamResolution: "480P", secCost: 11_200, minSec: 4, maxSec: 15, refImagesMax: 5, freeOk: true, label: "草稿" },
+  { id: "hd-mm", family: "hd", model: "MiniMax-H3-Highspeed", upstreamResolution: "768P", secCost: 26_900, minSec: 4, maxSec: 15, refImagesMax: 5, freeOk: false, label: "高清" },
+  { id: "ultra-mm", family: "ultra", model: "MiniMax-H3", upstreamResolution: "768P", secCost: 35_800, minSec: 4, maxSec: 15, refImagesMax: 5, freeOk: false, label: "电影级" },
+];
 
 describe("跨仓档位表一致性（app 的报价 vs 服务端的结算，按 (模型, 分辨率) 认）", () => {
   // ★ 为什么把 app 那份**抄**在这里，而不是 fs 读 app 仓的 economy.ts：
@@ -373,10 +387,30 @@ describe("跨仓档位表一致性（app 的报价 vs 服务端的结算，按 (
     expect(server).toEqual(fromApp);
   });
 
-  test("免费档清单 = app 里 freeOk 的那几行（按 (模型, 分辨率, 档名) 逐条相等）", () => {
+  test("免费档清单 = app 里 freeOk 的那几行（Seedance 与 MiniMax H3 两张表合起来，按 (模型, 上游分辨率, 档名) 逐条相等）", () => {
     const { FREE_VIDEO_ALLOW } = require("../src/config/tokens");
-    const fromApp = APP_VIDEO_TIERS.filter((t) => t.freeOk).map((t) => ({ model: t.model, resolution: t.resolution, label: t.label }));
-    expect(FREE_VIDEO_ALLOW.map((t) => ({ ...t }))).toEqual(fromApp);
+    // ★ MiniMax 那几行按 upstreamResolution（480P）认 —— 拿 App 那格小写的 resolution 比，免费用户会看见灰键而服务端其实放行
+    //   （2026-10-26 审核点名的两仓大小写对不上）。顺序不作数：清单只回答「这一格免不免费」，按键排好再比。
+    const key = (t) => `${t.model}@${t.resolution}`;
+    const fromApp = [
+      ...APP_VIDEO_TIERS.filter((t) => t.freeOk).map((t) => ({ model: t.model, resolution: t.resolution, label: t.label })),
+      ...APP_MM_TIERS.filter((t) => t.freeOk).map((t) => ({ model: t.model, resolution: t.upstreamResolution, label: t.label })),
+    ].sort((a, b) => key(a).localeCompare(key(b)));
+    const server = FREE_VIDEO_ALLOW.map((t) => ({ model: t.model, resolution: t.resolution, label: t.label })).sort((a, b) => key(a).localeCompare(key(b)));
+    expect(server).toEqual(fromApp);
+  });
+
+  test("免费档清单的每一条都挂在对的链路上、而且报得出价（kind 对不上 = 那一格永远不免费，零报错）", () => {
+    const { FREE_VIDEO_ALLOW, VIDEO_RESOLUTIONS, MINIMAX_SEC_COST, minimaxSecCost } = require("../src/config/tokens");
+    for (const t of FREE_VIDEO_ALLOW) {
+      if (Object.hasOwn(MINIMAX_SEC_COST, t.model)) {
+        expect({ model: t.model, kind: t.kind }).toEqual({ model: t.model, kind: "minimax_v2" });
+        expect(minimaxSecCost(t.model, t.resolution)).not.toBeNull();
+      } else {
+        expect({ model: t.model, kind: t.kind }).toEqual({ model: t.model, kind: "task" });
+        expect(VIDEO_RESOLUTIONS[t.model]).toContain(t.resolution);
+      }
+    }
   });
 
   test("停用时刻逐条相等（app 隐藏档位与服务端拒单是同一刻）", () => {
@@ -499,17 +533,25 @@ describe("跨仓时长窗口一致性（app 的时长按钮 vs 服务端的结�
   // 抄自 app/src/data/economy.ts 的 VIDEO_TIERS[].minSec / maxSec（为什么抄不 fs 读：与上面档位系数那组同一个理由）。
   // ★ 2026-10-03「段时长放开」：高清 2.0-mini 到 15 秒、电影级 2.5 到 30 秒（这两个模型的协议上限），1.0 两档仍 [3,10]。
   //   两边差一格的症状是"页面按 15 秒报价、这边按 10 秒夹"（少收）或"按钮能点、请求被这边 400"（点了没反应）。
+  // ★ 2026-10-26 加 MiniMax H3 三个（官方 V2 duration 枚举 4~15，整数）：从上面 APP_MM_TIERS 的 minSec / maxSec 取，不再抄第二份。
   const APP_SEC_WINDOW = {
     "doubao-seedance-1-0-pro-fast-251015": [3, 10],
     "doubao-seedance-1-0-pro-250528": [3, 10],
     "doubao-seedance-2-0-mini-260615": [4, 15],
     "doubao-seedance-2-5-260628": [4, 30],
+    ...Object.fromEntries(APP_MM_TIERS.map((t) => [t.model, [t.minSec, t.maxSec]])),
   };
 
-  test("两张表完全相等，且覆盖档位系数表里的每个视频模型", () => {
-    const { VIDEO_SEC_WINDOW, VIDEO_MULT } = require("../src/config/tokens");
+  test("两张表完全相等，且覆盖档位系数表与 MiniMax H3 价目表里的每个视频模型", () => {
+    const { VIDEO_SEC_WINDOW, VIDEO_MULT, MINIMAX_SEC_COST } = require("../src/config/tokens");
     expect(VIDEO_SEC_WINDOW).toEqual(APP_SEC_WINDOW);
-    expect(Object.keys(VIDEO_SEC_WINDOW).sort()).toEqual(Object.keys(VIDEO_MULT).sort());
+    expect(Object.keys(VIDEO_SEC_WINDOW).sort()).toEqual([...Object.keys(VIDEO_MULT), ...Object.keys(MINIMAX_SEC_COST)].sort());
+  });
+
+  test("用户可控的 model 查窗口不顺原型链（`constructor` 原来会拿到一个函数，解构它就抛）", () => {
+    const { videoSecWindow } = require("../src/config/tokens");
+    expect(videoSecWindow("constructor")).toEqual([3, 10]);
+    expect(videoSecWindow("__proto__")).toEqual([3, 10]);
   });
 
   test("结算按窗口夹：高清 15 秒按 15 秒收、1.0 的 15 秒仍按 10 秒收（第二道保险，路由层先拒）", () => {
@@ -525,6 +567,67 @@ describe("跨仓时长窗口一致性（app 的时长按钮 vs 服务端的结�
     const { videoSecWindow } = require("../src/config/tokens");
     expect(videoSecWindow("doubao-seedance-9-9-999999")).toEqual([3, 10]);
     expect(videoSecWindow(undefined)).toEqual([3, 10]);
+  });
+});
+
+describe("跨仓 MiniMax H3 价目（app 报价 vs 服务端结算，按 (模型, 上游分辨率) 认；2026-10-26）", () => {
+  const T = require("../src/config/tokens");
+  // 官方 Pay-as-you-go 价目页「H3 Series Flagship Models」的输出单价（美元 / 秒）。抄在这里是为了让每个数都能回溯到刊例
+  const OFFICIAL_USD_PER_SEC = { "MiniMax-H3-Lite@480P": 0.025, "MiniMax-H3-Highspeed@768P": 0.06, "MiniMax-H3@768P": 0.08 };
+  const keyOf = (model, res) => `${model}@${res}`;
+
+  test("每秒价逐条相等，两边的 (模型, 上游分辨率) 集合一样（多一格少一格都红）", () => {
+    for (const t of APP_MM_TIERS) {
+      expect({ id: t.id, perSec: T.minimaxSecCost(t.model, t.upstreamResolution) }).toEqual({ id: t.id, perSec: t.secCost });
+    }
+    const server = Object.entries(T.MINIMAX_SEC_COST).flatMap(([m, row]) => Object.keys(row).map((r) => keyOf(m, r)));
+    expect(server.sort()).toEqual(APP_MM_TIERS.map((t) => keyOf(t.model, t.upstreamResolution)).sort());
+  });
+
+  test("每个数都回溯得到刊例：美元 × 6.71345 ÷ 15 元/百万 token，取整到百位", () => {
+    for (const [m, row] of Object.entries(T.MINIMAX_SEC_COST)) {
+      for (const [r, perSec] of Object.entries(row)) {
+        const usd = OFFICIAL_USD_PER_SEC[keyOf(m, r)];
+        expect({ cell: keyOf(m, r), perSec }).toEqual({ cell: keyOf(m, r), perSec: Math.round(((usd * 6.71345) / 15) * 1e6 / 100) * 100 });
+      }
+    }
+    expect(T.MINIMAX_SEC_COST).toEqual({
+      "MiniMax-H3-Lite": { "480P": 11_200 },
+      "MiniMax-H3-Highspeed": { "768P": 26_900 },
+      "MiniMax-H3": { "768P": 35_800 },
+    });
+  });
+
+  test("一段的价 = 整数秒 × 每秒价，窗口内每一秒都与 app 的报价（clampDuration × secCost）逐位相等", () => {
+    for (const t of APP_MM_TIERS) {
+      for (let s = t.minSec; s <= t.maxSec; s++) {
+        const body = { model: t.model, resolution: t.upstreamResolution, duration: s, content: [{ type: "text", text: "x" }] };
+        expect({ id: t.id, s, cost: T.priceOf("minimax_v2", body) }).toEqual({ id: t.id, s, cost: s * t.secCost });
+      }
+    }
+    // 档位越高越贵（顺序倒挂 = 用户为更好的片付更少）
+    const perSec = APP_MM_TIERS.map((t) => T.minimaxSecCost(t.model, t.upstreamResolution));
+    expect([...perSec].sort((a, b) => a - b)).toEqual(perSec);
+  });
+
+  test("一段最多几张图两边相等，而且就是官方的免费张数（5）：5 张以内不另收", () => {
+    expect(T.MINIMAX_V2_MAX_IMAGES).toBe(5);
+    for (const t of APP_MM_TIERS) expect({ id: t.id, max: t.refImagesMax }).toEqual({ id: t.id, max: T.MINIMAX_V2_MAX_IMAGES });
+    const img = (role) => ({ type: "image_url", image_url: { url: "https://res.cloudinary.com/x/image/upload/a.png" }, role });
+    const text = { type: "text", text: "x" };
+    const base = { model: "MiniMax-H3-Highspeed", resolution: "768P", duration: 5 };
+    const five = Array.from({ length: 5 }, () => img("reference_image"));
+    expect(T.priceOf("minimax_v2", { ...base, content: [text] })).toBe(5 * 26_900);
+    expect(T.priceOf("minimax_v2", { ...base, content: [text, ...five] })).toBe(5 * 26_900);
+    expect(T.priceOf("minimax_v2", { ...base, content: [text, img("first_frame"), img("last_frame")] })).toBe(5 * 26_900);
+  });
+
+  test("免费档：只有 H3-Lite · 480P 对没付过钱的人开（app 的 freeOk），另外两个照会员档", () => {
+    for (const t of APP_MM_TIERS) {
+      const denied = T.videoPlanDenial({ paid: false, kind: "minimax_v2", model: t.model, resolution: t.upstreamResolution });
+      expect({ id: t.id, free: denied === null }).toEqual({ id: t.id, free: t.freeOk });
+      expect(T.videoPlanDenial({ paid: true, kind: "minimax_v2", model: t.model, resolution: t.upstreamResolution })).toBeNull();
+    }
   });
 });
 
@@ -1100,7 +1203,18 @@ describe("跨仓出图价目一致性（app 的报价 vs 服务端的结算）",
 
 describe("健康端点", () => {
   test("不需要登录，且只说配没配、不泄露 key", async () => {
-    const res = await request(app).get("/api/ark/health").expect(200);
+    // minimaxV2 跟着 MiniMax 的 key 走：这一条不吃开发机环境的运气（配了国际站 key 的机器上它会是 true）
+    const saved = {};
+    for (const k of ["MINIMAX_API_KEY", "MINIMAX_INTL_API_KEY", "MINIMAX_REGION"]) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    let res;
+    try {
+      res = await request(app).get("/api/ark/health").expect(200);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+    }
     // imageGroups：这台服务器有没有组图任务（App 据此决定九宫格分镜能不能用），能力位、不是秘密
     // res480 / draftMode / failRefund / freeVideo：2026-10-07 的四个能力位（老服务端没有 = App 把对应的东西藏起来）
     expect(res.body).toEqual({
@@ -1111,9 +1225,11 @@ describe("健康端点", () => {
       draftMode: true,
       failRefund: true,
       // 停用的档自动出局（1.0 极速 2026-11-24 13:00 起就不在这里了）：按「此刻」断言，别让这条在那一天变红
+      // MiniMax H3-Lite（草稿的 MiniMax 对标，2026-10-26）原样下发上游的大写 480P；只带 label / model / resolution，不带 kind
       freeVideo: [
         { label: "极速", model: "doubao-seedance-1-0-pro-fast-251015", resolution: "720p" },
         { label: "草稿", model: "doubao-seedance-2-0-mini-260615", resolution: "480p" },
+        { label: "草稿", model: "MiniMax-H3-Lite", resolution: "480P" },
       ].filter((t) => !require("../src/config/tokens").isRetired(t.model)),
       // 两个运维开关的现状（2026-10-07 评审）：缺省都开着
       freeVideoGate: true,
@@ -1122,6 +1238,10 @@ describe("健康端点", () => {
       clientEvents: true,
       // videoZone：这台服务器有 GET /api/video/zone（出片地区，2026-10-26；tests/videoZone.spec.js）—— 只放「有没有」，不放地区本身
       videoZone: true,
+      // minimaxV2：这台服务器开着 MiniMax H3 出片（只在国际站 key 配着时为真；这一套不配 MiniMax，所以是 false —— tests/minimaxV2.spec.js）
+      minimaxV2: false,
+      // minimaxV2FreeTextOnly：没付过钱的人在 H3 上只能纯文字出片（tokens.MINIMAX_V2_FREE_TEXT_ONLY，2026-10-26 终审）—— 代码常量，不随 key 变
+      minimaxV2FreeTextOnly: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

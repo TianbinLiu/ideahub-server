@@ -22,6 +22,13 @@
  *                ★ 2026-10-26 审核改的：原来 providers 不跟 gate，「gate 不是 on 就别拿 providers 藏档」只是 App 自己的决定，
  *                  有一个版本的 App 没照做，服务端切 off 这个急停开关就救不回海外的 Seedance，而服务端这一侧毫无办法；
  *                ★ MiniMax 连站一起判：海外只准国际站 —— 这台服务器的 MiniMax 走中国站时，gate 为 on 的海外回包里没有 "minimax"；
+ *                ★ "minimax" 一个名字管 MiniMax 的**全部**出片：真人档（海螺 2.3，`POST /api/minimax/video`）与 H3 三档
+ *                  （「草稿 / 高清 / 电影级」在 MiniMax 上的对标，V2，`POST /api/minimax/v2/video`）。两种都打到这台服务器走的同一个站，
+ *                  地区门禁也按「站」判（config/videoRegion.gatedProviderOf：minimax_video 与 minimax_v2 同一个答案），所以不拆成两个名字。
+ *                  App 摆 H3 三档 = 这里的 providers 有 "minimax" **且** `/api/ark/health` 的 `minimaxV2` 为真（2026-10-26）：
+ *                  `minimaxV2` 是这台服务器开没开 V2（config/minimax.minimaxV2Enabled，只在国际站），是能力、不随地区变，所以在 health；
+ *                  地区会在会话中途变，所以在这里。★ 别在这个回包里再报一位 minimaxV2：同一件事两个端点各报一份，App 读的那两份
+ *                  对不上时谁都说不清该信哪一份（tests/minimaxV2.spec 拿 V2 出片那一发核这条规矩：两位都真 ⇔ 那一发真受理）；
  *   gate      —— 地区门禁此刻开到哪一档："off" | "observe" | "on"（VIDEO_REGION_GATE，缺省 observe），只作说明与排查用。
  *   v         —— 回包形状的版本：以后加字段（比如按型号单独关）不升，改了已有字段的意思才升
  *                （providers 跟着 gate 走是 v1 发布之前、同一批里改的，所以还是 v1）。

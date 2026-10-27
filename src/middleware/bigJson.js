@@ -14,6 +14,10 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
 
+/**
+ * 小上限（与 app.js 里全局那一道同一个数）。验不过签名的请求在大 body 的前缀上走它；
+ * 前缀底下另有**不需要**大 body 的子路径时，也把它挂在那一层前面（app.js 的 /api/minimax/v2）。
+ */
 const smallJson = express.json({ limit: "1mb" });
 
 /**
@@ -41,4 +45,4 @@ function jsonGateWith(limit) {
 
 const jsonGate = jsonGateWith(process.env.BRANCH_JSON_LIMIT || "50mb");
 
-module.exports = { jsonGate, jsonGateWith };
+module.exports = { jsonGate, jsonGateWith, smallJson };

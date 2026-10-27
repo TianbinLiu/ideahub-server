@@ -50,6 +50,7 @@ const {
   retiredDenial,
   freeVideoTiers,
   freeVideoGateOn,
+  MINIMAX_V2_FREE_TEXT_ONLY,
 } = require("../config/tokens");
 // 白模模板：r2v 结算按参考视频 URL 反查登记（resolveR2v），试炼闸靠任务追踪（noteR2vOutcome）
 const BranchTemplate = require("../models/BranchTemplate");
@@ -81,6 +82,8 @@ const {
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
 const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_POLL } = require("../services/arkGateway.service");
 const wallet = require("../services/tokenWallet.service");
+// MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
+const { isMinimaxV2VideoUrl, minimaxV2Enabled } = require("../config/minimax");
 
 const router = express.Router();
 
@@ -121,6 +124,16 @@ const MAX_ASSET_BYTES = 64 * 1024 * 1024;
 const ASSET_HOST_RE = /(^|\.)(volces|volccdn)\.com$|^public-cdn-video-data[\w-]*\.oss-cn-[\w-]+\.aliyuncs\.com$/i;
 
 /**
+ * 产物代理放不放这个地址（`parsed` 是 `raw` 拆好的那一份）。
+ * ★ 第三家是 MiniMax H3（V2）的成片落点（2026-10-26）：整条判据交给 config/minimax.isMinimaxV2VideoUrl —— 转存与发布时的兜底认的
+ *   是同一个函数（https、不带端口、不带账号密码、主机恰好是那一个）。2026-10-26 终审改的：原来这里只拿主机名比，带端口 / 带账号密码的写法
+ *   这边放、转存那边拒 —— 同一条规矩两种松紧。方舟与真人档那两家照旧只看主机名（这一处没变）。
+ */
+function assetHostOk(parsed, raw) {
+  return ASSET_HOST_RE.test(parsed.hostname) || isMinimaxV2VideoUrl(raw);
+}
+
+/**
  * GET /api/ark/health —— 只回"这台服务器配没配 key"，不泄露 key 本身。
  * 与 /api/tts/health 同口径：部署自检与人工 curl 用它判断"AI 到底通不通"，
  * 不必去翻日志猜。
@@ -146,6 +159,12 @@ router.get("/health", (_req, res) => {
   //   · videoZone：有 GET /api/video/zone（这次请求按哪个出片地区算、这个地区给得出哪几家供应商、地区门禁开到哪一档；
   //     routes/videoZone.routes.js 文件头）。★ 这里只放「有没有」，**不放地区本身**：App 把 health 的结论记一整场会话，
   //     而开关 VPN 会让地区在会话中途变 —— 地区每次去 /api/video/zone 现问（no-store）。
+  //   · minimaxV2：这台服务器开着 MiniMax H3 出片（POST /api/minimax/v2/video，「草稿 / 高清 / 电影级」在 MiniMax 上的对标）。
+  //     判据只在 config/minimax.minimaxV2Enabled（只在国际站、国际站的 key 配着时为真）—— 路由开不开问的是同一个。
+  //     App 只在这一位为真时摆 H3 那三档；freeVideo 里那一行 H3-Lite 是**价目**（免费版能用哪一格），不说明这台服务器开没开。
+  //   · minimaxV2FreeTextOnly：没付过钱的人在 H3 上只能纯文字出片（带首帧 / 尾帧 / 参考图要付过钱；tokens.MINIMAX_V2_FREE_TEXT_ONLY，
+  //     2026-10-26 终审：H3 收不收真人照片还没验过）。App 照它对没付过钱的人只发纯文字 —— 不照的话那些人每一发都在扣费之前吃 403 PLAN_REQUIRED
+  //     （回包带 freeTextOnly: true）。读不到这一位 = 老服务端，那上面本来就没有 H3（minimaxV2 也读不到）。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -158,6 +177,8 @@ router.get("/health", (_req, res) => {
     minimaxFailRefund: taskRefund.minimaxRefundOn(),
     clientEvents: true,
     videoZone: true,
+    minimaxV2: minimaxV2Enabled(),
+    minimaxV2FreeTextOnly: MINIMAX_V2_FREE_TEXT_ONLY,
   });
 });
 
@@ -1264,7 +1285,7 @@ router.get("/asset", requireAuth, pollLimit, async (req, res) => {
   } catch {
     return res.status(400).json({ message: "bad url" });
   }
-  if (parsed.protocol !== "https:" || !ASSET_HOST_RE.test(parsed.hostname)) {
+  if (parsed.protocol !== "https:" || !assetHostOk(parsed, raw)) {
     return res.status(400).json({ message: "host not allowed" });
   }
   try {
@@ -1335,7 +1356,8 @@ router.post("/transfer-video", requireAuth, genLimit, async (req, res) => {
   } catch {
     return res.status(400).json({ message: "bad url" });
   }
-  if (parsed.protocol !== "https:" || !videoAsset.isArkVideoUrl(raw)) {
+  // 方舟成片之外也收 MiniMax H3 的成片（2026-10-26：它的 content.url 同样有时效，判据在 videoAsset.isUpstreamTempVideoUrl）
+  if (parsed.protocol !== "https:" || !videoAsset.isUpstreamTempVideoUrl(raw)) {
     return res.status(400).json({ message: "host not allowed" });
   }
   try {

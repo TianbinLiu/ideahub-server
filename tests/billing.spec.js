@@ -305,14 +305,19 @@ describe('每日上限（§14.10）', () => {
     // ★ 2026-10-07 起免费版只能用 FREE_VIDEO_ALLOW 里的档出片（极速 / 草稿），而极速 11-24 停用 ——
     //   所以按「停用之后还开着的免费档」里最便宜的一段算（4 秒草稿 = 61,603）。
     //   别拿已停用的极速 3 秒（18,144）蒙混过关：那一天之后它根本点不了，自检就成了假的。
+    // ★ 2026-10-26 起清单里还有 MiniMax H3-Lite 480P（「草稿」的 MiniMax 对标，4 秒 44,800）。按**每一档各自**最短的一段算、
+    //   取其中最贵的那个（4 秒 Seedance 草稿 61,603）：出片按地区下发之后，有的人只看得到其中一家
+    //   （海外只有 MiniMax；没配 MiniMax 的服务器上只有 Seedance）—— 只拿全表最便宜的那一段自检，另一家的人可能一段都出不来。
+    //   价钱按各自那条链路的 priceOf（kind 记在清单上），不拿 segTokens 去算 MiniMax 的一段（那张像素表里没有它）。
     const afterRetire = Math.max(...Object.values(tokens.RETIRED_MODELS_AT).map((s) => Date.parse(s)));
     const open = tokens.freeVideoTiers(afterRetire);
     expect(open.length).toBeGreaterThan(0);
-    const cheapestVideo = Math.min(...open.map((t) => tokens.segTokens(tokens.videoSecWindow(t.model)[0], t.model, t.resolution)));
-    expect(cheapestVideo).toBe(61603);
-    expect(tokens.DAILY_LIMITS.freeDaily).toBeGreaterThanOrEqual(cheapestVideo);
+    const minSeg = (t) => tokens.priceOf(t.kind, { model: t.model, resolution: t.resolution, duration: tokens.videoSecWindow(t.model)[0], content: [] });
+    expect(open.map(minSeg)).toEqual([61603, 44800]);
+    const dearestCheapest = Math.max(...open.map(minSeg));
+    expect(tokens.DAILY_LIMITS.freeDaily).toBeGreaterThanOrEqual(dearestCheapest);
     // 同一个形状的另一半：新人额度要够出**几段**（主人 2026-10-07：「而不是连一个视频都生成不了」）
-    expect(tokens.planOf('free').welcomeTokens).toBeGreaterThanOrEqual(2 * cheapestVideo);
+    expect(tokens.planOf('free').welcomeTokens).toBeGreaterThanOrEqual(2 * dearestCheapest);
   });
 });
 

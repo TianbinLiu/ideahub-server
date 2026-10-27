@@ -186,7 +186,8 @@ describe("白名单转发（配假 key + 假上游，看真正发出去的是什
       expect(mm.status).toBe(403);
       expect(mm.body.code).toBe("PLAN_REQUIRED");
       // 按「此刻」断言：极速 2026-11-24 13:00 停用之后清单只剩「草稿」（写死的话这条会在那一天变红）
-      expect(mm.body.allowed).toEqual(require("../src/config/tokens").freeVideoTiers().map((t) => t.label));
+      // 档名去重走 freeVideoLabels（MiniMax H3-Lite 也叫「草稿」，2026-10-26）
+      expect(mm.body.allowed).toEqual(require("../src/config/tokens").freeVideoLabels());
       const rw = await request(app)
         .post("/api/runway/video")
         .set({ Authorization: `Bearer ${freeToken}` })

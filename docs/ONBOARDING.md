@@ -42,10 +42,14 @@ cp .env.example .env
 `FREE_VIDEO_GATE`（可选）：免费档出片限制的应急总开关，缺省开；写 `off` 退回改版前的口径（只有电影级挡免费版）。
 规则本身见 `docs/api-contract.md`「视频档位与模型能力」。
 
-`MINIMAX_FAIL_REFUND`（可选）：真人档（MiniMax）受理之后报 Fail 时退不退钱，缺省退；写 `off` 关掉。
+`MINIMAX_INTL_API_KEY` / `MINIMAX_API_KEY` / `MINIMAX_REGION`（可选）：MiniMax 国际站 / 中国站的 key 与走哪个站（两把都配必须写 `MINIMAX_REGION`，否则生产拒绝启动）。
+真人档两个站都能走；海外的「草稿 / 高清 / 电影级」（MiniMax H3，V2）**只在走国际站时开**（`/api/ark/health` 的 `minimaxV2`），没有单独的开关。
+契约见 `docs/api-contract.md`「MiniMax H3（V2）出片」。
+
+`MINIMAX_FAIL_REFUND`（可选）：MiniMax 出片（真人档、H3）受理之后报失败时退不退钱，缺省退；写 `off` 关掉。
 方舟那边的失败退款没有开关（方舟只对成功的视频计费）。规则见 `docs/api-contract.md`「扣费」与「失败退款」。
 
-`VIDEO_REGION_GATE`（可选）：出片地区门禁（海外不给 Seedance、MiniMax 只准国际站；受全面制裁的四国都不给），`off` / `observe` / `on`，缺省 `observe`（只记日志不拦，`/api/video/zone` 也照常全报）；写了认不出的值生产拒绝启动。**切 `on` 之前有五件要做完，完整清单在 `docs/api-contract.md`「出片地区」→「切 on 之前」**（`.env.example` 那一节是同一张单子），这里只列名目、别只照这几行做：① 用 App 发版脚本的 `--min-version-code` 把旁加载包的强制更新门槛抬到认得地区拒绝的那一版；② 确认 `/api/minimax/health` 的 `region` 是 `intl`；③ 核地区判得对 —— 当面核 `cf-ipcountry` 伪造不了，并做完源站那一道加固（细节在运维的私有笔记），这一步决定门禁能不能被绕开；④ 主人定已经付过钱的片子上的后续出片（样片第二步、片段重拍、往后延长）豁不豁免；⑤ 主人定海外免费用户怎么办（切下去之后他们一档视频都没有）。
+`VIDEO_REGION_GATE`（可选）：出片地区门禁（海外不给 Seedance、MiniMax 只准国际站；受全面制裁的四国都不给），`off` / `observe` / `on`，缺省 `observe`（只记日志不拦，`/api/video/zone` 也照常全报）；写了认不出的值生产拒绝启动。**切 `on` 之前有五件要做完，完整清单在 `docs/api-contract.md`「出片地区」→「切 on 之前」**（`.env.example` 那一节是同一张单子），这里只列名目、别只照这几行做：① 用 App 发版脚本的 `--min-version-code` 把旁加载包的强制更新门槛抬到认得地区拒绝的那一版；② 确认 `/api/minimax/health` 的 `region` 是 `intl`；③ 核地区判得对 —— 当面核 `cf-ipcountry` 伪造不了，并做完源站那一道加固（细节在运维的私有笔记），这一步决定门禁能不能被绕开；④ 主人定已经付过钱的片子上的后续出片（样片第二步、片段重拍、往后延长）豁不豁免；⑤ 海外免费用户留的是 MiniMax H3-Lite · 480P（2026-10-26 已定）：V2（H3）出片要在国际站上开着、带 H3 三档的 App 要铺开，缺一样切下去之后他们一档视频都没有。
 `VIDEO_ZONE_FORCE`（只给本机开发）：把每个请求的出片地区钉成 `cn` / `intl` / `blocked`，在美国测境内、在国内测海外；**生产配了它拒绝启动**。
 规则见 `src/config/videoRegion.js` 文件头；端点形状、被拦时的回包、等主人拍板的几件见 `docs/api-contract.md`「出片地区」。
 

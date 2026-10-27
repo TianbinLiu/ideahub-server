@@ -462,9 +462,14 @@ describe("清扫器", () => {
     await GenTaskCharge.collection.updateOne({ taskId: id }, { $set: { createdAt: new Date(lastSecond.getTime() - 20 * 60_000), nextCheckAt: new Date(Date.now() - 1000) } });
 
     const refundSpy = jest.spyOn(wallet, "refundSplit");
-    await svc.reconcile({ now: lastSecond, query: async () => ({ status: "failed" }) });
+    // ★ 上游只对**这一行**说 failed，别的一律「没问到」（null）：开轮的 now 在下个月初之前，同一个文件前面用例留下的 open 行
+    //   （nextCheckAt 都在「此刻 + 10 分钟」）也到点了 —— 在每个月最后约 8 天里它们还不够「老过 8 天」，会被一起问到；
+    //   query 对谁都回 failed 的话它们全被退款，refundSplit 被调十几次（2026-10-26 复跑抓到：只在月末那几天红）。
+    //   别靠改日期躲：这条用例本来就要拿「真实此刻的下一个月初」跑。
+    await svc.reconcile({ now: lastSecond, query: async (r) => (r.taskId === id ? { status: "failed" } : null) });
     // 动钱用的是这一行办的那一刻，不是开轮那一拍
     expect(refundSpy).toHaveBeenCalledTimes(1);
+    expect(String(refundSpy.mock.calls[0][0])).toBe(String(u.id));
     expect(refundSpy.mock.calls[0][4].getTime()).not.toBe(lastSecond.getTime());
     expect(refundSpy.mock.calls[0][4].getTime()).toBeLessThanOrEqual(Date.now());
 

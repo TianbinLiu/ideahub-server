@@ -82,8 +82,9 @@ function schedule(key, url, userId) {
  *  轮询端点报的就是库里这份，落不下去客户端会一直看到 pending 干等（铁律八）。 */
 async function runTransfer(key, url, userId) {
   try {
-    // 防御两道与 /asset 同款：url 来自方舟响应或已过路由校验，这里再收一次口不花钱
-    if (!videoAsset.isArkVideoUrl(url)) throw new Error("not an ark video url");
+    // 防御两道与 /asset 同款：url 来自方舟响应或已过路由校验，这里再收一次口不花钱。
+    // 认的是「上游的临时成片」（方舟 / MiniMax H3，2026-10-26 起），判据只在 videoAsset.isUpstreamTempVideoUrl
+    if (!videoAsset.isUpstreamTempVideoUrl(url)) throw new Error("not an upstream video url");
     await assertPublicUrl(url);
     const buf = await videoAsset.downloadToBuffer(url, { timeoutMs: TRANSFER_FETCH_TIMEOUT_MS });
     const cldKey = `${userId || "anon"}-${Date.now()}-seg`;
