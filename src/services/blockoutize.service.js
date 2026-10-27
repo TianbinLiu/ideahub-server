@@ -6,6 +6,9 @@
 //   ①d **角色位的序数措辞**（ordinalSlots）—— label 直接就是那句措辞（`从左数第3个`），
 //       App 仓**一个序数措辞常量都不许有**（措辞随 roles[].label 与 markSlots 下发）
 //   ② 两段提示词（"先看"的视觉清单 + "点名"的白模化）
+//   ②b **神态列**的解析与清洗（takeExprColumn / sanitizeExpr / EXPR_MAX，2026-10-26）——
+//       看帧那一发顺带记下的每个人的神态，进模板的 markExprs；认出来的神态列不进 desc，
+//       也就**不进**白模化提示词（边界写在「神态列」那一节头上）；看帧回包怎么读（visionReply）
 //   ③ 方舟任务状态的**一次性核实**与产物转存
 // 路由（routes/branchTemplate.js 的 /templates/blockoutize 与 …/finish）只负责编排与整句报错。
 //
@@ -561,6 +564,229 @@ function parseBoxes(text, expected) {
 const VISION_SYSTEM =
   "你是影视分镜助理。只描述你在画面里**真实看到**的人物，不要推测、不要补充剧情、不要评价。";
 
+// ── 神态列（2026-10-26，白模保留神态的 D 方案）──────────────────────────
+//
+// 白模化把人脸抹成光滑的白人偶，套用之后原片里的表情（惊讶张嘴、眯眼大笑）大半丢了。
+// D 方案不动白模视频一个像素：看帧那一发（本来就要花）顺带让模型给每个人写一句神态，
+// 存成模板的 `markExprs`（与 markSlots 按下标对齐），App 套用时按卡名写一句
+// 「神态：凛先平静，后惊讶张嘴；阿岚…」。付费小验（2026-10-26）：二次元素材上 D 明显补回了神态，
+// 半写实 3D 素材上不增不减；零额外视频费用。
+//
+// ★ 神态**只进模板、不进白模化提示词**（blockoutPrompt 一个字不动）：那份提示词说的是
+//   「没有五官、没有表情」，往里塞表情只会和它打架。
+//   ⚠ 这句话的边界（复核后写准的）：**认出来是神态的那一列**（带前缀的、在哪一列都算；
+//   或漏写前缀但认得出的）一律不进 desc，也就进不了点名清单；只剩神态列的一行 desc 记占位
+//   （EXPR_ONLY_DESC）。认不出是神态的文字（漏写前缀又不像神态、外观列里本来就写着的表情）
+//   与没有神态列的老回话一样并进 desc —— 那不是这一列的事，今天就是这样。
+
+/**
+ * 一句神态最多几个字 —— **这条上限的唯一实现**：看帧提示词里那个「N 字内」从它插值，
+ * `sanitizeExpr` 按它截。App 侧不另抄一份（它只清分隔符，长度以服务端为准）。
+ * ★ 16 是付费小验里用的那个数：「先平静，后惊讶张嘴，再大笑」15 字，三段变化正好放得下；
+ *   多人模板里每人一句要拼进套用提示词，再长就开始挤后面的要害句。
+ */
+const EXPR_MAX = 16;
+
+/**
+ * 神态列的前缀 —— 认列（takeExprColumn）与剥前缀（sanitizeExpr）**同一条**。
+ * ★ 按前缀认、不按列数认：老回话（四列）的第 4 列是外观，按列数摘就把外观摘走了。
+ * ★ 冒号**必须有**（复核抓到）：可选的话「神态自若」开头那两个字被当成前缀剥掉，
+ *   「神态：神态自若」洗一遍是「神态自若」、再洗一遍成了「自若」—— 幂等也跟着破了。
+ * ★ 也认「表情：」：模型偶尔把列名换成同义词，那一列照样是神态（不认的话「表情：大笑」
+ *   要么整句进了 desc，要么带着「表情：」被当神态存下）。可以叠（「神态：表情：…」一次剥完，
+ *   幂等）；前面允许带一个开引号 —— 提示词的示例是「神态：…」，模型有时连书名号一起抄。
+ */
+const EXPR_PREFIX_RE = /^[\s「『“"]*(?:(?:神态|表情)\s*[:：]\s*)+/;
+
+/**
+ * 回话被截断时，最后一行行尾那半截列名（「神」「神态」「表」「表情」，冒号还没写出来）。
+ * 只在 takeExprColumn 的 `cut` 为真时用：它不是外观，留在 desc 里会经点名清单进白模化提示词。
+ */
+const EXPR_CUT_PREFIX_RE = /^[「『“"]*(?:神态?|表情?)$/;
+
+/**
+ * 「这一截说的是外观 / 衣着 / 道具 / 身材，不是神态」。两处用：
+ *   ① sanitizeExpr 按分句丢掉这种分句（模型偶尔在神态列里写「戴眼镜，先皱眉」——
+ *      套用时那半句会和卡图打架）；
+ *   ② 漏写前缀时，行尾那一列像外观就**不**当神态摘走、照旧留在描述里（见 takeExprColumn）。
+ * ⚠ 只放**不会出现在表情描述里**的词：「眼」「发」「色」单字都不行（眯眼 / 发呆 / 脸色发白），
+ *   颜色单字一个都不放（「脸红」是表情）。
+ * ★★ 发色那一组（「白发」「直发」）两头都带闸（复核抓到：原来裸写 `[…]发`，「一直发呆」中了
+ *   「直发」、「吓得脸色煞白发抖」中了「白发」、「脸红发烫」中了「红发」，整句神态被清空）：
+ *   · 前一个字是「一 / 脸 / 煞 / 得 / 眼」时不算（一直发X、脸红发X、煞白发X、急得直发X、眼红发X）；
+ *   · 后一个字是表情里接在「发」后面的那些（呆 愣 抖 烫 怒 慌 麻 狠 毛 软 青 白 冷…）时不算。
+ *   两道闸各自都挡得住上面那几句，叠着是因为「X发Y」两边都可能是表情。挡掉的方向是「留下神态」：
+ *   真是外观的「白发苍苍」「金发碧眼」「短发」照样丢。
+ * ★ 「胡子」前面是「吹」时不算（吹胡子瞪眼是生气）。
+ * ★ 身材 / 肤色那几个词（复核补的）：漏写前缀的「身材高大」原来会被当神态摘走，写成「神态：凛身材高大」。
+ */
+const EXPR_LOOK_RE =
+  /眼镜|墨镜|头发|发型|发色|发髻|(?<![一脸煞得眼])[黑白红金银棕灰蓝粉紫绿黄短长卷直]发(?![呆愣怔抖颤烫笑怒火慌麻懵狠疯出声问觉怵毛汗紧软僵酸窘急晕蒙青白黑紫冷热直光泄誓作难])|马尾|辫|刘海|帽|衣|衫|恤|裙|裤|袍|盔甲|外套|夹克|西装|制服|鞋|靴|袜|领带|围巾|耳环|项链|手套|背包|书包|纹身|(?<!吹)胡[子须]|化妆|穿|戴|手持|拿着|握着|背着|挎着|提着|抱着|举着|扛着|拎着|身材|体型|个子|个头|身高|皮肤|肤色|微胖|偏瘦|魁梧/;
+
+/**
+ * 「这一列像神态」的**正向**判据 —— **只给漏写前缀那条兜底用**（takeExprColumn 的 ②）。
+ * ★ 复核抓到：兜底原来只问「不像外观」，而外观里多一个「|」的回话（`1|30|左侧|白发少年|手里拿伞`）
+ *   末列不像外观、也不像神态，照样被摘走 —— desc 少了半句认人的依据，神态里多了一句「手里拿伞」。
+ *   EXPR_LOOK_RE 是**黑名单**，永远列不全（拿伞 / 身材高大…），所以兜底改成要**正向证据**：
+ *   含表情 / 口型 / 视线类的词，或以「先」「一直」开头（提示词示例与真实回话都是这两种起头）。
+ * ⚠ 带前缀的列**不问它**：前缀本身就是证据，按它再筛只会把「神态：若有所思」这种没列到的说法丢掉。
+ */
+const EXPR_FACE_RE =
+  /^(?:先|一直)|笑|哭|泣|泪|皱眉|挑眉|扬眉|眉头|张嘴|张口|闭嘴|抿嘴|抿唇|咬唇|咬牙|撇嘴|噘嘴|嘟嘴|瞪|眯|垂眼|闭眼|眨眼|睁眼|眼神|目光|视线|凝视|注视|盯着|平静|淡定|惊讶|吃惊|震惊|惊恐|表情|神情|神色|害羞|羞涩|生气|愤怒|发怒|恼|愁|悲伤|伤心|难过|开心|高兴|喜悦|兴奋|紧张|害怕|恐惧|慌张|疑惑|困惑|发呆|发愣|愣住|呆住|冷漠|严肃|坚定|专注|得意|无奈|不屑|轻蔑|疲惫|叹气|尖叫|大喊|脸红|脸色|面无/;
+
+/**
+ * 「这一截是在说看不清」—— 整句都是它就记空串，混在别的分句里就只丢这一截。
+ * ★ 复核补了「看不见 / 看不出 / 无法看到 / 不可见 / 被…遮住 / 被…挡住」：原来这几种说法原样留下，
+ *   App 套用时成了「神态：凛看不见脸」写进付费提示词，可能把卡上人物的脸遮住或画成背对。
+ *   「背对镜头」**不在里面**：那是白模视频里本来就有的姿态，与成片一致。
+ */
+const EXPR_UNSEEN_RE = /看不[清见到出]|无法(?:判断|辨认|看清|看到|看见|识别|分辨)|不清楚|不可见|被.{0,6}?(?:遮|挡)/;
+
+/** 清洗完整句只剩这些 = 没有神态（记空串）。★ 「无表情」不在里面：那是一种神态（一直面无表情） */
+const EXPR_NONE_RE = /^(?:无|没有|未知|none|n\/?a)$/i;
+
+/**
+ * 引号（连同里面的字）。★★ 为什么清：App 里引号是**台词**的判据（segmentGen.hasDialogue /
+ * shotScript.lineSpeakers 认「」『』“”"），神态句里带一对引号，套用那一段就会被当成有台词；
+ * 而看帧提示词正要模型写「口型」，`后喊“快跑”` 是很自然的写法。
+ * ★★ 为什么连里面的字一起去、而不是只去引号留字（复核要求「挑更安全的那个」，挑的是这个）：
+ *   引号里装的几乎总是**说出来的话**，它不是神态；白模套用那一发不出声（BLOCKOUT_TASK 关着声音），
+ *   话只能以字的形式出现在画面上 —— 那正是「台词被烧成字幕、软话压不住」的形状。口型本身由引号
+ *   外面的动词留着（喊 / 说 / 念叨）。代价是「做出“嘘”的口型」洗成「做出的口型」—— 少一点信息，
+ *   方向与这一列的总原则一致（认不准就少说，别说错）。
+ * ★ 例外只有一个：**整句**被一对引号包着（`神态：「先平静，后大笑」` —— 提示词的示例本身就套着「」，
+ *   模型会照抄）时只拆掉那一对，不然整句神态就没了。不成对的引号单个去掉。
+ */
+const EXPR_QUOTED_RE = /“[^“”]*”|「[^「」]*」|『[^『』]*』|‘[^‘’]*’|"[^"]*"|＂[^＂]*＂/g;
+const EXPR_QUOTE_CHAR_RE = /[“”‘’"＂「」『』]/g;
+const EXPR_QUOTE_PAIR = { "“": "”", "「": "」", "『": "』", "‘": "’", '"': '"', "＂": "＂" };
+
+/** 整句被一对引号包着 → 拆掉那一对（里面不能再有同一种引号，否则说不清哪两个是一对） */
+function unwrapWholeQuote(s) {
+  const open = s[0];
+  const close = EXPR_QUOTE_PAIR[open];
+  if (!close || s.length < 2 || s[s.length - 1] !== close) return s;
+  const inner = s.slice(1, -1);
+  return inner.includes(open) || inner.includes(close) ? s : inner;
+}
+
+/**
+ * 神态列的清洗 —— **唯一实现**（parseRoles 摘出来的那一列只走这里）。
+ *
+ * 产出要能原样拼进 App 那句「神态：凛先平静，后惊讶张嘴；阿岚一直皱眉。」，所以：
+ *   · 去掉「神态：」/「表情：」前缀（冒号必须有，见 EXPR_PREFIX_RE）；
+ *   · 去掉引号连同里面说的话（整句被一对引号包着时只拆那一对），理由见 EXPR_QUOTED_RE；
+ *   · 去掉括号、`=` `＝`、`@` `＠` 与换行；`；` `;` 换成「，」—— 这些是 App 套用提示词里的
+ *     **绑定分隔符**（`从左数第2个（…）=阿岚`、人与人之间的「；」、@ 点名），混进神态句会被当成
+ *     另一条绑定。分号换逗号而不是删掉：模型拿它隔开先后两段，删掉就成了「张嘴再大笑」连成一截；
+ *   · 顿号、逗号、句号、感叹号也一律换成「，」，再按「，」切成分句（每个分句再剥一次前缀）：
+ *     说看不清的分句、说外观的分句（EXPR_LOOK_RE）丢掉，剩下的用「，」接回去；
+ *   · 整句只剩「无 / 没有 / NONE」、或一个字都没有（只剩「—」「…」这类符号）= 没有神态，记空串；
+ *   · 截到 EXPR_MAX：落在分句中间时退到上一个「，」（「再眯」这种半截词比少一段更糟），
+ *     一个「，」都没有才硬切。
+ * ★ 幂等：对清洗过的结果再洗一遍结果不变（出口不必再洗，洗了也无害）。
+ * @param {unknown} raw
+ * @returns {string} 空串 = 这个人没有可用的神态
+ */
+function sanitizeExpr(raw) {
+  const unquoted = unwrapWholeQuote(
+    String(raw ?? "")
+      .replace(/[\r\n]+/g, "")
+      .trim()
+      .replace(EXPR_PREFIX_RE, ""),
+  )
+    .replace(EXPR_QUOTED_RE, "")
+    .replace(EXPR_QUOTE_CHAR_RE, "");
+  const flat = unquoted.replace(/[（）()【】[\]=＝@＠]/g, "").replace(/[、,。.！!；;]/g, "，");
+  const kept = flat
+    .split("，")
+    .map((c) => c.replace(/\s+/g, " ").trim().replace(EXPR_PREFIX_RE, ""))
+    .filter((c) => c && !EXPR_UNSEEN_RE.test(c) && !EXPR_LOOK_RE.test(c));
+  let v = kept.join("，");
+  if (EXPR_NONE_RE.test(v) || !/\p{L}/u.test(v)) return "";
+  if (v.length > EXPR_MAX) {
+    const cut = v.slice(0, EXPR_MAX);
+    const k = cut.lastIndexOf("，");
+    v = k > 0 ? cut.slice(0, k) : cut;
+  }
+  return v;
+}
+
+/**
+ * 一行里摘掉神态列之后一列描述都不剩时，desc 记这一句（复核后加的）。
+ * ★★ 为什么不丢行：丢了人数就变，全部序数整份挪位（ordinalSlots 按总人数发），比少一句描述坏得多。
+ * ★★ 为什么不把神态留在 desc 里（原来的做法）：desc 进点名清单、点名清单进白模化提示词，
+ *   那份提示词说的是「没有表情」—— 「神态：笑」原样写进去，契约那句「神态不进白模化提示词」就不成立了。
+ * 措辞照实说「没写外观」：作者在核对面板上看得懂，白模化那一发读到的也只是「有这么一个人」。
+ */
+const EXPR_ONLY_DESC = "没写外观的人物";
+
+/**
+ * 从一行的 rest（`序号` 与 `横向位置` 已经摘掉之后剩下的那几列）里摘出神态列。
+ * 摘不出来就原样还回去、expr 记空串 —— 前四列的解析与今天逐字相同。
+ *
+ * ★★ 先去掉**行尾空列**再认：2026-10-26 实测模型常在神态列后面多写一个「|」，真实回话形如
+ *   `1|75|右侧靠前|深棕短发，戴黑框眼镜，穿浅灰翻领衬衫|神态：先惊讶张嘴，后垂眼抿唇|`。
+ *   不去的话「最后一列」是个空串，前缀判断落空 —— **一个神态都认不出**，而它零报错
+ *   （模板照建、只是少了这一位）。⚠ 只在摘神态这件事上去：desc 那一行本来就 filter(Boolean)，
+ *   认横向位置那一段也在这之前跑完，所以这一步不改动前四列的任何结果。
+ * ★ 两种情况摘：
+ *   ① 带前缀（EXPR_PREFIX_RE）的列 —— **在哪一列都摘**（复核抓到：只看末列的话
+ *      `…|神态：大笑|多写一列` 整行并进 desc，带着「神态：大笑」进了白模化提示词）。
+ *      不止一列带前缀（不该有）时神态取最后那一列，带前缀的列一律不进 desc；
+ *   ② **漏写前缀**：这一行认出了横向位置、后面又**恰好**剩 3 列，而末列**像神态**
+ *      （EXPR_FACE_RE，正向证据）且不像外观（EXPR_LOOK_RE）。不摘的话「惊讶张嘴」
+ *      会并进 desc、再经点名清单写进白模化提示词，而那份提示词正说着「没有表情」。
+ *      末列说不清（「手里拿伞」「身材高大」）时**不摘**（那多半是外观里多了一个「|」），留在 desc 里与今天一样。
+ *      ⚠ 只认「恰好 3 列」：4 列以上说不清哪一列多出来，宁可按老样子全并进 desc。
+ * ★ 摘完一列描述都不剩时 desc 记 EXPR_ONLY_DESC（不丢行，理由写在它上面）。
+ * ★ `cut` = 这一行是被截断的回话的最后一行（finish_reason: "length"）：行尾那半截列名
+ *   （EXPR_CUT_PREFIX_RE）也算神态列摘掉，**神态一律记空串** —— 半截的「先惊」「一直皱」
+ *   比没有更糟；认人那一半照旧（与以前一样不拒、不丢行）。
+ * @param {string[]} rest
+ * @param {boolean} hadX  这一行有没有认出横向位置
+ * @param {boolean} [cut] 这一行是不是被截断的最后一行
+ * @returns {{ expr: string, rest: string[] }}
+ */
+function takeExprColumn(rest, hadX, cut = false) {
+  let end = rest.length;
+  while (end > 0 && !rest[end - 1]) end -= 1;
+  const cells = rest.slice(0, end);
+  const tagged = cells.map(
+    (c, i) => EXPR_PREFIX_RE.test(c) || (cut && i === end - 1 && EXPR_CUT_PREFIX_RE.test(c)),
+  );
+  let exprCell = null;
+  let keep = cells;
+  if (tagged.some(Boolean)) {
+    exprCell = cells[tagged.lastIndexOf(true)];
+    keep = cells.filter((_, i) => !tagged[i]);
+  } else if (hadX && end === 3 && EXPR_FACE_RE.test(cells[2]) && !EXPR_LOOK_RE.test(cells[2])) {
+    exprCell = cells[2];
+    keep = cells.slice(0, 2);
+  }
+  if (exprCell === null) return { expr: "", rest };
+  if (!keep.some(Boolean)) keep = [EXPR_ONLY_DESC];
+  return { expr: cut ? "" : sanitizeExpr(exprCell), rest: keep };
+}
+
+/**
+ * 看帧回包（方舟 /chat/completions 的原始 JSON 文本）→ 模型写的那段话 + 有没有被截断。
+ * **两条看帧路共用的唯一读法**（V2 白模化阶段一、V1 认人 measureRoster）。
+ * ★ 复核补的：这一发 max_tokens 是 1200，神态列让每行长了约一半，群像更早顶到上限；
+ *   被截断的回话原来照常解析、零报错（最后一行半截的神态被当真）。现在把截断交给 parseRoles，
+ *   由它只把最后一行的神态记空串、并响亮记一笔。
+ * ⚠ 回包不是 JSON 时照旧抛（调用方各自的 catch 管）。
+ * @param {string} text
+ * @returns {{ content: string, truncated: boolean }}
+ */
+function visionReply(text) {
+  const choice = JSON.parse(text || "{}")?.choices?.[0];
+  return {
+    content: String(choice?.message?.content ?? ""),
+    truncated: choice?.finish_reason === "length",
+  };
+}
+
 function visionPrompt(note) {
   return [
     "看这几帧（同一段视频的不同时刻）。列出画面里出现的**每一个人物角色**，包括位于画面正中央、体型最大、看起来像主角的那一个。",
@@ -573,10 +799,22 @@ function visionPrompt(note) {
     //   **不是同一个序**：排序是"重要度降序"（截断的前提，一个字不许动），这一列是
     //   "画面从左到右"。两者混成一个的话，截断会按左右砍人（砍掉的可能正是主角），
     //   或者序数会按戏份排（整份指错人），两个方向都零报错。
-    "每个人物给一条，格式严格为：`序号|横向位置|位置|外观特征`。",
+    // ★★ 2026-10-26 末尾加了第五列「神态」（白模保留神态的 D 方案：看帧这一发顺带记下每个人
+    //   在这几帧里的表情变化，存成模板的 markExprs，套用时 App 按卡名写一句神态）。
+    //   ⚠ **前四列一个字没动**：格式行只在末尾接了一段，下面「横向位置 / 位置 / 外观特征」三句原样。
+    //   认人、横向位置、外观描述是序数与挂卡的全部输入，它们退化一点就是挂错人、零报错 ——
+    //   2026-10-26 付费小验：同一份双人素材上，现行提示词一发、带神态列两发，人数、左右（x 27/74
+    //   对 27/75、28/72）与外观描述三发一致。
+    //   神态放在**最后一列**、并要求带「神态：」前缀，是为了解析时能从行尾把它摘走而不碰前四列
+    //   （按列数认会把老回话的第 4 列错摘，见 parseRoles 的 takeExprColumn）。
+    "每个人物给一条，格式严格为：`序号|横向位置|位置|外观特征|神态：…`。",
     "横向位置写一个 0~100 的整数：0 = 紧贴画面左边缘，100 = 紧贴画面右边缘，按这个人**身体中心**的水平位置估；走动的人按他大部分时间所在的位置；",
     "位置写他在画面里的大致位置（如「画面正中央」「左侧靠前」）；",
     "外观特征写发色、发型、服装颜色与款式、明显道具，控制在 30 字内。",
+    // ★ 这一句与付费小验里用的那句**逐字相同**（字数上限从 EXPR_MAX 插值，与清洗那一刀是同一个数）。
+    //   审核建议过再加半句「不写外观和衣着」—— 没加：那半句没验过，而这一发的前四列不许冒险；
+    //   「神态列里混进外观」改由 sanitizeExpr 按分句挡（EXPR_LOOK_RE），挡在代码里比挡在提示词里稳。
+    `最后一列以「神态：」开头，按先后写这个人在这几帧里的表情、口型和视线，${EXPR_MAX} 字内（如「神态：先平静，后惊讶张嘴，再大笑」）；看不清脸就写「神态：看不清」。`,
     "只输出这些行，不要标题、不要解释、不要 Markdown 代码块。",
     "如果画面里一个人都没有，只输出一行：NONE",
     note ? `作者补充：${String(note).slice(0, 500)}` : "",
@@ -608,11 +846,28 @@ function visionPrompt(note) {
  *   ③ 每个人的名次 k 在**全部 M 个人**里按 x 升序算
  *   ④ 措辞表 = ordinalSlots(M)
  *   ⑤ label = 措辞表[k-1]，并按 k 升序落库
+ *
+ * ★ 第二个参数 `meta` 是可选的**回填口**（两位）：
+ *   · `meta.allSlots` —— 完整措辞表（理由见函数体里那条 ★★★）；
+ *   · `meta.exprs`（2026-10-26）—— 每个**返回的**角色位的神态（空串 = 没有），
+ *     与返回的 roles **同序、同长**（截断、按左右排序之后）。为什么不塞进 roles[] 里：
+ *     roles 的形状进库、进响应、进作者的 PATCH，多一位就要过一遍 roleDraftSchema / roleSchema /
+ *     zod / rolesPayload 四处；而神态的去处只有一个（模板的 markExprs，与 markSlots 下标对齐），
+ *     走回填口就一处都不用动。返回值的形状因此与今天逐字相同。
+ * ★ 第三个参数 `opts.truncated`（复核后加的）= 这份回话被截断了（`visionReply` 读出来的
+ *   finish_reason: "length"）。只影响**最后一行**的神态（记空串、半截列名不进 desc，见
+ *   takeExprColumn 的 `cut`）；认人那一半与以前一样（半截的那一行照样算一个人、不拒），
+ *   只多一条响亮的警告 —— 截断可能少认了人，序数按认出来的人数发，作者核对时要看。
  */
-function parseRoles(text, meta) {
+function parseRoles(text, meta, opts) {
   // ★★ 先只收**描述与横向位置**，标记留到名次算完再发（见下面那条 ★★）。
   const rows = [];
-  for (const rawLine of String(text || "").split(/\r?\n/)) {
+  const lines = String(text || "").split(/\r?\n/);
+  const truncated = Boolean(opts && opts.truncated);
+  // 被截断时，切在哪一行 = 最后一个非空行（模型不会在截断处恰好换完行）
+  let cutAt = -1;
+  if (truncated) for (let i = lines.length - 1; i >= 0 && cutAt < 0; i -= 1) if (lines[i].trim()) cutAt = i;
+  for (const [lineIdx, rawLine] of lines.entries()) {
     const line = rawLine.trim();
     if (!line || /^NONE$/i.test(line)) continue;
     // 容错：模型可能吐 "1|30|正中央|白发黑袍" 或 "1. 30｜正中央｜白发黑袍"
@@ -630,11 +885,22 @@ function parseRoles(text, meta) {
       x = Number(rest[0]);
       rest = rest.slice(1);
     }
+    // ★ 神态列在这里摘走（摘不出来 expr 记空串、rest 原样）。排在认横向位置之后、拼 desc 之前：
+    //   前者一个字不受影响，后者只是少了神态那一列 —— 老回话（没有神态列）的 desc 逐字不变。
+    const took = takeExprColumn(rest, x !== null, lineIdx === cutAt);
+    rest = took.rest;
     const desc = rest.filter(Boolean).join("，").slice(0, 300);
     if (!desc) continue;
-    rows.push({ x, desc });
+    rows.push({ x, desc, expr: took.expr });
   }
   const M = rows.length;
+  if (truncated) {
+    // ★ 响亮（铁律八）：截断不拒、不丢行，所以这是唯一能让人知道"这一发可能少认了人"的地方。
+    console.warn(
+      `[blockoutize] 看帧回话被截断（finish_reason=length），认出 ${M} 个人物：` +
+        "最后一行的神态不取；画面里可能还有没列出来的人（序数按认出来的人数发），作者核对时要重点看",
+    );
+  }
   if (!M) return [];
 
   if (M > BLOCKOUT_ROLE_MAX) {
@@ -706,11 +972,15 @@ function parseRoles(text, meta) {
   //   若同时存一个 pos，两者立刻能互相矛盾且无人能仲裁。
   // ★ labelConfirmed 在这里写死 false（见函数头 ★★）：这份序数是猜的，作者没点头之前
   //   它只能算草稿。想改成 true 只有一条路 —— 作者的 PATCH /roles。
-  return rows
+  const order = rows
     .map((_, i) => i)
     .slice(0, BLOCKOUT_ROLE_MAX) // ② 截断按重要度（= 解析出来的原序）
-    .sort((a, b) => rank[a] - rank[b]) // ⑤ 落库按画面从左到右
-    .map((i) => ({ label: slots[rank[i] - 1], desc: rows[i].desc, labelConfirmed: false }));
+    .sort((a, b) => rank[a] - rank[b]); // ⑤ 落库按画面从左到右
+  // ★★ 神态按**同一份 order** 取：截断与左右排序都已经做完，exprs[i] 就是 roles[i] 那个人的。
+  //   另排一次（比如按解析原序给）就是神态整份挂到别人身上，零报错 —— 测试里专门拿
+  //   「重要度序与左右序相反」的回话钉这一条。
+  if (meta && typeof meta === "object") meta.exprs = order.map((i) => rows[i].expr);
+  return order.map((i) => ({ label: slots[rank[i] - 1], desc: rows[i].desc, labelConfirmed: false }));
 }
 
 /**
@@ -1122,10 +1392,13 @@ async function measureRoster({ publicId, version, durSec, note, model, send, fra
     return { roles: [], allSlots: null, why: `AI 调用没成功（status=${out?.status ?? "?"}）` };
   }
   let roles = [];
+  // ★ `meta.exprs`（神态列）这里**刻意不往外带**：这条路看的是作者自带的白模视频，
+  //   人偶没有脸，神态列多半是「看不清」；而且它不建模板，没有 markExprs 可写。
   const meta = {};
   try {
-    const parsed = JSON.parse(out.text || "{}");
-    roles = parseRoles(parsed?.choices?.[0]?.message?.content ?? "", meta);
+    // 回包的读法与 V2 那条同一份（visionReply）：截断了就让 parseRoles 记一笔、不取最后一行的神态
+    const reply = visionReply(out.text);
+    roles = parseRoles(reply.content, meta, { truncated: reply.truncated });
   } catch {
     return { roles: [], allSlots: null, why: "回包不是 JSON" };
   }
@@ -1653,6 +1926,10 @@ module.exports = {
   VISION_SYSTEM,
   visionPrompt,
   parseRoles,
+  visionReply,
+  EXPR_MAX,
+  EXPR_ONLY_DESC,
+  sanitizeExpr,
   blockoutPrompt,
   fetchTaskState,
   transferToCloudinary,

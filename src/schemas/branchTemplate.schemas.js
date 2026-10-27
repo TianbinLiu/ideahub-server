@@ -28,6 +28,8 @@
 //   这一位记的是"当初那段视频上究竟做出了哪几个位置"——是历史事实，不是作者的意见，
 //   只由服务端在白模化那一步自己写（谁发的提示词，谁记这个模板是什么方案）。
 //   z.object 默认 strip，在这里**是帮手**：客户端塞了也进不来。
+// ★ `markExprs`（神态，2026-10-26）同样三条 body 一律不收：它是看帧那一发从原片读出来的，
+//   作者改 roles 时由服务端按人搬（BranchTemplate.markExprsAfterRolesEdit），客户端写不进来。
 const { z } = require("../middleware/validate");
 // ★ 「最多看几帧」这个数**只有 services/blockoutize.service 一处**（铁律六）：
 //   下面 frameTimes 的数组上限从那里 import，不在这儿抄一个 8。
