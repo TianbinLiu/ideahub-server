@@ -460,6 +460,9 @@ describe("清扫器", () => {
     expect(w1.cycle).toBe(newCycle);
     // 这一行受理在开轮前 20 分钟（不然按开轮的 now 算会「老过 8 天」被记成 lost），到点该问了
     await GenTaskCharge.collection.updateOne({ taskId: id }, { $set: { createdAt: new Date(lastSecond.getTime() - 20 * 60_000), nextCheckAt: new Date(Date.now() - 1000) } });
+    // 前面几个用例留下的 open 行别掺进这一轮：月底最后 8 天里，它们按 lastSecond 算还不到 8 天，会被一起退
+    // （2026-10-27 起 CI 收到 13 次 refundSplit；月初跑时它们「老过 8 天」记成 lost，所以前半个月一直是绿的）
+    await GenTaskCharge.collection.updateMany({ taskId: { $ne: id }, state: "open" }, { $set: { nextCheckAt: new Date(boundary.getTime() + 86_400_000) } });
 
     const refundSpy = jest.spyOn(wallet, "refundSplit");
     // ★ 上游只对**这一行**说 failed，别的一律「没问到」（null）：开轮的 now 在下个月初之前，同一个文件前面用例留下的 open 行
