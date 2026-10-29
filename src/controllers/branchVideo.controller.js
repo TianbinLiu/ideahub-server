@@ -849,7 +849,7 @@ async function blockedAuthorFilter(user, field = "author") {
 
 async function listVideos(req, res, next) {
   try {
-    const { feed, category, q, cursor, limit, author } = listQuery.parse(req.query);
+    const { feed, category, q, cursor, limit, author, remixOf } = listQuery.parse(req.query);
 
     const filter = {};
 
@@ -862,6 +862,22 @@ async function listVideos(req, res, next) {
     if (author) {
       if (!isValidId(author)) badRequest("Invalid author id");
       authorFilter = { author: new mongoose.Types.ObjectId(author) };
+    }
+
+    // 照这条做的同款（2026-10-29）：与详情里的 remixCount **同一个口径** —— 只数别人看得到的（非私密、没被下架），
+    //   不算原作者自己照自己的流程做的那几条。否则详情写「3 人做了同款」、点开列出来是 4 条（或把作者的私密作品也列出来）。
+    // ★ 原作不存在 / 看不到时回空表（不是 404）：同款列表是详情页里的一块，原作被删的那一刻这块该安静地空着
+    let remixFilter = null;
+    if (remixOf) {
+      if (!isValidId(remixOf)) badRequest("Invalid remixOf id");
+      const src = await BranchVideo.findOne({ _id: remixOf, visibility: { $ne: "private" }, ...NOT_TAKEN_DOWN }).select("author").lean();
+      if (!src) return res.json({ ok: true, items: [], nextCursor: null, remixOf });
+      remixFilter = {
+        "remixOf.video": new mongoose.Types.ObjectId(remixOf),
+        author: { $ne: src.author },
+        visibility: { $ne: "private" },
+        ...NOT_TAKEN_DOWN,
+      };
     }
 
     if (feed === "following") {
@@ -899,6 +915,7 @@ async function listVideos(req, res, next) {
     const range = cursorFilter(cursor);
     const parts = [filter, readableFilter(req.user)];
     if (authorFilter) parts.push(authorFilter);
+    if (remixFilter) parts.push(remixFilter);
     if (range) parts.push(range);
     // 拉黑：与上面那条 ★★ 同一个理由 —— 首页/分区/搜索/他人主页全走这一个查询，加在这里就够
     const blockPart = await blockedAuthorFilter(req.user);
@@ -932,6 +949,8 @@ async function listVideos(req, res, next) {
       //   回显一个键就把它变成**判形状**（这个键在不在），而不是猜内容；
       //   状态码在 Capacitor 那边永远是 200，判不出任何东西。
       ...(authorFilter ? { author } : {}),
+      // 同一个能力探针（见上一行的 ★★）：老服务端不认 remixOf，会照常回推荐流
+      ...(remixFilter ? { remixOf } : {}),
     });
   } catch (err) {
     next(err);
@@ -2330,16 +2349,21 @@ async function listDanmaku(req, res, next) {
     // 拉黑：见 blockedAuthorFilter 的 ★★。这条虽然不是游标分页，但同样必须进查询 ——
     // 后过滤会让 truncated 说谎（取回 limit 条、滤掉几条，却仍然报"还有更多"）
     const blockPart = await blockedAuthorFilter(req.user);
-    const docs = await BranchDanmaku.find(blockPart ? { $and: [{ video: id }, blockPart] } : { video: id })
-      .sort({ createdAt: -1, _id: -1 })
-      .limit(limit)
-      .select("at text color author createdAt")
-      .lean();
+    const where = blockPart ? { $and: [{ video: id }, blockPart] } : { video: id };
+    // total（2026-10-29）：作品详情页的「弹幕 N」—— 截断时原来只能写「N+」。与列表同一个过滤（拉黑的人不算），走 video 索引
+    const [docs, total] = await Promise.all([
+      BranchDanmaku.find(where)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit)
+        .select("at text color author createdAt")
+        .lean(),
+      BranchDanmaku.countDocuments(where),
+    ]);
 
     const items = docs.map((d) => toDanmakuPayload(d, req.user)).sort((a, b) => a.at - b.at);
     // truncated：明确告诉客户端"这不是全部"。不给这个标记的话，
     // 客户端没法区分"这条作品就这么多弹幕"和"被我们截断了"
-    res.json({ ok: true, items, truncated: docs.length >= limit });
+    res.json({ ok: true, items, truncated: docs.length >= limit, total });
   } catch (err) {
     next(err);
   }

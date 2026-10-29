@@ -268,6 +268,8 @@ const listQuery = z
     //   ⚠ 它**不是**可见性的替代品：拿到别人的 id 也只能看到对方的公开作品，
     //     私密作品由 visibilityFilter 那一条挡（见 controller 里的 $and 拼法）。
     author: z.string().trim().max(64).optional().default(""),
+    // 「照这条做的同款」：只列 remixOf.video 是这一条的作品（2026-10-29，作品详情页的同款列表）。形状同 author，合法性在 controller 里判
+    remixOf: z.string().trim().max(64).optional().default(""),
     // cursor 形如 "<ISO时间>_<ObjectId>"，由上一页 nextCursor 原样回传
     cursor: z.string().trim().max(80).optional().default(""),
     limit: z.coerce.number().int().min(1).max(50).default(12),
