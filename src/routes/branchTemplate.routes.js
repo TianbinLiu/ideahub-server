@@ -131,6 +131,23 @@ function markDescsPayload(doc) {
   return out.some((d) => d) ? { markDescs: out } : {};
 }
 
+/**
+ * 神态那一位的出口（2026-10-26，白模保留神态的 D 方案）。★ 与 `markDescsPayload` 同一条纪律：
+ * **真有才出、长度必须等于 markSlots、全是空串就当没有**。长度对不上就整份不出 ——
+ * 少一条就不知道少的是谁，按下标硬配等于把后面每个人的神态挂到下一个人身上，零报错。
+ * ★ 对所有人都出（不只作者）：它是从原片读出来的表情，清洗时外观已经按分句丢掉，不含身份信息；
+ *   套用的人正要靠它把表情补回来。
+ * ★ 受理回执（startedPayload）与待取回列表**不出**：App 读取件凭据的那一份（jobOf）不认它，
+ *   核对面板与套用都读模板；两处一起接之前先别出（审核那条「要么一起接，要么别出」）。
+ */
+function markExprsPayload(doc) {
+  const exprs = Array.isArray(doc?.markExprs) ? doc.markExprs : null;
+  const slots = Array.isArray(doc?.markSlots) ? doc.markSlots.length : 0;
+  if (!exprs || exprs.length !== slots || !slots) return {};
+  const out = exprs.map((e) => String(e || ""));
+  return out.some((e) => e) ? { markExprs: out } : {};
+}
+
 /** 响应形状。cloudinaryPublicId 刻意不出（纯内部回收记账，客户端拿它没有正当用途） */
 function toTemplatePayload(doc, viewer) {
   if (!doc) return null;
@@ -182,6 +199,8 @@ function toTemplatePayload(doc, viewer) {
     // 人偶描述（写进套用提示词、给 r2v 指认用）。★ 与上面两位同一条纪律：真有才出。
     //   ⚠ 它**不是** roles[].desc 的副本，两者回答的是不同的问题，理由写在 model 里。
     ...markDescsPayload(doc),
+    // 神态（原片里每个人的表情，套用时补回来）。★ 同一条纪律：真有才出、长度等于 markSlots。
+    ...markExprsPayload(doc),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
     // 分段归组（长视频切段登记）。真有才出；sourcePublicId 不出（同上隐私理由），
@@ -761,8 +780,11 @@ router.post(
       //   就再也说不出"画面里到底有几个人偶"了，而量框那一步必须知道（见 BlockoutJob.visionSlots）
       const roleMeta = {};
       try {
-        const parsed = JSON.parse(visionOut.text || "{}");
-        roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "", roleMeta);
+        // ★ 回包读法只在 blockout.visionReply（复核后收的）：它顺带读 finish_reason ——
+        //   max_tokens 还是 1200，神态列让每行长了约一半，群像更早顶到上限。截断时认人照旧
+        //   （不拒、不丢行），只是最后那一行的神态不取，并由 parseRoles 响亮记一笔。
+        const reply = blockout.visionReply(visionOut.text);
+        roles = blockout.parseRoles(reply.content, roleMeta, { truncated: reply.truncated });
       } catch (e) {
         console.error("[blockoutize] 视觉回包解析失败:", e.message);
       }
@@ -916,6 +938,13 @@ router.post(
           // 全部 M 个人的措辞表（截断之前）—— 只给量框那一步用，不出任何响应
           ...(Array.isArray(roleMeta.allSlots) && roleMeta.allSlots.length
             ? { visionSlots: roleMeta.allSlots }
+            : {}),
+          // ★ 神态（看帧这一发顺带记下的，与 markSlots 下标对齐）。与 markSlots **同一批**写：
+          //   它说的是"原片里这几个人"，到 finish 时手上只有白模产物，再也读不出来了。
+          //   只在**长度对得上、且至少有一个人有神态**时写 —— 全是空串与没有这一位要做的事一样，
+          //   长度对不上（不该发生）就宁可不写，也不留一份按下标会错位的数组。
+          ...(Array.isArray(roleMeta.exprs) && roleMeta.exprs.length === roles.length && roleMeta.exprs.some(Boolean)
+            ? { markExprs: roleMeta.exprs }
             : {}),
           // ★ 存下来只为**回执能重放**：阶段一重试撞上既有凭据时走的是 startedPayload(exist)，
           //   不存的话那条路回出来的帧数是空的，而 App 拿它对账 —— 一条路对得上、另一条对不上，
@@ -1416,6 +1445,13 @@ router.post(
           // ★ 在途的老凭据没有这一位 → 这里也不写 → 建出编号方案模板 → **正确**
           //   （它的白模视频上印的确实是数字）。所以用存在性展开，绝不 `|| []`。
           ...(BranchTemplate.isOrdinalMark(claimed) ? { markSlots: claimed.markSlots } : {}),
+          // 神态：从凭据原样搬（阶段一看原片时记下的）。★ 只在序数方案、且长度与 markSlots
+          //   相等时搬 —— 在途的老凭据没有这一位 → 模板也没有 → 套用不带神态句，与今天逐字相同。
+          ...(BranchTemplate.isOrdinalMark(claimed) &&
+          Array.isArray(claimed.markExprs) &&
+          claimed.markExprs.length === claimed.markSlots.length
+            ? { markExprs: claimed.markExprs }
+            : {}),
           // 画面位置框（⑧b 量出来才有；量不出来就整份没有 → 拖拽层关着，点列表照常）
           ...boxPatch,
           blockoutJobId: claimed._id,
@@ -1664,7 +1700,7 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
 //
 // ★★ 可重试是这条路存在的**全部意义**，所以它必须是**幂等且能反复调**的：
 //   · 失败不留痕（模板上什么都不写）——下一次调用面对的状态与第一次完全相同；
-//   · 成功则整份覆盖 roles/markSlots/markBoxes/markBoxAtSec（四位同批写）；
+//   · 成功则整份覆盖 roles/markSlots/markBoxes/markBoxAtSec（四位同批写；V2 留下的 markExprs 同批清掉）；
 //   · **作者已经核对过的（labelConfirmed）一律拒**：再认一遍会把他逐个改过的措辞
 //     整份冲掉，而那是他花时间对着画面做的事，没有任何东西找得回来。
 //
@@ -1795,6 +1831,12 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     if (roles.length) {
       update.$set.roles = roles;
       update.$set.markSlots = roles.map((x) => x.label);
+      // ★★ 神态（markExprs）**一律清掉**：它是 V2 白模化看**原片**时记下的、与旧 markSlots 对齐的，
+      //   而这一次是在白模视频上重新认人 —— 新旧两份对不齐，也没有原片可以重读。
+      //   ⚠ 不清的话最坏的情况零报错：人数一样时 markSlots 逐字相同（标签只由人数决定），
+      //   出口那道长度闸照样放行，神态整份挂到别人身上。V2 模板作者还没核对时 App 会摆
+      //   「重新识别角色位」，所以这条路对 V2 模板是真走得到的（审核抓到的那条）。
+      update.$unset = { markExprs: "" };
       // ★★ 人偶描述与 markSlots **同生同死**（一起写、长度必然相等，都来自同一个 kept）。
       //   这条路（自己传白模视频）上传的**就是**白模视频，所以这份描述在产物里成立 ——
       //   V2 白模化那条路不写这一位，它的认人看的是原片（理由写在 model 的 markDescs 上）。
@@ -1806,7 +1848,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       } else {
         // ★ 上一次可能留着一份框：这次没量出来就必须**清掉**，否则新 roles 会配着旧框。
         //   长度还可能正好相等（人数没变），于是出口那道长度校验也放行 —— 零报错的整份错位。
-        update.$unset = { markBoxes: "", markBoxAtSec: "" };
+        update.$unset = { ...update.$unset, markBoxes: "", markBoxAtSec: "" };
       }
     }
     const saved = await BranchTemplate.findByIdAndUpdate(found._id, update, { returnDocument: "after" }).lean();
@@ -2067,6 +2109,19 @@ router.patch(
         // mongoose 对数组元素的原地赋值不一定认得出来，显式标脏（不标的话作者的改动
         // **静默不落库** —— 又是同一个形状）
         doc.markModified("markDescs");
+      }
+      // ★★★ 神态（markExprs）**跟着人走**，与上面 markDescs「跟着位置上的文字走」不是一回事：
+      //   神态说的是原片里那个人，作者对调两行 / 删位后整体左移，改的正是「哪个位置是谁」。
+      //   PATCH 不碰它的话，对调一次神态就零报错地挂到别人身上（审核抓到的高危那条）。
+      //   规则（按 desc 认人、认不准清成空串、没有这一位就不凭空造）只在
+      //   BranchTemplate.markExprsAfterRolesEdit 一处；⚠ 必须在 `doc.roles = …` **之前**调 ——
+      //   它要读改之前的 roles 才知道每句 desc 原来在哪个位置。
+      // ★ 老 App 的 PATCH 不带任何神态字段，这里也不收（zod 那边没声明）：神态只由服务端搬，
+      //   作者能做的是改 roles，神态随之移动或清空。
+      const nextExprs = BranchTemplate.markExprsAfterRolesEdit(doc, roles);
+      if (nextExprs) {
+        doc.markExprs = nextExprs;
+        doc.markModified("markExprs");
       }
       doc.roles = roles.map((r) => ({ ...r, labelConfirmed: true }));
       await doc.save();

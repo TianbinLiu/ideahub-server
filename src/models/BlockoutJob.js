@@ -141,6 +141,20 @@ const blockoutJobSchema = new mongoose.Schema(
      */
     markSlots: { type: [String], default: undefined },
     /**
+     * 每个角色位上那个人在**原片**这几帧里的神态（「先平静，后惊讶张嘴，再大笑」），
+     * 与 `markSlots` **按下标一一对应**；空串 = 这个人没认出神态（看不清 / 漏写）。
+     * 来自阶段一看帧那一发的第五列（blockoutize.parseRoles 的 `meta.exprs`），finish 原样搬进模板。
+     *
+     * ★★ 必须在 schema 里声明：mongoose 默认 strict，没声明的路径在 create 里会被**静默丢掉**，
+     *   模板照建、只是永远没有这一位 —— 与 detectingAt 那条同一个形状。
+     * ★ 只在**至少有一个人有神态**时才写（全是空串 = 与没有这一位要做的事完全相同）；
+     *   `default: undefined` + 判存在性：这一位上线之前落的在途凭据没有它 → finish 出来的模板
+     *   也没有它 → 套用时不带神态句，与今天逐字相同。
+     * ★ 不给元素加 maxlength：值都过了 sanitizeExpr（≤ EXPR_MAX 字）；在这里再卡一道，
+     *   万一哪天两边不一致，炸的是**钱已经花掉之后**的 create（取件凭据落不下去）。
+     */
+    markExprs: { type: [String], default: undefined },
+    /**
      * 这一发视觉认出的**全部** M 个人的措辞表（`ordinalSlots(M)`）。
      * **纯服务端内部**，一个字都不出响应 —— 客户端要的是 `markSlots`（可挂卡的那几个）。
      *
