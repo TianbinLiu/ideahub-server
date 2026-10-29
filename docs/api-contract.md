@@ -283,7 +283,7 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/api/branch/videos` | optional | 列表。query：`feed=recommend\|following`、`category`、`q`（对 **title / description / tags** 三者做不区分大小写的子串匹配）、`author`(用户 id)、`cursor`、`limit`(默认 12)。返回 `{ ok, items, nextCursor, author? }`；`items[].liked` 表示当前用户是否已赞。**只返回公开作品 + 自己的作品**（见下「可见性」）。★ `author` 生效时会**原样回显**在响应里 —— 老服务端会把这个 query strip 掉然后照常回推荐流，客户端只能靠"这个键在不在"分辨"按作者筛过、这人没作品"与"压根没筛"，判内容或判状态码都分不出来 |
+| GET | `/api/branch/videos` | optional | 列表。query：`feed=recommend\|following`、`category`、`q`（对 **title / description / tags** 三者做不区分大小写的子串匹配）、`author`(用户 id)、`remixOf`(作品 id，2026-10-29：只列**照这条做的同款** —— 与详情的 `remixCount` 同一个口径：非私密、没下架、不算原作者自己的；原作看不到时回空表)、`cursor`、`limit`(默认 12)。返回 `{ ok, items, nextCursor, author?, remixOf? }`（`remixOf` 生效时同样原样回显，理由见下面 `author` 那句）；`items[].liked` 表示当前用户是否已赞。**只返回公开作品 + 自己的作品**（见下「可见性」）。★ `author` 生效时会**原样回显**在响应里 —— 老服务端会把这个 query strip 掉然后照常回推荐流，客户端只能靠"这个键在不在"分辨"按作者筛过、这人没作品"与"压根没筛"，判内容或判状态码都分不出来 |
 | POST | `/api/branch/videos` | required | 发布。body=DraftVideo（title/category/description/**tags**/cover/segments/branchTree/**deck**/**visibility**/**linkOnly**/**clientId**）。**服务端负责把 body 里的外链资源转存**（见下）。带 `clientId` 时按 `{author, clientId}` 幂等：重发返回首次那条、状态码 200（首发是 201） |
 | GET | `/api/branch/videos/:id` | optional | 详情（含 comments 前 50 条）。非作者访问 private 作品返回 **404**（不是 403） |
 | PATCH | `/api/branch/videos/:id` | required | 作品编辑 **+ 回炉重做**，仅作者。body `{ title?, category?, description?, tags?, visibility?, linkOnly?, cover?, segments?, branchTree?, deck?, baseRevision? }`，**至少给一个字段**（空对象 400；只给 `baseRevision` 也 400）。限流 **6/分钟按账号**（`branch:revise` 桶）。★ **带了 `segments` / `branchTree` / `deck` 任意一个 = 回炉**（换内容），否则是改壳，行为一字未变。回炉详见下「回炉重做」 |
@@ -297,7 +297,7 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | DELETE | `/api/branch/videos/:id/comments/:commentId/like` | required | 取消 → `{ ok, likes, liked: false }` |
 | DELETE | `/api/branch/videos/:id/comments/:commentId` | required | 删评论。**评论作者本人 或 作品作者**。连带删：回复、评论赞、指向它的通知；重算 `commentCount`。→ `{ ok, removed, commentCount }`。限流 30/分钟按账号 |
 | DELETE | `/api/branch/videos/:id/danmaku/:danmakuId` | required | 删弹幕。**弹幕作者本人 或 作品作者**。→ `{ ok: true }`。限流 30/分钟按账号。★ 无权时回**裸 403**，回包与文案里**绝不能出现作者信息** —— 否则对每条弹幕试删一次，就等于给整面匿名弹幕墙开了一个逐条查作者的接口 |
-| GET | `/api/branch/videos/:id/danmaku` | optional | 弹幕列表（见下「弹幕」）。query `limit`(默认 200，上限 500)。返回 `{ ok, items, truncated }` |
+| GET | `/api/branch/videos/:id/danmaku` | optional | 弹幕列表（见下「弹幕」）。query `limit`(默认 200，上限 500)。返回 `{ ok, items, truncated, total }`（`total` = 这条作品一共多少条弹幕，拉黑的人不算，2026-10-29 加；老服务端没有这一位）|
 | POST | `/api/branch/videos/:id/danmaku` | required | 发弹幕 `{ at, text, color? }` → 201 `{ ok, danmaku }`。限流 **30/分钟**（按账号） |
 | GET | `/api/branch/projects` | required | 我留存的工坊工程列表 → `{ ok, items: [{ video, title, bytes, videoRevision, stale, lostCount, updatedAt }] }`，最多 200 条。⛔ **绝不回 `canvas`**（那是"有没有"的问题；回正文等于每次进个人页下载几十 MB） |
 | PUT | `/api/branch/videos/:id/recipe` | required | 公开配方（制作过程）：留存一份白名单形状的流水线描述，见下「公开配方」。body `{ recipe, videoRevision, public? }`，`videoRevision` 对不上作品当下的 `revision` 400 `RECIPE_REVISION_MISMATCH`。限流 12/分钟 |

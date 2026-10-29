@@ -618,6 +618,15 @@ describe("同款：归属与计数", () => {
     const row = list.body.items.find((v) => String(v._id) === remix);
     expect(row.remixOf).toBeUndefined();
     expect(row.remixCount).toBeUndefined();
+
+    // 「照这条做的同款」列表与 remixCount 同一个口径：只有 fan 那一条（作者自己的、私密的都不列），并回显 remixOf 当能力探针
+    const remixes = await request(app).get(`/api/branch/videos?remixOf=${src}`).expect(200);
+    expect(remixes.body.remixOf).toBe(src);
+    expect(remixes.body.items.map((v) => String(v._id))).toEqual([remix]);
+    // 非法 id 400；原作看不到（不存在）→ 空表
+    await request(app).get("/api/branch/videos?remixOf=nope").expect(400);
+    const none = await request(app).get("/api/branch/videos?remixOf=0123456789abcdef01234567").expect(200);
+    expect(none.body.items).toEqual([]);
   });
 
   test("R6 remixOf 认不下来不挡发布：脏值 / 不存在的 id / 读不到的私密作品 → 照常 201，只是不落归属", async () => {
