@@ -25,7 +25,7 @@ npm install
 cp .env.example .env      # 填 MONGO_URI / JWT_SECRET 等，见 docs/ONBOARDING.md
 npm run dev               # nodemon，默认 4000
 npm test                  # jest --runInBand，提交前必须全绿
-npm run check:config      # 配置自检；生产环境弱密钥会直接拒绝启动
+npm run check:config      # 配置自检；生产环境弱密钥、配了 VIDEO_ZONE_FORCE、VIDEO_REGION_GATE 写错都会直接拒绝启动
 ```
 
 ## 本仓已有的文档（不要重复造）
@@ -53,6 +53,8 @@ npm run check:config      # 配置自检；生产环境弱密钥会直接拒绝�
 | 在服务器上直接改代码 | 下次部署被抹掉 | `deploy.sh` 会 `git reset --hard origin/main` |
 | 用 root 跑 `pm2 reload` | 起出第二份重复服务 | 该命令在进程不存在时会新建。只用 deploy 用户 |
 | 工作区里有仓库的嵌套副本 | `npm test` 结果时好时坏 | jest 已用 `roots` 限定只跑 `tests/`；副本是同事的 WIP，不要删 |
+| 把本机 `.env` 里的 `VIDEO_ZONE_FORCE` 带到生产 | 部署时配置自检失败、服务起不来 | 刻意的：它把每个请求的出片地区钉死，写 `cn` 就是对海外放开 Seedance。只给本机开发用，生产删掉 |
+| 以为出片地区门禁上线就在拦 | 海外照样能用 Seedance 出片，日志里只有 `[region] would-deny` | `VIDEO_REGION_GATE` 缺省 `observe`，只记不拦；`on` 才拦，`off` 完全不管。什么时候切 `on` 等主人拍板，见 `docs/api-contract.md`「出片地区」 |
 
 ## 约定
 

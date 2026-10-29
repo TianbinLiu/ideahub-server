@@ -1120,6 +1120,8 @@ describe("健康端点", () => {
       minimaxFailRefund: true,
       // clientEvents：这台服务器有 POST /api/client-events（App 自报白屏 / 更新失败那几类，2026-10-15；tests/clientEvents.spec.js）
       clientEvents: true,
+      // videoZone：这台服务器有 GET /api/video/zone（出片地区，2026-10-26；tests/videoZone.spec.js）—— 只放「有没有」，不放地区本身
+      videoZone: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

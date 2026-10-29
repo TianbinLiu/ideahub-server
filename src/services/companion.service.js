@@ -291,7 +291,7 @@ function personaExampleMessages(persona, { max = 6 } = {}) {
  * @param {Function|null} [opts.onPrelude] prelude 发完后的回调（记下告知时间）
  * @param {boolean} [opts.guard] 输出侧安全守卫，**默认开**：逐句查，命中则不发该句、abort 上游、改发求助卡。
  *   传 false 才关掉 —— 少数不该有守卫的链路必须显式说明理由（目前没有）
- * @param {string} [opts.country] CF-IPCountry，决定求助卡给哪个地区的热线
+ * @param {string} [opts.country] 国家码（取自 chatSafety.countryOf），决定求助卡给哪个地区的热线
  * @param {string} [opts.lang] 求助卡的文案语言（热线仍按 country 给）
  * @param {string[]} [opts.caps] 客户端认识的新事件（safety / notice）
  * @param {string} [opts.scene] 匿名转介计数用的场景名，默认取 tag

@@ -1657,12 +1657,17 @@ body：`{ publicId }`。响应与老路**逐字相同**（有测试比对字段�
 对着转圈干等）：
 
 ```
-{ ok: false, message: "<能直接显示给用户的整句中文>", billed: true|false, code?: "PLAN_REQUIRED" }
+{ ok: false, message: "<能直接显示给用户的整句中文>", billed: true|false, code?: "PLAN_REQUIRED" | "REGION_UNAVAILABLE" }
 ```
+
+`REGION_UNAVAILABLE`（2026-10-26）另带 `reason: "region"`、`zone`、`providers`，`message` 是**英文在前、中文在后**的一整行（形状与
+`/api/ark` 被拦时逐字相同，见「出片地区」）。★ 别把阶段一的 403 一律当成「去升级套餐」：先认 `code`。
+一般是 `billed: false`（看帧之前的预检就拦下了）；只有看帧之后才被拦的那个窄窗口（两次之间门禁被从 `observe` 拨到 `on`）是
+`billed: true` + `visionFrames`，`message` 两半各多一句「看帧那一笔已经花了、不退」（见「出片地区」→「被拦的回包」最后一条）。
 
 | `billed` | 含义 | 典型场景 |
 |---|---|---|
-| `false` | **这一次调用**一分钱没动，或已经原路退回 | 【阶段一】归属/四组数没过、预热失败、套餐不够格（403 `PLAN_REQUIRED`）、余额不足（402）、方舟**受理前** 400（敏感词/输入不合格，W2 已退）；【阶段二】**全部**（它本来就不扣钱） |
+| `false` | **这一次调用**一分钱没动，或已经原路退回 | 【阶段一】归属/四组数没过、预热失败、地区不提供（403 `REGION_UNAVAILABLE`，见「出片地区」）、套餐不够格（403 `PLAN_REQUIRED`）、余额不足（402）、方舟**受理前** 400（敏感词/输入不合格，W2 已退）；【阶段二】**全部**（它本来就不扣钱） |
 | `true` | 已经产生费用（看帧那一笔退不回来；r2v 那一笔受理后方舟明说失败会自动退回，见下） | 【阶段一】看帧那一步花完之后的任何失败：`roles` 为空、r2v 受理后才发现的问题 |
 
 ★ 客户端缺省按 `false`（非 JSON 回包 = 请求根本没落到这个端点上）。**别把两类混成一句话** ——
@@ -2127,7 +2132,7 @@ App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。�
 
 | 方法 | 路径 | 鉴权 | 限流 | 说明 |
 |---|---|---|---|---|
-| GET | `/api/ark/health` | 无 | — | `{ ok, ark, imageGroups, res480, draftMode, failRefund, freeVideo: [{label, model, resolution}], freeVideoGate, minimaxFailRefund }`：配没配 key + 能力位（老服务端没有的位 = 没有这个能力，App 据此藏起对应的东西；判能力只看能力位，不看状态码）。`failRefund` 只说**方舟**任务（无条件退）；`freeVideo` 是免费档门禁开着时免费版能用的档；最后两位是运维开关的现状（老服务端没有 = 当成开着）：`freeVideoGate`（`FREE_VIDEO_GATE`，false = 服务端不按免费档拦、只挡电影级）、`minimaxFailRefund`（`MINIMAX_FAIL_REFUND`，false = 真人档受理之后的失败**不退**）。App 照 `freeVideo` / `freeVideoGate` 置灰（读不到 = 老服务端，按自己档位表的 `freeOk`），照 `minimaxFailRefund` 决定对真人档说不说「会自动退回」（见下「免费版」那条与「失败退款」的 MiniMax 那条） |
+| GET | `/api/ark/health` | 无 | — | `{ ok, ark, imageGroups, res480, draftMode, failRefund, freeVideo: [{label, model, resolution}], freeVideoGate, minimaxFailRefund, videoZone }`：配没配 key + 能力位（老服务端没有的位 = 没有这个能力，App 据此藏起对应的东西；判能力只看能力位，不看状态码）。`failRefund` 只说**方舟**任务（无条件退）；`freeVideo` 是免费档门禁开着时免费版能用的档；最后两位是运维开关的现状（老服务端没有 = 当成开着）：`freeVideoGate`（`FREE_VIDEO_GATE`，false = 服务端不按免费档拦、只挡电影级）、`minimaxFailRefund`（`MINIMAX_FAIL_REFUND`，false = 真人档受理之后的失败**不退**）。App 照 `freeVideo` / `freeVideoGate` 置灰（读不到 = 老服务端，按自己档位表的 `freeOk`），照 `minimaxFailRefund` 决定对真人档说不说「会自动退回」（见下「免费版」那条与「失败退款」的 MiniMax 那条）。`videoZone`（2026-10-26）= 有 `GET /api/video/zone`，只说有没有、不带地区本身（见「出片地区」） |
 | POST | `/api/ark/images/generations` | required | 30/min | Seedream 出图（卡面 / 首尾帧）。方舟下线了的老 id 由服务端换成接班型号再发（见下「出图模型接班」） |
 | POST | `/api/ark/contents/generations/tasks` | required | 30/min | Seedance 出视频 / Seed3D 建模（同一个异步任务端点） |
 | GET | `/api/ark/contents/generations/tasks/:id` | required | 90/min | 轮询任务状态（每 5s 一次，一段视频最多 120 次，所以单独一个桶） |
@@ -2478,6 +2483,9 @@ App 2.63 起两档（2026-10-10 主人拍板：速写换成 4.0 新版本，「�
 | `GET /asset` | **0** |
 
 - 余额不足 → **402** `{ code: "INSUFFICIENT_TOKENS", need, balance }`，**方舟根本不会被调用**
+- 地区门禁开着（`VIDEO_REGION_GATE=on`）、这一发是这个地区不给的出视频 → **403** `{ code: "REGION_UNAVAILABLE", billed: false }`，
+  排在扣钱之前、不写钱包头：**创建任务那一发不会发给方舟，一分不扣**。样片第二步会先向方舟查一次样片状态（不收钱）、
+  带参考视频的请求可能先向 Cloudinary 查一次时长（不收钱）—— 这两次查询在 403 之前（见下「出片地区」）
 - 扣费先 plan 后 addon；服务端记下**这一笔从两桶各扣了多少**（`tokenWallet.debitSplit`）。
 - 上游非 2xx（400 敏感词 / 429 限流 / 5xx / 501 没配 key）→ 扣掉的**按原桶退回**（plan 的回 plan、addon 的回 addon，
   `ark_refund`）。★ 2026-10-07 之前一律退进 addon —— 那是一条把会过期的当月额度洗成永久余额的路（敏感词提示词反复 400 即可）。
@@ -2646,6 +2654,243 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
 - **单张出图那条路从此只出一张**（`POST /api/ark/images/generations`）：`sequential_image_generation` 不是 `disabled`、`layer_decomposition`
   不是 false、`stream` 不是 false、`n` 不是 1、`tools` 非空 —— 一律 400 `IMAGE_PARAMS_NOT_ALLOWED`，不扣钱。此前请求体原样转发、按一张收，
   带上组图开关就能用一张的钱换十五张，零症状。App 从来只发 model / prompt / image / size / response_format / watermark，不受影响。
+
+## 出片地区（`GET /api/video/zone` + 出片地区门禁，2026-10-26）
+
+主人原话：美国境内不能用 Seedance、只能用 MiniMax 国际版；中国境内 IP 可以选；海外由于政策原因只能用 MiniMax。
+
+⚠ 「政策原因」的出处（条款原文或供应商的书面答复）还没落进文档。在那之前这是**按主人要求的产品限制**：
+本节、客服知识库、商店材料里都别写成「法规要求」。
+
+代码在四处，各管一件事：
+
+| 文件 | 管什么 |
+|---|---|
+| `src/utils/geo.js` | 请求方在哪个国家（`countryOf`）、国家落到哪个地区（`videoZoneOf`） |
+| `src/config/videoRegion.js` | 每个地区准用哪几家、门禁档位、该不该拦（`regionDenial`，纯判定）、被拦时那句话 |
+| `src/services/arkGateway.service.js` | 门禁的执行（`regionGate`），挂在 `chargedArkCall` 上 |
+| `src/routes/videoZone.routes.js` | `GET /api/video/zone` |
+
+### 判据：国家 → 地区
+
+**国家码**只有 `utils/geo.countryOf` 一处实现。登录页（`/api/auth/capabilities`）和求助卡的国家也从这里取。
+
+1. 先认 `cf-ipcountry`。★ 它可信，只因为源站 443 / 80 只对 Cloudflare 网段开放、而且 Cloudflare 会覆盖客户端自带的那一份（后一条还没核实，见下 ⚠）。
+   哪天放开源站直连，任何人都能自己写一个 `cf-ipcountry: CN`，那时这一条必须改。
+2. 读不到、是 `XX`、或形状不对，再用 geoip-lite 查 `rateLimit.clientIp(req)`（X-Real-IP 优先，不用 `req.ip`）。
+3. `T1`（Tor）当「没有国家」，**不再**查 geoip：查到的只是出口节点在哪，等于让人挑节点选地区。
+4. 不认 `x-vercel-ip-country` / `x-country-code` / `x-appengine-country`：我们的链路上没有一跳会覆盖它们，全是客户端自报。
+
+⚠ 两件事还没在生产核实：Cloudflare 后台的 IP Geolocation 开着；客户端自带的 `cf-ipcountry` 会被 Cloudflare 覆盖。
+两件各有各的核法（都写进了下面「切 on 之前」第 3 步）：
+
+- **会不会被伪造**：只能拿 curl 当面核。在中国以外、**不是数据中心**的网络上跑（本 zone 的 Cloudflare 拦一切数据中心来源）：
+  `curl -s -H 'cf-ipcountry: CN' https://<host>/api/video/zone`，回的 `country` 必须是真实所在的国家、**不是** `CN`。
+  回了 `CN` = Cloudflare 把客户端自带的头原样传了过来，加一个头就能在海外拿到 Seedance —— 这时不许切 `on`。
+- **IP Geolocation 开没开**：不带那个头再跑一次，`country` 不能是空的（这只说明判得出国家，回包里不带是 `cf` 还是 `geoip` 判的）；
+  看 observe 期间 `[region] would-deny` 那几行的 `source=`：是 `cf` 就是 Cloudflare 给了国家头，全是 `geoip` 说明没给、判据退到了 geoip-lite。
+- ★ `[region] would-deny` 日志**核不了伪造**：它只记「该拦」的请求，伪造成 `CN` 的那一发落在 `cn`、不该拦，一行都不会留。
+  这份日志只看得出**拦多了**（境内的人被判成海外），看不出**拦少了**（伪造 `CN`，或别的原因被判成境内）。
+
+⚠ 还有一道源站加固要在切 `on` 之前做（2026-10-26 最终审核）：这个头现在是一道拦人的闸，上面那条 curl 核不全它的可信度。
+细节不进公开仓，在运维的私有笔记里；都在 nginx / Cloudflare 后台，代码里改不了。
+
+**地区**（`utils/geo.videoZoneOf`）：
+
+| 地区 | 国家码 | 按政策准用 |
+|---|---|---|
+| `cn` | 只有 `CN` | Seedance（方舟）、MiniMax（中国站或国际站） |
+| `intl` | 其余全部，含 HK / MO / TW、判不出、Tor | 只有 MiniMax **国际站** |
+| `blocked` | IR / CU / KP / SY | 一家都不给 |
+
+- ★ 国家名单和政策表（`ZONE_UPSTREAMS`）都是代码里的冻结常量，不做环境变量：放宽要过评审；环境变量写错一个字母，整道闸就零症状地绕开了。
+- ★ `blocked` 的来由：MiniMax 国际站协议的出口管制条款，管到「把客户数据交给终端用户」。
+  克里米亚、顿涅茨克、卢甘斯克是国家以下的地区，国家码判不出来（落在 UA / RU 里），这一层管不到。
+- ⚠ 按出口 IP 判。开着 VPN 的人按 VPN 出口算：境内用 Google Play 的人多半开着 VPN，会被判成海外；在海外挂中国线路的人会拿到 Seedance。
+- 本机开发可以用 `VIDEO_ZONE_FORCE` 钉死地区（见下「环境变量」）。钉的只是 zone，`country` 照实报；登录页不受它影响。
+
+### `GET /api/video/zone`
+
+- **免登录**（`optionalAuth`）：开机就要决定摆哪几档，在登录之前。带了 token 只用来按账号分限流桶。
+- **每一种回包都带 `Cache-Control: no-store`**（429 也带）：地区跟着出口 IP 走，开关 VPN 会在会话中途变。
+- **限流**约 60 次/分钟：登录的按账号，游客按 IP。超了回 429 `{ ok: false, code: "RATE_LIMIT_EXCEEDED" }` + `Retry-After`。
+
+回包（v1）：
+
+```
+{ ok: true, v: 1,
+  zone: "cn" | "intl" | "blocked",
+  country: "US",                      // 判不出 / Tor 是 ""
+  providers: ["ark", "minimax"],      // 或 ["minimax"]、[]
+  gate: "off" | "observe" | "on" }
+```
+
+| 字段 | 含义 |
+|---|---|
+| `zone` | 这一个请求按哪个地区算 |
+| `country` | 判出来的两位国家码；判不出 / Tor 是 `""` |
+| `providers` | 此刻对这个请求**放行**哪几家：`ark` = 火山方舟 Seedance，`minimax` = MiniMax。没配 key 的那家永远不报。**跟着 gate 走**（`videoRegion.offeredProviders` 一处算）：`on` = 这个地区按政策准用的 ∩ 这台服务器接着的；`off` / `observe` = 这台服务器接着的全部几家，不看地区 |
+| `gate` | 门禁此刻的档位。只作说明与排查 |
+| `v` | 回包形状的版本。加字段不升，改了已有字段的意思才升 |
+
+- ★ **App 只照 `providers` 摆档**，不要自己看 `gate` 决定放不放开。这样切 `off` 才是真急停：服务端切下去那一刻就一发都不拦了；
+  App 那一侧是**下一次探这个端点**时照常全摆（回到前台、定时重探、或收到一次 403 之后，见下「新版 App 该做的」）——
+  探到之前它还照上一次的结论藏着 Seedance（问不到时也退回本机上一次的结论）。藏着只是没摆出来，点不到也拦不到钱。
+  observe 期间新 App 也不会提前把海外的 Seedance 藏掉。
+- ★ MiniMax 连站一起判：这台服务器的 MiniMax 走中国站时，`gate` 为 `on` 的海外回包里没有 `minimax`。
+- **能力位**：`GET /api/ark/health` 的 `videoZone: true`。App 先看到这一位再来问：老服务端上这条路不存在，
+  而 Capacitor 对未命中路径回 200 + index.html，判「有没有这个端点」只看能力位。
+  health 里**不放地区本身**：App 把 health 的结论记一整场会话，地区却会中途变。
+
+### 出片地区门禁
+
+**拦什么**（`videoRegion.gatedProviderOf`，改范围只改这一处）：
+
+- **Seedance 出视频**：`kind: "task"` 且 `tokens.isVideoGeneration` 为真。普通出片、带参考视频（r2v、白模化那一发）、样片两步都在内；Seed3D 不在内。
+  入口是 `POST /api/ark/contents/generations/tasks` 和白模化。
+- **MiniMax 真人档**（`POST /api/minimax/video`）：按「地区 + 站」判。海外只准国际站，`blocked` 一家都不给。
+  这台服务器没配 MiniMax 时不归门禁管（那一发在扣费之前就回 501 了）。
+- ★ 2026-10-26 先定的默认是「只拦 Seedance」，审核时补了 MiniMax 这一半。不判站的话，`blocked` 区 `/api/video/zone` 说「一家都没有」，
+  出片那一发却照收照转；「海外只能用 MiniMax 国际版」也只有连站一起判才兑现得了。
+
+**不拦**：
+
+- 出图（Seedream 单张、组图）、对话 / 推演 / 看帧 / AI 客服（豆包）、TTS、Seed3D、真人肖像授权（`/api/ark/portrait/*`）、Runway。范围等主人拍板，见下。
+- 只读的几条：任务轮询、MiniMax 取件、`/api/ark/video-tasks`、`/api/ark/task-charges/:taskId`、转存、`/api/ark/asset`。在途任务照常取得回来。
+  ⚠ 这一条只管「取得回来」。在**已经付过钱的片子上再发一发** Seedance 不算只读：样片第二步（升 1080p —— `resolveDraftFinal` 把它变成一个新的
+  Seedance 任务）、片段重拍、往后延长（r2v 带本人自己的成片，`resolveR2v` 的 `ownEdit` / `ownExtend`）都是新的出视频，归门禁管。
+  切 `on` 之后，海外用户在 observe 期间付过第一步的样片**升不了成片**（7 天有效期之内也不行），付过钱的成片也**重拍不了、延长不了**。
+  见下「切 on 之前」第 4 步与「等主人拍板」第 7 条。
+
+**怎么执行**（`arkGateway.regionGate` 是唯一实现；该不该拦只问 `videoRegion.regionDenial`，它是纯判定、不看 gate）：
+
+| `VIDEO_REGION_GATE` | 行为 |
+|---|---|
+| `off` | 什么都不做：不判、不记、连 `req` 都不看。这是急停开关 |
+| `observe`（缺省） | 判。该拦的记一行 `[region] would-deny at=… <kind> <model> zone=… country=… source=… user=…`，照常放行。同一个请求同一个模型只记一行 |
+| `on` | 判。该拦的记一行 `[region] deny …`，回下面那个 403。在扣钱之前：出视频那一发（创建任务）不发出去，一分不扣 |
+
+- ⚠ 「不发出去」只说**创建任务那一发**。`POST /api/ark/contents/generations/tasks` 上排在 `billedForward` 前面的两个中间件照常先跑：
+  样片第二步先向方舟查一次样片的状态（`resolveDraftFinal`，GET、不收钱），带参考视频的请求有几条分支先向 Cloudinary 查一次时长
+  （`resolveR2v`，不收钱，但占 Cloudinary Admin API 的全局配额）—— 都在 403 之前就出网了。钱不受影响；白模化与 `/api/minimax/video`
+  被拦时一发都不出网。要连这两次查询都省掉，得在 `resolveDraftFinal` 之前加一道同样的 `regionGate` 预检（照白模化那样）—— 今天没加。
+- **挂点**：`chargedArkCall` 里「免费档门禁判定之后、扣钱（`billing.chargedCall`）之前」。
+  效果上**先于**套餐门禁：海外的免费用户听到的是地区，不是「去升级」。地区不给时，付了钱也用不了。
+- **白模化**（`POST /api/branch/templates/blockoutize`）先花一发看帧（豆包 chat，门禁不管），再发 Seedance 2.5 r2v。
+  所以它在套餐预检之前、看帧之前，用同一个 `regionGate` 预检一次。被拦时一发都不出网（不看帧、不问 Cloudinary），回同样的 403。
+  ★ 以后新加「先付一笔、再出视频」的路由，也要在第一笔付费调用之前这样预检。
+- **管理员不豁免**：这是地区政策，不是计费。`billing.preAuthorize` 的免单是另一件事。
+- **地区从请求现算**：归门禁管的调用必须把 `req` 交给 `chargedArkCall`，不带直接抛（扣钱之前，500）。
+  不让每个调用点各算一个 zone 再传：N 处各算一遍就是 N 份实现，漏一处零症状。`tests/regionGate.spec.js` 扫源码，钉着每个调用点都带 `req`。
+
+**被拦的回包**（`/api/ark`、`/api/minimax/video`、白模化三处逐字相同）：
+
+```
+403 { ok: false, code: "REGION_UNAVAILABLE", reason: "region",
+      zone, providers, message, billed: false }
+```
+
+- `providers`：门禁开着时这个地区在这台服务器上**换得过去**的几家（政策 ∩ 接着的上游），可能是空的。
+  ⚠ 里面有 `minimax` 不等于**这一发**换得过去（见下 `message` 那四种）：它说的是这个地区有哪几家，不看这一发是什么、这个人是什么套餐。
+- 不写钱包头（余额没变）。
+- `message` 是英文在前、中文在后的一整行，**只在 MiniMax 真做得了这一发时才指人去换 MiniMax**。四种，挑哪一种只在
+  `videoRegion.regionDenial`（`swapVariant`）一处判（2026-10-26 最终审核：原来只看 `providers` 里有没有 `minimax`，
+  于是 MiniMax 做不了的几样、以及套餐用不了 MiniMax 的人，也都被指去换 MiniMax）：
+
+  | 哪一种 | 什么时候 | 那句话（英文 / 中文） |
+  |---|---|---|
+  | 换 MiniMax | 普通出片（含样片第一步），这个地区给得出 MiniMax，这个人的套餐也开着真人档 | `Seedance is not available in your region; not accepted, not charged. Switch the model to MiniMax (update the app if it is missing). / 你所在的地区暂不提供 Seedance 出片：这一发没有受理、也没有扣费。请换成 MiniMax（没有的话先更新 App）。` |
+  | 要付费才有 MiniMax | 同上，但免费档门禁（`FREE_VIDEO_GATE`）开着、这个人没付过钱 —— 真人档只给付费用户，指过去就是再吃一个 403 `PLAN_REQUIRED` | `… not accepted, not charged. MiniMax works here with a paid plan or after any top-up. / …这里能用的 MiniMax 要付费套餐，或充值过任意一次。` |
+  | 没有可换的 | 带参考视频（白模化、白模模板段、片段重拍、往后延长、素材参考）或样片第二步（升 1080p）：MiniMax 真人档只做照片起拍的图生视频，这几样没有对应做法 | `Seedance is not available in your region, and this kind of video has no other model here; not accepted, not charged. / 你所在的地区暂不提供 Seedance 出片，这类片子（参考视频、模板、重拍、延长、样片定稿）也没有别的模型可换：这一发没有受理、也没有扣费。` |
+  | 一家都没有 | 这个地区在这台服务器上给不出 MiniMax（`blocked`，或 MiniMax 走中国站时的海外），或被拦的本来就是真人档 | `Video generation is not available in your region; not accepted, not charged. / 你所在的地区目前没有可用的出片模型：这一发没有受理、也没有扣费。` |
+
+  - 「这个人的套餐开不开真人档」与出片那一发的套餐门禁同一个判据（`tokens.videoPlanDenial`），管理员算开着（`billing.preAuthorize` 对管理员免套餐门禁）。
+    白模化的预检排在读钱包之前，不知道套餐 —— 它带着参考视频，本来就是「没有可换的」那一句。
+  - 「换 MiniMax」只说到「有这个替代」：真人档只收照片起拍，这一段能不能照搬过去要 App 那边看，服务端不知道这一段有没有照片。
+  - ★ 双语、英文在前、整句 ≤ 200 字、英文半句 ≤ 150 字（测试钉着）。老 App 不认这个 code，会把这句原样显示；
+    它的段卡截 240 字、步骤日志截 160 字，而被拦的正是默认英文界面的海外用户。
+  - ★ 不许有 ASCII 双引号、反斜杠、换行：老 App 用正则从原始回包文本里抠 `message`。
+  - ★ 不写原因（「政策原因」的出处还没落进文档）。
+  - 白模化在看帧**之后**才被拦的那一种（看帧之前的预检放行、两次之间有人把门禁从 `observe` 拨到 `on`；地区按请求记着、门禁档位每次现读）：
+    回包同样是 `REGION_UNAVAILABLE`，但 `billed: true` + `visionFrames`，`message` 是上面那句话两半各补一句「看帧那一笔已经花了、不退」
+    （`videoRegion.withDenialNote`，格式不变）。
+- ⚠ 「没有扣费」只说**这一发视频**。出片之前补画的设定帧、推演的方案都不归门禁管，各自已经结算过（见下「老 App」）。
+- 新版 App 该做的（截至 2026-10-26 **还没做**）：认 `code` 说自己的整句；钱上按「没扣」说（`ai/failCharge`）；收到它就重探 `/api/video/zone`。
+  **什么时候重探**（三处都要有：服务端切 `off` / 切 `on`、人开关 VPN，App 都只能在下一次探的时候才知道）：
+  ① 回到前台；② 定时重探（App 开着就隔一段时间问一次，间隔 App 侧定，别超过 60 次/分钟的限流）；③ 收到一次 `REGION_UNAVAILABLE` 之后。
+  问不到时退回本机上一次的结论 —— 所以切 `off` 之后，App 最晚在下一次重探时才把 Seedance 摆回来。
+
+### 环境变量
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `VIDEO_REGION_GATE` | `off` / `observe` / `on`，缺省 `observe` | 不计大小写和首尾空白。写了认不出的值按 `observe` 跑，**生产上启动自检拒绝启动**（以为开了、其实只在记日志）；非生产只告警 |
+| `VIDEO_ZONE_FORCE` | `cn` / `intl` / `blocked` | **只给本机开发**：把每个请求的出片地区钉死，在美国测境内、在国内测海外。**生产配了它（不管写什么）启动自检拒绝启动** —— 写 `cn` 就是对海外放开 Seedance，整道门禁失效。万一自检没跑到，生产运行时也不认它（按真实地区判，`console.error` 一次）。非生产写了认不出的值会告警，并当没配处理；生效时每个进程吼一次 `[video-region] VIDEO_ZONE_FORCE=…` |
+
+启动自检就是 `npm run check:config`（`config/preflight` → `videoRegion.collectVideoRegionProblems`），`deploy.sh` 部署前先跑它。
+
+**在服务器上手动拨这个开关**（切 `on`、急停切 `off`、切回 `observe`）—— 一步都别省：
+
+1. 改 `/var/www/ideahub-server/.env` 里那一行。
+2. `cd /var/www/ideahub-server && NODE_ENV=production npm run check:config`，**通过了才往下走**。
+3. 以 **deploy 用户** `pm2 reload ecosystem.config.js --update-env`。
+
+- ★ 为什么第 2 步不能省：每个 worker 启动时都跑同一份自检（`config/preflight.assertProductionConfig`），认不出的值直接 `process.exit(1)`。
+  `deploy.sh` 只在部署时先跑 `check:config`，手动拨开关不经过它 —— 写错一个字母（`of`、`onn`），重启之后**每个 worker 都起不来，整个 API 停掉**，
+  不只是这道门禁。`reload` 也挡不住坏值，挡在第 2 步。
+- ★ 用 `reload` 不用 `restart`：`restart` 先停掉全部 worker 再起（SECURITY_HARDENING.md 量过：约 3 秒 502）；`reload` 一个一个换、不停机。
+  不带 `--update-env` 读不到改过的 `.env`。
+- ★ 不许用 root：`pm2 reload <文件>` 在那个用户下没有这个进程时会**新建一份**，起出第二份平行的服务（AGENTS.md）。
+
+### 老 App 会怎样
+
+- 老 App 不读 `/api/video/zone`，照旧摆 Seedance 档。门禁 `on` 之后，海外用户点 Seedance 档，会在提交视频那一刻收到 403 那句双语的话；视频那一发不扣钱。
+- 真人档在 MiniMax 走国际站时照常能用；在途任务照常取回。
+- ⚠ 视频之前那几笔照扣：推演（对话 + 出图）、出片前补画设定帧都不归门禁管，各自先结算，到视频那一发才 403。
+  白付多少看 App 版本：**2.62 起**补画好的帧随失败留在这一段上（App `segmentGen.settleSegment` 把它们带在 `SegmentGenFailed.kept` 上，
+  `flowStore.genNode` 写回方案），重试不重画、不再收图钱；推演是另一步，重试视频不会再推演一次 —— 所以**每段白付一轮**。
+  **2.61 及更早**每重试一次都重画一遍、再收一遍图钱。
+- ⚠ 不分新老 App：切 `on` 之后，海外用户付过第一步的样片升不了成片、付过钱的成片重拍不了 / 延长不了（都是新的 Seedance 出视频，见上「不拦」那条 ⚠）。
+- ⚠ 不分新老 App：切 `on` 之后，**海外的免费用户一档视频都没有**（见下「切 on 之前」第 5 步）。
+
+### 切 `on` 之前
+
+1. 旁加载包用 App 发版脚本的 `--min-version-code`，把强制更新门槛抬到认得 `REGION_UNAVAILABLE`、会读 `/api/video/zone` 的那一版。Play 版等那一版铺开。
+2. `curl https://<host>/api/minimax/health`，确认 `region` 是 `intl`。MiniMax 走中国站的话，海外连 MiniMax 也没有，切 `on` 那一刻海外一家都不剩。
+3. 核地区判得对，两头分开核（理由见上「判据」那条 ⚠）：
+   - **拦少了**（伪造）：在中国以外、不是数据中心的网络上 `curl -s -H 'cf-ipcountry: CN' https://<host>/api/video/zone`，`country` 必须是真实国家、不是 `CN`；
+     不带这个头再跑一次，`country` 不能是空的。回了 `CN` 就不许切 `on`。
+   - **源站加固**（理由见上「判据」第二个 ⚠，做法在运维的私有笔记）：没做完不许切 `on`。
+   - **拦多了**：翻 observe 期间的 `[region] would-deny` 日志，看被判成海外的都是哪些国家、`source=` 是 `cf` 还是 `geoip`。
+     ★ 这份日志只记该拦的请求，伪造成 `CN` 的那一发一行都不会留 —— 它只能核「拦多了」，核不了「拦少了」。
+4. 想清楚已经付过钱的那几样（主人定，见下第 7 条）：切下去那一刻，海外用户付过第一步的样片升不了成片（7 天有效期内也不行），
+   付过钱的成片重拍不了、延长不了。不豁免的话至少提前说一声（公告 / 发版说明）。
+5. 想清楚海外的免费用户（主人定，见下第 8 条）：切下去那一刻，**海外的免费用户一档视频都没有**。
+   免费档（「草稿」，11-24 之前还有「极速」）全是 Seedance，海外被拦；真人档（MiniMax）在免费档门禁（`FREE_VIDEO_GATE`，缺省开）开着时只给付费用户；
+   而地区门禁排在套餐门禁之前（地区不给时付钱也没用，所以先说地区）。拒绝话会对他们说「MiniMax 要付费套餐」（见上「被拦的回包」），
+   不会指他们去换一个换过去还是 403 的档 —— 但「海外免费试用」这件事本身就没有了，要不要给海外免费用户留一档得主人定。
+
+### 等主人拍板
+
+下面几件都按「先定的默认」写在代码里，每件只改一处：
+
+1. **拦的范围**：今天只拦出视频（Seedance 按地区，MiniMax 真人档按地区 + 站）。出图、对话 / 推演 / AI 客服、TTS、Seed3D、Runway 都不拦。
+   要全拦的话，海外这几样都没有替代供应商，得另起一期。改在 `videoRegion.gatedProviderOf`。
+2. **港澳台**：今天判境外，只给 MiniMax。改在 `utils/geo.CN_ZONE_COUNTRIES`。
+3. **真人肖像授权邀约**（`/api/ark/portrait/*`，把本人照片发给火山做可信素材）：今天海外不拦。
+4. **管理员 / 测试账号例外**：今天不豁免。在美国要测 Seedance，就用本机开发服务端 + `VIDEO_ZONE_FORCE=cn`。
+5. **什么时候切 `on`**：缺省 `observe`。前置见上「切 on 之前」。
+6. **受全面制裁的名单**：今天只有国家码认得出的 IR / CU / KP / SY 四个。改在 `utils/geo.BLOCKED_COUNTRIES`。
+7. **已经付过钱的片子上的后续出片**：样片第二步（升 1080p）、片段重拍、往后延长，今天与新出片一样拦 —— 切 `on` 之后海外用户付过第一步的样片
+   升不了成片（7 天有效期内也不行），付过钱的成片重拍不了、延长不了。要不要豁免这几样，或者至少切之前提前公告？
+   要豁免得在 `arkGateway.regionGate` 里按 `draftFinal` 与 `r2v.kind`（`ownEdit` / `ownExtend`）放行 —— 它今天已经收这两样，
+   但只拿来挑拒绝话（说「没有可换的」那一句），不放行。
+8. **海外的免费用户**：切 `on` 之后一档视频都没有（免费档全是 Seedance；真人档在免费档门禁开着时只给付费用户；地区门禁排在套餐门禁之前）。
+   拒绝话对他们说「MiniMax 要付费套餐」。要不要给海外免费用户开一档（比如真人档对海外免费用户开、按免费额度扣），还是就这样？
+   改的话在 `tokens.videoPlanDenial`（真人档对谁开），拒绝话会跟着变（`videoRegion.regionDenial` 问的是同一个判据）。
+
+测试：`tests/geo.spec.js`（判国家 / 地区）、`tests/videoZone.spec.js`（政策表、gate、拒绝话、端点）、
+`tests/regionGate.spec.js`（门禁接到钱上）、`tests/branchTemplate.spec.js`（白模化预检）。
 
 ## 真人肖像授权（方舟可信素材）
 

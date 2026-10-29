@@ -1218,6 +1218,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       ratio: "adaptive",
       resolution: "720p",
     });
+    // ★ 不出声是显式发出去的（与 App 的 BLOCKOUT_TASK 同一个值）：edit 会连参考视频里的歌一起复刻，带歌的素材会被方舟在输出端整发拒。
+    //   判「严格等于 false」而不是「不是 true」：缺省（不传）就是把这件事交给方舟的缺省值，那正是这一行要钉死的东西
+    expect(body.generate_audio).toBe(false);
     // F4：白模化提示词必须**点名**（"包括…在内"），泛指会漏掉主角
     const text = body.content.find((c) => c.type === "text").text;
     expect(text).toContain("包括");
@@ -1921,6 +1924,119 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(res.body.allowed).toEqual(require("../src/config/tokens").freeVideoTiers().map((t) => t.label));
     expect(res.body.message).toMatch(/免费版/);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── 出片地区门禁前置（2026-10-26：海外不给 Seedance）──────────────────
+  // ★ 这条路先花一发看帧（豆包 chat，地区门禁不管对话）、再发 Seedance 2.5。门禁只挂在 chargedArkCall 上的话，
+  //   海外用户先被扣掉看帧那笔钱、再在 r2v 那一步吃 403 —— 而 403 那句话说的是「没有扣费」。所以预检必须排在看帧之前。
+  describe("出片地区门禁的前置预检（排在看帧之前）", () => {
+    const blockoutJobsOf = () => BlockoutJob().countDocuments({ ownerId: owner.id });
+    const balanceOf = async () => {
+      const w = await walletSvc.getWallet(owner.id);
+      return w.plan + w.addon;
+    };
+    let savedGate;
+    let warnSpy;
+    beforeEach(() => {
+      savedGate = process.env.VIDEO_REGION_GATE;
+      warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      if (savedGate === undefined) delete process.env.VIDEO_REGION_GATE;
+      else process.env.VIDEO_REGION_GATE = savedGate;
+      warnSpy.mockRestore();
+    });
+    const regionLines = () => warnSpy.mock.calls.map((c) => String(c[0])).filter((s) => s.startsWith("[region]"));
+
+    test("★ 门禁 on、海外 → 403 REGION_UNAVAILABLE + billed:false；根本不发看帧（一发都不出网、连 Cloudinary 都不问）、不扣钱、不留取件单", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const before = await balanceOf();
+      const jobs = await blockoutJobsOf();
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(403);
+      // 与 /api/ark 被拦时逐字同一个形状（body 只在 arkGateway.regionGate 一处拼）
+      expect(Object.keys(res.body).sort()).toEqual(["billed", "code", "message", "ok", "providers", "reason", "zone"]);
+      expect(res.body).toMatchObject({ ok: false, code: "REGION_UNAVAILABLE", reason: "region", zone: "intl", billed: false });
+      expect(fetchSpy).not.toHaveBeenCalled(); // 没有看帧、没有预热、没有 r2v
+      expect(resourceSpy).not.toHaveBeenCalled();
+      expect(await balanceOf()).toBe(before);
+      expect(await blockoutJobsOf()).toBe(jobs);
+      expect(regionLines()).toEqual([expect.stringMatching(/^\[region\] deny at=blockoutize task doubao-seedance-2-5-/)]);
+    });
+
+    test("门禁 on、境内（CN）→ 照常受理（看帧 + Seedance 都发了）", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "CN" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(net.calls.some((c) => c.url === `${ARK}/chat/completions`)).toBe(true);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(true);
+      expect(regionLines()).toEqual([]);
+    });
+
+    test("门禁 observe（缺省）、海外 → 照常受理；would-deny 一个请求只记一行（预检与 Seedance 那一发不重记）", async () => {
+      delete process.env.VIDEO_REGION_GATE;
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(true);
+      const lines = regionLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^\[region\] would-deny at=blockoutize task doubao-seedance-2-5-.* zone=intl country=US source=cf /);
+    });
+
+    test("门禁 off：海外照常受理、一行都不记", async () => {
+      process.env.VIDEO_REGION_GATE = "off";
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(regionLines()).toEqual([]);
+    });
+
+    // 2026-10-26 最终审核：海外给得出 MiniMax 时，拒绝话原来照样叫人「换成 MiniMax」—— 可白模化在 MiniMax 上没有对应做法
+    test("门禁 on、海外、这台服务器的 MiniMax 走国际站 → 拒绝话说「没有可换的」，不指人去换 MiniMax", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const savedKey = process.env.MINIMAX_INTL_API_KEY;
+      process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+      try {
+        const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+        expect(res.status).toBe(403);
+        expect(res.body).toMatchObject({ code: "REGION_UNAVAILABLE", providers: ["minimax"], billed: false });
+        expect(res.body.message).not.toMatch(/MiniMax/);
+        expect(res.body.message).toMatch(/no other model here/);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        if (savedKey === undefined) delete process.env.MINIMAX_INTL_API_KEY;
+        else process.env.MINIMAX_INTL_API_KEY = savedKey;
+      }
+    });
+
+    // ★ 地区按请求记着、门禁档位每次现读：看帧之前的预检在 observe 下放行，看帧那几秒里有人把门禁拨到 on，⑥ 那一发就被拦 ——
+    //   这时看帧那笔已经花了。原来拿 `${why}。出片那一笔…` 接，接在以「。」结尾的双语拒绝话后面成了「。。」、英文那半也不知道看帧花了钱。
+    test("看帧之后才被拦（两次之间门禁从 observe 拨到 on）→ 403 REGION_UNAVAILABLE + billed:true + visionFrames；两半各补一句看帧的钱、没有「。。」", async () => {
+      delete process.env.VIDEO_REGION_GATE;
+      const impl = fetchSpy.getMockImplementation();
+      fetchSpy.mockImplementation(async (url, init) => {
+        if (String(url) === `${ARK}/chat/completions`) process.env.VIDEO_REGION_GATE = "on";
+        return impl(url, init);
+      });
+      const jobs = await blockoutJobsOf();
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ ok: false, code: "REGION_UNAVAILABLE", reason: "region", zone: "intl", billed: true });
+      expect(res.body.visionFrames).toBeGreaterThan(0);
+      const m = res.body.message;
+      expect(m).not.toMatch(/。。/);
+      const [en, zh] = m.split(" / ");
+      expect(m.split(" / ")).toHaveLength(2);
+      expect(en).toMatch(/not accepted, not charged\..*The frame check that ran first was charged and cannot be refunded\.$/);
+      expect(zh).toMatch(/没有受理、也没有扣费。.*不过看画面那一步的费用已经产生、无法退回。$/);
+      // 老 App 照样抠得出整句（不含 JSON 要转义的字符）
+      expect(JSON.stringify(m)).toBe(`"${m}"`);
+      // 看帧发了，Seedance 那一发没发；没留取件单
+      expect(net.calls.some((c) => c.url === `${ARK}/chat/completions`)).toBe(true);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(false);
+      expect(await blockoutJobsOf()).toBe(jobs);
+      // 预检记一行 would-deny，⑥ 那一发记一行 deny
+      expect(regionLines().map((s) => s.split(" ")[1])).toEqual(["would-deny", "deny"]);
+    });
   });
 
   test("未登录 → 401（这条链路每一发都真花钱，不许裸奔）", async () => {
