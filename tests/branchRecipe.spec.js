@@ -217,6 +217,12 @@ describe("公开配方：写入与白名单", () => {
     ark.deck[0].cover = "https://ark-content.tos-cn-beijing.volces.com/x.jpg";
     await putRecipe(author, videoId, { recipe: ark, videoRevision: 0 }).expect(400);
 
+    // MiniMax H3 的成片（有时效）与方舟临时链接同一类：配方复用工程那条 NO_LOCAL，2026-10-26 之前它只认方舟
+    const h3 = recipeOf();
+    h3.nodes[0].preview = { first: "https://video-product.cdn.minimax.io/h3-480p/2000/01/01/test/1-1-a_aigc.mp4" };
+    const h3Res = await putRecipe(author, videoId, { recipe: h3, videoRevision: 0 }).expect(400);
+    expect(JSON.stringify(h3Res.body)).toMatch(/临时链接/);
+
     const real = recipeOf();
     real.deck[0].realPerson = true;
     await putRecipe(author, videoId, { recipe: real, videoRevision: 0 }).expect(400);

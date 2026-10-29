@@ -18,10 +18,17 @@
 //    记进去，等于自己给自己造对不上的账。
 //  · 出图在④那一刻才把方舟下线了的老 id 换成接班型号（withUpstreamImageModel，2026-10-10）：
 //    ①②③ 认的都是客户端发来的 id —— 老包按自己的报价收钱。组图那个出口（arkImageGroup）走同一个换法。
+//  · 出片地区门禁（2026-10-26，regionGate）排在②与③之间：海外不给 Seedance 出片，被拦的那一发一分钱不动。
+//    它在效果上先于套餐门禁生效（套餐那道真正拒人是在 billing 里、和扣费同一拍），理由见 chargedArkCall 里那一段。
 const wallet = require("./tokenWallet.service");
 const billing = require("./billing.service");
-const { priceOf, videoPlanDenial, isPaidUser, VIDEO_MULT, upstreamImageModel } = require("../config/tokens");
-// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
+const { priceOf, videoPlanDenial, isPaidUser, VIDEO_MULT, upstreamImageModel, minimaxV2HasMedia } = require("../config/tokens");
+// ★ 顶层 require 不会半初始化：config/videoRegion 顶层只 require 纯配置，它要问本文件的 arkConfigured 时是用到才 require
+//   （见那个文件头）。经模块对象调（不解构）：测试要能 spyOn。
+const videoRegion = require("../config/videoRegion");
+const { logSafe } = require("../utils/logSafe");
+// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）。这里只有地区门禁挑拒绝话时用它（regionGate 的 paid）
+const { isAdmin } = require("../utils/roles");
 
 const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 
@@ -115,6 +122,75 @@ function arkConfigured() {
 }
 
 /**
+ * 每个请求的地区结论与「这一发记过 would-deny 没有」。键是 req 对象本身（请求结束就跟着回收）。
+ * ★ 为什么按请求记：白模化一个请求要过两次门禁（看帧之前的预检 + Seedance 那一发本身），H3 出片也是（并发闸之前的预检 + chargedArkCall 里那一处）——
+ *   ① 两次必须是**同一个结论**（各算一遍的话，中途改了 VIDEO_ZONE_FORCE 之类就能一次放、一次拦）；
+ *   ② observe 档的 would-deny 一个请求只记一行，不然数日志时白模化 / H3 会被算成两发。
+ */
+const regionSeen = new WeakMap();
+
+/**
+ * 出片地区门禁的**执行** —— 唯一实现（铁律六）。chargedArkCall 每一发都过它；有付费步骤排在出视频之前的路由
+ * （白模化：先看帧、再 Seedance）在第一笔付费调用之前也调它预检一次；在 chargedArkCall 之前另有会拒人的闸的路由
+ * （H3 出片的两道并发闸）在那些闸之前预检一次（config/videoRegion.gatedProviderOf 的 ★★）。
+ * 「该不该拦、拦了说什么」只问 config/videoRegion.regionDenial（纯判定）；这里只决定**怎么执行**：
+ *   VIDEO_REGION_GATE = off     —— 什么都不做（不判、不记、连 req 都不看：急停开关要能把这道闸整个摘掉）；
+ *                       observe —— 判；该拦的记一行 `[region] would-deny`、照常放行（缺省，等主人拍板什么时候切 on）；
+ *                       on      —— 判；该拦的记一行 `[region] deny`，回 403 REGION_UNAVAILABLE（billed:false）。
+ * ★ 地区**从请求现算**（config/videoRegion.requestZone：cf-ipcountry → X-Real-IP 查 geoip → 开发用的 VIDEO_ZONE_FORCE），
+ *   调用方只把 req 交进来 —— 不让每个调用点各算一个 zone 再传（N 处各算一遍就是 N 份实现，漏一处零症状）。
+ * ★ 归这道闸管的调用（Seedance 出视频、MiniMax 出片：真人档与 H3）**必须**带 req：不带直接抛（扣钱之前，500）。
+ *   不给缺省值：缺省成「境外」是悄悄把人拦掉，缺省成「境内」是悄悄放行，两个方向都零症状；抛出来才看得见。
+ *   不归它管的（出图 / 对话 / Seed3D / 服务端自己发起、手上没有 req 的调用）不看 req。
+ * ★ 管理员**不豁免**：这是地区政策，不是计费（billing.preAuthorize 的免单与它是两件事）。测试账号要不要例外等主人定。
+ *
+ * @param {object} o
+ * @param {object|null} o.req  Express 请求（要读它的头与 IP）
+ * @param {object|null} [o.user] 只进日志（谁被拦 / 本该被拦）
+ * @param {string} o.kind  priceOf 的 kind
+ * @param {string} o.model
+ * @param {string} o.at    日志里的位置标签（上游路径 / "blockoutize"）
+ * @param {object|null} [o.r2v]        与 chargedArkCall 收的同一个；白模化的预检传 `{ kind: "blockout" }`（与它旁边的套餐预检同一个记号）
+ * @param {object|null} [o.draftFinal] 与 chargedArkCall 收的同一个
+ * @param {object|null} [o.wallet]     这个人的钱包（chargedArkCall 里已经读过的那一份）。没有就是 null（白模化的预检排在读钱包之前）
+ *   ★ 这三样**只决定拒绝话说哪一句**（videoRegion.regionDenial 的 swapVariant：指不指人去换 MiniMax），不影响拦不拦 ——
+ *   带参考视频 / 样片第二步在 MiniMax 上没有对应做法；这台服务器上的 MiniMax 没有一档对他开着的人被指过去只会再吃一个 403 PLAN_REQUIRED（2026-10-26 最终审核；
+ *   「有没有一档开着」连 H3 一起算，见 videoRegion.minimaxOpenTo）。
+ * @returns {null | { status: 403, body: { ok:false, code:"REGION_UNAVAILABLE", reason:"region", zone:string, providers:string[], message:string, billed:false } }}
+ *   null = 放行；否则调用方原样 `res.status(status).json(body)`（两处回同一个形状，body 只在这里拼）
+ */
+function regionGate({ req, user = null, kind, model, at, r2v = null, draftFinal = null, wallet: w = null }) {
+  const mode = videoRegion.gateMode();
+  if (mode === "off") return null;
+  if (!videoRegion.gatedProviderOf(kind, model)) return null;
+  if (!req || typeof req !== "object") {
+    throw new TypeError(`[region] ${at}: ${kind} ${logSafe(model, 64)} 归出片地区门禁管，调用方必须把 req 交进来（地区从请求现算）`);
+  }
+  let seen = regionSeen.get(req);
+  if (!seen) {
+    seen = { where: videoRegion.requestZone(req), noted: new Set() };
+    regionSeen.set(req, seen);
+  }
+  const { zone, country, source, forced } = seen.where;
+  // 按套餐门禁算这个人算不算付费：管理员算（billing.preAuthorize 对管理员免套餐门禁，真人档对他一样开着）；
+  // 没读钱包时不知道（null），由 regionDenial 按「不知道」说
+  const paid = isAdmin(user) ? true : w ? isPaidUser(w) : null;
+  const denial = videoRegion.regionDenial({ kind, model, zone, r2v, draftFinal, paid });
+  if (!denial) return null;
+  const key = `${kind} ${model}`;
+  // on 每次都记（每一次都真拦了一发）；observe 同一个请求同一个模型只记一行
+  if (mode === "on" || !seen.noted.has(key)) {
+    seen.noted.add(key);
+    console.warn(
+      `[region] ${mode === "on" ? "deny" : "would-deny"} at=${logSafe(at, 64)} ${kind} ${logSafe(model, 64)} ` +
+        `zone=${zone} country=${country || "-"} source=${source || "-"}${forced ? " forced" : ""} user=${String(user?._id ?? "-")}`,
+    );
+  }
+  if (mode !== "on") return null;
+  return { status: 403, body: { ok: false, ...denial, billed: false } };
+}
+
+/**
  * 转发一条已经过白名单的请求，返回上游的 { status, text }。
  * key 只在这里出现，永远不回给客户端（铁律三）。
  */
@@ -184,11 +260,13 @@ async function openArkStream({ path, body, timeoutMs }) {
  *        仍只在 config/tokens.js 一处，这里只把结论递进去）。
  * @param {{draftTaskId:string, durationSec:number, ratio?:string}|null} [args.draftFinal]
  *        resolveDraftFinal 解析出的样片第二步结论。有它 = 按 draftFinalTokens 计价、免费版一律拒。
+ * @param {object|null} [args.req]      发起这一发的 Express 请求：出片地区门禁从它现算地区（regionGate）。
+ *        归门禁管的调用（Seedance 出视频、MiniMax 出片）不带就抛；路由里的调用点一律带（tests/regionGate.spec 扫源码钉着）。
  * @param {number} [args.timeoutMs]
  * @returns {Promise<
  *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean,
  *       took:{plan:number, addon:number}, memo:string, upstreamModel:string }
- *   | { ok:false, reason:"model"|"plan"|"funds", status:number, body:object, wallet:object|null }
+ *   | { ok:false, reason:"model"|"region"|"plan"|"debt"|"funds", status:number, body:object, wallet:object|null }
  * >}
  */
 /**
@@ -234,6 +312,12 @@ async function chargedArkCall({
   now = Date.now(),
   /** req.appVersion（middleware/appVersion）：只进「哪个版本还在发老 id」那一行日志，不影响这一发怎么走 */
   appVersion = null,
+  /**
+   * 发起这一发的请求（出片地区门禁从它现算地区，见 regionGate）。
+   * ★ 收 req 而不是收算好的 zone：地区只在 config/videoRegion.requestZone 一处合（geo + VIDEO_ZONE_FORCE），
+   *   让每个调用点各算一个 zone 传进来，就是 N 份实现。归门禁管的调用不带它直接抛 —— 漏传要响。
+   */
+  req = null,
 }) {
   const model = String(body?.model ?? "");
   if (!modelAllowed(model)) {
@@ -266,6 +350,8 @@ async function chargedArkCall({
   // ★ 读的是**钉子补齐之后**的 body.resolution（pinPlainVideoTask 把缺省补成 720p）：
   //   草稿与高清是同一个模型，只差分辨率 —— 只看 model 就会把高清一起放给免费版。
   //   真人档的 768P 由 minimax 路由在调这里之前钉好。管理员的豁免在 billing.preAuthorize 里（denyReason 对免单不生效）。
+  // ★ media（只给 H3）：带不带图在**这里**从 body 现算 —— H3 路由的 forward 转发的就是这同一个 body 对象。
+  //   不让路由传：漏传是零症状的（免费用户带图照样过去，tokens.MINIMAX_V2_FREE_TEXT_ONLY 的 ★）
   const denied = videoPlanDenial({
     paid: isPaidUser(before),
     kind,
@@ -274,7 +360,19 @@ async function chargedArkCall({
     r2v,
     draft: body?.draft !== undefined && body?.draft !== false,
     draftFinal,
+    ...(kind === "minimax_v2" ? { media: minimaxV2HasMedia(body) } : {}),
   });
+
+  // 出片地区门禁（海外不给 Seedance；MiniMax 出片（真人档 / H3）海外只准国际站）。执行只在 regionGate 一处，地区从 req 现算。
+  // ★ 排在扣钱（billing.chargedCall）之前：被拦的这一发一分钱不动、不出网；回包带 billed:false、不写钱包头（余额没变）。
+  // ★ 效果上**先于**套餐门禁：套餐那道真正拒人是在 billing 里（与冻结、扣费同一拍），这里拦了就走不到那儿。
+  //   这是对的顺序 —— 地区不给的时候付钱也没用；先说「免费版只能用…去升级」，海外的人付完钱回来还是被拒
+  //   （与 ark.routes 那段「套餐门禁必须排在扣费之前」同一个理由：别让真正的原因被另一句话盖住）。
+  // ★ 管理员不豁免（regionGate 的 ★）。只读的轮询 / 取件 / 查询不经过这里，在途任务照常取得回来。
+  // r2v / draftFinal / 钱包只用来挑拒绝话（指不指人去换 MiniMax），不影响拦不拦（regionGate 的 ★）
+  const regionBlock = regionGate({ req, user, kind, model, at: path, r2v, draftFinal, wallet: before });
+  if (regionBlock) return { ok: false, reason: "region", status: regionBlock.status, body: regionBlock.body, wallet: null };
+
   if (denied) console.warn(`[ark] 免费档门禁，拒绝 ${kind} ${model} @ ${String(body?.resolution ?? "-")}（planId=${before?.planId ?? "?"}）`);
   // 每一发 Seedance 出片任务套上服务端钉死的字段（见 SERVER_TASK_FIELDS）：转发的是这一份，不是调用方那份。
   // 出图转发换了接班型号的那一份（在册、门禁、计价都已经按发来的 id 判完了）
@@ -290,7 +388,11 @@ async function chargedArkCall({
     memo,
     refundTag,
     denyReason: denied?.message || "",
-    denyExtra: denied?.allowed ? { allowed: denied.allowed } : null,
+    // 结构化给 App 的两样（英文界面不显示服务端的中文句子，靠它们自己说）：allowed = 免费版能用哪几档；freeTextOnly = 档位开着、拒的是带图
+    denyExtra:
+      denied?.allowed || denied?.freeTextOnly
+        ? { ...(denied.allowed ? { allowed: denied.allowed } : {}), ...(denied.freeTextOnly ? { freeTextOnly: true } : {}) }
+        : null,
     forward: async () => {
       // 真要发出去了才记（被余额 / 冻结 / 上限挡下的那几发没到方舟，不算「还在发老 id」）
       if (image) noteImageAlias(model, upstreamModel, appVersion);
@@ -325,6 +427,7 @@ module.exports = {
   callArk,
   openArkStream,
   chargedArkCall,
+  regionGate,
   setWalletHeaders,
   SERVER_TASK_FIELDS,
   withServerTaskFields,

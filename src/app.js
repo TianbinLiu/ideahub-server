@@ -91,9 +91,13 @@ app.use(require("./middleware/appVersion").appVersion);
 //   /api/ark     Seedance 任务创建请求带 base64 首尾帧（压到 720p 后仍有 2-3MB）
 // 「大 body 只对持有效签名 token 的请求开放」这条闸门的实现见 middleware/bigJson.js
 // （两处共用一份：改了阈值或判据要两边同时生效）。
-const { jsonGate, jsonGateWith } = require("./middleware/bigJson");
+const { jsonGate, jsonGateWith, smallJson } = require("./middleware/bigJson");
 app.use("/api/branch", jsonGate);
 app.use("/api/ark", jsonGate);
+// MiniMax H3（V2）出片**不要**大 body（2026-10-26 终审）：图片只收我们图床上的 https 地址（data: 内联图一律拒），
+// 一发合规的请求体也就几十 KB。给它 50MB 的话，任何登录用户都能让服务端在白名单之前先解析一整份 50MB 的 JSON（不花钱）。
+// ★ 必须排在下面 /api/minimax 那一道**之前**：先挂的解析器读完 body，后面的就跳过（body-parser 见请求已读完不再读）
+app.use("/api/minimax/v2", smallJson);
 // 真人视频档：创建体带 base64 首帧/参考图（与 /api/ark 同理，不放宽就是 413）
 app.use("/api/minimax", jsonGate);
 app.use("/api/runway", jsonGate);
@@ -138,6 +142,9 @@ app.use("/api/app", require("./routes/appRelease.routes"));
 // App 自报的客户端事件（白屏 / 更新失败 / IndexedDB 丢数据 …）：免登录、按 IP 限流、**只进日志**（理由见文件头）。
 // 挂在 /api/app 旁边：都是「登录之前就要能打」的 App 基础设施；App 先探 /api/ark/health 的 clientEvents 能力位再发
 app.use("/api/client-events", require("./routes/clientEvents.routes"));
+// 出片地区（2026-10-26）：GET /api/video/zone —— 这次请求按哪个地区算、这台服务器在这个地区给得出哪几家视频供应商。
+// 免登录（开机就要决定摆哪几档，在登录之前）、no-store；App 先看 /api/ark/health 的 videoZone 能力位再来问
+app.use("/api/video", require("./routes/videoZone.routes"));
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/feed", require("./routes/feed.routes"));

@@ -118,6 +118,18 @@ GITHUB_CLIENT_SECRET=your-github-client-secret
 PORT=4000
 NODE_ENV=development
 
+# MiniMax（可选；真人档 + 海外的「草稿 / 高清 / 电影级」= MiniMax H3）。H3 只在走国际站时开、没有单独的开关：
+# 配国际站的 key，两把都配时 MINIMAX_REGION 写 intl（两把都配又不写，生产拒绝启动）。
+# 完整说明见 .env.example 与 docs/api-contract.md「MiniMax H3（V2）出片」
+# MINIMAX_INTL_API_KEY=
+# MINIMAX_REGION=intl
+
+# 出片地区（可选；完整说明见 .env.example「出片按地区」与 docs/api-contract.md「出片地区」）
+# off | observe（缺省：只记日志不拦）| on（真拦：海外不给 Seedance 出片，MiniMax 只准国际站）；写了认不出的值，生产拒绝启动
+# VIDEO_REGION_GATE=observe
+# 只给本机开发：把出片地区钉成 cn | intl | blocked；生产配了它（不管写什么）拒绝启动
+# VIDEO_ZONE_FORCE=cn
+
 # 项目文档（可选，缺少本地文件时使用远程）
 PROJECT_DOCS_URL=https://raw.githubusercontent.com/TianbinLiu/ideahub-server/main/PROJECT_STRUCTURE.md
 ```

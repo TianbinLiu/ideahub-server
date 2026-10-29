@@ -14,6 +14,8 @@
 //   抄一份的话，两处的域名表/上限/超时迟早各改各的——而漂移没有任何症状，
 //   只表现为"同一条链接发布时能转存、出片时却说 host 不认"。
 const { cloudinary } = require("../config/cloudinary");
+// MiniMax H3 成片的落点主机只在 config/minimax 一处（产物代理也认它）
+const { isMinimaxV2VideoUrl } = require("../config/minimax");
 
 /** 成片段落在 Cloudinary 里的家 —— **这个字符串只有这一处**（写入方持有它）。
  *  校验方（utils/videoCompose 的归属判据）从这里 import：两处各写一份的话，
@@ -47,6 +49,18 @@ function isArkVideoUrl(value) {
   } catch {
     return false;
   }
+}
+
+/**
+ * 上游给的**临时**成片地址：方舟（TOS，24 小时过期）或 MiniMax H3（V2 查询回的 `content.url`，官方说有时效；2026-10-26）。
+ * **「这条链接要不要 / 能不能转存」只问它**：出片后的转存（POST /api/ark/transfer-video）、后台搬运（arkTransfer.runTransfer）、
+ * 发布时的兜底转存（branchVideo.controller 的 transferVideo）三处共用 —— 只认方舟的话，H3 的成片转存被 400 拒、
+ * 发布时原样留着一条会过期的链接，过几天作品就黑了，全程零报错。
+ * ★ MiniMax 那一半的判据只在 config/minimax.isMinimaxV2VideoUrl（只认 https + 那一个 CDN 主机）。
+ * ★ 轮询端点的「看到 succeeded 顺手搬」（ark.routes 的 ?transfer=1）只管方舟的任务，仍然只问 isArkVideoUrl。
+ */
+function isUpstreamTempVideoUrl(value) {
+  return isArkVideoUrl(value) || isMinimaxV2VideoUrl(value);
 }
 
 /**
@@ -154,6 +168,7 @@ module.exports = {
   ARK_HOST_PATTERNS,
   isHttpUrl,
   isArkVideoUrl,
+  isUpstreamTempVideoUrl,
   isHevcMp4,
   H264_TRANSCODE,
   uploadVideoBuffer,

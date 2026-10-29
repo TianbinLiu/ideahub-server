@@ -152,7 +152,7 @@ const recipeBody = z
     listed: z.boolean().optional().default(false),
   })
   .refine((v) => !NO_LOCAL.test(JSON.stringify(v.recipe)), {
-    message: "配方里还有本机地址（dataURL / idb: / 方舟临时链接），不能公开",
+    message: "配方里还有本机地址或上游的临时链接（dataURL / idb: / 方舟或 MiniMax 的成片），不能公开",
   })
   .refine((v) => Buffer.byteLength(JSON.stringify(v.recipe)) <= RECIPE_MAX_BYTES, {
     message: "这份制作过程太大了",

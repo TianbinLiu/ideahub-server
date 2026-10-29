@@ -19,6 +19,10 @@ function collectConfigProblems(env = process.env) {
   // 支付：假渠道没有验签，生产环境开着等于任何人都能给自己发 token
   problems.push(...require("./payment").collectPaymentProblems(env));
 
+  // 出片地区门禁（2026-10-26）：VIDEO_REGION_GATE 写了认不出的值（按 observe 跑 = 以为开了、其实只记日志）、
+  // 生产配了开发用的 VIDEO_ZONE_FORCE（写 cn = 对海外放开 Seedance）—— 都是「配错了但能跑起来」，规则在 config/videoRegion
+  problems.push(...require("./videoRegion").collectVideoRegionProblems(env));
+
   const secret = env.JWT_SECRET || "";
   if (!secret) problems.push("JWT_SECRET 未设置");
   else if (secret.length < 32) problems.push(`JWT_SECRET 过短（${secret.length} 字符，至少 32）`);

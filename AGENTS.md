@@ -68,6 +68,10 @@
 - **生产密钥在服务器上生成**（`openssl rand -base64 48`），不要在聊天/工单里传递。
 - 生产环境的 `JWT_SECRET`、`OTP_PEPPER` 弱值会被 `npm run check:config` **拒绝启动** ——
   这是刻意的，不要为了跑起来去放宽校验。
+- 同一道自检还拦两个不是密钥的出片地区开关，生产上同样**拒绝启动**：
+  配了 `VIDEO_ZONE_FORCE`（只给本机开发，把出片地区钉死；写 `cn` 就是对海外放开 Seedance），
+  或 `VIDEO_REGION_GATE` 写了 `off` / `observe` / `on` 以外的值（会按 `observe` 只记不拦）。
+  说明见 `.env.example`「出片按地区」与 `docs/api-contract.md`「出片地区」。
 
 ### 4. 生产只走发布链路，不手改线上
 

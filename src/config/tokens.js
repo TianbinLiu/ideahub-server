@@ -9,6 +9,9 @@
 // ★ 为什么不能只信客户端报的价：改客户端就能报 0。整个"把钱包搬到服务端"这件事，
 //   要害就在这里——余额判断与扣费必须发生在**服务端拿到请求体之后、转发出去之前**。
 
+// 纯函数、不碰网络不连库（本文件顶层只许 require 这一类）：报不了价时把客户端给的值写进日志之前过一遍
+const { logSafe } = require("../utils/logSafe");
+
 /**
  * 订阅套餐。付费套餐的 plan 额度每月刷新（作废未用完的），addon 永不过期。
  *
@@ -334,6 +337,15 @@ const SEEDANCE_MINI = "doubao-seedance-2-0-mini-260615";
 const SEEDANCE_FAST = "doubao-seedance-1-0-pro-fast-251015";
 const SEEDANCE_STD = "doubao-seedance-1-0-pro-250528";
 
+/**
+ * MiniMax H3 三个模型的 id（国际站 V2 出片，2026-10-26 起；对标「草稿 / 高清 / 电影级」，见 MINIMAX_SEC_COST）。
+ * 提到这里的理由与 SEEDANCE_2_5 相同：它们同时出现在价目表、时长窗口、免费档清单里，写字面量迟早漏一处。
+ * ★ 与 v1 真人档（MINIMAX_FLAT_COST 的海螺 2.3 系列）不是一回事：v1 按发一口价，H3 按秒计价、走另一个端点。
+ */
+const MINIMAX_H3_LITE = "MiniMax-H3-Lite";
+const MINIMAX_H3_HIGHSPEED = "MiniMax-H3-Highspeed";
+const MINIMAX_H3 = "MiniMax-H3";
+
 /** Seedance 档位系数（相对标准档 1-0-pro）。★ 与 app 的 VIDEO_TIERS 一一对应 */
 const VIDEO_MULT = {
   // ✅ 2026-08-16 拿 8 月账单明细逐行核过（bill_detail…20260801）。三条口径一致的证据：
@@ -404,17 +416,25 @@ function audioSupported(model) {
  * ★ 与 app 仓 `src/data/economy.ts` 的 `VideoTier.minSec / maxSec` **逐条相等**（跨仓契约，钉在 tests/arkProxy.spec.js
  *   「跨仓时长窗口一致性」）：app 报 15 秒的价、这边按 10 秒夹，就是"页面报 X、扣的是另一个数"。
  * ★ 认不出的模型按 [3,10]（改版前所有模型的口径），往窄的一侧退是安全的。
+ * ★ MiniMax H3 三个模型（2026-10-26，V2 出片）：官方「Create Video Generation Task」（V2）的 duration 是**整数枚举 4~15**，
+ *   H3 / H3-Highspeed / H3-Lite 三个一样（H3-Max 是 5~15，我们不接）。这张表就是它们的「一段几秒」，
+ *   计价（minimaxV2Tokens）与 V2 路由的时长钉子读同一格；整数这一条由 minimaxV2Tokens 自己判（Seedance 那几格由 segTokens 取整夹窗）。
  */
 const VIDEO_SEC_WINDOW = {
   "doubao-seedance-1-0-pro-fast-251015": [3, 10],
   "doubao-seedance-1-0-pro-250528": [3, 10],
   "doubao-seedance-2-0-mini-260615": [4, 15],
   [SEEDANCE_2_5]: [4, 30],
+  [MINIMAX_H3_LITE]: [4, 15],
+  [MINIMAX_H3_HIGHSPEED]: [4, 15],
+  [MINIMAX_H3]: [4, 15],
 };
 
 /** 这个模型一段视频能选的时长窗口 [最短, 最长]。判据只有这一处（铁律六） */
 function videoSecWindow(model) {
-  return VIDEO_SEC_WINDOW[String(model || "")] ?? [3, 10];
+  // ★ model 是用户可控的字符串：查表用 Object.hasOwn，别让 `constructor` 顺着原型链拿到一个函数（解构它就抛）
+  const key = String(model || "");
+  return Object.hasOwn(VIDEO_SEC_WINDOW, key) ? VIDEO_SEC_WINDOW[key] : [3, 10];
 }
 
 // ── 分辨率与像素（2026-10-07，「草稿」档与电影级「样片」）────────────────
@@ -534,20 +554,165 @@ function perSecTokens(model, resolution = "720p", ratio) {
   return (cell[0] * cell[1] * 24) / 1024;
 }
 
+// ── MiniMax H3（国际站 V2 出片）的按秒价目（2026-10-26）──────────────────────
+//
+// ★★ 为什么有这一张：出片按地区下发之后，海外只给 MiniMax（主人原话「海外由于政策原因只能用 minimax」），
+//   「草稿 / 高清 / 电影级」在 MiniMax 上各对标一个 (模型, 分辨率)：
+//     草稿 → MiniMax-H3-Lite · 480P　高清 → MiniMax-H3-Highspeed · 768P　电影级 → MiniMax-H3 · 768P（2K 先不开）。
+//   与 v1 真人档（MINIMAX_FLAT_COST，海螺 2.3 按发一口价）不是一回事：H3 只走 V2 端点，官方按「输出秒数 × 每秒单价」计费
+//   （V2 查询回包的 usage.total_seconds）。2026-10-26 付费小验核过：成片实际比请求长 0.2~0.5 秒，usage 按**请求的整数秒**记 ——
+//   所以按请求里的 duration 收，与上游计费同一个数。
+//
+// ★ 数的来历（官方 Pay-as-you-go 价目页「H3 Series Flagship Models」的输出单价，2026-10-26 读）：
+//     MiniMax-H3-Lite       480P  $0.025 / 秒
+//     MiniMax-H3-Highspeed  768P  $0.06  / 秒
+//     MiniMax-H3            768P  $0.08  / 秒
+//   折算 = 美元刊例 × 6.71345（全仓汇率锚）÷ 15 元/百万 token（全仓的成本口径，见上「单次调用的 token 等价」）
+//        = 美元 × 447,563 token，取整到百位（与 RUNWAY_TOKENS_PER_SECOND、MINIMAX_FLAT_COST 同一把尺）：
+//     0.025 → 11,189 → 11,200　0.06 → 26,854 → 26,900　0.08 → 35,805 → 35,800。成本价 1.0x。
+// ★ 价钱只跟 (模型, 分辨率) 走：官方写明同模型同分辨率的各种任务（文生 / 首帧 / 尾帧 / 首尾帧 / 参考图）单价相同；
+//   价目表也没有画幅这一维（不像 Seedance 的 480p 要按像素表逐格查）。
+// ★ 图：官方「每个任务**前 5 张**图免费、之后按张另收」，这 5 张是首帧、尾帧、参考图**合在一起**数的
+//   （查询回包 usage.input_image_count 是合计）。我们一段最多发 5 张（MINIMAX_V2_MAX_IMAGES），正好都在免费额度里 ——
+//   所以价目里没有「每张图多少钱」；第 6 张起这张表报不了价（minimaxV2Tokens 回 null），路由要在扣费之前整句拒。
+//   输入视频（官方按时长另收）与参考音频这张表也不报价：V2 出片今天不收 video_url / audio_url。
+// ★ 只放三个 (模型, 分辨率)：H3-Lite 768P（$0.04）与 H3 2K（$0.13）**故意不在表里** —— 产品上没开这两格，
+//   这张表报不出价的请求 V2 路由在扣费之前整句拒。要开先有对标档位，两仓一起加。
+//   ⚠ 「报得出价」只是放行的**必要条件之一**，不是全部（2026-10-26 审核：原来这里写成「这张表报得出价就是放不放的判据」，
+//   而价钱只看得见 model / resolution / duration / 条目的 type —— 拿它当整张白名单，callback_url 之类的字段照样过得去）。
+//   字段名单在下面 MINIMAX_V2_BODY_KEYS 那几份（minimaxV2Tokens 把名单外的键一律判成报不了价）；每个字段**取什么值**
+//   （图片地址收哪些主机、role 怎么配、text 必填与长度、ratio 的取值）是 V2 路由白名单的事，见 minimaxV2Tokens 的 ⚠。
+// ★★ 跨仓契约：与 app 仓档位表里 MiniMax H3 那三行的 secCost **逐条相等**（报价 = 实扣；钉在 tests/arkProxy.spec.js
+//   「跨仓 MiniMax H3 价目」）。键是**发给上游的原样写法**（大写 P：480P / 768P，V2 API 的枚举）—— App 那三行按上游分辨率对。
+// ⚠ 汇率会动：调价时**两仓同一个提交**改（MINIMAX_FLAT_COST 那条 ⚠ 的同一个教训：锚偏了没有任何症状）。
+// ⚠ 官方写明视频资源包不覆盖 H3（只能按量付费）；按量付费的失败任务计不计费官方没有书面说法 —— 失败退款另见 taskRefund。
+
+/** (H3 模型, 上游分辨率) → token/秒。来历见上 */
+const MINIMAX_SEC_COST = Object.freeze({
+  [MINIMAX_H3_LITE]: Object.freeze({ "480P": 11_200 }),
+  [MINIMAX_H3_HIGHSPEED]: Object.freeze({ "768P": 26_900 }),
+  [MINIMAX_H3]: Object.freeze({ "768P": 35_800 }),
+});
+
+/** 一段（一个 V2 任务）最多几张图：首帧 + 尾帧 + 参考图**合计**。= 官方的免费张数（见上 ★），再多就要另收钱 */
+const MINIMAX_V2_MAX_IMAGES = 5;
+
+/**
+ * V2 出片请求体里**报得出价的字段名**：顶层几个键、每种条目几个键、image_url 对象里几个键。名单之外的键 ⇒ minimaxV2Tokens 回 null。
+ * ★ 为什么价目要管字段名（2026-10-26 审核）：上游同一个端点还收 callback_url（MiniMax 把任务数据 POST 到调用方指定的地址 ——
+ *   等于拿我们的 key 替别人发请求）、extra（H3-Max 的提示词扩写）、条目上的 video_url / audio_url（输入视频按时长另收）……
+ *   只看 model / resolution / duration 与条目的 type 的话，带着这些键的请求照样报得出价。
+ *   判否定：没列出来的一律报不了价（与 v1 真人档 CREATE_FIELDS「没列出来的字段就没有路能到上游」同一个取向；
+ *   那边是丢掉、这边是拒 —— 价钱问的是「这一发值多少」，带着没估过价的东西就答不出来）。
+ *   以后每放一个新字段都是一笔新的单价 / 一个新的攻击面，应该有人明确点头，两仓一起改。
+ * ★ ratio 在名单里：官方价目表没有画幅这一维（见上 ★），它不进价，但出片必须给（纯文生不许 adaptive，见 V2 路由）。
+ * ★ **这几份名单只在这里列一次**：V2 路由的白名单照它们建（别另抄一份字段名），而且路由最后还要拿重建好的那份请求体问
+ *   minimaxV2Tokens —— 两处对不上时报不了价、在扣费之前就拒，不会悄悄放过去。
+ */
+const MINIMAX_V2_BODY_KEYS = Object.freeze(["model", "resolution", "duration", "content", "ratio"]);
+const MINIMAX_V2_ITEM_KEYS = Object.freeze({
+  text: Object.freeze(["type", "text"]),
+  image_url: Object.freeze(["type", "image_url", "role"]),
+});
+const MINIMAX_V2_IMAGE_KEYS = Object.freeze(["url"]);
+
+/**
+ * obj 是普通对象，且每个**有值**的键都在 allowed 里。
+ * ★ 值是 undefined 的键不算：JSON.stringify 会丢掉它、发不到上游（代码里拼请求体时 `{ ...o, ratio: undefined }` 很常见）。
+ * ★ JSON.parse 出来的 `"__proto__"` 是自有键、值不是 undefined ⇒ 不在名单里 ⇒ 拒（不会顺原型链被当成「没有」）。
+ */
+function onlyKeys(obj, allowed) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  return Object.keys(obj).every((k) => obj[k] === undefined || allowed.includes(k));
+}
+
+/**
+ * 某个 H3 模型在某个**上游分辨率**（480P / 768P）下一秒多少 token；表外组合回 **null**（不是 0）。
+ * ★ null 的含义是「这个组合没有价」，调用方必须据此**拒绝** —— 当成 0 就是一条免费链路（同 minimaxFlatCost 的 ★）。
+ * ★ model / resolution 是用户可控的字符串：查表用 Object.hasOwn（`constructor` 不许顺原型链拿到东西）。
+ */
+function minimaxSecCost(model, resolution) {
+  const m = String(model ?? "");
+  const r = String(resolution ?? "");
+  if (!Object.hasOwn(MINIMAX_SEC_COST, m)) return null;
+  const row = MINIMAX_SEC_COST[m];
+  return Object.hasOwn(row, r) ? row[r] : null;
+}
+
+/**
+ * 一个 V2 出片请求体（{ model, resolution, duration, content, ratio }）值多少 token；这张表报不了价时回 **null**。
+ * **「H3 一段多少钱 / 报不报得出价」只在这一处判**（priceOf 与 V2 路由的扣费前校验都问它）。报得出价的条件：
+ *   · 请求体是普通对象，顶层只有 MINIMAX_V2_BODY_KEYS 里的键（callback_url / extra / 顶层的 first_frame_image 之类一律报不了价）；
+ *   · (model, resolution) 在 MINIMAX_SEC_COST 里（分辨率按上游原样的大写写法）；
+ *   · duration 是 **number 类型的整数**、落在 videoSecWindow(model) 里（4~15）—— 不取整、不夹窗：
+ *     上游只收整数枚举，5.5 或 "5" 发过去是上游的事，这里不替它猜按几秒收；
+ *   · content 缺省或是数组，条目只有 text 与 image_url 两种，每个条目只带 MINIMAX_V2_ITEM_KEYS 里它那一种的键
+ *     （text 条目挂着 video_url、image_url 条目里又塞一个 video_url，都报不了价），image_url 对象里只有 url；
+ *     image_url 合计 ≤ MINIMAX_V2_MAX_IMAGES（都在官方免费张数内）。
+ * 价 = duration × 每秒价（图不另收，见上 ★）。
+ * ⚠ 报得出价 ≠ 可以放行。这里只管**名单与价钱**；值上的规矩 —— 图片地址收哪些协议与主机（上游还认 mm_file:// 与 data:）、
+ *   role 收哪几种、首尾帧与参考图互斥、text 必填与长度上限、ratio 的取值 —— 在 V2 路由的白名单里（schemas/minimaxV2.schemas，
+ *   2026-10-26；它的形状照上面那几份名单建、加载时核对）。路由（routes/minimax.routes 的 POST /v2/video）按白名单**重建**一份请求体，
+ *   拿**那一份**来问这里、扣费、转发；别拿 req.body 原样问完再原样转发。
+ */
+function minimaxV2Tokens(body) {
+  if (!onlyKeys(body, MINIMAX_V2_BODY_KEYS)) return null;
+  const perSec = minimaxSecCost(body.model, body.resolution);
+  if (perSec === null) return null;
+  const d = body.duration;
+  const [lo, hi] = videoSecWindow(body.model);
+  if (typeof d !== "number" || !Number.isInteger(d) || d < lo || d > hi) return null;
+  const content = body.content;
+  if (content !== undefined && !Array.isArray(content)) return null;
+  let images = 0;
+  for (const item of content ?? []) {
+    const type = item && typeof item === "object" ? item.type : undefined;
+    const keys = typeof type === "string" && Object.hasOwn(MINIMAX_V2_ITEM_KEYS, type) ? MINIMAX_V2_ITEM_KEYS[type] : null;
+    // video_url / audio_url / 认不出的条目（输入视频官方另按时长收），或条目上挂着名单外的键：这张表报不了价
+    if (!keys || !onlyKeys(item, keys)) return null;
+    if (type === "image_url") {
+      if (!onlyKeys(item.image_url, MINIMAX_V2_IMAGE_KEYS)) return null;
+      images += 1;
+    }
+  }
+  if (images > MINIMAX_V2_MAX_IMAGES) return null;
+  return d * perSec;
+}
+
+/**
+ * 报不了价时 priceOf 按它收：表内最贵的一格 × 那个模型最长的一段（今天 = 35,800 × 15 = 537,000）。
+ * ★ 方向宁高不低（与 minimax_video 的兜底同一取向）。⚠ 它**不是**上游最贵那种请求的价（第 6 张起的图、输入视频另收）——
+ *   真正挡住表外请求的是 V2 路由在扣费之前的校验，这里只是第二道保险。
+ */
+const MINIMAX_V2_MAX_TOKENS = Math.max(
+  ...Object.entries(MINIMAX_SEC_COST).flatMap(([m, row]) => Object.values(row).map((perSec) => perSec * videoSecWindow(m)[1])),
+);
+
 // ── 免费版能用哪几档出片（2026-10-07 主人拍板）──────────────────────────
 //
-// ★★ 规则：**没付过钱的用户只能用「极速」（1.0 pro fast · 720p）与「草稿」（2.0 mini · 480p）出普通片**；
-//   标准 / 高清 / 电影级（含样片两步）/ 真人档（MiniMax、Runway）/ 一切带参考视频的出片（白模、返修、延长、素材参考）
-//   都要付过钱。为什么这么划：免费额度（新人一次 + 每天一点）要够出几段几秒的片，而不是一段都出不来；
-//   同时把更好的档位留给付费的人，给升级一个理由。
+// ★★ 规则：**没付过钱的用户只能用「极速」（1.0 pro fast · 720p）与「草稿」（2.0 mini · 480p；MiniMax 上是 H3-Lite · 480P）出普通片**；
+//   标准 / 高清 / 电影级（含样片两步，以及它们在 MiniMax 上的对标 H3-Highspeed / H3）/ 真人档（MiniMax 海螺、Runway）/
+//   一切带参考视频的出片（白模、返修、延长、素材参考）都要付过钱。为什么这么划：免费额度（新人一次 + 每天一点）要够出几段几秒的片，
+//   而不是一段都出不来；同时把更好的档位留给付费的人，给升级一个理由。
 // ★ 「付过钱」= 有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买都算）—— 判据只有 isPaidUser 一处。
 // ★ 草稿与高清**是同一个模型**，只差分辨率 ⇒ 这张表必须按 (model, resolution) 认，只按 model 认就会把高清一起放给免费版。
 // ★ 与 app 仓 `VideoTier.freeOk` 一一对应（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。客户端置灰只是提示，门在这里。
+// ★ 2026-10-26 加 MiniMax H3-Lite · 480P（「草稿」在 MiniMax 上的对标）：出片按地区下发之后海外只有 MiniMax，
+//   免费档要是全在 Seedance 上，海外的免费用户（含 Google Play 的审核账号）一段都出不了。另外两个 H3 照会员档。
+//   它 4 秒 44,800（minimaxV2Tokens），比 Seedance 草稿 4 秒 61,603 还便宜，免费额度够得着。
+//   ⚠ 免费版在 H3 上**只能纯文字出片**（MINIMAX_V2_FREE_TEXT_ONLY，2026-10-26 终审）：这张表只回答「这一档开不开」，带不带图另判。
+// ★ 每一条带 `kind`（priceOf / videoPlanDenial 的 kind）：同一个 (模型, 分辨率) 只在它自己那条链路上算免费。
+// ★ `resolution` 是**发给上游的原样写法**：Seedance 小写（480p），MiniMax 大写（480P）—— 门禁拿钉子补齐之后请求体里那一格比，
+//   不归一大小写（归一就是同一条规则的第二种写法）。/api/ark/health 的 freeVideo 原样下发 ⇒ App 那一侧要按 (model, 上游分辨率) 认：
+//   MiniMax 那几行拿上游分辨率（480P）比，别拿档位表里的小写 resolution 比 —— 那样永远对不上，免费用户看见的是灰键、服务端其实放行。
+// ★ `label` 按档位**家族**起名（App 同一家族的几行同名），所以 H3-Lite 也叫「草稿」、label 会重复：
+//   给人看的档名清单（拒绝那句话、403 的 allowed）一律走 freeVideoLabels（去重），别直接 map(label) —— 会说成「草稿」「草稿」。
 
-/** 免费版能出普通片的 (模型, 分辨率)。label 是给人看的档名（拒绝那句话与 /health 里用，不出现模型 id） */
+/** 免费版能出普通片的 (kind, 模型, 上游分辨率)。label 是给人看的档名（拒绝那句话与 /health 里用，不出现模型 id） */
 const FREE_VIDEO_ALLOW = Object.freeze([
-  Object.freeze({ model: SEEDANCE_FAST, resolution: "720p", label: "极速" }),
-  Object.freeze({ model: SEEDANCE_MINI, resolution: "480p", label: "草稿" }),
+  Object.freeze({ kind: "task", model: SEEDANCE_FAST, resolution: "720p", label: "极速" }),
+  Object.freeze({ kind: "task", model: SEEDANCE_MINI, resolution: "480p", label: "草稿" }),
+  Object.freeze({ kind: "minimax_v2", model: MINIMAX_H3_LITE, resolution: "480P", label: "草稿" }),
 ]);
 
 /**
@@ -578,9 +743,18 @@ function retiredDenial(model, now = Date.now()) {
   return "这一档用的 Seedance 1.0 已于 2026-11-24 停止服务（火山方舟下线了这一代模型），请换一档再出片（档位里没有「草稿」的话，请先更新 App）——当前请求未被受理，也没有扣费。";
 }
 
-/** 此刻免费版还能用的档（停用的那几档自动出局：11-24 之后只剩「草稿」） */
+/** 此刻免费版还能用的档（停用的那几档自动出局：11-24 之后只剩两家的「草稿」） */
 function freeVideoTiers(now = Date.now()) {
   return FREE_VIDEO_ALLOW.filter((t) => !isRetired(t.model, now));
+}
+
+/**
+ * 此刻免费版能用的**档名**（去重，按清单顺序：11-24 之前「极速」「草稿」，之后「草稿」）。
+ * **给人看的那一份只走这里**：videoPlanDenial 的拒绝话与 403 回包的 allowed 都是它。
+ * ★ 为什么要去重：label 按档位家族起名，Seedance 草稿与 MiniMax 草稿同名（FREE_VIDEO_ALLOW 的 ★）。
+ */
+function freeVideoLabels(now = Date.now()) {
+  return [...new Set(freeVideoTiers(now).map((t) => t.label))];
 }
 
 /** 这个套餐是不是免费档。判据是**月费为 0**，不是 `id === "free"`——
@@ -601,14 +775,57 @@ function isPaidUser(wallet) {
   return planOf(wallet.planId).price > 0 || wallet.paidEver === true;
 }
 
+/**
+ * 没付过钱的人在 MiniMax H3 上**只能纯文字出片**（不带首帧 / 尾帧 / 参考图）。2026-10-26 终审定的，今天为真。
+ * ★ 为什么：服务端分不出一张图里是不是真人，而 H3 收不收真人照片还没有验过（契约「出片地区」→「等主人拍板」第 9 条）。
+ *   收的话，免费档里那一档 H3-Lite 就成了不花钱的真人出片 —— 绕开「真人档只给付过钱的人」。纯文字出片不带任何人的照片。
+ * ★ 付过钱的人带图照常：他们在真人档（v1）上本来就能拿一张图当首帧出片，H3 没有为他们多开一扇门。管理员同（billing 免套餐门禁）。
+ * ★ 不跟着 FREE_VIDEO_GATE 走：那是额度上的开关（关掉 = 退回改版前只挡电影级的口径，H3 三档对免费版都放开），这一条是内容安全上的 ——
+ *   关闸时 H3 三档对免费版都开着，带图照样要付过钱。
+ * ★ 放开 = 改成 false，要第 9 条的小验做完、主人点头（代码常量、不做环境变量：放开要过代码评审，不能在服务器上悄悄拨）。
+ *   /api/ark/health 的 minimaxV2FreeTextOnly 原样下发它：App 照它对没付过钱的人只发纯文字（不补画帧、不带参考图），
+ *   不然那些人每一发都在扣费之前吃一个 403。
+ */
+const MINIMAX_V2_FREE_TEXT_ONLY = true;
+
+/**
+ * 一发 H3（V2）请求体里有没有文字以外的条目（首帧 / 尾帧 / 参考图，或认不出的条目）。content 的形状认不出也算「有」（从严）。
+ * ★ 只有 arkGateway.chargedArkCall 调它（从**真要转发的那一份**请求体现算），交给 videoPlanDenial 的 media —— 不让路由自己传：
+ *   漏传是零症状的（免费用户带图照样过去）。
+ */
+function minimaxV2HasMedia(body) {
+  const c = body?.content;
+  if (c === undefined) return false;
+  if (!Array.isArray(c)) return true;
+  return c.some((it) => !it || typeof it !== "object" || it.type !== "text");
+}
+
+/**
+ * 「免费版在 H3 上只能纯文字」那一句（MINIMAX_V2_FREE_TEXT_ONLY）。null = 不归它管 / 放行。
+ * media 只认真值 true：不传（undefined）是在问「这一档对他开不开」（videoRegion.minimaxOpenTo），不是问某一发请求。
+ */
+function freeTextOnlyDenial(kind, media) {
+  if (kind !== "minimax_v2" || !MINIMAX_V2_FREE_TEXT_ONLY || media !== true) return null;
+  return {
+    message:
+      "免费版在 MiniMax 上只能用文字出片（不带首帧、尾帧和参考图）；带图出片需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。",
+    allowed: null,
+    freeTextOnly: true,
+  };
+}
+
 /** 免费档限制的总开关：`FREE_VIDEO_GATE=off` 关掉（缺省开）。每次现读 env —— 运维改完重启即生效，测试也能切 */
 function freeVideoGateOn() {
   return String(process.env.FREE_VIDEO_GATE ?? "").trim().toLowerCase() !== "off";
 }
 
-/** 这一发是不是「出视频」：Seedance 任务、真人档（MiniMax / Runway）。出图 / 对话 / 语音 / Seed3D 都不是 */
+/**
+ * 这一发是不是「出视频」：Seedance 任务、MiniMax（真人档 v1 `minimax_video`、H3 V2 `minimax_v2`）、Runway。出图 / 对话 / 语音 / Seed3D 都不是。
+ * ★ `minimax_v2` 不看 model：V2 端点只出视频；认不出的型号在 V2 路由的白名单（minimaxV2Tokens）那一关就拒了，
+ *   这里判成「是视频」= 免费档门禁照样管它（往从严的一侧退）。
+ */
 function isVideoGeneration(kind, model) {
-  if (kind === "minimax_video" || kind === "runway") return true;
+  if (kind === "minimax_video" || kind === "minimax_v2" || kind === "runway") return true;
   return kind === "task" && Object.hasOwn(VIDEO_MULT, String(model || ""));
 }
 
@@ -618,14 +835,22 @@ function isVideoGeneration(kind, model) {
  *
  * @param {object} o
  * @param {boolean} o.paid       isPaidUser(钱包) 的结论（调用方读钱包，这里不碰库）
- * @param {string}  o.kind       priceOf 的 kind：task / minimax_video / runway / image / chat …
+ * @param {string}  o.kind       priceOf 的 kind：task / minimax_v2 / minimax_video / runway / image / chat …
  * @param {string}  o.model
- * @param {string}  [o.resolution] **钉子补齐之后**的分辨率（pinPlainVideoTask 会把缺省补成 720p）
+ * @param {string}  [o.resolution] **钉子补齐之后**的分辨率，按上游原样的写法（pinPlainVideoTask 会把缺省补成 720p；
+ *   MiniMax V2 是大写的 480P / 768P —— 与 FREE_VIDEO_ALLOW 逐字比，不归一大小写）
  * @param {object|null} [o.r2v]  resolveR2v 的结论；有它 = 带参考视频的出片
  * @param {boolean} [o.draft]    样片第一步（draft: true）
  * @param {object|null} [o.draftFinal] 样片第二步（resolveDraftFinal 的结论）
- * @returns {{message:string, allowed:string[]|null}|null} null = 放行；否则 message 是能直接显示的整句、
- *   allowed 是此刻免费版能用的档名（结构化给客户端：英文界面不显示服务端的中文句子，靠它自己说）
+ * @param {boolean} [o.media] 只给 MiniMax H3（minimax_v2）：这一发带不带图（minimaxV2HasMedia；chargedArkCall 从请求体现算）。
+ *   带图 + 没付过钱 → 拒（MINIMAX_V2_FREE_TEXT_ONLY）。**不传 = 只问「这一档对他开不开」**（不看图；videoRegion.minimaxOpenTo 就这么问）
+ * @returns {{message:string, allowed:string[]|null, freeTextOnly?:true}|null} null = 放行；否则 message 是能直接显示的整句、
+ *   allowed 是此刻免费版能用的档名（freeVideoLabels，去重；结构化给客户端：英文界面不显示服务端的中文句子，靠它自己说）；
+ *   freeTextOnly 为真 = 档位本身对他开着、拒的是「带图」（这时 allowed 为 null：说「只能用草稿」对一个正在用草稿的人是错话）
+ *
+ * ★ 「普通片」= 没有参考视频（r2v）、不是样片两步，且 (kind, 模型, 分辨率) 三样都对上 FREE_VIDEO_ALLOW 里的一条。
+ *   MiniMax V2 今天不收参考视频 / 音频，所以 V2 路由不传 r2v；哪天 V2 开了 video_url（H3 参考视频），
+ *   路由要像 resolveR2v 那样把「带参考视频」交进来（r2v 传真值）—— 否则 H3-Lite 480P 带参考视频也会被当成免费的普通片。
  *
  * ★ 只管「出视频」：出图 / 对话 / 语音 / Seed3D 一律放行（免费额度本来就该能做这些）。
  * ★ 与 402「余额不足」是**两件事**，不能合并：402 充值就能解决（充了也就成了付费用户），
@@ -634,21 +859,25 @@ function isVideoGeneration(kind, model) {
  *   客户端要么显示成天书、要么自己再拼一遍文案（第二处实现）。句子里**不许有 ASCII 双引号**：
  *   老 App 用 `"message"\s*:\s*"([^"]+)"` 抠这句话，带引号会被拦腰截断。
  */
-function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, now = Date.now() }) {
+function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, media, now = Date.now() }) {
   const m = String(model ?? "");
   if (!isVideoGeneration(kind, m)) return null;
   if (paid) return null;
   if (!freeVideoGateOn()) {
     // 关闸 = 退回改版前的口径：只有 2.5 挡免费版（10 秒一段 ≈ 101 万 token，它从来就不是免费额度够得着的东西）
+    // ★ MiniMax H3（含对标电影级的 MiniMax-H3）关闸时照样放开：挡 2.5 的理由是「一段就远超免费额度」，
+    //   而 H3 768P 10 秒是 358,000，不是那个量级；App 关闸那一支（account.tierFreeOk 的 legacy）也只挡 Seedance 2.5 —— 两边一致。
     if (kind === "task" && m === SEEDANCE_2_5) {
       return { message: "「电影级」只对付费用户开放：单段消耗远超免费版的额度。开通任意付费套餐，或充值过任意一次，即可使用。", allowed: null };
     }
-    return null;
+    // 档位放开了，带图照样要付过钱（MINIMAX_V2_FREE_TEXT_ONLY 的 ★：不跟着这个开关走）
+    return freeTextOnlyDenial(kind, media);
   }
   const open = freeVideoTiers(now);
-  const plain = kind === "task" && !r2v && !draft && !draftFinal;
-  if (plain && open.some((t) => t.model === m && t.resolution === resolution)) return null;
-  const allowed = open.map((t) => t.label);
+  const plain = !r2v && !draft && !draftFinal;
+  // 档位对他开着时才看「带没带图」：档位都不开的（H3-Highspeed / H3），先说「这一档要付费」—— 那才是根本原因
+  if (plain && open.some((t) => t.kind === kind && t.model === m && t.resolution === resolution)) return freeTextOnlyDenial(kind, media);
+  const allowed = freeVideoLabels(now);
   // ★ 旧版 App（2.61 及更早）原样显示这句话，而它们的档位表里**没有「草稿」**（只有「极速」可用；11-24 之后连它都停了）——
   //   只说「只能用草稿」，那些包里的人找不到这一档。所以点到草稿时补半句「看不到就更新 App」：新版 App 看得到，这半句对它不算错话。
   //   请求里没有版本号可以分辨新旧包，只能一句话两边都成立。
@@ -1061,6 +1290,23 @@ function priceOf(kind, body, r2v = null, draftFinal = null) {
     //   而 NaN 一路流进扣费只会得到"不扣钱"，正好是兜底想防的反面。
     return Math.max(...Object.values(MINIMAX_FLAT_COST).flatMap((row) => Object.values(row)));
   }
+  // MiniMax H3（V2）：整数秒 × 每秒价，判据只在 minimaxV2Tokens。报不了价（表外的模型 / 分辨率、时长不是窗口内的整数、
+  // 第 6 张图、输入视频 / 音频、名单外的字段）→ 按表内最贵的一段收并吼一嗓子：V2 路由该在扣费之前就拒了，这里是第二道保险，方向宁高不低。
+  // ★ 不回 null：chargedArkCall 直接拿 priceOf 的结果去扣费，没有「null = 拒绝」那条出路（runway 是路由自己先判的 null）。
+  //   所以这一支**拦不住**名单外的字段被转发出去 —— 它只保证不少收；拦是路由在扣费之前问 minimaxV2Tokens 的那一道。
+  // ★ 这一支必须有：走到函数末尾的 `return 0` 就是一条免费出片的链路。
+  if (kind === "minimax_v2") {
+    const hit = minimaxV2Tokens(body);
+    if (hit !== null) return hit;
+    // 这几个值都是客户端给的：过 logSafe（一个换行就能伪造一整行日志）
+    const media = Array.isArray(body?.content) ? `${body.content.length} 条` : typeof body?.content;
+    const keys = body && typeof body === "object" ? Object.keys(body).join(",") : typeof body;
+    console.error(
+      `[tokens] minimax_v2 报不了价：model=${logSafe(body?.model, 64)} resolution=${logSafe(body?.resolution, 16)} ` +
+        `duration=${logSafe(body?.duration, 16)} content=${media} keys=${logSafe(keys, 120)}，按 ${MINIMAX_V2_MAX_TOKENS} 收（调用方该先校验）`,
+    );
+    return MINIMAX_V2_MAX_TOKENS;
+  }
   if (kind === "task") {
     const model = String(body?.model ?? "");
     if (model === MODEL3D_ID) return MODEL3D_TOKENS;
@@ -1109,6 +1355,19 @@ module.exports = {
   minimaxFlatCost,
   MINIMAX_REAL_MODEL,
   MINIMAX_REAL_RESOLUTION,
+  MINIMAX_H3_LITE,
+  MINIMAX_H3_HIGHSPEED,
+  MINIMAX_H3,
+  MINIMAX_SEC_COST,
+  MINIMAX_V2_MAX_IMAGES,
+  MINIMAX_V2_MAX_TOKENS,
+  MINIMAX_V2_BODY_KEYS,
+  MINIMAX_V2_ITEM_KEYS,
+  MINIMAX_V2_IMAGE_KEYS,
+  minimaxSecCost,
+  minimaxV2Tokens,
+  MINIMAX_V2_FREE_TEXT_ONLY,
+  minimaxV2HasMedia,
   PLANS,
   DEFAULT_PLAN_ID,
   planOf,
@@ -1147,6 +1406,7 @@ module.exports = {
   isRetired,
   retiredDenial,
   freeVideoTiers,
+  freeVideoLabels,
   isPaidUser,
   freeVideoGateOn,
   isVideoGeneration,

@@ -21,6 +21,7 @@
  * ★ 纯正则、纯函数、零 IO（recordReferral 除外），可以在流式回调里逐句跑。
  */
 const SafetyReferralStat = require("../models/SafetyReferralStat");
+const geo = require("../utils/geo");
 
 /** 协议版本：官网 /safety/ai-chat 引用同一个值；改检测口径或求助文案时 +1 */
 const PROTOCOL_VERSION = "2026-09-24.1";
@@ -126,12 +127,14 @@ function regionOf(country) {
 }
 
 /**
- * 这次请求来自哪个国家（**只用来选求助热线**，不做权限判断、不落库）。
- * 只认 Cloudflare 的国家码：生产的源站只放行 Cloudflare 网段，所以这个头可信；直连本机时为空 → OTHER。
- * ★ 一处实现（铁律六）：陪聊、试聊都从这里取。
+ * 这次请求来自哪个国家（**只用来选求助热线**，不做权限判断、不落库）。回两位大写国家码，不知道 / Tor 时回 ""（→ OTHER）。
+ * ★ 国家怎么判只在 utils/geo.countryOf 一处（铁律六，2026-10-26 收口；出片地区门禁与登录页也问它）：
+ *   cf-ipcountry 优先，没有这个头时按 clientIp 查 geoip 兜底 —— 收口之前这里只认 cf 头、不兜底，
+ *   直连本机或头没到时一律给 OTHER 那组热线；现在查得到国家就给那个国家的。
+ *   陪聊、试聊、客服三条链路都从这里取，不要绕过它直接读请求头。
  */
 function countryOf(req) {
-  return String((req && req.headers && req.headers["cf-ipcountry"]) || "").trim().toUpperCase();
+  return geo.countryOf(req).country;
 }
 
 /**

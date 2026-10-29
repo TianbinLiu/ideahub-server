@@ -34,8 +34,10 @@
 按 `video` 唯一的**独立集合**（不挂在 BranchVideo 上：那三条读路径都是无投影 `lean()`，
 挂上去每页要多搬 12~50 份画布，而补 `.select()` 就是同一条规则写三处）。
 **不加 TTL**（工程是用户资产，不是任务行）。`canvas` 形状由客户端定义，服务端只当 Mixed 存，
-但强制两条不变量：**不许出现** `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`，
-且单份 ≤ 2MB。端点见下「端点」表的 `/api/branch/projects*` 四行，语义见「回炉重做」。
+但强制两条不变量：**不许出现** `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com` / `video-product.cdn.minimax.io`
+（MiniMax H3 的成片，有时效；2026-10-26 补上 —— 之前这道门只认方舟，揣着 H3 链接的工程照样落库、过期后回炉拿回来的是死链），
+且单份 ≤ 2MB。⚠ 真人档（v1）的成片（`public-cdn-video-data*.aliyuncs.com`）**还没进这道门**：那条链接今天出片后与发布时都没有转存路，
+这里先拦的话带真人档段的作品就整份存不上工程 —— 先补转存、再收紧（2026-10-26 记下的缺口）。端点见下「端点」表的 `/api/branch/projects*` 四行，语义见「回炉重做」。
 
 #### 平台下架（`takedown`）
 
@@ -303,7 +305,7 @@ BranchAssetView  { kind, key, viewer, expiresAt }                        唯一 
 | GET | `/api/branch/videos/:id/recipe` | optional | 读配方：作者本人任何状态都读得到；别人只在公开且不过期时读得到，否则 404 `RECIPE_NOT_PUBLIC` |
 | DELETE | `/api/branch/videos/:id/recipe` | required | 作者删掉留存的配方 → `{ ok: true }`，作品不受影响 |
 | GET | `/api/branch/projects/by-video/:videoId` | required | 取回画布（**仅作者**）→ `{ ok, project: { video, title, canvas, videoRevision, stale, lostCount, updatedAt } }`。没有 → **404** `{ code: "PROJECT_NOT_FOUND", message: "这条作品没有留存工坊工程。" }`（客户端据此把「回炉重做」画成灰键 + 一句原因，不许摆没有原因的灰）。★★ 客户端**必须**拿 `videoRevision` 与作品当下的 `revision` 比，对不上就**不许铺进工坊**（那份画布描述的是上一版，就着它提交会把线上内容静默退回） |
-| PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。**`videoRevision` 必须等于作品当下的 `revision`**，对不上 400 `PROJECT_REVISION_MISMATCH`（带 `details.currentRevision`）—— 这是「这一格只能靠真的 PUT 新画布往前走」那条纪律的唯一实现。五种 400：版次对不上、画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com`（「画布里还有本机地址…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）；另有作品不是你的（403）/ 不存在（404） |
+| PUT | `/api/branch/projects/by-video/:videoId` | required | 留存/覆盖（**仅作者**，upsert）。body `{ title?, canvas, videoRevision, lostCount? }`。限流 **12/分钟按账号**（`branch:project`）。`bytes` 与 `owner` 由服务端自己算/自己填，客户端报的一律不信。**`videoRevision` 必须等于作品当下的 `revision`**，对不上 400 `PROJECT_REVISION_MISMATCH`（带 `details.currentRevision`）—— 这是「这一格只能靠真的 PUT 新画布往前走」那条纪律的唯一实现。五种 400：版次对不上、画布里残留 `data:<mime>/` / `idb:` / `*.volces.com` / `*.volccdn.com` / `video-product.cdn.minimax.io`（「画布里还有本机地址或上游的临时链接…」）、单份超 **2MB**（「这份工程太大了」）、配额超 **100 条 / 50MB**（`PROJECT_QUOTA`，⛔ **不自动淘汰**，整句告诉用户去删）；另有作品不是你的（403）/ 不存在（404） |
 | DELETE | `/api/branch/projects/by-video/:videoId` | required | 放弃留存（**仅作者**）。作品本身不受影响 |
 | GET | `/api/branch/cards` | required | 我的卡片 |
 | POST | `/api/branch/cards` | required | 批量新增 `{ cards: Card[] }`（按 cardId 幂等） |
@@ -357,7 +359,7 @@ WorkflowRecipe {
   复制时客户端现取（`GET /templates/:id`），取不到那一段退成普通段并说明。
 - 白模段的 `plot` 恒空（点名句里是原作挂的卡名）；`flags` 记原作这一段还用过但没带走的东西
   （`ref-video` / `mid-frames` / `stage` / `anns` / `revised`），故事板据此说一句。
-- `preview.first / last` 只许 http(s) 且不是方舟临时链接（与工程那条不变量同一判据）；整份 ≤ 512KB，
+- `preview.first / last` 只许 http(s) 且不是上游的临时链接（方舟 / MiniMax H3 的成片；与工程那条不变量同一判据）；整份 ≤ 512KB，
   本机地址（`data:` / `idb:`）出现即 400。
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -1704,12 +1706,17 @@ body：`{ publicId }`。响应与老路**逐字相同**（有测试比对字段�
 对着转圈干等）：
 
 ```
-{ ok: false, message: "<能直接显示给用户的整句中文>", billed: true|false, code?: "PLAN_REQUIRED" }
+{ ok: false, message: "<能直接显示给用户的整句中文>", billed: true|false, code?: "PLAN_REQUIRED" | "REGION_UNAVAILABLE" }
 ```
+
+`REGION_UNAVAILABLE`（2026-10-26）另带 `reason: "region"`、`zone`、`providers`，`message` 是**英文在前、中文在后**的一整行（形状与
+`/api/ark` 被拦时逐字相同，见「出片地区」）。★ 别把阶段一的 403 一律当成「去升级套餐」：先认 `code`。
+一般是 `billed: false`（看帧之前的预检就拦下了）；只有看帧之后才被拦的那个窄窗口（两次之间门禁被从 `observe` 拨到 `on`）是
+`billed: true` + `visionFrames`，`message` 两半各多一句「看帧那一笔已经花了、不退」（见「出片地区」→「被拦的回包」最后一条）。
 
 | `billed` | 含义 | 典型场景 |
 |---|---|---|
-| `false` | **这一次调用**一分钱没动，或已经原路退回 | 【阶段一】归属/四组数没过、预热失败、套餐不够格（403 `PLAN_REQUIRED`）、余额不足（402）、方舟**受理前** 400（敏感词/输入不合格，W2 已退）；【阶段二】**全部**（它本来就不扣钱） |
+| `false` | **这一次调用**一分钱没动，或已经原路退回 | 【阶段一】归属/四组数没过、预热失败、地区不提供（403 `REGION_UNAVAILABLE`，见「出片地区」）、套餐不够格（403 `PLAN_REQUIRED`）、余额不足（402）、方舟**受理前** 400（敏感词/输入不合格，W2 已退）；【阶段二】**全部**（它本来就不扣钱） |
 | `true` | 已经产生费用（看帧那一笔退不回来；r2v 那一笔受理后方舟明说失败会自动退回，见下） | 【阶段一】看帧那一步花完之后的任何失败：`roles` 为空、r2v 受理后才发现的问题 |
 
 ★ 客户端缺省按 `false`（非 JSON 回包 = 请求根本没落到这个端点上）。**别把两类混成一句话** ——
@@ -2176,13 +2183,13 @@ App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。�
 
 | 方法 | 路径 | 鉴权 | 限流 | 说明 |
 |---|---|---|---|---|
-| GET | `/api/ark/health` | 无 | — | `{ ok, ark, imageGroups, res480, draftMode, failRefund, freeVideo: [{label, model, resolution}], freeVideoGate, minimaxFailRefund }`：配没配 key + 能力位（老服务端没有的位 = 没有这个能力，App 据此藏起对应的东西；判能力只看能力位，不看状态码）。`failRefund` 只说**方舟**任务（无条件退）；`freeVideo` 是免费档门禁开着时免费版能用的档；最后两位是运维开关的现状（老服务端没有 = 当成开着）：`freeVideoGate`（`FREE_VIDEO_GATE`，false = 服务端不按免费档拦、只挡电影级）、`minimaxFailRefund`（`MINIMAX_FAIL_REFUND`，false = 真人档受理之后的失败**不退**）。App 照 `freeVideo` / `freeVideoGate` 置灰（读不到 = 老服务端，按自己档位表的 `freeOk`），照 `minimaxFailRefund` 决定对真人档说不说「会自动退回」（见下「免费版」那条与「失败退款」的 MiniMax 那条） |
+| GET | `/api/ark/health` | 无 | — | `{ ok, ark, imageGroups, res480, draftMode, failRefund, freeVideo: [{label, model, resolution}], freeVideoGate, minimaxFailRefund, videoZone, minimaxV2, minimaxV2FreeTextOnly }`：配没配 key + 能力位（老服务端没有的位 = 没有这个能力，App 据此藏起对应的东西；判能力只看能力位，不看状态码）。`failRefund` 只说**方舟**任务（无条件退）；`freeVideo` 是免费档门禁开着时免费版能用的档（2026-10-26 起含 MiniMax H3-Lite 那一行；`resolution` 是**发给上游的原样写法** —— Seedance 小写 `480p` / `720p`，MiniMax 大写 `480P`，App 拿 MiniMax 档位行的**上游分辨率**比，别拿那一行里只为「每行都写」的小写 `resolution` 比，对不上就是免费用户看见灰键、服务端其实放行；`label` 按档位家族起名，两家的「草稿」同名，给人看的档名清单要去重，见下「免费版」那条）；最后两位是运维开关的现状（老服务端没有 = 当成开着）：`freeVideoGate`（`FREE_VIDEO_GATE`，false = 服务端不按免费档拦、只挡电影级）、`minimaxFailRefund`（`MINIMAX_FAIL_REFUND`，false = 真人档受理之后的失败**不退**）。App 照 `freeVideo` / `freeVideoGate` 置灰（读不到 = 老服务端，按自己档位表的 `freeOk`），照 `minimaxFailRefund` 决定对真人档说不说「会自动退回」（见下「免费版」那条与「失败退款」的 MiniMax 那条）。`videoZone`（2026-10-26）= 有 `GET /api/video/zone`，只说有没有、不带地区本身（见「出片地区」）；`minimaxV2`（2026-10-26）= 这台服务器开着 MiniMax H3 出片（只在国际站、国际站的 key 配着时为真），App 只在它为真时摆 H3 三档 —— `freeVideo` 里那一行 H3-Lite 是价目，不说明开没开（见「MiniMax H3（V2）出片」）；`minimaxV2FreeTextOnly`（2026-10-26 终审）= 没付过钱的人在 H3 上只能纯文字出片（同一节「免费档」） |
 | POST | `/api/ark/images/generations` | required | 30/min | Seedream 出图（卡面 / 首尾帧）。方舟下线了的老 id 由服务端换成接班型号再发（见下「出图模型接班」） |
 | POST | `/api/ark/contents/generations/tasks` | required | 30/min | Seedance 出视频 / Seed3D 建模（同一个异步任务端点） |
 | GET | `/api/ark/contents/generations/tasks/:id` | required | 90/min | 轮询任务状态（每 5s 一次，一段视频最多 120 次，所以单独一个桶） |
 | POST | `/api/ark/chat/completions` | required | 30/min | 豆包对话 / 看图说话 |
-| GET | `/api/ark/asset?url=…` | required | 90/min | 取方舟产物（图片 / 视频 / 3D zip），域名限 `*.volces.com`、`*.volccdn.com` |
-| POST | `/api/ark/transfer-video` | required | 30/min | body=`{url}`（限方舟视频域名）→ 服务端拉取并传 Cloudinary → `{url}` 永久地址。**出片一成客户端就调它**（2026-08-20 起）：TOS 直链跨境下载速度低于成片码率，预览黑屏、合并超时；转存失败客户端退回方舟直链（24h 内有效，发布时的转存老路会再兜一次）。不计费（不产生算力消耗）。实现与发布时的转存共用 `services/videoAsset.service` 一份；H.265 的成片存成 8 bit H.264（见「样片两步」） |
+| GET | `/api/ark/asset?url=…` | required | 90/min | 取方舟产物（图片 / 视频 / 3D zip），域名限 `*.volces.com`、`*.volccdn.com`（另认真人档的 `public-cdn-video-data*.oss-cn-*.aliyuncs.com`，以及 2026-10-26 起 MiniMax H3 的 `video-product.cdn.minimax.io`） |
+| POST | `/api/ark/transfer-video` | required | 30/min | body=`{url}`（限上游的临时成片：方舟视频域名，2026-10-26 起也收 MiniMax H3 的 `video-product.cdn.minimax.io`）→ 服务端拉取并传 Cloudinary → `{url}` 永久地址。**出片一成客户端就调它**（2026-08-20 起）：TOS 直链跨境下载速度低于成片码率，预览黑屏、合并超时；转存失败客户端退回方舟直链（24h 内有效，发布时的转存老路会再兜一次）。不计费（不产生算力消耗）。实现与发布时的转存共用 `services/videoAsset.service` 一份；H.265 的成片存成 8 bit H.264（见「样片两步」） |
 
 请求体与响应**原样透传**方舟 v3（含错误码：`400` 敏感词、`429` 限流——客户端对这两者的
 处置完全不同，聚合成 502 会把区分抹掉）。`POST /api/ark` 的 body 上限放宽到 50MB
@@ -2210,6 +2217,27 @@ App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。�
 ★ **「草稿」与「高清」是同一个模型**，只差分辨率 —— 服务端的免费档清单、分辨率清单、跨仓测试都按 **(模型, 分辨率)** 认，
 只按模型认就会把高清一起放给免费版（或者把草稿一起挡掉）。
 
+**MiniMax H3 三档**（2026-10-26，海外的对标档：出片按地区下发之后海外只给 MiniMax；走 V2 出片 `kind: "minimax_v2"`，端点与请求体白名单见「MiniMax H3（V2）出片」那一节）：
+
+| App 档位 id | label | 模型 | 上游分辨率 | token / 秒 | 官方刊例 | 首尾帧 / 参考图 | 时长窗口 | 谁能用 |
+|---|---|---|---|---|---|---|---|---|
+| `draft-mm` | 草稿 | `MiniMax-H3-Lite` | `480P` | 11,200 | $0.025 / 秒 | ✓ / ✓ | 4~15s，整数 | **免费版可用**（只能纯文字） |
+| `hd-mm` | 高清 | `MiniMax-H3-Highspeed` | `768P` | 26,900 | $0.06 / 秒 | ✓ / ✓ | 4~15s，整数 | 付过钱 |
+| `ultra-mm` | 电影级 | `MiniMax-H3` | `768P` | 35,800 | $0.08 / 秒 | ✓ / ✓ | 4~15s，整数 | 付过钱 |
+
+- **价 = 请求里的整数秒 × 每秒价**（服务端 `tokens.minimaxV2Tokens` 一处判，App 的 `secCost` 逐条相等，钉在 `arkProxy.spec.js`「跨仓 MiniMax H3 价目」）。
+  每秒价 = 美元刊例 × 6.71345 ÷ 15 元/百万 token，取整到百位。官方按**请求的**秒数计费（成片实际长 0.2~0.5 秒，2026-10-26 付费小验核过），
+  价钱不分画幅、不分文生 / 首帧 / 尾帧 / 首尾帧 / 参考图。
+- **一段最多 5 张图**：首帧、尾帧、参考图**合计**（官方每个任务前 5 张不另收，第 6 张起按张另收）—— 第 6 张起服务端报不了价、在扣费之前拒。
+  首尾帧与参考图互斥（官方原文）。今天不收参考视频 / 参考音频（输入视频官方另按时长收）。
+- **时长只收 4~15 的整数**（官方是整数枚举）：5.5、`"5"` 都报不了价，不取整、不夹窗。
+- **请求体只认名单里的字段**（`tokens.MINIMAX_V2_BODY_KEYS` / `MINIMAX_V2_ITEM_KEYS` / `MINIMAX_V2_IMAGE_KEYS`）：
+  顶层 `model` / `resolution` / `duration` / `content` / `ratio`，`text` 条目 `type` / `text`，`image_url` 条目 `type` / `image_url` / `role`、
+  `image_url` 里只有 `url`。名单外的（`callback_url`、`extra`、顶层 `first_frame_image`、条目上的 `video_url` …）一律报不了价、整句拒。
+- **键是上游的原样写法**：`MiniMax-H3-Lite` + 大写 `480P`。H3-Lite 768P、H3 2K、H3-Max 故意不开（没有对标档位）。
+- 没有的能力：白模模板、往后延长、样片两步、片段重拍（参考视频）、声音样本 —— MiniMax 档位上不摆或说清。H3 **一定出声**（API 没有开关）。
+- V2 只在**国际站**开（`config/minimax.minimaxV2Enabled`）：价目是按国际站美元刊例折的，中国站那套账号没有核过。
+
 - **参考图（全模态参考生视频）只有 2.5 与 2.0 系列有**；1.0/1.5 完全不支持。没人验证过
   1.0 收到 `reference_image` 是 400 还是**静默忽略** —— 若是忽略，用户就"加了图、多付了钱、
   画面一点没变、零报错"。所以 App 侧按 `VideoTier.refImg` 做硬白名单，不满足**降级回
@@ -2224,7 +2252,12 @@ App 2.58 ~ 2.62 的剪辑页写着「现在免费」，实际按字扣了）。�
 - **2.5 的时长区间是 [4,30]**，给 3 秒同步 400。App 的时长下限写在 `VideoTier.minSec`，
   报价（`segTokens`）与出片（`composeSegments`）用同一个 `clampDuration`。
 - **免费版（没付过钱）只能用「极速」「草稿」出普通片**（2026-10-07 主人拍板）：标准 / 高清 / 电影级（含样片两步）/
-  真人档（MiniMax、Runway）/ 一切带参考视频的出片（白模、返修、延长、素材参考）都要**付过钱** ——
+  真人档（MiniMax 海螺、Runway）/ 一切带参考视频的出片（白模、返修、延长、素材参考）都要**付过钱** ——
+  ★ 2026-10-26 起「草稿」有两行：Seedance 2.0 mini · 480p（`kind: "task"`）与 MiniMax H3-Lite · `480P`（`kind: "minimax_v2"`，海外的对标，
+  见上「MiniMax H3 三档」）。H3-Highspeed / H3 是会员档。为什么开 H3-Lite：出片按地区下发之后海外只有 MiniMax，免费档要是全在 Seedance 上，
+  海外的免费用户（含 Google Play 的审核账号）一段都出不了。免费版在 H3 上只能纯文字出片（带图要付过钱，见「MiniMax H3（V2）出片」→「免费档」）。免费档清单（`tokens.FREE_VIDEO_ALLOW`）每一条按 **(kind, 模型, 上游分辨率)** 三样认；
+  `allowed` 与拒绝那句话里的档名一律经 `tokens.freeVideoLabels` 去重（两家的「草稿」同名，不去重就说成「草稿」「草稿」）。
+  `FREE_VIDEO_GATE=off` 时 H3 三档对免费版都放开（关闸只挡 Seedance 电影级，与 App 关闸那一支一致）。
   有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买；钱包上的 `paidEver`）。
   判据只有服务端 `config/tokens.videoPlanDenial` 一处（「付过钱」是 `isPaidUser`）；它只管出视频，出图 / 对话 / 语音 / Seed3D 照常开放。
   拒绝回 **403** `{ code: "PLAN_REQUIRED", message, planId, allowed: ["极速","草稿"] }`：`message` 是能直接显示的整句中文
@@ -2527,6 +2560,9 @@ App 2.63 起两档（2026-10-10 主人拍板：速写换成 4.0 新版本，「�
 | `GET /asset` | **0** |
 
 - 余额不足 → **402** `{ code: "INSUFFICIENT_TOKENS", need, balance }`，**方舟根本不会被调用**
+- 地区门禁开着（`VIDEO_REGION_GATE=on`）、这一发是这个地区不给的出视频 → **403** `{ code: "REGION_UNAVAILABLE", billed: false }`，
+  排在扣钱之前、不写钱包头：**创建任务那一发不会发给方舟，一分不扣**。样片第二步会先向方舟查一次样片状态（不收钱）、
+  带参考视频的请求可能先向 Cloudinary 查一次时长（不收钱）—— 这两次查询在 403 之前（见下「出片地区」）
 - 扣费先 plan 后 addon；服务端记下**这一笔从两桶各扣了多少**（`tokenWallet.debitSplit`）。
 - 上游非 2xx（400 敏感词 / 429 限流 / 5xx / 501 没配 key）→ 扣掉的**按原桶退回**（plan 的回 plan、addon 的回 addon，
   `ark_refund`）。★ 2026-10-07 之前一律退进 addon —— 那是一条把会过期的当月额度洗成永久余额的路（敏感词提示词反复 400 即可）。
@@ -2541,16 +2577,20 @@ App 2.63 起两档（2026-10-10 主人拍板：速写换成 4.0 新版本，「�
 ★ **定价表两边都有，必须一起改**：服务端 `src/config/tokens.js` 是**结算**口径，
 App `src/data/economy.ts` 是**报价**口径。不一致的后果是"报价 216k、余额掉了 243k"，
 用户会觉得被偷了钱。已知的两处不一致写在 `tokens.js` 的 `priceOf` 注释里。
-两张表的 **key 集合与数值必须逐条相等**，服务端有测试钉着（加档位漏一边就会红）：
+两张表的 **key 集合与数值必须逐条相等**，服务端有测试钉着（加档位漏一边就会红）。
+⚠ 测试比的是**抄在服务端测试里的那一份** App 档位表（`tests/arkProxy.spec.js` 的 `APP_VIDEO_TIERS` / `APP_MM_TIERS`，为什么抄不读文件见那里的注释）——
+改价要改三处：服务端 `tokens.js`、App `economy.ts`（档位表）、服务端测试里那份抄本。H3 那三行（`APP_MM_TIERS`）是 2026-10-26 先写在服务端的**契约**：
+App 带 H3 三档的那一版还没合进去之前，这几行的「两仓相等」只是「服务端 ↔ 抄本」相等，App 那一版照着抄本写（按设计它的构建检查再抄一份服务端的数反过来比）：
 
 | 内容 | app（报价） | server（结算） | 钉住它的测试 |
 |---|---|---|---|
 | 视频档位系数 | `VIDEO_TIERS[].mult` | `VIDEO_MULT` | `arkProxy.spec.js`「跨仓档位表一致性」（按 **(模型, 分辨率)** 认，草稿与高清不许塌成一行） |
 | 每档分辨率 | `VIDEO_TIERS[].resolution` | `VIDEO_RESOLUTIONS` | 同上 |
-| 免费档 | `VIDEO_TIERS[].freeOk` | `FREE_VIDEO_ALLOW` | 同上 |
+| 免费档 | `VIDEO_TIERS[].freeOk`（2026-10-26 起含 MiniMax H3 那张表的 `draft-mm.freeOk`：H3-Lite · 480P） | `FREE_VIDEO_ALLOW`（同日起含 `kind: "minimax_v2"` 的 H3-Lite · `480P` 那一行） | 同上（「免费档清单 = app 里 freeOk 的那几行」：Seedance 与 H3 两张表合起来，H3 按**上游分辨率**大写的 `480P` 认） |
 | 停用时刻 | `VIDEO_TIERS[].retireAt` | `RETIRED_MODELS_AT` | 同上 |
 | 像素表（480p / 1080p） | 像素表 | `VIDEO_PIXELS` | `arkProxy.spec.js`「跨仓像素表与 480p / 1080p 价目」（含草稿 / 样片两步的价目钉子） |
 | **r2v 档位系数** | `VIDEO_TIERS[].r2vMult`（非 null 的那些档） | `VIDEO_MULT_R2V` | `arkProxy.spec.js`（r2vMult ↔ VIDEO_MULT_R2V 双向相等） |
+| **MiniMax H3 每秒价**（2026-10-26） | H3 三档的 `secCost`（`draft-mm` / `hd-mm` / `ultra-mm`，按 (模型, 上游分辨率) 认）与一段最多几张图 | `MINIMAX_SEC_COST` / `MINIMAX_V2_MAX_IMAGES` | `arkProxy.spec.js`「跨仓 MiniMax H3 价目」（逐条相等、(模型, 上游分辨率) 集合一样、每个数回溯到美元刊例、窗口内每一秒的整段价） |
 | 出图单价 | `IMAGE_TOKENS_BY_MODEL` | `IMAGE_TOKENS_BY_MODEL` | `arkProxy.spec.js`「跨仓出图价目一致性」 |
 | 套餐 / 直充包 | `PLANS` / `RECHARGE_PACKS` | `PLANS` / `order.service.RECHARGE_PACKS` | `payOrder.spec.js`「跨仓价目一致性」 |
 
@@ -2619,13 +2659,243 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
 - **已经因为失败退了钱的任务不列**（2026-10-07）：它们没有成片可取了；列出来就是一张永远取不回、还说着「钱已经花了」的卡
   （老 App 也靠这一条不去捞它们）。登记本身还在（样片第二步要用）。
 - 与 `BranchTemplateTrial` 不是一回事：那条是试炼闸，任务一出结果就删。
+- **只列方舟的行**（2026-10-26）：同一张登记表也记 MiniMax H3 的任务（`provider: "minimax"`），它们只从下面那条 `GET /api/minimax/video-tasks` 出 ——
+  混进来的话老 App 会拿 H3 的任务号去问方舟，摆出一张永远取不回的卡。
+
+**MiniMax H3 那一份**（`GET /api/minimax/video-tasks`，2026-10-26）：`POST /api/minimax/v2/video` 受理的那一拍记一条（同一张 `ArkVideoTask`，
+`provider: "minimax"`、`api: "v2"`）。回 `{ ok, tasks: [{ taskId, api: "v2", createdAt, model, durationSec, ratio, resolution, prompt, costTokens? }] }`
+（规矩与方舟那张表相同：最近 24 小时、新的在前、最多 50 条、已退款的不列、走轮询限流桶、不计费、只读库不出网）。`resolution` 是上游的写法（`480P` / `768P`）。
+`costTokens` 是这一发**实扣**的数，管理员免单记 0（与方舟那张登记表同一条；2026-10-26 文档审核之前记的是报价 —— 取回卡会对一发没扣过钱的任务说「花了 N」）。
+
+- 为什么（2026-10-26 审核）：出片按地区下发之后海外的普通出片全走 H3；H3 原来只有账、没有登记，App 被杀两次那一发就再也找不回来，
+  最后被清扫器结成 settled（照收钱）—— 等于把海外的出片全退回到 2026-09-06 那次事故的形态。
+- 取回走 `GET /api/minimax/v2/video/:taskId`（不计费，见「MiniMax H3（V2）出片」）。**认不得的 `api` 要跳过**：真人档（v1）以后也会登记进这张表（P3），取件是另一条路。
+- 这台服务器没开 V2（走中国站 / 没配国际站的 key）时回**空表**：列出来 App 去问只会拿回 501（任务绑站）。
+- App 那一半（`data/videoJobs.importServerVideoJobs` 把它也合进来）跟着带 H3 三档的那一版走。
+
+### MiniMax H3（V2）出片（`POST /api/minimax/v2/video`，2026-10-26）
+
+海外的「草稿 / 高清 / 电影级」（出片按地区下发之后海外只给 MiniMax）；境内的人选 MiniMax 也走这一条、同一个国际站
+（App 在他第一次选 MiniMax 时当面说一句：照片与提示词交给 MiniMax 位于境外的服务器处理 —— 那是 App 一侧的事）。
+档位、价目、能力的总表见上「视频档位与模型能力」→「MiniMax H3 三档」；这一节是端点与规矩。
+
+实现分四处，各管一件事：路由在 server `routes/minimax.routes.js` 末尾一节；请求体每个字段取什么值在 `schemas/minimaxV2.schemas.js`；
+字段名单与价钱在 `config/tokens.js`（`MINIMAX_V2_*_KEYS` / `MINIMAX_SEC_COST` / `minimaxV2Tokens`）；往哪个站打、成片落在哪个主机在 `config/minimax.js`。
+与真人档（`/api/minimax/video`，海螺 2.3，v1）是**两套接口**，别混用：V2 用真的 HTTP 状态码报错、状态是小写的 `succeeded` / `failed`、
+成片地址直接在查询回包里、按秒计价。
+
+| 方法 | 路径 | 鉴权 | 限流 | 说明 |
+|---|---|---|---|---|
+| POST | `/api/minimax/v2/video` | required | 与真人档同一个桶（每人 30/min） | 建一段 H3 出片任务，**先扣钱再转发**，上游没受理就退 |
+| GET | `/api/minimax/v2/video/:taskId` | required | 与真人档同一个桶（每人 90/min） | 查一发任务，**不计费**；只给任务的主人看 |
+| GET | `/api/minimax/video-tasks` | required | 同上（90/min） | 自己最近 24 小时的 H3 任务（App 重启之后取回用，见「视频任务登记与找回」），**不计费**、不出网 |
+
+#### 能力位（App 摆不摆 H3 三档）
+
+- `/api/ark/health` 的 `minimaxV2`：这台服务器开着 V2。判据只在 `config/minimax.minimaxV2Enabled` —— **只在 MiniMax 走国际站时为真**
+  （`MINIMAX_REGION=intl`，或只配了国际站的 key；两把 key 都配了又没写 `MINIMAX_REGION`，生产自检拒绝启动）。**没有单独的开关**。
+  为假时 `POST /v2/video`、`GET /v2/video/:taskId` 回 **501** `{ code: "MINIMAX_V2_OFF" }`（扣费之前），`GET /video-tasks` 回空表。
+  为什么只在国际站：价目是按国际站的美元刊例折的，中国站那套账号的价钱与字段没有核过；任务绑站，一台服务器只走一个站。
+- App 摆 H3 三档 = `minimaxV2` 为真 **且** `GET /api/video/zone` 的 `providers` 里有 `minimax`（能力不随地区变、在 health；地区会中途变、在 zone。
+  见「出片地区」→「H3 三档摆不摆」）。`freeVideo` 里那一行 H3-Lite 是价目，不说明开没开。
+- 判能力只看能力位，不看状态码（SPA 回退是 200 + HTML；老服务端上这几条路根本不存在）。
+- `/api/ark/health` 的 `minimaxV2FreeTextOnly`：没付过钱的人在 H3 上只能纯文字出片（见下「免费档」）。App 照它对没付过钱的人只发纯文字。
+
+#### 请求体（名单外的键整句拒，不悄悄丢）
+
+```json
+{ "model": "MiniMax-H3-Lite", "resolution": "480P", "duration": 5, "ratio": "9:16",
+  "content": [ { "type": "text", "text": "…" },
+               { "type": "image_url", "image_url": { "url": "https://res.cloudinary.com/<我们的 cloud>/image/upload/…" }, "role": "reference_image" } ] }
+```
+
+- `model` 只收 `MiniMax-H3-Lite` / `MiniMax-H3-Highspeed` / `MiniMax-H3`；`resolution` 要对得上 model、写上游的大写（`480P` / `768P` / `768P`）；
+- `duration` 是 4~15 的**整数**（`5.5`、`"5"` 都拒，不取整、不夹窗）；
+- `content` 恰好一条 `text`（去掉首尾空白不是空的，**≤ 2000 字**，按字符数 —— 官方上限 7000，2000 是产品口径）+ 至多 5 张图；
+- 图片条目必须写 `role`：`first_frame` / `last_frame` / `reference_image`；首帧、尾帧各至多一张，参考图至多 5 张，**首尾帧与参考图不能混**；只给尾帧可以；
+- 图片地址**只收我们自己图床上的图**：`https://res.cloudinary.com/<我们的 cloud>/image/upload/…`（先经 `POST /api/uploads/image` 传上去）。
+  `data:` 内联图、别人的 Cloudinary、方舟临时链接、任意网址一律拒 —— 上游拿我们的 key 去拉这个地址，收任意地址就是替任何人拉任意网址；
+- `ratio`：带首帧 / 尾帧时只能是 `adaptive` 或不写（服务端补成 `adaptive`；上游按图的比例出，写了别的也会被当成 adaptive）；
+  参考图出片与纯文字出片**必须写具体比例**（`21:9` / `16:9` / `4:3` / `1:1` / `3:4` / `9:16`）—— 纯文字是官方硬规矩，参考图上 H3-Lite 不收 adaptive，
+  另外两个模型我们也一样要求（一条规矩）；
+- 不收：`callback_url`、`extra`、`video_url` / `audio_url`（参考视频 / 音频）、2K、H3-Max。
+- 整个请求体 **≤ 1MB**，超了回 **413**（排在登录与白名单之前，2026-10-26 终审）：图只收图床地址，合规的请求体也就几十 KB ——
+  `/api/minimax` 那 50MB 的大 body 是真人档的 base64 首帧要的，`/v2` 不吃它（不然任何登录用户都能让服务端在白名单之前先解析一整份 50MB）。
+
+不合规 → **400** `{ code: "VIDEO_PARAMS_NOT_ALLOWED", message }`（整句中文，「没有扣费」）。服务端拿**重建过**的那一份请求体去问价、扣费、转发，不再碰原样的那一份。
+
+#### 被拒的先后（App 按 `code` 分，别按状态码：429 就有三种）
+
+| 先后 | 回包 | 钱 |
+|---|---|---|
+| 1 | 413（请求体超过 1MB）→ 401（没登录）→ 429 `RATE_LIMIT_EXCEEDED`（每人每分钟 30 发） | 没扣 |
+| 2 | 501 `MINIMAX_V2_OFF` | 没扣 |
+| 3 | 400 `VIDEO_PARAMS_NOT_ALLOWED` | 没扣 |
+| 4 | 403 `REGION_UNAVAILABLE`（门禁 `on`、这个地区不给 H3；回包形状见「出片地区门禁」） | 没扣 |
+| 5 | 429 `IN_FLIGHT_LIMIT`（这个人同时在出的到 4，见下「并发」） | 没扣 |
+| 6 | 503 `UPSTREAM_BUSY`（全站同时在出的到 25；上游限流退回来的也是这个码，见下「受理与上游没受理」） | 没扣 |
+| 7 | 403 `WALLET_FROZEN` → 403 `PLAN_REQUIRED`（没付过钱：这一档不开，或者带了图 —— 后一种带 `freeTextOnly: true`、不带 `allowed`，见下「免费档」）→ 429 `DAILY_LIMIT` → 402 `INSUFFICIENT_TOKENS`（与 Seedance、真人档同一套） | 没扣 |
+| 8 | 扣钱、转发；上游没受理 → 下面「受理与上游没受理」那张表 | 扣了又退（`billed: false`） |
+| — | 受理 → 200 `{ ok: true, task_id }` | 扣了 |
+
+#### 钱
+
+- 价 = 请求里的**整数秒** × 每秒价（`tokens.minimaxV2Tokens` 一处判）。表外的 (模型, 分辨率)、不是窗口内整数的时长、第 6 张图、名单外的字段都报不了价 → 扣费之前拒。
+
+  | 时长 | H3-Lite · 480P（草稿，11,200/秒） | H3-Highspeed · 768P（高清，26,900/秒） | H3 · 768P（电影级，35,800/秒） |
+  |---|---|---|---|
+  | 4 秒 | 44,800 | 107,600 | 143,200 |
+  | 5 秒 | 56,000 | 134,500 | 179,000 |
+  | 10 秒 | 112,000 | 269,000 | 358,000 |
+  | 15 秒（上限） | 168,000 | 403,500 | 537,000 |
+
+  对照：同样 5 秒竖屏，Seedance 草稿 77,004、高清 165,600、电影级 507,600。
+- 不分画幅、不分文生 / 首帧 / 尾帧 / 首尾帧 / 参考图；一段最多 5 张图（首帧 + 尾帧 + 参考图合计），正好是官方每个任务免费的张数，所以价目里没有「每张图多少钱」。
+- 上游按**请求的**秒数计费（成片实际长 0.2~0.5 秒，2026-10-26 付费小验核过）。第一次看见成片时服务端拿 `usage.total_seconds × 每秒价` 对一下实扣，
+  对不上只吼（`[minimax-v2] 计费对不上`）、不拦 —— 两边对不上没有别的症状，只会出现在月底的账单上。
+- 跨仓：App 档位表 `draft-mm` / `hd-mm` / `ultra-mm` 的 `secCost` 与 `MINIMAX_SEC_COST` 逐条相等（报价 = 实扣；钉在 `tests/arkProxy.spec.js`「跨仓 MiniMax H3 价目」）。
+  调价两仓同一个提交改。
+- 序列与 Seedance、真人档是同一份 `arkGateway.chargedArkCall`（`kind: "minimax_v2"`）：在册 → 出片地区门禁 → 冻结 / 套餐 / 日上限 → 原子扣 → 转发 →
+  没受理退 → 管理员免单照实记账。受理之后记一笔账（`GenTaskCharge`：`provider: "minimax"`、`api: "v2"`、`kind: "video"`、建任务的站），失败退款按它退。
+
+#### 免费档
+
+- 免费版（没付过钱）在 H3 上只能用 **H3-Lite · 480P**（「草稿」在 MiniMax 上的对标，2026-10-26 定：海外的免费用户与 Google Play 的审核账号要能出片）；
+  H3-Highspeed / H3 回 403 `PLAN_REQUIRED`，同 Seedance。判据只在 `tokens.videoPlanDenial`，清单 `tokens.FREE_VIDEO_ALLOW` 按 **(kind, 模型, 上游分辨率)** 三样逐字比。
+- `/api/ark/health` 的 `freeVideo` 原样下发这一行 `{ label: "草稿", model: "MiniMax-H3-Lite", resolution: "480P" }`。**App 拿档位行的上游分辨率（`480P`）比**，
+  别拿那一行里只为「每行都写」的小写 `resolution` 比 —— 对不上的症状是免费用户看见灰键、服务端其实放行。
+- 403 的 `allowed` 与拒绝话里的档名经 `tokens.freeVideoLabels` 去重（两家的「草稿」同名）：2026-11-24 13:00 之前 `["极速","草稿"]`，之后 `["草稿"]`。
+- `FREE_VIDEO_GATE=off` 时 H3 三档对免费版都放开（只能纯文字，见下一条；关闸只挡 Seedance 电影级，与 App 关闸那一支一致）。免费额度、每日上限照常算。
+- **免费版在 H3 上只能纯文字出片**（2026-10-26 终审，`tokens.MINIMAX_V2_FREE_TEXT_ONLY`）：带首帧 / 尾帧 / 参考图 → **403** `{ code: "PLAN_REQUIRED", freeTextOnly: true, message }`
+  （不带 `allowed`：对一个正在用「草稿」的人说「只能用草稿」是错话），扣费之前、不出网。付过钱的与管理员带图照常（与真人档同一个口径：他们在真人档上本来就能拿一张图当首帧）。
+  为什么：服务端分不出图里是不是真人，而 H3 收不收真人照片还没验过（「出片地区」→「等主人拍板」第 9 条）。判据同在 `tokens.videoPlanDenial`
+  （带没带图由 `chargedArkCall` 从要转发的那一份请求体现算，路由不传）；**不跟着 `FREE_VIDEO_GATE` 走**：关闸时 H3 三档对免费版都开，带图照样要付过钱。
+  现状在 `/api/ark/health` 的 `minimaxV2FreeTextOnly`：App 照它对没付过钱的人只发纯文字（不补画帧、不带参考图）。放开 = 改那个常量（第 9 条验过、主人点头，过代码评审），App 读这一位跟着放开。
+
+#### 并发（两道闸都在**扣费之前**，被拦不扣钱）
+
+- 官方 V2 的上限：每分钟 300 次请求、同时 30 发（国际站速率限制页，2026-10-26 读）。
+- **按人**（排在全站那一道之前）：同一个人「30 分钟内受理、还没结局的 H3 任务 + 本进程正在建的」到 **4** →
+  **429** `{ code: "IN_FLIGHT_LIMIT", limit: 4, billed: false }` + `Retry-After: 30`。管理员免单的行不算在按人的数里（它们落库就是 skipped、永远不结），全站那一道照算。
+  为什么要有：只有全站那一道的话，一个账号就能把 25 个位全占掉，海外所有人随后都收到 `UPSTREAM_BUSY`（海外只有 MiniMax 这一家）。
+  App 认这个码说「你同时在出的已经有 4 段了，等一段出来再点」（中文界面可以原样说服务端那句）。
+- **全站**：「30 分钟内受理、还没结局（或管理员免单）的 H3 任务 + 本进程正在建的」到 **25** → **503** `{ code: "UPSTREAM_BUSY", billed: false }` + `Retry-After: 30`。
+  数的是库（`GenTaskCharge`），不是进程内计数：生产是 pm2 两个实例，用户也可能不再来问。这个数是「大概」（两个实例可能同时放一发），所以离 30 留了 5 发余量。
+- 「还没结局」= 账还 `open`、**而且**上游没明说过失败（判据只在 `taskRefund.v2RunningFilter`，两道闸共用）。出成了但没人来问的，
+  要等清扫器去问才结（受理 10 分钟之后第一次问，清扫器每 5 分钟一轮）。
+- `MINIMAX_FAIL_REFUND=off` 时：失败不退、账留 `open`，但用户自己轮询看见的 `failed` / `cancelled` 会记在账上（`upstreamStatus`），**不再算在跑**、不占位
+  （2026-10-26 文档审核：原来照算 —— 4 发审核没过的失败就把一个人关在 H3 门外半小时，而那几段永远出不来；全站 25 发就是海外所有人都 `UPSTREAM_BUSY`）。
+  清扫器在开关关着时不问 MiniMax，所以**没人来问的**任务（出成了的、失败了的都一样）照旧在 30 分钟窗口里一直占着位。
+- **出片地区门禁排在两道闸之前**：门禁 `on`、这个地区不给 H3 时，池子满不满都回 403 `REGION_UNAVAILABLE`。App 只在收到它之后才重探地区，
+  被并发闸先拒的话它照旧摆着 H3 三档、叫人「过一会儿再点」，而那个重试永远不会成。路由在数并发之前用同一个 `regionGate` 预检（见「出片地区门禁」）。
+- ⚠ 每分钟 300 次我们没有全站限，只有按人的限流（建 30/min、查 90/min）；查询算不算进这 300 次官方没写 —— 25 发同时在跑、每发每 5 秒问一次就是每分钟 300 次。
+  超了上游回 429：建任务那一发退钱、回 503 `UPSTREAM_BUSY`；查询回 503（不是结局，接着问）。App 的轮询间隔别短于真人档的 8 秒。
+
+#### 受理与上游没受理
+
+- **受理** → **200** `{ ok: true, task_id }`（`task_id` 是字符串，今天是十几位的数字串；带余额头 `X-Wallet-*`）。判据：上游 2xx **且**回包里有能用的任务号
+  （2xx 却读不出任务号 = 没法查询、没法取件，当没受理退钱）。
+- **上游没受理**：钱已退回，回包 `billed: false`，`upstream: { status, code }` 是上游原样的状态与内部错误码（只给人排查）。
+  状态码换成我们自己的，**不原样透传** —— 上游 401 是我们的 key 坏了、402 是我们在 MiniMax 的余额不足，原样回去 App 会当成「登录过期」「余额不足」：
+
+| 上游 | 回给 App | 含义 |
+|---|---|---|
+| 400（2013） | 400 `UPSTREAM_PARAMS` | 参数不对（多半是白名单与上游没对齐，服务端会吼） |
+| 422（1026 / 1027） | 422 `UPSTREAM_SENSITIVE` | 提示词或图片没过 MiniMax 的内容审核 |
+| 429（1002 / 1045） | 503 `UPSTREAM_BUSY` | 限流 / 并发满，过一会儿再试 |
+| 没等到回话 | 504 `UPSTREAM_TIMEOUT` | 钱退了；上游那边可能已经建了任务（平台白付，同真人档 / 方舟） |
+| 其余（401 / 402 / 403 / 5xx / 2xx 却没有任务号） | 502 `UPSTREAM_ERROR` | 服务端的事，服务端会吼 |
+
+#### 查询（`GET /api/minimax/v2/video/:taskId`，不计费）
+
+**200** `{ ok: true, taskId, status, url?, usage?, duration?, ratio?, resolution?, error?, refund? }`：
+
+- `status` 是上游原样：`queued` / `running` / `succeeded` / `failed` / `cancelled`（V2 **没有** `expired`）；
+- `succeeded` 才有 `url`（见下「成片地址与转存」）与 `usage`（只转 `total_seconds` / `input_seconds` / `output_seconds` / `input_image_count` 这四样）；
+- `failed` / `cancelled` 有 `error: { code, message }`（上游原样），并按下面「失败退款」退回（`refund` 只给账的主人，带余额头）；
+- **只给任务的主人看**（H3 的任务号是十几位、几乎连号的数字，挨个猜就能拿到别人的成片）：账上有 H3 的那一行 → 只给那一行的主人；
+  账上没有（落账失败过，或任务号撞上了同号的真人档老账）→ 看取回登记，登记是这个人的才照常查（服务端吼一次：这一发失败了退不了钱）；
+  两样都没有（从没经过这台服务器，或删号级联把账与登记一起删了）→ **404** `{ code: "TASK_NOT_FOUND" }`。别人的 → 404。都不说有没有；管理员例外。
+  2026-10-26 终审改的：原来没有账就照常放行 —— 删号之后那个人的 H3 任务在上游还查得到 7 天，挨个猜号就拿得到成片地址。登记只留 48 小时（覆盖 App 取回的 24 小时）。
+  ⚠ 这一条只管 V2 的查询。真人档（v1）的 `GET /api/minimax/video/:taskId` 照「失败退款」那一节的口径**不查归属**，
+  但认得出账上记着是 H3 的任务号 → 一律 **404** `{ ok: false, code: "TASK_NOT_FOUND" }`、不去问上游（2026-10-26 文档审核：两版的任务号在 MiniMax 那边是同一个命名空间，
+  v1 的查询认不认 H3 的号没有验过，按「认」处理；话里不说「这是 H3 的号」）。`GET /api/minimax/file/:fileId` 不查归属
+  （我们不记 file_id 属于哪一发；真人档取件的归属跟着它的取回登记一起做，P3）—— H3 的成片不走它（V2 的查询回包里直接给地址）。
+- 不是 200 的都**不是结局**（钱不动，App 接着问或按「没接到」处理）：404 `TASK_NOT_FOUND`（上游也查不到 —— 超过 7 天或从没有过）、
+  503 `UPSTREAM_BUSY`、504 `UPSTREAM_TIMEOUT`、502 `UPSTREAM_ERROR`；任务号形状不对 400、V2 没开 501 `MINIMAX_V2_OFF`。
+
+#### 成片地址与转存
+
+- `url` 落在 `video-product.cdn.minimax.io`（主机只在 `config/minimax.MINIMAX_V2_VIDEO_HOST_FRAGMENT` 一处，别的判据都由它派生），**有时效**
+  （官方：拿到就下载或存起来；过期了再查一次会给一个新地址 —— 任务只在 7 天内查得到）。
+- **拿到就转存**：`POST /api/ark/transfer-video` 认这个主机，与方舟成片同一条（`{ url, wait: false }` → 202 + `POST /api/ark/transfer-video/status` 短轮询；
+  不带 `wait` 就同步等），转出来的是我们 Cloudinary 上的永久地址、不计费。查询端点**不替你转存**（方舟轮询那条 `?transfer=1` 这里没有）。
+- 兜底与门：发布时段的 `videoUrl` 还是 H3 链接的，服务端下载再转存（判据 `videoAsset.isUpstreamTempVideoUrl`，方舟 ∪ H3）；`/api/ark/asset` 产物代理认它（与转存同一个判据 `config/minimax.isMinimaxV2VideoUrl`：https、不带端口、不带账号密码）；
+  回炉工程与公开配方**不许**揣着它落库（见上「BranchProject」的不变量）—— 先转存，再存工程。
+- 成片是 8 bit H.264 + AAC（2026-10-26 付费小验），WebView 直接放得出、转存不转码；**一定带声音**（API 没有开关）；
+  实际长度比请求长 0.2~0.5 秒（4 秒出 4.46 秒、5 秒出 5.17 秒）—— App 量真实时长，别拿申报值截。
+
+#### 失败退款（与方舟、真人档同一份 `services/taskRefund`，全文见下「失败退款」）
+
+- 什么算失败：上游**明说** `failed` / `cancelled`。查不到（7 天外 / 从没有过）、我们没等到回话、回包读不懂、`queued` / `running`、认不出的新状态都**不是**失败
+  （那时钱可能正在变成一段好好的视频）。
+- 谁发现：① App 自己轮询 `GET /v2/video/:taskId`，失败那一拍回包带 `refund: { state, tokens }` + 余额头（只给账的主人）；
+  ② 没人再来问的，由清扫器（0 号实例，每 5 分钟一轮；受理 10 分钟后第一次问，之后退避到 60 分钟）回**建任务的那个站**问 `/v2/query/video_generation/{id}`，
+  退了钱发一条 `GEN_TASK_REFUND`（`kind: "video"`）。8 天问不出结局的记 `lost` 交人工（H3 只查得到受理之后 7 天内的任务，没人问过的第 7 天之后就问不出了）。
+- 退多少：这一发的实扣，按扣的那两桶原样退回；管理员免单不退。只结国际站、V2 建的账（`settleTask` 按 `region` 与 `api` 圈定）：
+  v1 真人档的轮询动不了 H3 的账，反过来也一样。
+- 开关同真人档：`MINIMAX_FAIL_REFUND=off` 关掉（账留 `open`，开关打开后还能接着退）；现状在 `/api/ark/health` 的 `minimaxFailRefund` ——
+  App 对 H3 说「会自动退回」之前看这一位（`failRefund` 只说方舟）。
+- ⚠ 平台这一侧：H3 只能按量付费（官方写明视频资源包不覆盖 H3），而 MiniMax 对按量付费的失败任务计不计费**没有书面说法**
+  （官方只对**视频资源包**写明失败不扣；V2 查询文档里失败示例的 `usage` 是空的、并写着 `usage` 只在成功时回 —— 只算弱证据）。
+  **带 H3 三档的 App 发版之前先把这个开关定下来**（2026-10-26 还没做）。不花钱的对账只在**两个前提都成立**时才算数：
+  ① 只看**国际站**、真人档、已退款的行（`GenTaskCharge` 里 `provider: "minimax"`、`region: "intl"`、`state: "refunded"`、没有 `api`）——
+     中国站是另一个账号、另一份账单，那边的结论搬不到国际站来；
+  ② 这几发在 MiniMax 控制台账单上是**从按量付费的余额里扣的**，不是从视频资源包里扣的 —— 资源包本来就写明失败不扣，在它上面看到「没收」说明不了按量付费。
+  两个前提都成立、那几发都没收钱 → 把结论写进这里与 `tokens.js` 的注释，开关保持缺省（退）；有一发收了 → 发版之前写 `MINIMAX_FAIL_REFUND=off`
+  （不然 MiniMax 收了我们的钱、我们又把钱退给用户，平台付两遍）。
+  **凑不齐前提（比如国际站没有按量付费的失败行）= 没有结论，别当成「没收」**：优先付费小验一发 H3 受理之后的失败、再看那一发的账单行
+  （例如受理之后马上用官方的取消任务端点取消一发 H3-Lite 4 秒，最多约 0.1 美元 —— 这只证明「取消」那一种，审核没过的那种计费口径可能不同）；
+  发版那天还没有结论，就在 `MINIMAX_FAIL_REFUND=off` 下发（对平台是安全的方向；App 读 `minimaxFailRefund`，不会对用户许诺「会自动退回」），有了结论再打开 ——
+  关着期间失败的那些账留着 `open`，打开之后还能接着退，但两种失败的期限不一样（2026-10-26 终审更正，原来一律写「8 天之内」）：
+  · 用户自己问到过失败的那几发（账上记着上游的原话 `upstreamStatus`）：清扫器直接按记下的那句退、不再回去问 —— 受理之后 **8 天**之内都退得到；
+  · 没人问过的：要清扫器回去问，而 H3 只查得到受理之后 **7 天**内的任务 —— 这一种只有 **7 天**（之后问不出结局，第 8 天记 `lost`、交人工）。
+  ⚠ 这个开关真人档与 H3 **共用**：关掉之后真人档受理之后的失败也不退（同一个站、同一种付费方式时它们是同一个没有书面说法的问题）。
+  关着时用户自己问到的失败不占 H3 的并发闸（见上「并发」），没人来问的照旧占到 30 分钟窗口结束。
+
+#### 取回登记
+
+受理那一拍另记一条登记（同一张 `ArkVideoTask`，`provider: "minimax"`、`api: "v2"`），`GET /api/minimax/video-tasks` 列出来；
+App 冷启动拿它把本机不认识的任务补成「待取回」，再走上面的查询（不计费）。规矩见「视频任务登记与找回」的 MiniMax H3 那一份。
+账只管钱、登记管「找得回来」，两样各记各的。
+
+#### 老 App 会怎样（以及新 App 碰上老服务端）
+
+- **老 App（没有 H3 三档的那些版本）在这一版服务端上什么都不变**：它们不打 `/api/minimax/v2/*`、不读 `minimaxV2`。逐条核过：
+  · `/api/ark/health` 多了 `minimaxV2`，`freeVideo` 多一行 H3-Lite —— 2.62 起的 App 按 (模型, 分辨率) 拿它比自己档位表里的行，一行都对不上，置灰照旧；
+    更老的不读 `freeVideo`；
+  · 403 `PLAN_REQUIRED` 的 `allowed` 与那句话照旧（两家的「草稿」去重之后还是「极速」「草稿」）；
+  · `GET /api/ark/video-tasks` 照旧只列方舟的任务（H3 的另走 `/api/minimax/video-tasks`）—— 混进来的话老 App 会拿 H3 的号去问方舟，摆出一张永远取不回的卡；
+  · 真人档（v1）照旧：v1 的轮询与清扫只结没有 `api` 的账，H3 的账它动不到；v1 的查询多拒一种号（账上记着是 H3 的 → 404），老 App 从不拿 H3 的号去问它；
+  · 转存 / 产物代理多认一个主机、回炉工程与公开配方多拒一个主机 —— 老 App 手上没有 H3 的成片，碰不到。
+- 出片地区门禁切 `on` 之后老 App 会怎样（海外只剩真人档、海外的免费用户一档视频都没有）是地区门禁的事，见「出片地区」→「老 App 会怎样」。
+- **新 App 碰上老服务端 / 走中国站的服务端**：`minimaxV2` 读不到或为假 → 不摆 H3 三档、不去问 `/api/minimax/video-tasks`。
+- **上线顺序**：服务端先上（这一节的路由、`minimaxV2` 那一位、价目与免费档那一行），带 H3 三档的 App 后发 —— 新增档位走「服务端先上」。
+  服务端先上不会提前放出「免费的带图 H3」：免费版在 H3 上只能纯文字（见上「免费档」），任何登录用户直接打这条路也一样。
+  第 9 条（「出片地区」→「等主人拍板」）挡的是**放开**这一条，不挡部署。
+  H3 是新的 kind，老 App 从不报这几格的价，所以没有「报价与实扣对不上」的过渡期；以后给 H3 **涨价**才要按「App 先上」排（过渡期 App 报得比实扣高，是安全的方向）。
+
+#### 还没有的
+
+真人档（v1）的取回登记（P3）；参考视频 / 参考音频 / 2K / H3-Max；中国站的 V2；H3 上的真人照片（待付费小验；在那之前免费版在 H3 上只能纯文字，见上「免费档」）。
+H3 三档没有白模模板、往后延长、样片两步、片段重拍、声音样本 —— MiniMax 档位上不摆或说清。
 
 ### 失败退款（受理之后才失败的任务，2026-10-07）
 
 主人 2026-10-07 拍板：上游**受理之后**明说这一发失败了，就把这一发的钱退回去。唯一实现 server `services/taskRefund.service.js`，
 底账 `models/GenTaskCharge.js`（一个上游任务号一行：扣了多少、从哪两桶扣的、是不是管理员免单、结局）。
 
-- **什么算失败**：方舟 `failed` / `cancelled` / `expired`；MiniMax `Fail`。**只认上游明说的状态** —— 我们自己的超时、方舟 404 / 504、
+- **什么算失败**：方舟 `failed` / `cancelled` / `expired`；MiniMax 真人档 `Fail`、H3（V2）`failed` / `cancelled`（V2 没有 `expired`）。**只认上游明说的状态** —— 我们自己的超时、方舟 404 / 504、
   回包读不懂、`queued` / `running`、认不出的新状态，一律**不是**失败（那时钱可能正在方舟那边变成一段好好的视频）。
 - **每一发 Seedance 任务都钉了 `execution_expires_after: 86400`**（server 覆盖客户端的值）：排队 / 运行超过 24 小时方舟标 `expired`，
   于是每一发都会在我们的观察窗口里走到明确的终态。
@@ -2633,7 +2903,7 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
   管理员免单（没扣钱）与自动退款上线之前受理的任务（没有账）**不退**。样片两步是两笔独立的钱：第二步失败只退第二步。
 - **恰好一次**：账的状态 `open → claimed → refunded`（条件原子抢占，两个 pm2 实例 + 清扫器 + 白模化取回同时看见也只退一次）；
   崩在半截的由清扫器按账本 memo 续办。8 天还问不出结局的记成 `lost` 并告警（人工核对）。
-- **谁来发现失败**：① App 自己的轮询（`GET /api/ark/contents/generations/tasks/:id`、`GET /api/minimax/video/:taskId`）；
+- **谁来发现失败**：① App 自己的轮询（`GET /api/ark/contents/generations/tasks/:id`、`GET /api/minimax/video/:taskId`、`GET /api/minimax/v2/video/:taskId`）；
   ② 白模化取回（`POST /templates/blockoutize/finish`）；③ 0 号实例的清扫器（每 5 分钟，替没人再来问的那些问一次上游，退避 10 → 60 分钟）。
 - **轮询回包多一个 `refund` 字段**（只在失败终态、只给账的主人）：`{ state, tokens }`，同时带余额头 `X-Wallet-*`：
   | `state` | 含义 |
@@ -2656,8 +2926,11 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
   清扫器退的也一样，pending 列表不会对一发已经退了钱的任务说「无法挽回」。
 - **MiniMax**：账上记着任务建在哪个站（`cn` / `intl`），**只认那个站回的结论**：清扫器只回同一个站去问（区域切走了就不问 —— 拿另一把 key 去问只会查无此任务），
   轮询端点（问的是此刻配的站）也只结同一个站建的账（2026-10-07 评审补：切过站之后另一个站上同号的任务报 Fail 不退这一笔、报 Success 也不结它；判据在 `settleTask` 的 `region`）。
-  开关 `MINIMAX_FAIL_REFUND=off` 关掉 MiniMax 的失败退款（MiniMax 对按量付费的失败任务计不计费没有书面说法）；关着期间账留 `open`，打开后还能接着退。
+  开关 `MINIMAX_FAIL_REFUND=off` 关掉 MiniMax 的失败退款（MiniMax 对按量付费的失败任务计不计费没有书面说法）；关着期间账留 `open`，打开后还能接着退（上游已经明说过失败、只是当时没退的，清扫器按记下的那句直接退，不再回去问）。
   开关的现状在 `/api/ark/health` 的 `minimaxFailRefund` —— App 对真人档说「会自动退回」之前要看它（`failRefund` 只说方舟）。
+  **H3（V2，2026-10-26）**：账上另记 `api: "v2"`（没有这一位 = 真人档 v1）—— 结局按 V2 的写法认（`succeeded` / `failed` / `cancelled`，与 v1 的 `Success` / `Fail` 互不相认），
+  清扫器问 `/v2/query/video_generation/{id}`，`settleTask` 只结同一版接口建的账；同一个开关 `MINIMAX_FAIL_REFUND` 管它，App 对 H3 说「会自动退回」之前同样看 `minimaxFailRefund`。
+  站内通知里 H3 的 `kind` 是 `video`（说「一段视频没出成」），`minimax` 那一格只给真人档。
 - ⚠ **钱不能"退"进别人的余额镜像**：`refund` 字段与余额头只给账的主人；别人轮询我的任务只看得见方舟的原话。
 
 ### 组图（`POST /api/ark/image-groups`，2026-10-05）
@@ -2695,6 +2968,266 @@ resolution, prompt(前 300 字), r2v, templateId }`（`ArkVideoTask`，48h TTL�
 - **单张出图那条路从此只出一张**（`POST /api/ark/images/generations`）：`sequential_image_generation` 不是 `disabled`、`layer_decomposition`
   不是 false、`stream` 不是 false、`n` 不是 1、`tools` 非空 —— 一律 400 `IMAGE_PARAMS_NOT_ALLOWED`，不扣钱。此前请求体原样转发、按一张收，
   带上组图开关就能用一张的钱换十五张，零症状。App 从来只发 model / prompt / image / size / response_format / watermark，不受影响。
+
+## 出片地区（`GET /api/video/zone` + 出片地区门禁，2026-10-26）
+
+主人原话：美国境内不能用 Seedance、只能用 MiniMax 国际版；中国境内 IP 可以选；海外由于政策原因只能用 MiniMax。
+
+⚠ 「政策原因」的出处（条款原文或供应商的书面答复）还没落进文档。在那之前这是**按主人要求的产品限制**：
+本节、客服知识库、商店材料里都别写成「法规要求」。
+
+代码在四处，各管一件事：
+
+| 文件 | 管什么 |
+|---|---|
+| `src/utils/geo.js` | 请求方在哪个国家（`countryOf`）、国家落到哪个地区（`videoZoneOf`） |
+| `src/config/videoRegion.js` | 每个地区准用哪几家、门禁档位、该不该拦（`regionDenial`，纯判定）、被拦时那句话 |
+| `src/services/arkGateway.service.js` | 门禁的执行（`regionGate`），挂在 `chargedArkCall` 上 |
+| `src/routes/videoZone.routes.js` | `GET /api/video/zone` |
+
+### 判据：国家 → 地区
+
+**国家码**只有 `utils/geo.countryOf` 一处实现。登录页（`/api/auth/capabilities`）和求助卡的国家也从这里取。
+
+1. 先认 `cf-ipcountry`。★ 它可信，只因为源站 443 / 80 只对 Cloudflare 网段开放、而且 Cloudflare 会覆盖客户端自带的那一份（后一条还没核实，见下 ⚠）。
+   哪天放开源站直连，任何人都能自己写一个 `cf-ipcountry: CN`，那时这一条必须改。
+2. 读不到、是 `XX`、或形状不对，再用 geoip-lite 查 `rateLimit.clientIp(req)`（X-Real-IP 优先，不用 `req.ip`）。
+3. `T1`（Tor）当「没有国家」，**不再**查 geoip：查到的只是出口节点在哪，等于让人挑节点选地区。
+4. 不认 `x-vercel-ip-country` / `x-country-code` / `x-appengine-country`：我们的链路上没有一跳会覆盖它们，全是客户端自报。
+
+⚠ 两件事还没在生产核实：Cloudflare 后台的 IP Geolocation 开着；客户端自带的 `cf-ipcountry` 会被 Cloudflare 覆盖。
+两件各有各的核法（都写进了下面「切 on 之前」第 3 步）：
+
+- **会不会被伪造**：只能拿 curl 当面核。在中国以外、**不是数据中心**的网络上跑（本 zone 的 Cloudflare 拦一切数据中心来源）：
+  `curl -s -H 'cf-ipcountry: CN' https://<host>/api/video/zone`，回的 `country` 必须是真实所在的国家、**不是** `CN`。
+  回了 `CN` = Cloudflare 把客户端自带的头原样传了过来，加一个头就能在海外拿到 Seedance —— 这时不许切 `on`。
+- **IP Geolocation 开没开**：不带那个头再跑一次，`country` 不能是空的（这只说明判得出国家，回包里不带是 `cf` 还是 `geoip` 判的）；
+  看 observe 期间 `[region] would-deny` 那几行的 `source=`：是 `cf` 就是 Cloudflare 给了国家头，全是 `geoip` 说明没给、判据退到了 geoip-lite。
+- ★ `[region] would-deny` 日志**核不了伪造**：它只记「该拦」的请求，伪造成 `CN` 的那一发落在 `cn`、不该拦，一行都不会留。
+  这份日志只看得出**拦多了**（境内的人被判成海外），看不出**拦少了**（伪造 `CN`，或别的原因被判成境内）。
+
+⚠ 还有一道源站加固要在切 `on` 之前做（2026-10-26 最终审核）：这个头现在是一道拦人的闸，上面那条 curl 核不全它的可信度。
+细节不进公开仓，在运维的私有笔记里；都在 nginx / Cloudflare 后台，代码里改不了。
+
+**地区**（`utils/geo.videoZoneOf`）：
+
+| 地区 | 国家码 | 按政策准用 |
+|---|---|---|
+| `cn` | 只有 `CN` | Seedance（方舟）、MiniMax（中国站或国际站） |
+| `intl` | 其余全部，含 HK / MO / TW、判不出、Tor | 只有 MiniMax **国际站** |
+| `blocked` | IR / CU / KP / SY | 一家都不给 |
+
+- ★ 国家名单和政策表（`ZONE_UPSTREAMS`）都是代码里的冻结常量，不做环境变量：放宽要过评审；环境变量写错一个字母，整道闸就零症状地绕开了。
+- ★ `blocked` 的来由：MiniMax 国际站协议的出口管制条款，管到「把客户数据交给终端用户」。
+  克里米亚、顿涅茨克、卢甘斯克是国家以下的地区，国家码判不出来（落在 UA / RU 里），这一层管不到。
+- ⚠ 按出口 IP 判。开着 VPN 的人按 VPN 出口算：境内用 Google Play 的人多半开着 VPN，会被判成海外；在海外挂中国线路的人会拿到 Seedance。
+- 本机开发可以用 `VIDEO_ZONE_FORCE` 钉死地区（见下「环境变量」）。钉的只是 zone，`country` 照实报；登录页不受它影响。
+
+### `GET /api/video/zone`
+
+- **免登录**（`optionalAuth`）：开机就要决定摆哪几档，在登录之前。带了 token 只用来按账号分限流桶。
+- **每一种回包都带 `Cache-Control: no-store`**（429 也带）：地区跟着出口 IP 走，开关 VPN 会在会话中途变。
+- **限流**约 60 次/分钟：登录的按账号，游客按 IP。超了回 429 `{ ok: false, code: "RATE_LIMIT_EXCEEDED" }` + `Retry-After`。
+
+回包（v1）：
+
+```
+{ ok: true, v: 1,
+  zone: "cn" | "intl" | "blocked",
+  country: "US",                      // 判不出 / Tor 是 ""
+  providers: ["ark", "minimax"],      // 或 ["minimax"]、[]
+  gate: "off" | "observe" | "on" }
+```
+
+| 字段 | 含义 |
+|---|---|
+| `zone` | 这一个请求按哪个地区算 |
+| `country` | 判出来的两位国家码；判不出 / Tor 是 `""` |
+| `providers` | 此刻对这个请求**放行**哪几家：`ark` = 火山方舟 Seedance，`minimax` = MiniMax（真人档与 H3 三档都算这一家，见下「H3 三档摆不摆」）。没配 key 的那家永远不报。**跟着 gate 走**（`videoRegion.offeredProviders` 一处算）：`on` = 这个地区按政策准用的 ∩ 这台服务器接着的；`off` / `observe` = 这台服务器接着的全部几家，不看地区 |
+| `gate` | 门禁此刻的档位。只作说明与排查 |
+| `v` | 回包形状的版本。加字段不升，改了已有字段的意思才升 |
+
+- ★ **App 只照 `providers` 摆档**，不要自己看 `gate` 决定放不放开。这样切 `off` 才是真急停：服务端切下去那一刻就一发都不拦了；
+  App 那一侧是**下一次探这个端点**时照常全摆（回到前台、定时重探、或收到一次 403 之后，见下「新版 App 该做的」）——
+  探到之前它还照上一次的结论藏着 Seedance（问不到时也退回本机上一次的结论）。藏着只是没摆出来，点不到也拦不到钱。
+  observe 期间新 App 也不会提前把海外的 Seedance 藏掉。
+- ★ MiniMax 连站一起判：这台服务器的 MiniMax 走中国站时，`gate` 为 `on` 的海外回包里没有 `minimax`。
+- **H3 三档摆不摆**（「草稿 / 高清 / 电影级」在 MiniMax 上的对标，V2，见「MiniMax H3（V2）出片」，2026-10-26）：
+  `providers` 里有 `minimax` **且** `/api/ark/health` 的 `minimaxV2` 为真，两位都真才摆。
+  - `minimax` 不分真人档与 H3：两种都打到这台服务器走的同一个站，门禁也按站判（`videoRegion.gatedProviderOf` 对 `minimax_video` 与 `minimax_v2`
+    回同一个答案），这个地区准不准用 MiniMax，两种的答案永远一样。
+  - `minimaxV2` 说的是这台服务器开没开 V2（`config/minimax.minimaxV2Enabled`，只在国际站）：是能力、不随地区变，所以在 health；
+    地区会在会话中途变，所以在这里。这个回包里**不再报一位** `minimaxV2` —— 同一件事两个端点各报一份，对不上时说不清该信哪一份。
+  - 这条规矩与出片那一发是同一个答案（`tests/minimaxV2.spec.js` 逐个核：站 × 门禁 × 地区 × 三档，两位都真 ⇔ `POST /api/minimax/v2/video` 真受理；
+    不真时那一发是 403 `REGION_UNAVAILABLE` 或 501 `MINIMAX_V2_OFF`，都在扣费之前）。
+  - 真人档只看 `providers` 有没有 `minimax`（没配 MiniMax 时它本来就不在里面）。H3 要多看一位，是因为 MiniMax 走**中国站**的服务器
+    有真人档、没有 V2：境内回包里照样有 `minimax`，只靠它摆 H3 就是三颗点下去必回 501 的键。
+- **能力位**：`GET /api/ark/health` 的 `videoZone: true`。App 先看到这一位再来问：老服务端上这条路不存在，
+  而 Capacitor 对未命中路径回 200 + index.html，判「有没有这个端点」只看能力位。
+  health 里**不放地区本身**：App 把 health 的结论记一整场会话，地区却会中途变。
+
+### 出片地区门禁
+
+**拦什么**（`videoRegion.gatedProviderOf`，改范围只改这一处）：
+
+- **Seedance 出视频**：`kind: "task"` 且 `tokens.isVideoGeneration` 为真。普通出片、带参考视频（r2v、白模化那一发）、样片两步都在内；Seed3D 不在内。
+  入口是 `POST /api/ark/contents/generations/tasks` 和白模化。
+- **MiniMax 出片**：真人档（`POST /api/minimax/video`，`kind: "minimax_video"`）与 H3（V2 出片，`kind: "minimax_v2"`，2026-10-26）都按「地区 + 站」判。
+  海外只准国际站，`blocked` 一家都不给。这台服务器没配 MiniMax 时不归门禁管（那一发在扣费之前就回 501 了）。
+  ⚠ 新加一种 MiniMax 出片的 kind 要同时加进 `gatedProviderOf`：漏了是零症状的 —— 门禁见「不归我管」就整个跳过，
+  受全面制裁的地区照样出片（`minimax_v2` 一度只进了 `tokens.isVideoGeneration`，2026-10-26 审核抓到；`tests/videoZone.spec.js` 拿 `isVideoGeneration` 反过来核）。
+- ★ 2026-10-26 先定的默认是「只拦 Seedance」，审核时补了 MiniMax 这一半。不判站的话，`blocked` 区 `/api/video/zone` 说「一家都没有」，
+  出片那一发却照收照转；「海外只能用 MiniMax 国际版」也只有连站一起判才兑现得了。
+
+**不拦**：
+
+- 出图（Seedream 单张、组图）、对话 / 推演 / 看帧 / AI 客服（豆包）、TTS、Seed3D、真人肖像授权（`/api/ark/portrait/*`）、Runway。范围等主人拍板，见下。
+- 只读的几条：任务轮询、MiniMax 取件、`/api/ark/video-tasks`、`/api/ark/task-charges/:taskId`、转存、`/api/ark/asset`。在途任务照常取得回来。
+  ⚠ 这一条只管「取得回来」。在**已经付过钱的片子上再发一发** Seedance 不算只读：样片第二步（升 1080p —— `resolveDraftFinal` 把它变成一个新的
+  Seedance 任务）、片段重拍、往后延长（r2v 带本人自己的成片，`resolveR2v` 的 `ownEdit` / `ownExtend`）都是新的出视频，归门禁管。
+  切 `on` 之后，海外用户在 observe 期间付过第一步的样片**升不了成片**（7 天有效期之内也不行），付过钱的成片也**重拍不了、延长不了**。
+  见下「切 on 之前」第 4 步与「等主人拍板」第 7 条。
+
+**怎么执行**（`arkGateway.regionGate` 是唯一实现；该不该拦只问 `videoRegion.regionDenial`，它是纯判定、不看 gate）：
+
+| `VIDEO_REGION_GATE` | 行为 |
+|---|---|
+| `off` | 什么都不做：不判、不记、连 `req` 都不看。这是急停开关 |
+| `observe`（缺省） | 判。该拦的记一行 `[region] would-deny at=… <kind> <model> zone=… country=… source=… user=…`，照常放行。同一个请求同一个模型只记一行 |
+| `on` | 判。该拦的记一行 `[region] deny …`，回下面那个 403。在扣钱之前：出视频那一发（创建任务）不发出去，一分不扣 |
+
+- ⚠ 「不发出去」只说**创建任务那一发**。`POST /api/ark/contents/generations/tasks` 上排在 `billedForward` 前面的两个中间件照常先跑：
+  样片第二步先向方舟查一次样片的状态（`resolveDraftFinal`，GET、不收钱），带参考视频的请求有几条分支先向 Cloudinary 查一次时长
+  （`resolveR2v`，不收钱，但占 Cloudinary Admin API 的全局配额）—— 都在 403 之前就出网了。钱不受影响；白模化、`/api/minimax/video` 与 `/api/minimax/v2/video`
+  被拦时一发都不出网。要连这两次查询都省掉，得在 `resolveDraftFinal` 之前加一道同样的 `regionGate` 预检（照白模化那样）—— 今天没加。
+- **挂点**：`chargedArkCall` 里「免费档门禁判定之后、扣钱（`billing.chargedCall`）之前」。
+  效果上**先于**套餐门禁：海外的免费用户听到的是地区，不是「去升级」。地区不给时，付了钱也用不了。
+- **白模化**（`POST /api/branch/templates/blockoutize`）先花一发看帧（豆包 chat，门禁不管），再发 Seedance 2.5 r2v。
+  所以它在套餐预检之前、看帧之前，用同一个 `regionGate` 预检一次。被拦时一发都不出网（不看帧、不问 Cloudinary），回同样的 403。
+  ★ 以后新加「先付一笔、再出视频」的路由，也要在第一笔付费调用之前这样预检。
+- **H3 出片**（`POST /api/minimax/v2/video`）的两道并发闸（按人 429 `IN_FLIGHT_LIMIT`、全站 503 `UPSTREAM_BUSY`）排在 `chargedArkCall` 前面，
+  所以它也在数并发之前用同一个 `regionGate` 预检一次（2026-10-26 审核）：池子满的时候，被拦的人听到的仍是地区，不是「过一会儿再点」。
+  ★ 同理：路由在 `chargedArkCall` 之前另有会拒人的闸时，预检排在那些闸之前 —— 别让真正的原因被另一句话盖住。
+- **管理员不豁免**：这是地区政策，不是计费。`billing.preAuthorize` 的免单是另一件事。
+- **地区从请求现算**：归门禁管的调用必须把 `req` 交给 `chargedArkCall`，不带直接抛（扣钱之前，500）。
+  不让每个调用点各算一个 zone 再传：N 处各算一遍就是 N 份实现，漏一处零症状。`tests/regionGate.spec.js` 扫源码，钉着每个调用点都带 `req`。
+
+**被拦的回包**（`/api/ark`、`/api/minimax/video`、`/api/minimax/v2/video`、白模化四处逐字相同）：
+
+```
+403 { ok: false, code: "REGION_UNAVAILABLE", reason: "region",
+      zone, providers, message, billed: false }
+```
+
+- `providers`：门禁开着时这个地区在这台服务器上**换得过去**的几家（政策 ∩ 接着的上游），可能是空的。
+  ⚠ 里面有 `minimax` 不等于**这一发**换得过去（见下 `message` 那四种）：它说的是这个地区有哪几家，不看这一发是什么、这个人是什么套餐。
+- 不写钱包头（余额没变）。
+- `message` 是英文在前、中文在后的一整行，**只在 MiniMax 真做得了这一发时才指人去换 MiniMax**。四种，挑哪一种只在
+  `videoRegion.regionDenial`（`swapVariant`）一处判（2026-10-26 最终审核：原来只看 `providers` 里有没有 `minimax`，
+  于是 MiniMax 做不了的几样、以及套餐用不了 MiniMax 的人，也都被指去换 MiniMax）：
+
+  | 哪一种 | 什么时候 | 那句话（英文 / 中文） |
+  |---|---|---|
+  | 换 MiniMax | 普通出片（含样片第一步），这个地区给得出 MiniMax，这台服务器上的 MiniMax 至少有一档对这个人开着（付过钱；或者 V2 开着、免费档里有 H3-Lite —— 国际站上海外的免费用户听到的就是这一句） | `Seedance is not available in your region; not accepted, not charged. Switch the model to MiniMax (update the app if none is usable). / 你所在的地区暂不提供 Seedance 出片：这一发没有受理、也没有扣费。请换成 MiniMax（没有能用的就先更新 App）。` |
+  | 要付费才有 MiniMax | 同上，但这台服务器上的 MiniMax **没有一档**对这个人开着：免费档门禁（`FREE_VIDEO_GATE`）开着、没付过钱，而 V2（H3）没开（只剩真人档，它只给付费用户）—— 指过去就是再吃一个 403 `PLAN_REQUIRED`。2026-10-26 起国际站上 V2 开着、H3-Lite 免费，这一句只剩兜底 | `… not accepted, not charged. MiniMax works here with a paid plan or after any top-up. / …这里能用的 MiniMax 要付费套餐，或充值过任意一次。` |
+  | 没有可换的 | 带参考视频（白模化、白模模板段、片段重拍、往后延长、素材参考）或样片第二步（升 1080p）：这几样我们在 MiniMax 上没接（真人档只做照片起拍；H3 今天不收参考视频、没有样片两步） | `Seedance is not available in your region, and this kind of video has no other model here; not accepted, not charged. / 你所在的地区暂不提供 Seedance 出片，这类片子（参考视频、模板、重拍、延长、样片定稿）也没有别的模型可换：这一发没有受理、也没有扣费。` |
+  | 一家都没有 | 这个地区在这台服务器上给不出 MiniMax（`blocked`，或 MiniMax 走中国站时的海外），或被拦的本来就是 MiniMax（真人档 / H3） | `Video generation is not available in your region; not accepted, not charged. / 你所在的地区目前没有可用的出片模型：这一发没有受理、也没有扣费。` |
+
+  - 「这台服务器上的 MiniMax 有没有一档对这个人开着」只在 `videoRegion.minimaxOpenTo` 一处判：挨个问真人档与 H3 价目表里的每一格（H3 只在 V2 开着时算，
+    `config/minimax.minimaxV2Enabled`），判据与出片那一发的套餐门禁同一个（`tokens.videoPlanDenial`）；管理员算付过钱（`billing.preAuthorize` 对管理员免套餐门禁）。
+    按「这一家有没有一档对你开着」判、不按「被拦的这一档在 MiniMax 上对标哪一档」判：话只说到供应商，哪几档点得动由 App 照 `freeVideo` 与钱包的 `paid` 画。
+    白模化的预检排在读钱包之前，不知道套餐 —— 它带着参考视频，本来就是「没有可换的」那一句。
+  - 「换 MiniMax」只说到「有这个替代」：真人档要照片起拍、H3 一段最多 5 张图，这一段能不能照搬过去要 App 那边看。
+  - 「换 MiniMax」那句的更新提示是「没有**能用的**就先更新 App」，不是「没有的话」（2026-10-26）：这句话只有老 App 原样显示，老 App 的 MiniMax
+    只有真人档，海外的免费用户看得见它、却是灰的「会员档」—— 只说「没有的话」，他们不会去更新、只会以为要付钱，而免费的 H3-Lite 在新版里。
+    付费用户与不知道套餐的听到的是同一句，不按套餐另拼。
+  - ★ 双语、英文在前、整句 ≤ 200 字、英文半句 ≤ 150 字（测试钉着）。老 App 不认这个 code，会把这句原样显示；
+    它的段卡截 240 字、步骤日志截 160 字，而被拦的正是默认英文界面的海外用户。
+  - ★ 不许有 ASCII 双引号、反斜杠、换行：老 App 用正则从原始回包文本里抠 `message`。
+  - ★ 不写原因（「政策原因」的出处还没落进文档）。
+  - 白模化在看帧**之后**才被拦的那一种（看帧之前的预检放行、两次之间有人把门禁从 `observe` 拨到 `on`；地区按请求记着、门禁档位每次现读）：
+    回包同样是 `REGION_UNAVAILABLE`，但 `billed: true` + `visionFrames`，`message` 是上面那句话两半各补一句「看帧那一笔已经花了、不退」
+    （`videoRegion.withDenialNote`，格式不变）。
+- ⚠ 「没有扣费」只说**这一发视频**。出片之前补画的设定帧、推演的方案都不归门禁管，各自已经结算过（见下「老 App」）。
+- 新版 App 该做的（截至 2026-10-26 **还没做**）：认 `code` 说自己的整句；钱上按「没扣」说（`ai/failCharge`）；收到它就重探 `/api/video/zone`。
+  **什么时候重探**（三处都要有：服务端切 `off` / 切 `on`、人开关 VPN，App 都只能在下一次探的时候才知道）：
+  ① 回到前台；② 定时重探（App 开着就隔一段时间问一次，间隔 App 侧定，别超过 60 次/分钟的限流）；③ 收到一次 `REGION_UNAVAILABLE` 之后。
+  问不到时退回本机上一次的结论 —— 所以切 `off` 之后，App 最晚在下一次重探时才把 Seedance 摆回来。
+
+### 环境变量
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `VIDEO_REGION_GATE` | `off` / `observe` / `on`，缺省 `observe` | 不计大小写和首尾空白。写了认不出的值按 `observe` 跑，**生产上启动自检拒绝启动**（以为开了、其实只在记日志）；非生产只告警 |
+| `VIDEO_ZONE_FORCE` | `cn` / `intl` / `blocked` | **只给本机开发**：把每个请求的出片地区钉死，在美国测境内、在国内测海外。**生产配了它（不管写什么）启动自检拒绝启动** —— 写 `cn` 就是对海外放开 Seedance，整道门禁失效。万一自检没跑到，生产运行时也不认它（按真实地区判，`console.error` 一次）。非生产写了认不出的值会告警，并当没配处理；生效时每个进程吼一次 `[video-region] VIDEO_ZONE_FORCE=…` |
+
+启动自检就是 `npm run check:config`（`config/preflight` → `videoRegion.collectVideoRegionProblems`），`deploy.sh` 部署前先跑它。
+
+**在服务器上手动拨这个开关**（切 `on`、急停切 `off`、切回 `observe`）—— 一步都别省：
+
+1. 改 `/var/www/ideahub-server/.env` 里那一行。
+2. `cd /var/www/ideahub-server && NODE_ENV=production npm run check:config`，**通过了才往下走**。
+3. 以 **deploy 用户** `pm2 reload ecosystem.config.js --update-env`。
+
+- ★ 为什么第 2 步不能省：每个 worker 启动时都跑同一份自检（`config/preflight.assertProductionConfig`），认不出的值直接 `process.exit(1)`。
+  `deploy.sh` 只在部署时先跑 `check:config`，手动拨开关不经过它 —— 写错一个字母（`of`、`onn`），重启之后**每个 worker 都起不来，整个 API 停掉**，
+  不只是这道门禁。`reload` 也挡不住坏值，挡在第 2 步。
+- ★ 用 `reload` 不用 `restart`：`restart` 先停掉全部 worker 再起（SECURITY_HARDENING.md 量过：约 3 秒 502）；`reload` 一个一个换、不停机。
+  不带 `--update-env` 读不到改过的 `.env`。
+- ★ 不许用 root：`pm2 reload <文件>` 在那个用户下没有这个进程时会**新建一份**，起出第二份平行的服务（AGENTS.md）。
+
+### 老 App 会怎样
+
+- 老 App 不读 `/api/video/zone`，照旧摆 Seedance 档。门禁 `on` 之后，海外用户点 Seedance 档，会在提交视频那一刻收到 403 那句双语的话；视频那一发不扣钱。
+- 真人档在 MiniMax 走国际站时照常能用；在途任务照常取回。
+- ⚠ 视频之前那几笔照扣：推演（对话 + 出图）、出片前补画设定帧都不归门禁管，各自先结算，到视频那一发才 403。
+  白付多少看 App 版本：**2.62 起**补画好的帧随失败留在这一段上（App `segmentGen.settleSegment` 把它们带在 `SegmentGenFailed.kept` 上，
+  `flowStore.genNode` 写回方案），重试不重画、不再收图钱；推演是另一步，重试视频不会再推演一次 —— 所以**每段白付一轮**。
+  **2.61 及更早**每重试一次都重画一遍、再收一遍图钱。
+- ⚠ 不分新老 App：切 `on` 之后，海外用户付过第一步的样片升不了成片、付过钱的成片重拍不了 / 延长不了（都是新的 Seedance 出视频，见上「不拦」那条 ⚠）。
+- ⚠ 海外的免费用户：新版 App（有 MiniMax H3 三档的那一版）有一档免费的 H3-Lite · 480P（「等主人拍板」第 8 条，2026-10-26 已定；在第 9 条有结论之前只能纯文字出片）；
+  老 App 没有 H3 档，只摆得出真人档（只给付费用户）—— 切 `on` 之后老 App 上的海外免费用户一档视频都没有，拒绝话叫他们换 MiniMax、没有能用的就先更新 App（他们看得见真人档，只是灰的，所以那句话不能只说「没有的话」）。
+
+### 切 `on` 之前
+
+1. 旁加载包用 App 发版脚本的 `--min-version-code`，把强制更新门槛抬到认得 `REGION_UNAVAILABLE`、会读 `/api/video/zone` 的那一版。Play 版等那一版铺开。
+2. `curl https://<host>/api/minimax/health`，确认 `region` 是 `intl`。MiniMax 走中国站的话，海外连 MiniMax 也没有，切 `on` 那一刻海外一家都不剩。
+3. 核地区判得对，两头分开核（理由见上「判据」那条 ⚠）：
+   - **拦少了**（伪造）：在中国以外、不是数据中心的网络上 `curl -s -H 'cf-ipcountry: CN' https://<host>/api/video/zone`，`country` 必须是真实国家、不是 `CN`；
+     不带这个头再跑一次，`country` 不能是空的。回了 `CN` 就不许切 `on`。
+   - **源站加固**（理由见上「判据」第二个 ⚠，做法在运维的私有笔记）：没做完不许切 `on`。
+   - **拦多了**：翻 observe 期间的 `[region] would-deny` 日志，看被判成海外的都是哪些国家、`source=` 是 `cf` 还是 `geoip`。
+     ★ 这份日志只记该拦的请求，伪造成 `CN` 的那一发一行都不会留 —— 它只能核「拦多了」，核不了「拦少了」。
+4. 想清楚已经付过钱的那几样（主人定，见下第 7 条）：切下去那一刻，海外用户付过第一步的样片升不了成片（7 天有效期内也不行），
+   付过钱的成片重拍不了、延长不了。不豁免的话至少提前说一声（公告 / 发版说明）。
+5. 海外的免费用户（见下第 8 条，2026-10-26 已定）：留给他们的是 MiniMax H3-Lite · 480P（在第 9 条有结论之前只能纯文字出片）。**V2（H3）出片路由要先上线、在国际站上开着**
+   （`config/minimax.minimaxV2Enabled`），App 那一版（带 H3 三档）要铺开 —— 否则切下去那一刻海外的免费用户一档视频都没有：
+   Seedance 被地区拦，真人档在免费档门禁（`FREE_VIDEO_GATE`，缺省开）开着时只给付费用户，而地区门禁排在套餐门禁之前。
+
+### 等主人拍板
+
+下面几件都按「先定的默认」写在代码里，每件只改一处：
+
+1. **拦的范围**：今天只拦出视频（Seedance 按地区，MiniMax 出片 —— 真人档与 H3 —— 按地区 + 站）。出图、对话 / 推演 / AI 客服、TTS、Seed3D、Runway 都不拦。
+   要全拦的话，海外这几样都没有替代供应商，得另起一期。改在 `videoRegion.gatedProviderOf`。
+2. **港澳台**：今天判境外，只给 MiniMax。改在 `utils/geo.CN_ZONE_COUNTRIES`。
+3. **真人肖像授权邀约**（`/api/ark/portrait/*`，把本人照片发给火山做可信素材）：今天海外不拦。
+4. **管理员 / 测试账号例外**：今天不豁免。在美国要测 Seedance，就用本机开发服务端 + `VIDEO_ZONE_FORCE=cn`。
+5. **什么时候切 `on`**：缺省 `observe`。前置见上「切 on 之前」。
+6. **受全面制裁的名单**：今天只有国家码认得出的 IR / CU / KP / SY 四个。改在 `utils/geo.BLOCKED_COUNTRIES`。
+7. **已经付过钱的片子上的后续出片**：样片第二步（升 1080p）、片段重拍、往后延长，今天与新出片一样拦 —— 切 `on` 之后海外用户付过第一步的样片
+   升不了成片（7 天有效期内也不行），付过钱的成片重拍不了、延长不了。要不要豁免这几样，或者至少切之前提前公告？
+   要豁免得在 `arkGateway.regionGate` 里按 `draftFinal` 与 `r2v.kind`（`ownEdit` / `ownExtend`）放行 —— 它今天已经收这两样，
+   但只拿来挑拒绝话（说「没有可换的」那一句），不放行。
+8. ~~**海外的免费用户**~~ —— **2026-10-26 已定**（主人授权替他定）：把 MiniMax H3-Lite · 480P（「草稿」在 MiniMax 上的对标）加进免费档，两仓一起
+   （服务端 `tokens.FREE_VIDEO_ALLOW`，App 档位表 `draft-mm` 的 `freeOk`）。真人档仍只给付费用户。海外的免费用户与 Google Play 的审核账号因此能出片（在第 9 条有结论之前只能纯文字）。
+   拒绝话跟着改：国际站上 V2 开着时，海外的免费用户被拦 Seedance 听到的是「换 MiniMax」（`videoRegion.minimaxOpenTo`），不再是「MiniMax 要付费套餐」。
+9. **H3 上的真人照片**（2026-10-26 审核提出，**没验过**）：服务端分不出图里是不是真人，H3 收不收真人照片要一次付费小验来定。
+   在有结论之前，免费版在 H3 上只能纯文字出片（2026-10-26 终审，`tokens.MINIMAX_V2_FREE_TEXT_ONLY`，见「MiniMax H3（V2）出片」→「免费档」）；
+   小验的做法与几种处置的取舍在运维的私有笔记。放开要小验做完、主人点头。
+
+测试：`tests/geo.spec.js`（判国家 / 地区）、`tests/videoZone.spec.js`（政策表、gate、拒绝话、端点）、
+`tests/regionGate.spec.js`（门禁接到钱上）、`tests/branchTemplate.spec.js`（白模化预检）。
 
 ## 真人肖像授权（方舟可信素材）
 

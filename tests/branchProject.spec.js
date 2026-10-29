@@ -162,6 +162,31 @@ describe("工坊工程：写入不变量", () => {
     }).expect(400);
   });
 
+  test("P1 canvas 里有 MiniMax H3 的成片地址 → 400（官方说有时效；2026-10-26 前这道门只认方舟、把它放了过去）", async () => {
+    const author = await registerUser();
+    const videoId = await publish(author.token);
+    const h3 = "https://video-product.cdn.minimax.io/h3-480p/2000/01/01/test/100000000000001-1-0000000000000000_aigc.mp4";
+    const res = await put(author.token, videoId, {
+      videoRevision: 0,
+      canvas: { v: 1, flow: { nodes: [{ videoUrl: h3 }] } },
+    }).expect(400);
+    expect(JSON.stringify(res.body)).toMatch(/临时链接/);
+    expect(await BranchProject.countDocuments({ video: videoId })).toBe(0);
+    // 对照：主机名只是以它开头的别的域、我们自己的图床 → 照常落库（这道门只认那一个主机）
+    await put(author.token, videoId, {
+      videoRevision: 0,
+      canvas: {
+        v: 1,
+        flow: {
+          nodes: [
+            { videoUrl: "https://video-product.cdn.minimax.io.example.com/a.mp4" },
+            { videoUrl: "https://res.cloudinary.com/demo/video/upload/v1/ideahub/branch-videos/a.mp4" },
+          ],
+        },
+      },
+    }).expect(200);
+  });
+
   test("P2 单份画布超过 2MB → 400", async () => {
     const author = await registerUser();
     const videoId = await publish(author.token);

@@ -109,3 +109,55 @@ describe("完整形状的草稿 × 三档可见性", () => {
     expect("poster" in unlisted.body.video.segments[0]).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 发布时的兜底转存（controller 的 transferVideo）：段的 videoUrl 还挂在**上游的临时成片**上时，下载下来存进图床再落库。
+// ★ 2026-10-26 审核：H3 上线时这里从「只认方舟」换成了 videoAsset.isUpstreamTempVideoUrl，可全仓只有 minimaxV2.spec 用到 H3 的 CDN 地址、
+//   测的又只是那个函数本身与产物代理 / 转存端点 —— 把 controller 改回 isArkVideoUrl，所有用例照样全绿，H3 的成片就原样发布、过几天作品变黑。
+//   这一组钉的是**发布这条路**真的去搬了它。
+// ★ 不出网：fetch 换成间谍（只认那两条成片地址），图床的上传流换成假的（回一条 Cloudinary 地址）；Cloudinary 上的地址原样保留、不下载。
+describe("发布时的兜底转存：上游的临时成片（方舟 / MiniMax H3）会被下载并存进图床", () => {
+  const { cloudinary } = require("../src/config/cloudinary");
+  const H3_URL = "https://video-product.cdn.minimax.io/h3-480p/2000/01/01/test/100000000000001-1-0000000000000000_aigc.mp4";
+  const ARK_URL = "https://ark-content.tos-cn-beijing.volces.com/doubao-seedance/x/out.mp4";
+
+  test("H3 的成片地址 → 下载 + 转存，落库的是图床地址；方舟的同样；图床上的原样留着、不下载", async () => {
+    const fetched = [];
+    const fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u === H3_URL || u === ARK_URL) return new Response("mp4-bytes", { status: 200, headers: { "content-type": "video/mp4" } });
+      throw new Error(`测试里没有为这个地址准备回应：${u}`);
+    });
+    const uploads = [];
+    const uploadSpy = jest.spyOn(cloudinary.uploader, "upload_stream").mockImplementation((opts, cb) => ({
+      end: (buf) => {
+        uploads.push({ opts, bytes: Buffer.from(buf).toString() });
+        cb(null, { secure_url: `https://res.cloudinary.com/demo/video/upload/v1/${opts.folder}/${opts.public_id}.mp4` });
+      },
+    }));
+    try {
+      const { token } = await registerUser();
+      const draft = richDraft({ visibility: "public" });
+      draft.segments = [
+        { ...seg(1), videoUrl: H3_URL },
+        { ...seg(2), videoUrl: ARK_URL },
+        seg(3), // 已经是图床地址
+      ];
+      const res = await request(app).post("/api/branch/videos").set("Authorization", `Bearer ${token}`).send(draft);
+      expect(res.status).toBe(201);
+      const urls = res.body.video.segments.map((s) => s.videoUrl);
+      expect(urls[0]).toMatch(/^https:\/\/res\.cloudinary\.com\/demo\/video\/upload\/v1\/ideahub\/branch-videos\//);
+      expect(urls[1]).toMatch(/^https:\/\/res\.cloudinary\.com\/demo\/video\/upload\/v1\/ideahub\/branch-videos\//);
+      expect(urls[2]).toBe(seg(3).videoUrl);
+      expect(JSON.stringify(res.body.video)).not.toMatch(/minimax\.io|volces\.com/);
+      // 两条上游地址各下载一次、各存一次（resource_type video），图床那条一个字节都没碰
+      expect(fetched.sort()).toEqual([ARK_URL, H3_URL].sort());
+      expect(uploads).toHaveLength(2);
+      expect(uploads.every((u) => u.opts.resource_type === "video" && u.bytes === "mp4-bytes")).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+      uploadSpy.mockRestore();
+    }
+  });
+});

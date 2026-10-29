@@ -1,7 +1,6 @@
 //auth.controller.js
 
 const bcrypt = require("bcryptjs");
-const geoip = require("geoip-lite");
 const { isRealSmsConfigured } = require("../services/sms.service");
 const User = require("../models/User");
 const AppError = require("../utils/AppError");
@@ -9,6 +8,7 @@ const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
 const { normalizeNewUsername, CI_COLLATION } = require("../utils/username");
 const { grantSignupBonus } = require("../services/points.service");
+const { countryOf } = require("../utils/geo");
 
 function serializeAuthUser(user) {
   return {
@@ -33,46 +33,29 @@ function parseBooleanEnv(value) {
   return null;
 }
 
-// 国家码 → region：CN→CN，其它非空→GLOBAL，空/占位(XX/T1)→UNKNOWN。
-function regionFromCountry(rawCountry) {
-  const country = String(rawCountry || "").trim().toUpperCase();
-  if (!country || country === "XX" || country === "T1") {
-    return { country: "", region: "UNKNOWN" };
-  }
+// 国家码 → region：CN→CN，其它非空→GLOBAL，空→UNKNOWN。
+// ★ 入参是 utils/geo.countryOf 归一过的国家码（两位大写；XX / T1 / 写法不对已经是 ""），
+//   「什么算没有国家」只在那一处判，这里不再抄一份。
+function regionFromCountry(country) {
+  if (!country) return { country: "", region: "UNKNOWN" };
   if (country === "CN") return { country, region: "CN" };
   return { country, region: "GLOBAL" };
 }
 
 // 判定请求方所在地区（用于登录界面按地区切换：CN→微信/QQ 套，其它→Google/GitHub 套）。
 //
-// 两级来源，可信度从高到低：
-// 1) 可信边缘/CDN 注入的国家头（Cloudflare cf-ipcountry / Vercel / GAE）—— 经可信代理设置，最权威；
-//    生产在阿里云直连、暂无这类头时它们都为空，落到第 2 步。
-// 2) geoip-lite 按【客户端 IP】自查国家 —— app.js 已 trust proxy=1，故 req.ip 是 nginx
-//    X-Forwarded-For 里的真实客户端 IP。私网/本地/库中查不到的 IP → UNKNOWN。
+// ★ 国家从哪来只问 utils/geo.countryOf（cf-ipcountry 优先、geoip 按 clientIp 兜底；出片地区门禁用的是同一个判定，
+//   铁律六）。2026-10-26 收口时这里变了三处，都只在**不带 cf-ipcountry** 或被判成 Tor 的请求上显现：
+//   ① 不再认 x-vercel-ip-country / x-country-code / x-appengine-country —— 我们的链路上没有任何一跳会覆盖它们，
+//      全是客户端自己写的；
+//   ② geoip 兜底改用 rateLimit.clientIp（X-Real-IP 优先），不再用 req.ip（取 IP 的顺序只有那一处实现）；
+//   ③ Cloudflare 判成 Tor（T1）时不再拿出口节点的 IP 去查 geoip —— 回 UNKNOWN。
+//   ①② 可能把 CN / 非 CN 的判定翻过来（也就翻了 oauthEnabled）：原来自报 CN 或 req.ip 查到 CN 的，现在按
+//   clientIp 查到哪里算哪里。经 Cloudflare 来的请求带 cf-ipcountry、走不到这两步（这一点未在生产核实，见 geo.js）。
 //
-// ⚠️ 该判定只驱动【展示哪套登录按钮】这类 UX，不是安全边界（两套 UI 最终走的是同一批鉴权后端，
-// 微信/QQ 目前还是占位）。故不必对 IP 伪造做强校验；真要做地区合规限制须在可信边缘层校验。
+// ⚠️ 该判定在这里只驱动【展示哪套登录按钮】这类 UX，不是安全边界（两套 UI 最终走的是同一批鉴权后端）。
 function detectRegion(req) {
-  const countryHeader =
-    req.headers["cf-ipcountry"] ||
-    req.headers["x-vercel-ip-country"] ||
-    req.headers["x-country-code"] ||
-    req.headers["x-appengine-country"];
-  const headerCountry = String(countryHeader || "").trim().toUpperCase();
-  if (headerCountry && headerCountry !== "XX" && headerCountry !== "T1") {
-    return regionFromCountry(headerCountry);
-  }
-
-  try {
-    // 去掉 IPv4-mapped IPv6 前缀（::ffff:1.2.3.4 → 1.2.3.4），否则 geoip 查不到。
-    const ip = String(req.ip || "").trim().replace(/^::ffff:/i, "");
-    const geo = ip ? geoip.lookup(ip) : null;
-    if (geo && geo.country) return regionFromCountry(geo.country);
-  } catch {
-    // geoip 查询异常绝不能影响登录能力探测，静默回退 UNKNOWN。
-  }
-  return { country: "", region: "UNKNOWN" };
+  return regionFromCountry(countryOf(req).country);
 }
 
 function getAvailableOauthProviders() {

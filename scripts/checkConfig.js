@@ -33,7 +33,12 @@ console.error(`
   OTP_PEPPER     —— openssl rand -base64 32   （换了会让已发出的验证码全部失效）
   SMS_PROVIDER   —— 真实短信通道标识，不能是 dev
   CORS_ORIGINS   —— https://ideahubs.org,https://www.ideahubs.org
-改完记得 pm2 restart ideahub-server --update-env（不带 --update-env 不会重读 .env）
+改完先再跑一遍 NODE_ENV=production npm run check:config，通过了再以 deploy 用户在 /var/www/ideahub-server 下
+  pm2 reload ecosystem.config.js --update-env
+（不带 --update-env 不会重读 .env；别用 restart —— 它先停掉全部 worker；别用 root —— pm2 reload 在 root 下会新建第二份服务）
 `);
+// ★ 2026-10-26 改的：原来这里教的是 `pm2 restart ideahub-server --update-env`。每个 worker 启动时都跑同一份自检
+//   （config/preflight.assertProductionConfig，认不出的值 exit(1)），所以「没过自检就重启」= 每个 worker 都起不来、整个 API 停掉；
+//   restart 还会先停掉全部 worker（约 3 秒 502，SECURITY_HARDENING.md），而 deploy.sh 用的一直是 reload。
 
 process.exit(1);
