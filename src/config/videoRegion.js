@@ -19,8 +19,8 @@
  *   · 「这一发按地区该不该拦、拦了说什么」—— 本文件 regionDenial（纯判定，不看 gate，见它的注释）。
  *
  * ★ 2026-10-26 先定下的默认（**等主人拍板**，都写成能改的一处）：
- *   ① 只拦**出视频**：Seedance（方舟）按地区拦；MiniMax 真人档按「地区 + 站」拦 —— 海外只准国际站，
- *     受全面制裁的地区一家都不给（gatedProviderOf）。出图（Seedream）、对话 / 推演 / 客服（豆包）、TTS、Seed3D、
+ *   ① 只拦**出视频**：Seedance（方舟）按地区拦；MiniMax 出片（真人档 `minimax_video`、H3 的 V2 `minimax_v2`）按「地区 + 站」拦 ——
+ *     海外只准国际站，受全面制裁的地区一家都不给（gatedProviderOf）。出图（Seedream）、对话 / 推演 / 客服（豆包）、TTS、Seed3D、
  *     真人肖像授权邀约（arkPortrait）、Runway 都**不拦** —— 海外要全拦的话这几样都没有替代供应商，要另起一期。
  *     ⚠ MiniMax 那一半是 2026-10-26 审核补的（原来只认 Seedance）：不拦的话 blocked 区「一家都不给」只是 App 上看不见、
  *       服务端照收照转（/api/video/zone 说没有，出片那一发却放行 —— 正是本文件要防的「一处说能用、一处说不能用」）；
@@ -37,8 +37,10 @@
  *         observe 的 would-deny 日志只记该拦的，伪造成 CN 的那一发一行都不留，核不了这一条；
  *       · 做完源站那一道加固（细节在运维的私有笔记，utils/geo.countryOf 的 ⚠ 点了名）；
  *       · 已经付过钱的片子上的后续出片（样片第二步、片段重拍、往后延长）今天照拦，豁不豁免等主人定（api-contract「等主人拍板」第 7 条）；
- *       · 知道切下去之后**海外的免费用户一档视频都没有**：免费档（草稿、极速）全是 Seedance，真人档（MiniMax）在免费档门禁开着时
- *         只给付费用户，而地区门禁排在套餐门禁之前 —— 要不要给海外免费用户留一档等主人定（api-contract「等主人拍板」第 8 条）。
+ *       · 海外的免费用户（2026-10-26 定，api-contract「等主人拍板」第 8 条已定）：免费档里加了 MiniMax H3-Lite · 480P
+ *         （「草稿」在 MiniMax 上的对标，tokens.FREE_VIDEO_ALLOW），所以切 on 之后海外的免费用户还有这一档 ——
+ *         **前提是 V2 出片在这台服务器上开着**（config/minimax.minimaxV2Enabled：只在国际站）。没开的话海外免费用户一档都没有
+ *         （Seedance 被地区拦、真人档只给付费用户），拒绝话也跟着说「MiniMax 要付费」（swapVariant）。
  *   ④ blocked（受全面制裁的四国）：Seedance 与 MiniMax 出视频都拦（门禁 on 时）；出图 / 对话等按 ① 不拦。
  *
  * ★ 本文件顶层只 require 纯配置（tokens / minimax / logSafe 都不碰网络、不连库）：`npm run check:config`
@@ -47,13 +49,16 @@
  *   后者另有一个理由：arkGateway 顶层 require 本文件做门禁（regionGate），顶层互相 require 就是半初始化的模块。
  */
 
-const { isVideoGeneration, videoPlanDenial, MINIMAX_REAL_MODELS } = require("./tokens");
-const { minimaxRegion } = require("./minimax");
+const { isVideoGeneration, videoPlanDenial, MINIMAX_REAL_MODELS, MINIMAX_SEC_COST } = require("./tokens");
+const { minimaxRegion, minimaxV2Enabled } = require("./minimax");
 const { logSafe } = require("../utils/logSafe");
 
 /**
  * 出片的上游：准不准用按这个粒度判（MiniMax 连站一起算）。
  *   provider —— 下发给 App 的名字：App 只管「哪家」（"ark" = 火山方舟 Seedance、"minimax"），走哪个站是服务端的事；
+ *               "minimax" 同时管真人档（minimax_video）与 H3 三档（minimax_v2）：两种都打到这台服务器走的那一个站、按同一个站判
+ *               （gatedProviderOf），拆成两个名字就是同一个答案报两遍。H3 三档摆不摆，App 再看 /api/ark/health 的 minimaxV2
+ *               （开没开 V2 是这台服务器的能力，判据只在 config/minimax.minimaxV2Enabled；契约见 routes/videoZone.routes 文件头）；
  *   live     —— 这台服务器此刻接着的是不是这个上游。只转问各自唯一的判据（铁律六），这里不再读 env：
  *               方舟问 arkGateway.arkConfigured（用到才 require，理由见文件头）；MiniMax 问 config/minimax.minimaxRegion
  *               —— 一台服务器的 MiniMax 只走一个站，中国站与国际站是两套账号、两个域名。
@@ -208,8 +213,13 @@ function requestZone(req) {
  *   · kind 'task' 且是 Seedance 出视频 → "ark"。「是不是 Seedance 视频」直接问 tokens.isVideoGeneration
  *     （那一处判据，不在这里抄一份 VIDEO_MULT 的查法）：普通出片、带参考视频（r2v / 白模化）、样片两步都在内；
  *     Seed3D（kind 'task' 但不在 VIDEO_MULT）不在内。
- *   · kind 'minimax_video'（真人档）→ "minimax:<这台服务器走的站>"。没配 MiniMax 时回 null：
- *     minimax.routes 在扣费之前就回 501 了，这一发根本到不了钱上，不归这道闸管。
+ *   · kind 'minimax_video'（真人档）与 'minimax_v2'（H3 的 V2 出片，2026-10-26）→ "minimax:<这台服务器走的站>"。
+ *     两种都按「这一发打到哪个站」判（一台服务器的 MiniMax 只走一个站，V2 也发到 config/minimax 那一个 base）——
+ *     V2 只在国际站开（minimax.minimaxV2Enabled），走中国站的服务器上 V2 路由在扣费之前就 501 了，判成 minimax:cn 也不会错拦谁。
+ *     没配 MiniMax 时回 null：路由在扣费之前就回 501 了，这一发根本到不了钱上，不归这道闸管。
+ *     ⚠ 新加一种 MiniMax 出片的 kind（tokens.isVideoGeneration 认它的那一刻）要同时加在这里：
+ *       漏了是零症状的 —— regionGate 见 null 就整个跳过（不拦、不记 would-deny、没带 req 也不抛），受全面制裁的地区照样出片
+ *       （2026-10-26 审核抓到：minimax_v2 一度只进了 isVideoGeneration、没进这里）。tests/videoZone.spec 拿 isVideoGeneration 反过来核。
  *   · 出图 / 对话 / TTS / Runway 都不在内。范围等主人拍板（见文件头 ①）—— 改范围只改这一处。
  *
  * ★★ 有付费步骤排在出视频**之前**的路由，要在**第一笔付费调用之前**自己预检一次（2026-10-26 审核）：
@@ -219,10 +229,13 @@ function requestZone(req) {
  *   任何付费调用之前，调**同一个执行** arkGateway.regionGate 预检（参数与 chargedArkCall 里那一处相同：req / user / kind /
  *   model / at，带参考视频的再带 r2v —— 拒绝话按它挑句子；on 拦、回 billed:false；observe 只记 would-deny；off 不管）——
  *   别在路由里照着 regionDenial + gateMode 再拼一份执行。白模化已经这么接了；以后新加「先付一笔、再出视频」的路由同理。
+ *   ★ 同一个理由的另一种：路由在 chargedArkCall **之前**另有会拒人的闸（不是付费，是「过一会儿再试」那类），也要在那些闸之前预检 ——
+ *   H3 出片（minimax.routes 的 POST /v2/video）的两道并发闸排在 chargedArkCall 前面，池子满的时候受制裁地区的人听到的是
+ *   「MiniMax 忙，过一会儿再点」，App 只在收到 REGION_UNAVAILABLE 之后才重探地区，于是叫人重试一件永远不会成的事（2026-10-26 审核）。
  */
 function gatedProviderOf(kind, model) {
   if (kind === "task" && isVideoGeneration(kind, model)) return "ark";
-  if (kind === "minimax_video") {
+  if (kind === "minimax_video" || kind === "minimax_v2") {
     const site = minimaxRegion();
     return site ? `minimax:${site}` : null;
   }
@@ -233,22 +246,43 @@ function gatedProviderOf(kind, model) {
  * 被拦的这一发，拒绝话该不该指人去换 MiniMax —— **只问这一处**（2026-10-26 最终审核）。
  * 原来只看 providers 里有没有 minimax：海外每一发被拦的 Seedance 都说「换成 MiniMax」，包括 MiniMax 根本做不了的那几样，
  * 以及这个人的套餐用不了 MiniMax 的时候 —— 照着做的人换过去还是走不通，等于指了一条死路。
- *   "none"     —— 这个地区在这台服务器上给不出 MiniMax（providers 里没有），或被拦的本来就是 MiniMax（真人档按站拦）；
- *   "noAlt"    —— 给得出 MiniMax，但这一发是它做不了的：带参考视频（r2v —— 白模化、白模模板段、片段重拍、往后延长、素材参考）、
- *                 样片第二步（draftFinal，升 1080p）。真人档只做照片起拍的图生视频，这几样在 MiniMax 上没有对应的做法；
- *   "paidOnly" —— 普通出片、MiniMax 做得了，但这个人的套餐用不了真人档（免费档门禁开着时真人档只给付费用户，判据只在
- *                 tokens.videoPlanDenial）。只说「换 MiniMax」的话，他换过去就是 403 PLAN_REQUIRED，同一面墙撞两次；
- *   "swap"     —— 普通出片、MiniMax 做得了、套餐也开着（或 paid 没传 = 不知道套餐，见 regionDenial 的 paid）。
- * ★ 样片第一步（draft:true）按普通出片算：换到真人档就是不走样片、直接出片，做得出来。
- * ★ 真人档只收照片起拍：这一段能不能照搬过去要 App 那边看（服务端不知道这一段有没有照片），这句话只说到「有这个替代」。
+ *   "none"     —— 这个地区在这台服务器上给不出 MiniMax（providers 里没有），或被拦的本来就是 MiniMax（真人档 / H3 按站拦）；
+ *   "noAlt"    —— 给得出 MiniMax，但这一发是我们在 MiniMax 上没接的：带参考视频（r2v —— 白模化、白模模板段、片段重拍、往后延长、素材参考）、
+ *                 样片第二步（draftFinal，升 1080p）。真人档只做照片起拍；H3 的 V2 出片今天不收参考视频（tokens.MINIMAX_V2_ITEM_KEYS
+ *                 里没有 video_url）、也没有样片两步 —— 这几样在 MiniMax 上没有对应的做法；
+ *   "paidOnly" —— 普通出片、MiniMax 做得了，但这台服务器上的 MiniMax **没有一档**对这个人开着（minimaxOpenTo；判据与出片那一发
+ *                 的套餐门禁同一个 tokens.videoPlanDenial）。只说「换 MiniMax」的话，他换过去就是 403 PLAN_REQUIRED，同一面墙撞两次；
+ *   "swap"     —— 普通出片、MiniMax 做得了、至少有一档对他开着（或 paid 没传 = 不知道套餐，见 regionDenial 的 paid）。
+ * ★ 样片第一步（draft:true）按普通出片算：换到 MiniMax 就是不走样片、直接出片，做得出来。
+ * ★ 这一段能不能照搬过去要 App 那边看（真人档要照片起拍；服务端不知道这一段有没有照片、几张参考图），这句话只说到「有这个替代」。
  */
 function swapVariant({ upstream, providers, r2v, draftFinal, paid }) {
   if (upstream !== "ark" || !providers.includes("minimax")) return "none";
   if (r2v || draftFinal) return "noAlt";
   if (paid === null || paid === undefined) return "swap";
-  // 「真人档对这个人开不开」与 chargedArkCall 里那道套餐门禁同一个判据（铁律六）；minimax_video 那一支不看具体型号
-  const planDenied = videoPlanDenial({ paid: paid === true, kind: "minimax_video", model: MINIMAX_REAL_MODELS[0] });
-  return planDenied ? "paidOnly" : "swap";
+  return minimaxOpenTo(paid === true) ? "swap" : "paidOnly";
+}
+
+/**
+ * 这台服务器上的 MiniMax 出片有没有**哪一档**对这个人开着 —— swapVariant 挑「换 MiniMax」还是「MiniMax 要付费」只问它。
+ * 判据与出片那一发的套餐门禁是同一个（tokens.videoPlanDenial，铁律六），挨个问这台服务器给得出的几种 MiniMax 出片：
+ *   · 真人档（minimax_video，海螺 2.3）：videoPlanDenial 那一支不看具体型号，问一个在册的就够；
+ *   · H3（minimax_v2）：只在 V2 开着时算（config/minimax.minimaxV2Enabled —— V2 路由开不开问的是同一个），
+ *     价目表（tokens.MINIMAX_SEC_COST）里的每一格挨个问。2026-10-26 起 H3-Lite · 480P 在免费档里（tokens.FREE_VIDEO_ALLOW），
+ *     所以国际站上海外的免费用户被拦 Seedance 时听到的是「换 MiniMax」。
+ * ★ 2026-10-26 审核点名的就是这里：原来只问真人档。H3-Lite 免费之后，海外的免费用户被告知「MiniMax 要付费套餐」，
+ *   而他们明明有一档免费的 —— 话把人往付钱那边推。
+ * ★ 按「这家有没有一档对你开着」判，不按「被拦的这一档在 MiniMax 上对标哪一档」判：拒绝话只说到供应商（换成 MiniMax），
+ *   哪几档点得动由 App 照 /api/ark/health 的 freeVideo 与钱包的 paid 画（会员档置灰 + 去升级）；
+ *   Seedance 档位 → MiniMax 档位的对标是 App 档位表的事，服务端不再抄一份。
+ * @param {boolean} paid 按套餐门禁算这个人算不算付费用户（regionDenial 的 paid，已经排除了「不知道」）
+ */
+function minimaxOpenTo(paid) {
+  if (!videoPlanDenial({ paid, kind: "minimax_video", model: MINIMAX_REAL_MODELS[0] })) return true;
+  if (!minimaxV2Enabled()) return false;
+  return Object.entries(MINIMAX_SEC_COST).some(([model, row]) =>
+    Object.keys(row).some((resolution) => !videoPlanDenial({ paid, kind: "minimax_v2", model, resolution })),
+  );
 }
 
 /** 拒绝话里中英两半之间的分隔（不换行，理由见 DENIAL_TEXT） */
@@ -268,11 +302,16 @@ const DENIAL_SEP = " / ";
  * ★ 只说「这一发」没受理、没扣费：出片之前补画的帧、推演的方案各自已经结算过，这句话不替它们打包票。
  * ★ 不写原因（「政策原因」的出处还没落进文档，见文件头）。
  * ★ paidOnly 说「付费套餐，或充值过任意一次」：与 tokens.isPaidUser 的口径一致（付费套餐**或**付过任何一笔钱）。
+ *   2026-10-26 起它只在「这台服务器上的 MiniMax 没有一档对这个人开着」时才说（minimaxOpenTo）：国际站上 V2 开着、
+ *   免费档里有 H3-Lite 时，海外的免费用户听到的是 swap 那一句。
  */
 const DENIAL_TEXT = Object.freeze({
+  // ★ 「没有能用的就先更新 App」，不是「没有的话」（2026-10-26，H3-Lite 进免费档之后）：这句话只有老 App 会原样显示，
+  //   而老 App 的 MiniMax 只有真人档 —— 海外的免费用户在那里看得见真人档、却是灰的「会员档」。原来只说「没有的话」，
+  //   他们看见了就不会去更新，只会以为要付钱；免费的 H3-Lite 在新版 App 里。整句 199 字，贴着 200 的上限（测试钉着）。
   swap: Object.freeze({
-    en: "Seedance is not available in your region; not accepted, not charged. Switch the model to MiniMax (update the app if it is missing).",
-    zh: "你所在的地区暂不提供 Seedance 出片：这一发没有受理、也没有扣费。请换成 MiniMax（没有的话先更新 App）。",
+    en: "Seedance is not available in your region; not accepted, not charged. Switch the model to MiniMax (update the app if none is usable).",
+    zh: "你所在的地区暂不提供 Seedance 出片：这一发没有受理、也没有扣费。请换成 MiniMax（没有能用的就先更新 App）。",
   }),
   paidOnly: Object.freeze({
     en: "Seedance is not available in your region; not accepted, not charged. MiniMax works here with a paid plan or after any top-up.",
@@ -324,7 +363,7 @@ function withDenialNote(message, note) {
  * ★ r2v / draftFinal / paid **只影响说哪一句**（swapVariant），不影响拦不拦：拦不拦只看政策表。
  *
  * @param {object} o
- * @param {string} o.kind  priceOf 的 kind（task / image / chat / minimax_video …）
+ * @param {string} o.kind  priceOf 的 kind（task / image / chat / minimax_video / minimax_v2 …）
  * @param {string} o.model
  * @param {"cn"|"intl"|"blocked"} [o.zone] 归这道闸管的调用**必填**（一般是 requestZone(req).zone），漏传 / 认不出直接抛；
  *   不归它管的调用（gatedProviderOf 回 null）不看它

@@ -25,7 +25,11 @@ const mongoose = require("mongoose");
 const KEEP_AFTER_SETTLE_MS = 30 * 24 * 60 * 60 * 1000;
 
 const STATES = ["open", "claimed", "refunded", "settled", "skipped", "lost"];
-// video      Seedance 普通出片（含 r2v、返修、延长、素材参考 —— 都走 /api/ark 代理那一条）
+// video      普通出片：Seedance（含 r2v、返修、延长、素材参考 —— 都走 /api/ark 代理那一条），
+//            以及 MiniMax H3（provider minimax + api v2，2026-10-26，海外的「草稿 / 高清 / 电影级」）。
+//            ★ H3 记成 video 而不是 minimax：kind 说的是「哪一种生成」（站内通知照它说「一段视频没出成」），
+//              minimax 那一格说的是真人档（老 App 照它说「一段真人档视频没出成」—— 拿来记 H3 就是说错话）。
+//              哪一家、哪一版协议看 provider 与 api，别拿 kind 判。
 // draft      电影级样片第一步（draft:true，480p）
 // draftFinal 电影级样片第二步（样片 → 1080p 成片）。★ 两步是两笔独立的钱，各退各的（第一步成了、第二步失败只退第二步）
 // 3d         Seed3D 图生 3D
@@ -60,10 +64,23 @@ const genTaskChargeSchema = new mongoose.Schema(
     memo: { type: String, default: "", maxlength: 200 },
     /** MiniMax 的任务绑区域（cn / intl）：清扫器只能回同一个站、用同一把 key 去问 */
     region: { type: String, default: undefined, maxlength: 8 },
+    /**
+     * MiniMax 的哪一版接口建的这一发（2026-10-26）：`"v2"` = H3（`/v2/video_generation`，状态是小写的 queued / running /
+     * succeeded / failed / cancelled，查询走 `/v2/query/video_generation/{id}`）；**没有这一位 = v1**（真人档海螺：Success / Fail，
+     * `/v1/query/video_generation?task_id=`）—— 判否定：这一位上线之前的每一行都是 v1，老行不用回填。方舟的行没有它。
+     * ★★ 为什么必须落库（2026-10-26 设计审核）：结局怎么认（taskRefund.verdictOf）、清扫器去哪个端点问（queryUpstream）
+     *   都按它分 —— 不记的话 V2 的 failed 在 v1 的判据里认不出、清扫器拿 V2 的任务号去问 v1 端点，H3 明说失败也永远不退钱。
+     *   mongoose 缺省 strict：schema 里没有这一位，recordCharge 传进来的 api 会被**悄悄丢掉**，所以它必须写在这里。
+     */
+    api: { type: String, enum: ["v2"], default: undefined },
     state: { type: String, enum: STATES, default: "open" },
     /** skipped / lost 的原因（给人查的，不上屏）：free / zero / user_gone / refund_off / too_old */
     note: { type: String, default: "", maxlength: 60 },
-    /** 上游最后一次明说的状态与错误码（failed 的 OutputVideoSensitiveContentDetected 之类），对账与客服用 */
+    /**
+     * 上游最后一次明说的状态与错误码（failed 的 OutputVideoSensitiveContentDetected 之类），对账与客服用。
+     * ★ 2026-10-26 起 H3 的两道并发闸也读 upstreamStatus（taskRefund.v2RunningFilter）：MINIMAX_FAIL_REFUND=off 时
+     *   上游明说失败的行不动钱、留 open，只在这里记下上游的话 —— 闸靠它才不把这几发算成「还在跑」。
+     */
     upstreamStatus: { type: String, default: "", maxlength: 32 },
     upstreamCode: { type: String, default: "", maxlength: 80 },
     /** 实退多少（refunded 才有） */
@@ -94,6 +111,8 @@ genTaskChargeSchema.index({ provider: 1, taskId: 1 }, { unique: true });
 // 清扫器：到点该问的 open 行 / 搁浅的 claimed 行 / 收尾没做完的 refunded 行
 genTaskChargeSchema.index({ state: 1, nextCheckAt: 1 });
 genTaskChargeSchema.index({ state: 1, notified: 1 });
+// MiniMax H3 的全站并发闸（taskRefund.minimaxV2InFlight，V2 出片每一发扣费之前数一次）：只索引 V2 的行，别的行一行都不进这个索引
+genTaskChargeSchema.index({ api: 1, createdAt: 1 }, { partialFilterExpression: { api: { $exists: true } } });
 // 只回收结完了的行（open / claimed 没有 purgeAt，TTL 线程不碰它们）
 genTaskChargeSchema.index({ purgeAt: 1 }, { expireAfterSeconds: 0 });
 

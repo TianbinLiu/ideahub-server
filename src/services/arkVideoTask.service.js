@@ -1,6 +1,7 @@
 // 视频任务登记与找回（模型见 models/ArkVideoTask 的 ★★）。调用方：
 //   · ark.routes.billedForward 受理之后 recordVideoTask（落库失败只吼不打断响应：任务已受理、钱已扣）
-//   · GET /api/ark/video-tasks → listVideoTasks（最近 24 小时，方舟产物的寿命；已退款的不列）
+//   · GET /api/ark/video-tasks → listVideoTasks（最近 24 小时，方舟产物的寿命；已退款的不列；只列方舟的行）
+//   · minimax.routes 的 POST /v2/video 受理之后 recordMinimaxV2Task；GET /api/minimax/video-tasks → listMinimaxVideoTasks（2026-10-26）
 //   · ark.routes.resolveDraftFinal → findOwnDraft（样片第二步：归属 + 样片的时长）
 //   · src/index.js 启动时（0 号实例）→ migrateExpiry（TTL 从 createdAt 搬到每行自带的 expireAt）
 const ArkVideoTask = require("../models/ArkVideoTask");
@@ -73,21 +74,29 @@ async function recordVideoTask({ userId, body, responseText, r2v, draftFinal = n
 }
 
 /**
- * 这个账号最近 24 小时提交过的视频任务（新的在前，最多 50 条）。
+ * 某个账号最近 24 小时登记的某一家的视频任务（新的在前，最多 50 条），**去掉已经因为失败退了钱的**。
+ * 两张列表（方舟 / MiniMax H3）共用这一份：窗口、条数、「退了钱的不列」三条规矩各写一遍的话迟早各改各的。
  * ★ 已经因为失败退了钱的那些不列（2026-10-07，services/taskRefund）：它们没有成片可取了，
  *   App 冷启动拿这张表补「待取回」凭据 —— 列出来就是一张永远取不回、还说着「钱已经花了」的卡。
  *   老 App 也靠这一条不去捞它们（它们不认 refund 字段）。查账失败不挡列表：退一步照旧全列。
+ * @param {object} filter 除了 userId / 时间窗之外的条件（哪一家的行）
+ * @param {"ark"|"minimax"} provider 去账本里查退款时按哪一家的任务号查（两家的任务号是两个命名空间）
  */
-async function listVideoTasks(userId) {
+async function recentUnrefunded(userId, filter, provider) {
   const since = new Date(Date.now() - LIST_WINDOW_MS);
-  let rows = await ArkVideoTask.find({ userId, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(50).lean();
+  let rows = await ArkVideoTask.find({ userId, ...filter, createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(50).lean();
   try {
-    const refunded = await require("./taskRefund.service").refundedTaskIds("ark", rows.map((r) => r.taskId));
+    const refunded = await require("./taskRefund.service").refundedTaskIds(provider, rows.map((r) => r.taskId));
     if (refunded.size) rows = rows.filter((r) => !refunded.has(r.taskId));
   } catch (e) {
-    console.error("[ark] 视频任务列表查退款失败（照旧全列）:", e.message);
+    console.error(`[${provider}] 视频任务列表查退款失败（照旧全列）:`, e.message);
   }
-  return rows.map((r) => ({
+  return rows;
+}
+
+/** 两张列表每一条共有的那几样（给人认「是哪一发」、给 App 按它铺回一段） */
+function itemOf(r) {
+  return {
     taskId: r.taskId,
     createdAt: r.createdAt,
     model: r.model || "",
@@ -95,10 +104,74 @@ async function listVideoTasks(userId) {
     ratio: r.ratio || "",
     resolution: r.resolution || "",
     prompt: r.prompt || "",
+  };
+}
+
+/**
+ * 这个账号最近 24 小时提交过的**方舟**视频任务（GET /api/ark/video-tasks）。规矩见 recentUnrefunded。
+ * ★ provider: null = 只要方舟的行（这一位不存在也算，老行就是这样）。MiniMax H3 的行另走 GET /api/minimax/video-tasks ——
+ *   混进来的话老 App 会拿 H3 的任务号去问方舟（models/ArkVideoTask 的 ★★）
+ */
+async function listVideoTasks(userId) {
+  const rows = await recentUnrefunded(userId, { provider: null }, "ark");
+  return rows.map((r) => ({
+    ...itemOf(r),
     r2v: !!r.r2v,
     // 2026-10-07 加的三位（老客户端不认，只是不显示）：这一发是不是样片 / 是哪条样片转的成片 / 实扣多少
     draft: !!r.draft,
     ...(r.draftOf ? { draftOf: r.draftOf } : {}),
+    ...(Number.isFinite(r.costTokens) ? { costTokens: r.costTokens } : {}),
+  }));
+}
+
+/**
+ * MiniMax H3 受理之后记一条（2026-10-26，models/ArkVideoTask 的 ★★）。与 recordVideoTask 同一条纪律：**任何失败只吼不抛** ——
+ * 调用方那一拍任务已受理、钱已扣，5xx 会让客户端误以为没受理去重试（= 再花一次钱）。
+ * 请求体是路由重建过、白名单核过的那一份（schemas/minimaxV2），content 的形状与方舟一样（`{type:"text", text}` 那一条就是提示词），
+ * 所以「给人认」的那几样照 summarizeTaskBody 抠（分辨率是上游的大写写法，原样记）。
+ * @returns {Promise<boolean>} 记没记上
+ */
+async function recordMinimaxV2Task({ userId, body, taskId, costTokens }) {
+  const id = String(taskId ?? "");
+  if (!TASK_ID_RE.test(id)) return false;
+  const { model, durationSec, ratio, resolution, prompt } = summarizeTaskBody(body);
+  try {
+    await ArkVideoTask.create({
+      userId,
+      taskId: id,
+      provider: "minimax",
+      api: "v2",
+      model,
+      durationSec,
+      ratio,
+      resolution,
+      prompt,
+      costTokens: Number.isFinite(Number(costTokens)) ? Number(costTokens) : undefined,
+      expireAt: new Date(Date.now() + ArkVideoTask.TTL_MS),
+    });
+    return true;
+  } catch (e) {
+    if (e && e.code === 11000) return true;
+    console.error(`[minimax-v2] 视频任务登记落库失败 task=${id}（App 重启之后取不回这一发）:`, e.message);
+    return false;
+  }
+}
+
+/**
+ * 这个账号最近 24 小时提交过的 **MiniMax H3** 视频任务（GET /api/minimax/video-tasks）。规矩见 recentUnrefunded。
+ * 每一条带 `api: "v2"`：取回走 GET /api/minimax/v2/video/:taskId（不计费）。App 认不得的 api 要跳过 ——
+ * 真人档（v1）以后也会登记进来（P3），取件是另一条路。
+ * ★ H3 那边一发任务 7 天内都查得到（过期的成片地址再查一次会换新的），列表仍只给 24 小时：与方舟那张表、App 的取回卡同一个承诺。
+ * @param {object} o
+ * @param {boolean} o.v2On 这台服务器此刻开着 V2 出片（config/minimax.minimaxV2Enabled）—— 没开的话一条都不列：
+ *   列出来 App 就去问 GET /v2/video/:taskId，只会拿回 501，那是一张永远取不回的卡（任务绑站：切到中国站的服务器问不了国际站建的任务）
+ */
+async function listMinimaxVideoTasks(userId, { v2On }) {
+  if (!v2On) return [];
+  const rows = await recentUnrefunded(userId, { provider: "minimax", api: "v2" }, "minimax");
+  return rows.map((r) => ({
+    ...itemOf(r),
+    api: "v2",
     ...(Number.isFinite(r.costTokens) ? { costTokens: r.costTokens } : {}),
   }));
 }
@@ -110,6 +183,17 @@ async function listVideoTasks(userId) {
 async function findOwnDraft(taskId, userId) {
   if (!TASK_ID_RE.test(String(taskId || ""))) return null;
   return ArkVideoTask.findOne({ taskId: String(taskId), userId, draft: true }).select("taskId createdAt durationSec ratio model").lean();
+}
+
+/**
+ * 这一发 H3 是不是**这个人**经我们这里建的（只看登记）。GET /api/minimax/v2/video/:taskId 在账上找不到 H3 那一行时问它
+ * （2026-10-26 终审：原来没有账就一律放行 —— 删号级联把账与登记都删掉之后，那个人的 H3 任务在上游还查得到 7 天，
+ *  挨个猜号的人就能拿到成片地址）。
+ * ★ 登记只活 48 小时（ArkVideoTask.TTL_MS）：它补的是「落账失败、登记落上了」那一种，覆盖 App 取回的那 24 小时就够了。
+ */
+async function ownsMinimaxV2Task(taskId, userId) {
+  if (!TASK_ID_RE.test(String(taskId || ""))) return false;
+  return !!(await ArkVideoTask.exists({ taskId: String(taskId), userId, provider: "minimax", api: "v2" }));
 }
 
 /**
@@ -150,8 +234,11 @@ async function migrateExpiry() {
 module.exports = {
   recordVideoTask,
   listVideoTasks,
+  recordMinimaxV2Task,
+  listMinimaxVideoTasks,
   summarizeTaskBody,
   findOwnDraft,
+  ownsMinimaxV2Task,
   migrateExpiry,
   LIST_WINDOW_MS,
   DRAFT_FINAL_WINDOW_MS,

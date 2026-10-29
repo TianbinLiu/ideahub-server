@@ -91,9 +91,13 @@ app.use(require("./middleware/appVersion").appVersion);
 //   /api/ark     Seedance 任务创建请求带 base64 首尾帧（压到 720p 后仍有 2-3MB）
 // 「大 body 只对持有效签名 token 的请求开放」这条闸门的实现见 middleware/bigJson.js
 // （两处共用一份：改了阈值或判据要两边同时生效）。
-const { jsonGate, jsonGateWith } = require("./middleware/bigJson");
+const { jsonGate, jsonGateWith, smallJson } = require("./middleware/bigJson");
 app.use("/api/branch", jsonGate);
 app.use("/api/ark", jsonGate);
+// MiniMax H3（V2）出片**不要**大 body（2026-10-26 终审）：图片只收我们图床上的 https 地址（data: 内联图一律拒），
+// 一发合规的请求体也就几十 KB。给它 50MB 的话，任何登录用户都能让服务端在白名单之前先解析一整份 50MB 的 JSON（不花钱）。
+// ★ 必须排在下面 /api/minimax 那一道**之前**：先挂的解析器读完 body，后面的就跳过（body-parser 见请求已读完不再读）
+app.use("/api/minimax/v2", smallJson);
 // 真人视频档：创建体带 base64 首帧/参考图（与 /api/ark 同理，不放宽就是 413）
 app.use("/api/minimax", jsonGate);
 app.use("/api/runway", jsonGate);

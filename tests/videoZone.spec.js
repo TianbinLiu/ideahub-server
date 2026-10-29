@@ -6,13 +6,31 @@
 // ★ 不出网、不花钱：这些判定都在发请求之前；端点只读 env 与请求头。geoip 用 spyOn 控结果（真库的接线在 tests/geo.spec.js 钉着）。
 // ★ 这一组判据漏了都**零症状**：providers 不看配置 = App 摆一个点下去必 501 的档；拒绝话里带双引号 = 老 App 只显示半句；
 //   生产认了 VIDEO_ZONE_FORCE = 整道地区门禁失效。所以每一条都有反例。
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const request = require("supertest");
 const geoip = require("geoip-lite");
 
 const region = require("../src/config/videoRegion");
-const { VIDEO_MULT, SEEDANCE_2_5, IMAGE_MODELS, videoPlanDenial } = require("../src/config/tokens");
+const { VIDEO_MULT, SEEDANCE_2_5, IMAGE_MODELS, videoPlanDenial, isVideoGeneration, MINIMAX_H3_LITE, MINIMAX_H3, MINIMAX_SEC_COST } = require("../src/config/tokens");
 const { collectConfigProblems } = require("../src/config/preflight");
+
+/**
+ * 一份「这台服务器的 V2（H3）没开」的 videoRegion（config/minimax.minimaxV2Enabled 换成恒假，别的照真的）。
+ * ★ 为什么要造：V2 开不开今天只看站（国际站才开），而海外能换到 MiniMax 的前提就是国际站 —— 真实配置下
+ *   「海外给得出 MiniMax、V2 却没开」造不出来，「MiniMax 要付费」那一句（swapVariant 的 paidOnly）就只剩这一种测法。
+ *   它是兜底：V2 哪天多一个开关、或免费档里撤掉 H3-Lite，海外的免费用户听到的就该是这一句。
+ */
+function regionWithoutV2() {
+  let mod;
+  jest.isolateModules(() => {
+    jest.doMock("../src/config/minimax", () => ({ ...jest.requireActual("../src/config/minimax"), minimaxV2Enabled: () => false }));
+    mod = require("../src/config/videoRegion");
+  });
+  jest.dontMock("../src/config/minimax");
+  return mod;
+}
 
 /** 这些 env 每条用例都从干净的开始（判据全是现读 env，脏值会让用例互相污染、也会让结论取决于跑测试的机器）。
  *  FREE_VIDEO_GATE：拒绝话「指不指人去换 MiniMax」要问真人档对免费用户开不开（tokens.videoPlanDenial 现读它） */
@@ -255,6 +273,7 @@ describe("regionDenial：只拦出视频（Seedance 按地区、MiniMax 按地�
     // 没配 MiniMax：真人档那一发在 minimax.routes 扣费之前就 501 了，不归这道闸管 —— zone 漏传也不抛
     await withEnv({ ARK_API_KEY: "a" }, () => {
       expect(region.regionDenial({ kind: "minimax_video", model: MM_MODEL, zone: undefined })).toBeNull();
+      expect(region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3_LITE, zone: undefined })).toBeNull();
     });
   });
 
@@ -268,6 +287,56 @@ describe("regionDenial：只拦出视频（Seedance 按地区、MiniMax 按地�
     });
     await withEnv({ ARK_API_KEY: "a" }, () => {
       expect(region.gatedProviderOf("minimax_video", MM_MODEL)).toBeNull();
+    });
+  });
+
+  // 2026-10-26 审核：minimax_v2（H3 的 V2 出片）一度只进了 tokens.isVideoGeneration、没进 gatedProviderOf ——
+  // regionGate 见 null 就整个跳过：不拦、不记 would-deny、没带 req 也不抛，受全面制裁的地区照样出 H3。零症状。
+  test("gatedProviderOf：H3（minimax_v2）与真人档同一个判法 —— 按这台服务器走的站；没配 MiniMax → 不归这道闸管", async () => {
+    for (const model of [MINIMAX_H3_LITE, MINIMAX_H3, "whatever"]) {
+      await withEnv(BOTH, () => expect(region.gatedProviderOf("minimax_v2", model)).toBe("minimax:intl"));
+      await withEnv(BOTH_CN_SITE, () => expect(region.gatedProviderOf("minimax_v2", model)).toBe("minimax:cn"));
+      await withEnv({ ARK_API_KEY: "a" }, () => expect(region.gatedProviderOf("minimax_v2", model)).toBeNull());
+    }
+  });
+
+  test("H3（minimax_v2）× MiniMax 国际站：境内 / 境外放行，受全面制裁的地区拦（providers 空、话里不指人去换 MiniMax）", async () => {
+    await withEnv(BOTH, () => {
+      for (const paid of [null, true, false]) {
+        expect(region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3_LITE, zone: "cn", paid })).toBeNull();
+        expect(region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3_LITE, zone: "intl", paid })).toBeNull();
+        const d = region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3_LITE, zone: "blocked", paid });
+        expect(d).toMatchObject({ code: "REGION_UNAVAILABLE", reason: "region", zone: "blocked", providers: [] });
+        expect(d.message).not.toMatch(/MiniMax/);
+        expect(d.message).toMatch(/没有可用的出片模型/);
+      }
+    });
+  });
+
+  test("H3（minimax_v2）× MiniMax 中国站：境外也拦（海外只准国际站；V2 路由在中国站上本来就不开，这里是第二道）", async () => {
+    await withEnv(BOTH_CN_SITE, () => {
+      expect(region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3, zone: "cn" })).toBeNull();
+      const d = region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3, zone: "intl" });
+      expect(d).toMatchObject({ code: "REGION_UNAVAILABLE", zone: "intl", providers: [] });
+      expect(d.message).not.toMatch(/MiniMax/);
+    });
+  });
+
+  test("★ tokens.isVideoGeneration 认的每一种出视频的 kind 都归这道闸管（Runway 除外：文件头 ①，范围等主人定）", async () => {
+    // 从源码里把 isVideoGeneration 认的 kind 抠出来，而不是在这里抄一份清单：新加一种 kind 时这条会自己把它带进来
+    const src = fs.readFileSync(path.join(__dirname, "../src/config/tokens.js"), "utf8");
+    const body = /function isVideoGeneration\([^)]*\)\s*\{([\s\S]*?)\r?\n\}/.exec(src)?.[1];
+    expect(body).toBeTruthy();
+    const kinds = [...new Set([...body.matchAll(/kind === "([a-z0-9_]+)"/g)].map((m) => m[1]))];
+    expect(kinds).toEqual(expect.arrayContaining(["task", "minimax_video", "minimax_v2", "runway"]));
+    /** 刻意不归这道闸管的出视频 kind（每一条都要有理由） */
+    const NOT_GATED = { runway: "Runway 海外没有替代、范围等主人定（videoRegion 文件头 ①）" };
+    await withEnv(BOTH, () => {
+      for (const kind of kinds) {
+        const model = kind === "task" ? SEEDANCE_2_5 : "any-model";
+        expect({ kind, video: isVideoGeneration(kind, model) }).toEqual({ kind, video: true });
+        expect({ kind, gated: region.gatedProviderOf(kind, model) !== null }).toEqual({ kind, gated: !Object.hasOwn(NOT_GATED, kind) });
+      }
     });
   });
 
@@ -310,6 +379,17 @@ describe("regionDenial：只拦出视频（Seedance 按地区、MiniMax 按地�
           if (region.gatedProviderOf("minimax_video", MM_MODEL)) {
             expect(offered.includes("minimax")).toBe(region.regionDenial({ kind: "minimax_video", model: MM_MODEL, zone }) === null);
           }
+          // H3（minimax_v2）与真人档同一个答案：报给 App 的 minimax 说的是这一家，不分 v1 / V2 —— 三档（价目表里的每一个型号）都一样，
+          // App 才能拿这一个名字（再加 /api/ark/health 的 minimaxV2）摆三档（契约：routes/videoZone.routes 文件头；经路由的核对在 tests/minimaxV2.spec）
+          for (const model of Object.keys(MINIMAX_SEC_COST)) {
+            if (!region.gatedProviderOf("minimax_v2", model)) continue;
+            expect({ env, zone, model, offered: offered.includes("minimax") }).toEqual({
+              env,
+              zone,
+              model,
+              offered: region.regionDenial({ kind: "minimax_v2", model, zone }) === null,
+            });
+          }
         }
       });
     }
@@ -327,6 +407,7 @@ describe("regionDenial：只拦出视频（Seedance 按地区、MiniMax 按地�
     expect(() => region.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone })).toThrow(TypeError);
     await withEnv(BOTH, () => {
       expect(() => region.regionDenial({ kind: "minimax_video", model: MM_MODEL, zone })).toThrow(TypeError);
+      expect(() => region.regionDenial({ kind: "minimax_v2", model: MINIMAX_H3_LITE, zone })).toThrow(TypeError);
     });
   });
 
@@ -370,15 +451,41 @@ describe("拒绝话只在 MiniMax 真做得了这一发时才指人去换 MiniMa
     });
   });
 
-  test("★ 普通出片、免费用户（免费档门禁缺省开）→ 「MiniMax 要付费套餐」，不说「换成 MiniMax」—— 与真人档那道套餐门禁同一个判据", async () => {
+  // 2026-10-26 审核：H3-Lite · 480P 进了免费档之后，这里原来只问真人档 —— 海外的免费用户被告知「MiniMax 要付费」，
+  // 而他们明明有一档免费的（话把人往付钱那边推）。现在问的是「这台服务器上的 MiniMax 有没有一档对他开着」（videoRegion.minimaxOpenTo）。
+  test("★ 普通出片、免费用户（免费档门禁缺省开）、国际站（V2 开着）→ 「换 MiniMax」：H3-Lite · 480P 对免费版开着，真人档仍只给付费用户", async () => {
     await withEnv(BOTH, () => {
-      // 同一个判据：真人档对没付过钱的人关着（tokens.videoPlanDenial），所以这句话不能叫他换过去
+      // 同一个判据（tokens.videoPlanDenial）：真人档对没付过钱的人关着，H3-Lite · 480P 开着
       expect(videoPlanDenial({ paid: false, kind: "minimax_video", model: MM_MODEL })).not.toBeNull();
+      expect(videoPlanDenial({ paid: false, kind: "minimax_v2", model: MINIMAX_H3_LITE, resolution: "480P" })).toBeNull();
+      expect(require("../src/config/minimax").minimaxV2Enabled()).toBe(true);
       const d = deny({ paid: false });
+      expect(d.providers).toEqual(["minimax"]);
+      expect(d.message).toMatch(SWAP);
+      expect(d.message).not.toMatch(/paid plan|付费套餐/);
+      // 这句话只有老 App 原样显示，而老 App 的 MiniMax 只有真人档 —— 免费用户看得见它、却是灰的「会员档」。
+      // 所以更新的提示要说「没有**能用的**就更新」，不能只说「没有的话」（看见了就不会去更新，只会以为要付钱；免费的 H3-Lite 在新版里）
+      expect(d.message).toMatch(/update the app if none is usable/);
+      expect(d.message).toMatch(/没有能用的就先更新 App/);
+      // 付费用户 / 不知道套餐听到的是同一句（一句话两种人都说得对，不按套餐另拼）
+      expect(deny({ paid: true }).message).toBe(d.message);
+      expect(deny({}).message).toBe(d.message);
+    });
+  });
+
+  test("★ 普通出片、免费用户、这台服务器的 V2 没开 → 「MiniMax 要付费套餐」，不说「换成 MiniMax」（只剩真人档，而它只给付费用户）", async () => {
+    const noV2 = regionWithoutV2();
+    await withEnv(BOTH, () => {
+      const d = noV2.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", paid: false });
       expect(d.providers).toEqual(["minimax"]);
       expect(d.message).not.toMatch(SWAP);
       expect(d.message).toMatch(/MiniMax works here with a paid plan or after any top-up/);
       expect(d.message).toMatch(/MiniMax 要付费套餐，或充值过任意一次/);
+      // 付费用户 / 免费档门禁关着（真人档对免费用户也开）照样是「换 MiniMax」
+      expect(noV2.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", paid: true }).message).toMatch(SWAP);
+    });
+    await withEnv({ ...BOTH, FREE_VIDEO_GATE: "off" }, () => {
+      expect(noV2.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", paid: false }).message).toMatch(SWAP);
     });
   });
 
@@ -447,7 +554,9 @@ describe("拒绝话：中英双语一行，老 App 抠得全、截得下", () =>
     await withEnv(BOTH_CN_SITE, () => out.push(region.regionDenial({ kind: "minimax_video", model: MM_MODEL, zone: "intl" }).message));
     // 2026-10-26 最终审核加的两种：「没有可换的」（带参考视频 / 样片第二步）与「MiniMax 要付费套餐」（免费用户）
     await withEnv(BOTH, () => out.push(region.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", r2v: { kind: "ownExtend" } }).message));
-    await withEnv(BOTH, () => out.push(region.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", paid: false }).message));
+    // 「MiniMax 要付费套餐」只在这台服务器上的 MiniMax 没有一档对免费用户开着时才说（国际站上有免费的 H3-Lite），造法见 regionWithoutV2
+    const noV2 = regionWithoutV2();
+    await withEnv(BOTH, () => out.push(noV2.regionDenial({ kind: "task", model: SEEDANCE_2_5, zone: "intl", paid: false }).message));
     // 白模化在看帧之后才被拦的那一种（两半各补一句看帧的钱）：一样要截得下、抠得全
     await withEnv(BOTH, () =>
       out.push(

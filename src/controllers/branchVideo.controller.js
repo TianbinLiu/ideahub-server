@@ -66,6 +66,7 @@ const MAX_INLINE_FALLBACK = Number(process.env.BRANCH_INLINE_FALLBACK_MAX || 512
 const {
   isHttpUrl,
   isArkVideoUrl,
+  isUpstreamTempVideoUrl,
   uploadVideoBuffer,
   downloadToBuffer,
 } = require("../services/videoAsset.service");
@@ -142,11 +143,12 @@ async function transferImage(ctx, value, label) {
   return out;
 }
 
-/** 视频资源：dataURL 或方舟 TOS 链接才转存，其它 http(s) 原样保留 */
+/** 视频资源：dataURL 或上游的临时成片链接（方舟 TOS / MiniMax H3 的 CDN）才转存，其它 http(s) 原样保留 */
 async function transferVideo(ctx, value, label) {
   const raw = String(value || "").trim();
   if (!raw) return "";
-  const needsTransfer = isDataUrl(raw) || isArkVideoUrl(raw);
+  // ★ 判据只问 videoAsset.isUpstreamTempVideoUrl（2026-10-26 起含 MiniMax H3）：只认方舟的话，H3 的成片原样发布、过几天链接失效
+  const needsTransfer = isDataUrl(raw) || isUpstreamTempVideoUrl(raw);
   if (!needsTransfer) {
     ctx.kept += 1;
     return raw;

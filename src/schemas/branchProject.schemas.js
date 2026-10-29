@@ -1,6 +1,8 @@
 // src/schemas/branchProject.schemas.js
 // 工坊工程（画布快照）请求校验（zod v4）。见 models/BranchProject.js 的文件头。
 const { z } = require("../middleware/validate");
+// MiniMax H3 成片主机的写法只在 config/minimax 一处（产物代理、转存、这两道门都从那一个片段派生）
+const { MINIMAX_V2_VIDEO_HOST_FRAGMENT } = require("../config/minimax");
 
 /**
  * 单份画布的字节上限（`JSON.stringify(canvas)`）。
@@ -26,12 +28,23 @@ const PROJECT_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
  * ★★ `data:` 那一段**必须带 mime 前缀**（`data:[a-z]+/`）：canvas 里有 requirement /
  *   plot / genPrompt / steps 这些**自由文本**字段，裸 `"data:` 会把一句
  *   「data: 这里指的是…」的剧情文案误判成 dataURL，表现是"这条作品永远存不上工程"。
- * ★ 三样都要挡，理由各不相同（见 models/BranchProject.js 的 ★★）：
- *   dataURL → 16MB 单文档上限；`idb:` → 换设备就是死指针；volces/volccdn → 约 24h 过期。
+ * ★ 四样都要挡，理由各不相同（见 models/BranchProject.js 的 ★★）：
+ *   dataURL → 16MB 单文档上限；`idb:` → 换设备就是死指针；volces/volccdn → 约 24h 过期；
+ *   MiniMax H3 的成片（video-product.cdn.minimax.io，2026-10-26 起海外出片走它）→ 官方明说有时效。
+ *   ★★ 后两样是**同一类**（上游给的临时成片），只认方舟的话，画布里揣着 H3 链接的工程 / 配方照样落库，
+ *   过期之后「回炉重做」拿回来的段是死链，全程零报错（2026-10-26 审核抓到：发布、产物代理、转存都认了 H3，唯独这两道门没跟上）。
  * ★ 前缀那个 `"` 是有意的：只判**整个字段值**是不是资产形状（JSON 里字符串值以引号开头），
- *   不扫自由文本内部。方舟那一段没有前导引号，因为它要匹配的是 host 片段。
+ *   不扫自由文本内部。上游那两段没有前导引号，因为它们要匹配的是 host 片段。
+ * ★ H3 那一段的主机片段从 config/minimax 取（别在这里再抄一份域名）；后面跟 `(?![\w.-])` 是要主机名到这里**结束** ——
+ *   `video-product.cdn.minimax.io.evil.com` 不是它（与 isMinimaxV2VideoUrl 的整名比对同一个口径）。
+ * ⚠ v1 真人档的成片（public-cdn-video-data*.aliyuncs.com）**没有**进这道门：那条链接今天在出片后与发布时都没有转存路
+ *   （isUpstreamTempVideoUrl 不认它），这里一拦，带真人档段的作品就整份存不上工程 —— 先得有转存，再收紧这道门（2026-10-26 记下的缺口）。
+ * ★ 各段都是正则字面量、再用 `.source` 拼（别写成字符串常量：`"\d"` 这类转义在字符串里会悄悄退化）。
  */
-const NO_LOCAL = /"(?:data:[a-z]+\/|idb:)|https?:\/\/[^"]*\.(?:volces|volccdn)\.com\//i;
+const LOCAL_VALUE_RE = /"(?:data:[a-z]+\/|idb:)/;
+const ARK_TEMP_RE = /https?:\/\/[^"]*\.(?:volces|volccdn)\.com\//;
+const MINIMAX_V2_TEMP_RE = new RegExp(`${/https?:\/\//.source}(?:${MINIMAX_V2_VIDEO_HOST_FRAGMENT.source})${/(?![\w.-])/.source}`);
+const NO_LOCAL = new RegExp([LOCAL_VALUE_RE, ARK_TEMP_RE, MINIMAX_V2_TEMP_RE].map((r) => r.source).join("|"), "i");
 
 /** PUT /api/branch/projects/by-video/:videoId */
 // ⛔ 不用 `.loose()`：canvas 是 Mixed 落库的，未声明字段能进来就等于给这张表开了个
@@ -50,7 +63,7 @@ const projectBody = z
     message: "缺少画布正文",
   })
   .refine((v) => !NO_LOCAL.test(JSON.stringify(v.canvas ?? null)), {
-    message: "画布里还有本机地址（dataURL / idb: / 方舟临时链接），不能留存",
+    message: "画布里还有本机地址或上游的临时链接（dataURL / idb: / 方舟或 MiniMax 的成片），不能留存",
   })
   .refine((v) => Buffer.byteLength(JSON.stringify(v.canvas ?? null)) <= PROJECT_MAX_BYTES, {
     message: "这份工程太大了",

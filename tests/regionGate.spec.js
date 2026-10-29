@@ -241,15 +241,30 @@ describe("门禁 on、海外、这台服务器的 MiniMax 走国际站：拒绝�
     await request(app).post("/api/minimax/video").set(u.auth).set(US).send(mmBody()).expect(200);
   });
 
-  test("★ 免费用户（免费档门禁缺省开）→ 不说「换 MiniMax」，说「MiniMax 要付费套餐」—— 因为他换过去就是 403 PLAN_REQUIRED", async () => {
+  // 2026-10-26：H3-Lite · 480P（「草稿」在 MiniMax 上的对标）进了免费档。国际站上 V2 开着（config/minimax.minimaxV2Enabled），
+  // 所以海外的免费用户被拦 Seedance 时听到的是「换 MiniMax」—— 原来说「MiniMax 要付费套餐」，把人往付钱那边推，而他们有一档免费的。
+  // 「V2 没开时才说要付费」的那一句在 tests/videoZone.spec.js（真实配置下造不出，那边换掉了 minimaxV2Enabled）。
+  test("★ 免费用户（免费档门禁缺省开）→ 也是「换 MiniMax」：H3-Lite · 480P 对他开着（真人档仍只给付费用户）", async () => {
     const free = await registerUser("msg_free", { plan: null });
     const res = await request(app).post("/api/ark/contents/generations/tasks").set(free.auth).set(US).send(hdTask());
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ code: "REGION_UNAVAILABLE", providers: ["minimax"], billed: false });
-    expect(res.body.message).not.toMatch(/Switch the model to MiniMax/);
-    expect(res.body.message).toMatch(/paid plan/);
-    expect(res.body.message).toMatch(/MiniMax 要付费套餐/);
-    // 拒绝话说的就是这面墙：真人档对他关着（地区放行，套餐门禁拒）
+    expect(res.body.message).toMatch(/Switch the model to MiniMax/);
+    expect(res.body.message).not.toMatch(/paid plan|付费套餐/);
+    // 换过去真走得通：H3-Lite · 480P 那一发按秒扣了钱、发了出去（同一个人、同一个地区；V2 路由走的就是这一份 chargedArkCall）
+    const before = await balance(free.id);
+    const v2 = await gateway.chargedArkCall({
+      user: await free.doc(),
+      modelAllowed: () => true,
+      kind: "minimax_v2",
+      path: "(minimax)/v2/video_generation",
+      body: { model: "MiniMax-H3-Lite", resolution: "480P", duration: 5, ratio: "9:16", content: [{ type: "text", text: "海边" }] },
+      forward: async () => ({ status: 200, text: JSON.stringify({ task_id: "424010985738629" }) }),
+      req: { headers: US },
+    });
+    expect(v2).toMatchObject({ ok: true, accepted: true, cost: 5 * 11_200 });
+    expect(before - (await balance(free.id))).toBe(5 * 11_200);
+    // 真人档（v1）对他照旧关着（地区放行，套餐门禁拒）
     const mm = await request(app).post("/api/minimax/video").set(free.auth).set(US).send(mmBody());
     expect(mm.status).toBe(403);
     expect(mm.body.code).toBe("PLAN_REQUIRED");
@@ -419,6 +434,92 @@ describe("真人档（POST /api/minimax/video）也过同一道门：海外只�
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ code: "REGION_UNAVAILABLE", zone: "blocked", providers: [] });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 2026-10-26 审核：kind minimax_v2（MiniMax H3 的 V2 出片）一度只进了 tokens.isVideoGeneration、没进 videoRegion.gatedProviderOf ——
+// regionGate 见 null 就整个跳过：门禁 on 也不拦受全面制裁的地区、observe 不记 would-deny、没带 req 也不抛。全程零症状。
+// 这里直接调 chargedArkCall / regionGate 钉住判据（写这一组时 V2 路由还没有）；路由（POST /api/minimax/v2/video）接上之后
+// 经路由走一遍的那一条在 tests/minimaxV2.spec.js「出片地区门禁（on）」。
+describe("MiniMax H3（kind minimax_v2）过同一道门：海外只准国际站、受全面制裁的地区一家都不给", () => {
+  const IR = { "cf-ipcountry": "IR" };
+  const v2Body = () => ({ model: "MiniMax-H3-Lite", resolution: "480P", duration: 5, ratio: "9:16", content: [{ type: "text", text: "海边" }] });
+  const v2Call = async (u, headers, forward = jest.fn(async () => ({ status: 200, text: JSON.stringify({ task_id: "424010985738629" }) }))) => ({
+    forward,
+    out: await gateway.chargedArkCall({
+      user: await u.doc(),
+      modelAllowed: () => true,
+      kind: "minimax_v2",
+      path: "(minimax)/v2/video_generation",
+      body: v2Body(),
+      forward,
+      req: headers === undefined ? undefined : { headers },
+    }),
+  });
+
+  beforeEach(() => {
+    process.env.VIDEO_REGION_GATE = "on";
+  });
+
+  test("国际站：受全面制裁的地区（IR）→ 403 REGION_UNAVAILABLE、不扣钱、不转发；话里不指人去换 MiniMax", async () => {
+    process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+    const u = await registerUser("v2_ir");
+    const before = await balance(u.id);
+    const { out, forward } = await v2Call(u, IR);
+    expect(out).toMatchObject({ ok: false, reason: "region", status: 403, wallet: null });
+    expect(out.body).toMatchObject({ ok: false, code: "REGION_UNAVAILABLE", zone: "blocked", providers: [], billed: false });
+    expect(out.body.message).not.toMatch(/MiniMax/);
+    expect(forward).not.toHaveBeenCalled();
+    expect(await balance(u.id)).toBe(before);
+    expect(regionLines()[0]).toMatch(/^\[region\] deny at=\(minimax\)\/v2\/video_generation minimax_v2 MiniMax-H3-Lite zone=blocked /);
+  });
+
+  test("国际站：境外（美国）/ 境内照常受理、按秒扣钱", async () => {
+    process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+    for (const headers of [US, CN]) {
+      const u = await registerUser("v2_ok");
+      const before = await balance(u.id);
+      const { out, forward } = await v2Call(u, headers);
+      expect(out).toMatchObject({ ok: true, accepted: true, cost: 5 * 11_200 });
+      expect(forward).toHaveBeenCalledTimes(1);
+      expect(before - (await balance(u.id))).toBe(5 * 11_200);
+    }
+    expect(regionLines()).toEqual([]);
+  });
+
+  test("中国站：境外也拦（海外只准国际站），providers 空", async () => {
+    process.env.MINIMAX_API_KEY = "mm-cn-test";
+    const u = await registerUser("v2_cn_site");
+    const { out, forward } = await v2Call(u, US);
+    expect(out).toMatchObject({ ok: false, reason: "region", status: 403 });
+    expect(out.body).toMatchObject({ code: "REGION_UNAVAILABLE", zone: "intl", providers: [] });
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test.each(["observe", "on"])("gate=%s：没带 req → 抛（扣钱之前：余额不动、不转发）—— 零症状的漏传要响", async (gate) => {
+    process.env.VIDEO_REGION_GATE = gate;
+    process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+    const u = await registerUser(`v2_noreq_${gate}`);
+    const before = await balance(u.id);
+    const forward = jest.fn();
+    await expect(v2Call(u, undefined, forward)).rejects.toThrow(/必须把 req 交进来/);
+    expect(forward).not.toHaveBeenCalled();
+    expect(await balance(u.id)).toBe(before);
+  });
+
+  test("observe：受全面制裁的地区记一行 would-deny、照常放行（V2 不再悄悄漏在门禁外面）", async () => {
+    process.env.VIDEO_REGION_GATE = "observe";
+    process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+    const u = await registerUser("v2_observe");
+    const { out } = await v2Call(u, IR);
+    expect(out).toMatchObject({ ok: true, accepted: true });
+    expect(regionLines()).toHaveLength(1);
+    expect(regionLines()[0]).toMatch(/^\[region\] would-deny .* minimax_v2 MiniMax-H3-Lite zone=blocked/);
+  });
+
+  test("没配 MiniMax：不归这道闸管（V2 路由在扣费之前就 501，到不了钱上）—— regionGate 不看 req", () => {
+    expect(gateway.regionGate({ req: undefined, user: null, kind: "minimax_v2", model: "MiniMax-H3-Lite", at: "t" })).toBeNull();
   });
 });
 
@@ -675,9 +776,9 @@ describe("调用方都把 req 交进来（扫源码）", () => {
 
   test.each(["chargedArkCall", "regionGate"])("每一处 %s({…}) 都带 req —— 漏了的话 Seedance / 真人档那一发在 observe / on 下当场抛", (name) => {
     const found = files.flatMap(({ rel, src }) => callObjects(src, name).map((obj) => ({ p: rel, obj })));
-    // 别让这条在一个调用点都没扫到的时候空转（今天 chargedArkCall 5 处；regionGate 2 处 —— chargedArkCall 里那一处 + 白模化的预检）。
+    // 别让这条在一个调用点都没扫到的时候空转（今天 chargedArkCall 5 处；regionGate 3 处 —— chargedArkCall 里那一处 + 白模化的预检 + H3 出片在并发闸之前的预检）。
     // ★ 剥了注释之后数的才是真调用（原来注释里那句示范写法也算一处）
-    expect(found.length).toBeGreaterThanOrEqual(name === "chargedArkCall" ? 5 : 2);
+    expect(found.length).toBeGreaterThanOrEqual(name === "chargedArkCall" ? 5 : 3);
     const missing = found.filter((f) => !hasReq(f.obj)).map((f) => `${f.p}: ${f.obj.slice(0, 80)}`);
     expect(missing).toEqual([]);
   });
