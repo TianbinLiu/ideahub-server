@@ -2998,6 +2998,17 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     expect(text).not.toContain("甲".repeat(61));
   });
 
+  test("★ 点名清单里有人戴眼镜 / 帽子时才加配饰 / 侧脸那一句，排在「不许保留原有的发型…」之后（2026-10-29 付费对照：没有它戴眼镜的侧脸男孩两发都没换头）；别的模板逐字节不变", () => {
+    const plain = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
+    expect(plain).not.toMatch(/戴在头上的东西/);
+    expect(plain).toMatch(/任何一个人物都不许保留原有的发型、发色、面部或衣服。\n点名清单/);
+    const roster = ["1|27|左侧靠前|深棕短发，穿白色短袖", "2|74|右侧靠前|深棕短发，戴黑框眼镜，穿白色衬衫"].join("\n");
+    const lines = blockout.blockoutPrompt(blockout.parseRoles(roster)).split("\n");
+    const keep = lines.findIndex((l) => l.startsWith("任何一个人物都不许保留"));
+    expect(lines[keep + 1]).toBe("眼镜、帽子、耳机这类戴在头上的东西一并去掉；侧脸、低头或背对镜头的人同样整个头都换成光滑的白色人偶头。");
+    expect(lines[keep + 2]).toMatch(/^点名清单/);
+  });
+
   test("★★ 全白版的四句要害都在（少一句就有一种挂错卡的路子）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
     // ① 全白 + **完全相同**：这一版的全部机制就是"不要有任何区分"，不需要维持任何绑定
