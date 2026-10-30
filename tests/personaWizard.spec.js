@@ -200,3 +200,90 @@ describe("创建 / 列表", () => {
     expect(hot.body.personas[0].name).toBe("咖啡师小北");
   });
 });
+
+// ★★ 2026-09-18 线上 bug：官网人格编辑器只认 summary / catchphrases / stats / stanceHint 四个 style 字段，
+//   而 PUT 原来是「zod 给没发的键填默认空值 → doc.style 整份替换」。于是 App 7 步向导做出来的人格，
+//   拿到官网上**哪怕只改个价格**保存一次，tone / addressUser / greeting / examples / boundaries 就被清空，
+//   200、零提示。这三条从三个方向钉住 PATCH 语义：没发的键保持原值、显式清空照常生效、不带 style 一个字不动。
+describe("PUT /api/personas/:id 的 style 是 PATCH 语义", () => {
+  const FULL = {
+    summary: "句子短",
+    catchphrases: ["冲了"],
+    stanceHint: "先做再说",
+    tone: "松弛",
+    addressUser: "老铁",
+    greeting: "来了老铁～",
+    examples: DRAFT.examples.slice(0, 2),
+    boundaries: ["不聊政治"],
+  };
+  async function mkFull(token) {
+    const res = await request(app).post("/api/personas").set(auth(token)).send({ name: "阿冲", style: FULL });
+    expect(res.status).toBe(201);
+    return res.body.persona;
+  }
+
+  it("官网那种只带四个老字段的 style：向导字段一个都不能丢，四个老字段照常更新", async () => {
+    const { token } = await createUser();
+    const p = await mkFull(token);
+    // 官网 PersonaEditorPage 提交的形状：只有这四个键。⚠ 官网原来清空立场时发的是
+    //   `stanceHint: undefined`（整个键被 JSON 丢掉），在 PATCH 语义下那会变成"清不掉"——
+    //   所以官网同批改成了显式发 ""（client PR「清空立场/倾向时显式发空串」），这里照改后的形状发。
+    const res = await request(app)
+      .put(`/api/personas/${p._id}`)
+      .set(auth(token))
+      .send({ price: 30, style: { summary: "改过的简介", catchphrases: ["冲了", "害"], stats: [], stanceHint: "" } });
+    expect(res.status).toBe(200);
+    const s = res.body.persona.style;
+    expect(s.summary).toBe("改过的简介");
+    expect(s.catchphrases).toEqual(["冲了", "害"]);
+    expect(s.stanceHint).toBe("");
+    expect(s.tone).toBe("松弛");
+    expect(s.addressUser).toBe("老铁");
+    expect(s.greeting).toBe("来了老铁～");
+    expect(s.examples).toHaveLength(2);
+    expect(s.boundaries).toEqual(["不聊政治"]);
+    // 落库那份也要对（回包是从库里重读的，但再直查一次，防止以后有人改成回包拼接）
+    const Persona = require("../src/models/Persona");
+    const db = await Persona.findById(p._id).lean();
+    expect(db.style.greeting).toBe("来了老铁～");
+    expect(db.style.examples).toHaveLength(2);
+  });
+
+  it("显式发空值 = 清掉（PATCH 不等于不能清空）", async () => {
+    const { token } = await createUser();
+    const p = await mkFull(token);
+    const res = await request(app)
+      .put(`/api/personas/${p._id}`)
+      .set(auth(token))
+      .send({ style: { greeting: "", examples: [], boundaries: [] } });
+    expect(res.status).toBe(200);
+    const s = res.body.persona.style;
+    expect(s.greeting).toBe("");
+    expect(s.examples).toEqual([]);
+    expect(s.boundaries).toEqual([]);
+    // 没发的照旧
+    expect(s.tone).toBe("松弛");
+    expect(s.summary).toBe("句子短");
+  });
+
+  it("没带的键 = 保持原值（所以客户端想清空一个字段，必须显式发空值，不能靠不发）", async () => {
+    const { token } = await createUser();
+    const p = await mkFull(token);
+    // 模拟官网**修之前**的提交体：清空立场时 stanceHint 这个键根本不在
+    const res = await request(app)
+      .put(`/api/personas/${p._id}`)
+      .set(auth(token))
+      .send({ style: { summary: "句子短", catchphrases: ["冲了"], stats: [] } });
+    expect(res.status).toBe(200);
+    expect(res.body.persona.style.stanceHint).toBe("先做再说");
+  });
+
+  it("不带 style：style 一个字不动", async () => {
+    const { token } = await createUser();
+    const p = await mkFull(token);
+    const res = await request(app).put(`/api/personas/${p._id}`).set(auth(token)).send({ name: "阿冲2" });
+    expect(res.status).toBe(200);
+    expect(res.body.persona.style.greeting).toBe("来了老铁～");
+    expect(res.body.persona.style.examples).toHaveLength(2);
+  });
+});
