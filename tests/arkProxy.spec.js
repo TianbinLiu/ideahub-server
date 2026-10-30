@@ -1221,6 +1221,9 @@ describe("健康端点", () => {
       ok: true,
       ark: false,
       imageGroups: true,
+      // videoHide / ipRegion：「不感兴趣」那对端点与资料里的 IP 属地（2026-10-30，#142）—— 能力位，不是秘密
+      videoHide: true,
+      ipRegion: true,
       res480: true,
       draftMode: true,
       failRefund: true,
