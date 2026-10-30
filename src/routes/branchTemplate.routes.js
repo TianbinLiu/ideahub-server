@@ -1602,6 +1602,24 @@ router.get("/templates/mine", requireAuth, mineListLimit, async (req, res, next)
   }
 });
 
+// 模板作者奖励的规则（每次多少、三道上限、要挂多久）与登录者自己（作为模板作者）的小结。App 上那句话读的是这里，不另抄一份数。
+// @endpoint GET /api/branch/template-reward
+//   → { ok, reward: { enabled, tokens, perAuthorPerDay, perTemplate, perUserPerDay, holdMs }, mine?: { count, tokens, last24h } }
+//   与 GET /api/branch/remix-reward 同形（键名按契约「模板作者奖励」）；`mine` 只在带了登录态时有。
+//   老服务端没有这条路 —— App 先看 /api/ark/health 的 `templateReward` 能力位，再判回包形状（有没有 reward 对象），不看状态码
+// ★ 静态路径，与下面的 `/templates/:id` 不重叠（前缀不同）
+router.get("/template-reward", optionalAuth, async (req, res, next) => {
+  try {
+    const templateReward = require("../config/templateReward");
+    const { summaryFor } = require("../services/templateReward.service");
+    const reward = templateReward.publicConfig();
+    const mine = req.user ? await summaryFor(req.user._id) : null;
+    res.json({ ok: true, reward, ...(mine ? { mine } : {}) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/templates/shared", optionalAuth, async (req, res, next) => {
   try {
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));

@@ -1241,6 +1241,8 @@ describe("健康端点", () => {
       clientEvents: true,
       // videoZone：这台服务器有 GET /api/video/zone（出片地区，2026-10-26；tests/videoZone.spec.js）—— 只放「有没有」，不放地区本身
       videoZone: true,
+      // templateReward：认发布体里的 templateIds、有 GET /api/branch/template-reward（模板作者奖励，2026-10-30；tests/templateReward.spec.js）
+      templateReward: true,
       // minimaxV2：这台服务器开着 MiniMax H3 出片（只在国际站 key 配着时为真；这一套不配 MiniMax，所以是 false —— tests/minimaxV2.spec.js）
       minimaxV2: false,
       // minimaxV2FreeTextOnly：没付过钱的人在 H3 上只能纯文字出片（tokens.MINIMAX_V2_FREE_TEXT_ONLY，2026-10-26 终审）—— 代码常量，不随 key 变

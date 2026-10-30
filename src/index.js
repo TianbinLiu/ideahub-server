@@ -169,6 +169,13 @@ async function start() {
         sweepRemixRewards().catch((e) => console.error("[remix-reward] 清扫失败:", (e && e.message) || e));
       }, 10 * 60 * 1000);
       remixRewardTimer.unref?.();
+      // 模板作者奖励：发布满 24 小时、套过模板的作品，每个 (作品, 模板) 判一次发不发（services/templateReward.service，2026-10-30）。
+      // ★ 与上面同款奖励同一套讲究：只在 0 号实例、10 分钟一轮、开关关着也照跑（关着时到期的一律记成不发，不攒着）。
+      const { sweepTemplateRewards } = require("./services/templateReward.service");
+      const templateRewardTimer = setInterval(() => {
+        sweepTemplateRewards().catch((e) => console.error("[template-reward] 清扫失败:", (e && e.message) || e));
+      }, 10 * 60 * 1000);
+      templateRewardTimer.unref?.();
       // 受理之后失败的生成任务：替没人再来问的那些（App 被杀 / 卸载）向上游问一次结局，失败的按原桶退钱（services/taskRefund）。
       // ★ 只在 0 号实例：两个实例各扫一遍不会多退（open → claimed 是条件原子抢占），但会把上游查询翻倍（方舟查询的 QPS 上限没有公开数）。
       // ★ 5 分钟一轮、一轮最多问 30 次、问不出结局就退避（10 → 60 分钟）；同实例不重入（一轮可能跨过下一个 5 分钟）。

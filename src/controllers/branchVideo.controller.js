@@ -30,6 +30,8 @@ const BranchProject = require("../models/BranchProject");
 // 公开配方（制作过程）。这里只用于**级联删除**；读写端点在 controllers/branchRecipe.controller.js，
 // 作品回包上的提示位读的是 BranchVideo.recipe（那边同拍写）。
 const BranchRecipe = require("../models/BranchRecipe");
+// 只用来核「发布体里报的模板 id 真有这一行」（resolveTemplateIds，模板作者奖励）
+const BranchTemplate = require("../models/BranchTemplate");
 const { sweepPendingPurges, pendingPurgeCount } = require("../services/assetPurge.service");
 // 「删一条作品要回收哪些云端资产」：地址枚举与归属判定各只有一处（见两个文件的 ★★）
 const { assetUrlsOfVideo } = require("../utils/branchAssetRefs");
@@ -984,6 +986,28 @@ async function resolveRemixOf(raw, user) {
   return { video: src._id, author: src.author, ...(self ? {} : { pending: true }) };
 }
 
+/**
+ * 发布体 / 回炉体里的 `templateIds` → 要写进作品的那几格（模板作者奖励，2026-10-30）。
+ * 回 null = 这一发没带这个键（库里那份不动）；回对象 = 要 $set 的字段。
+ *
+ * ★ 只认**存在的**模板（BranchTemplate 里真有这一行），不存在的丢掉、去重 —— 与 resolveRemixOf 同一条：认不下来**不挡发布**。
+ *   ⚠ 这里**不**排除作者自己的模板、也不看 status：谁是模板作者、模板还在不在市场上，都是**判定那一刻**（满 24 小时后）的事
+ *   （services/templateReward.service 的 verdictFor 回 self / template_blocked）。写入时排除的话，模板在这 24 小时里换主 / 被下架
+ *   就会判成另一个结果，而且 `templateIds` 这一格本身是「这条作品用了哪些模板」的事实，与发不发钱无关。
+ * ★ `templateReward.pending` 只在真有 id 时落（契约「有 id 才落」）：没套模板的作品不该在清扫器的 partial 索引里占一行。
+ *   `templateReward.at` 跟着一起写 = 这批 id 挂上的时刻，是到期的锚点（挂上满 24 小时才判；改壳 PATCH 给老作品挂 id 不会下一轮就发）。
+ *   带了 `[]`（回炉说「这一版没套模板」）就只落空数组、不碰 pending —— 上一版欠着的判定照旧由清扫器收口（它见 templateIds 为空会直接摘掉 pending）。
+ */
+async function resolveTemplateIds(raw, now = new Date()) {
+  if (!Array.isArray(raw)) return null;
+  const wanted = [...new Set(raw.map((s) => String(s).trim()).filter((s) => isValidId(s)))];
+  if (!wanted.length) return { templateIds: [] };
+  const found = await BranchTemplate.find({ _id: { $in: wanted } }).select("_id").lean();
+  const have = new Set(found.map((t) => String(t._id)));
+  const templateIds = wanted.filter((id) => have.has(id)).map((id) => new mongoose.Types.ObjectId(id));
+  return templateIds.length ? { templateIds, templateReward: { pending: true, at: now } } : { templateIds: [] };
+}
+
 // POST /api/branch/videos
 async function createVideo(req, res, next) {
   try {
@@ -1011,6 +1035,8 @@ async function createVideo(req, res, next) {
     const { cover, segments, branchTree, deck } = await transferDraftAssets(draft, String(req.user._id));
     // 同款归属（按谁的流程做的）。认不下来就是 null，见 resolveRemixOf 的 ★
     const remixOf = await resolveRemixOf(draft.remixOf, req.user);
+    // 套用过的模板（模板作者奖励）。老 App 不发这个键 → null → 一个字段都不落
+    const tplFields = await resolveTemplateIds(draft.templateIds);
 
     let doc;
     try {
@@ -1030,6 +1056,7 @@ async function createVideo(req, res, next) {
         author: req.user._id,
         ...(clientId ? { clientId } : {}),
         ...(remixOf ? { remixOf } : {}),
+        ...(tplFields && tplFields.templateIds.length ? tplFields : {}),
         plays: 0,
         likes: 0,
         commentCount: 0,
@@ -1335,7 +1362,7 @@ function normalizeLinkOnly(patch) {
  *   ⇒ ②b 把绝大多数冲突挡在花钱之前；真在 ②b 与 ④ 之间被人抢跑的那一发，
  *     ④ 负责把新地址交给清扫器。这正是 `purgeVideo` 那条「句柄先落库」的同一条纪律。
  */
-async function reviseVideoContent({ req, res, id, body, baseRevision }) {
+async function reviseVideoContent({ req, res, id, body, baseRevision, tplFields }) {
   // ① 旧正文要留着做 diff 回收（地址只存在于那份正文里，一 $set 就找不回来了）
   const before = await BranchVideo.findById(id)
     .select("_id author pricing takedown revision cover segments branchTree")
@@ -1457,6 +1484,8 @@ async function reviseVideoContent({ req, res, id, body, baseRevision }) {
   const $set = {
     ...shell,
     ...transferred,
+    // 套用过的模板（已经在 updateVideo 里核过存在性；null = 这一发没带，不动）
+    ...(tplFields || {}),
     revisedAt: new Date(),
     assetUrls: nextAssetUrls,
   };
@@ -1571,22 +1600,29 @@ async function updateVideo(req, res, next) {
     const body = { ...req.body };
     const baseRevision = body.baseRevision;
     delete body.baseRevision;
+    // ★ 归属先判、再去查别的表：带 templateIds 的 PATCH 会去 BranchTemplate 查一遍存在性，不该替一个不是作者的人跑那一查
+    //   （回炉那条路 reviseVideoContent 自己还会再判一次 —— 它要带着别的字段取 before，这里这一读只是把 403 提到最前）。
+    // ★ select 里带上 cover/segments/branchTree：改壳改封面时要按**合并之后**的正文重算 assetUrls（见下面那条 ★★）
+    const doc = await BranchVideo.findById(id).select("_id author cover segments branchTree").lean();
+    if (!doc) notFound("Video not found");
+    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+
+    // 套用过的模板（模板作者奖励）先摘出来单独核：它要查 BranchTemplate 的存在性，不能跟着壳字段裸 $set
+    // （裸写的话一个不存在的 id 也会落库，之后清扫器替一个不存在的模板判一遍 template_gone —— 白占一行）。
+    // 回 `templateReward.at` = 现在：到期从挂上那一刻起算（model 里 at 的 ★）
+    const tplFields = await resolveTemplateIds(body.templateIds);
+    delete body.templateIds;
     const isRevise =
       body.segments !== undefined || body.branchTree !== undefined || body.deck !== undefined;
 
     if (isRevise) {
-      await reviseVideoContent({ req, res, id, body, baseRevision });
+      await reviseVideoContent({ req, res, id, body, baseRevision, tplFields });
       return;
     }
     // ★ 只报了 baseRevision、一个真字段都没改 —— zod 的 refine 数的是键个数，放行了，
     //   但 `$set: {}` 会静默成功并回一条"改过了"的作品。整句拒（铁律八）。
-    if (!Object.keys(body).length) badRequest("no fields to update");
-
-    // ★ select 里带上 cover/segments/branchTree：改封面时要按**合并之后**的正文
-    //   重算 assetUrls（见下面那条 ★★）
-    const doc = await BranchVideo.findById(id).select("_id author cover segments branchTree").lean();
-    if (!doc) notFound("Video not found");
-    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+    //   只带 templateIds 算改了东西（它是作品上的一格，与标签同类）。
+    if (!Object.keys(body).length && !tplFields) badRequest("no fields to update");
 
     // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那五个键。
     // ★ cover 的 schema 已经把它限成 http(s) URL（不收 dataURL，见 schemas 里的说明），
@@ -1601,7 +1637,7 @@ async function updateVideo(req, res, next) {
     //     以后只会有人改一处（铁律六）。真正的门在 schema 上。
     // ★ 用上面那份已经摘掉 baseRevision 的 body（它不是壳字段，$set 进去就是往库里
     //   写一个模型都没有的路径 —— mongoose strict 会静默丢掉，但别指望它兜底）
-    const patch = { ...body };
+    const patch = { ...body, ...(tplFields || {}) };
     // 「凭链接可见」的归一规则：**唯一实现**在 normalizeLinkOnly（回炉那条路调的是同一个，
     // 铁律六）。原来这里与 reviseVideoContent 各有一份逐字相同的拷贝。
     const $unset = normalizeLinkOnly(patch);
@@ -1675,6 +1711,8 @@ async function removeVideo(req, res, next) {
  *
  * 不删（刻意的）：RemixReward（同款奖励的判定记录）—— 这条作品是同款也好、是被照着做的原作也好，那几行都留着：
  *   它们是别的原作者的上限计数与平台印钱的审计（models/RemixReward.js 的 ★★），奖励发了也不追回。
+ *   TemplateReward（模板作者奖励的判定记录，2026-10-30）同理不动：那是模板作者的上限计数与审计。
+ *   作品上还欠着的 `templateReward.pending` 随文档一起没了 —— 到期前就删掉的作品本来就不该发（规则是「那一刻还公开着」）。
  *
  * ★ 提成函数是因为它现在有**两个**调用方：作者/管理员直接删（removeVideo），
  *   以及举报处理里的 action=delete（services/takedown.service）。

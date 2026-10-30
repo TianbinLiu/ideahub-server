@@ -457,6 +457,52 @@ App 上那句「每次 N token、每天最多 M 次…」读的是这里，**不
 **删号 / 删作品**：`RemixReward` 里「他是原作者」的行随删号一起删；「他是同款作者」的行**留着**（那是别的原作者的上限计数，
 跟着删的话刷子号做完同款就注销、上限被悄悄清零）。删作品不动这张表。
 
+### 模板作者奖励（`template_reward`，2026-10-30）
+
+别人**套用了你的模板**出片、**套用记录挂上之后满 24 小时、那一刻作品还公开着** → **平台**印一笔 token 给模板作者（主人 10-30 拍板；设计正本在 app 仓
+`docs/template-author-reward-design.md`）。**形状照抄同款奖励**（上一节），只换触发源与几个数；钱的红线同一条：平台印钱、不在用户之间流转。
+
+| 数 | 值 | 在哪儿 |
+|---|---|---|
+| 每次 | 10,000 token（≈ 0.15 元；同款是 30k —— 套模板比照着流程做同款轻得多、频次高得多） | `config/templateReward.js` 的 `TOKENS` |
+| 每位模板作者 24 小时内 | 最多 20 次，**不顺延** | `PER_AUTHOR_PER_DAY` |
+| 每个模板一共 | 最多 200 次 | `PER_TEMPLATE` |
+| 每个**使用者** 24 小时内 | 最多给别人带来 3 次，不顺延（防互刷，与同款的 `PER_REMIXER_PER_DAY` 同一个理由） | `PER_USER_PER_DAY` |
+| 要挂多久 | 24 小时 | `HOLD_MS` |
+| 开关 | 缺省开；`TEMPLATE_REWARD_ENABLED=false` 关 | `enabled()` |
+| **全站** 24 小时内（保险丝） | 最多 200 次（≈ 30 元 / 天），可用 `TEMPLATE_REWARD_GLOBAL_PER_DAY` 调，不用发版；断了发信（同款那封的同一批收件人） | `globalPerDay()` |
+
+**发布体**：`POST /api/branch/videos` 与 `PATCH /api/branch/videos/:id`（回炉）多一格 **`templateIds?: string[]`**（≤ 20、24-hex；
+服务端去重、只收**存在的** BranchTemplate id、不存在的丢掉，**不挡发布**）。落 `BranchVideo.templateIds`；有 id 才落 `templateReward.pending: true`。
+回炉带了就整个覆盖；已经判过的 (作品, 模板) 不再判（`TemplateReward` 的 `{ video, template }` 唯一索引）。老 App 不发这个键 ⇒ 什么都不会发生。
+文字模板（App 2.71 起「只用文字 + 封面」）没有服务端 id，不在此列。**健康端点** `GET /api/ark/health` 多一位 `templateReward: true`：
+App 见不到就不说那一句、不发 `templateIds`（老服务端会 strip，发了也无害）。
+
+**规则端点**：`GET /api/branch/template-reward`（optionalAuth）
+→ `{ ok, reward: { enabled, tokens, perAuthorPerDay, perTemplate, perUserPerDay, holdMs }, mine?: { count, tokens, last24h } }`。
+App 上那句话读的是这里，**不在 App 里另抄一份数**（`holdMs` 给毫秒，与同款的 `holdHours` 不同，照契约）。
+
+**一条作品的一生**（唯一实现 `services/templateReward.service.js`）：
+1. 发布 / 回炉认下了 `templateIds` → 作品上落 `templateReward.pending`。**写入时不排除作者自己的模板、不看模板状态**：谁是模板作者
+   （`BranchTemplate.ownerId`）、模板还在不在，都是判定那一刻的事。
+2. **套用记录挂上之后满 24 小时、那一刻作品还公开着才判**（锚点是 `templateReward.at`：dueAt = max(`createdAt`, `at`) + 24h；
+   回炉 / 改发布体重新挂 id 的，新的那几对从挂上那一刻起算，早判过的对不受影响）。清扫器（`index.js`，只在 0 号实例，每 10 分钟一轮）
+   把这条作品套过的**每一个**模板各判**一次**，各写一行 `TemplateReward`；一对都不 busy 才摘掉作品上的 pending。不发的原因（`reason`）：`disabled` / `video_not_public`（私密、凭链接可见、
+   被下架）/ `template_gone`（模板删了）/ `template_blocked`（平台下架的模板；`retired` 照发）/ `author_inactive`、`user_inactive` /
+   `self`（自己套自己的）/ **`blocked`（两人之间有拉黑 —— 与同款不同：那边币照发只是通知匿名，这边规则写明「没有拉黑才发」）** /
+   `user_cap`、`template_cap`、`day_cap` / `budget`（保险丝，排在最后判）。**判一次就定案**、发了**不追回**。
+3. 发：先占位（`claimed`）→ `wallet.credit(模板作者, 10000, "template_reward", "模板奖励 video:<作品 id> tpl:<模板 id>")`（进 **addon**）
+   → `paid` → 一条 `BRANCH_TEMPLATE_REWARD` 通知。崩在中间的由下一轮按**账本**续办（memo 逐字是证据）。
+
+**通知** `BRANCH_TEMPLATE_REWARD`：收件人 = 模板作者；`actorId` = 套模板的人、顶层 `videoId` = 那条作品；
+`payload = { tokens, templateId, templateTitle, videoId, videoTitle }`。App 点进去落到**自己的模板详情页**（`payload.templateId`）。
+没有匿名那一支（拉黑的这一对不发币）。⚠ 老 App（≤ 2.76）**收不到**这一类（请求层白名单）：币照到，只是没有那条通知。
+
+**账本**：`TokenLedger.reason` 多一档 `template_reward`，与 `remix_reward` 同一条纪律（不在 `REPAY_REASONS`、不在 `SPEND_REASONS`）。
+
+**删号 / 删作品 / 删模板**：`TemplateReward` 里「他是模板作者」的行随删号一起删；「他是使用者」的行**留着**。删作品、删模板都不动这张表
+（模板删了之后到期的判成 `template_gone`）。
+
 ## 热度（`heat`）
 
 **只有一个公式**，实现在 server 的 `src/utils/hotScore.js`：
@@ -491,6 +537,10 @@ likes×6 + comments×4 + bookmarks×3 + min(views, 5000)×0.04
   ★ 两人之间有拉黑、或那条同款已经不公开时**不带** `actorId` / `videoId`（App 画成「有人做了你的同款」）：币已经进账，
   不能不说（App 没有流水页）；但也不能把被拉黑的人摆到眼前。
   ⚠ 老 App（≤ 2.60）**收不到**这一类（请求层白名单，同 `BRANCH_REVISED`）：币照到，只是没有那条通知。
+- `Notification.type` 另增 **`BRANCH_TEMPLATE_REWARD`**（2026-10-30，模板作者奖励）：**模板作者奖励到账**。收件人 = 模板作者。
+  `payload = { tokens, templateId, templateTitle, videoId, videoTitle }`；`actorId` = 套模板的人、顶层 `videoId` = 那条作品。
+  App 点进去落到**自己的模板详情页**（`payload.templateId`）。金额是 `payload.tokens`（数），句子由 App 按界面语言说。
+  没有匿名那一支（两人之间有拉黑的这一对根本不发币，见上面「模板作者奖励」）。⚠ 老 App（≤ 2.76）**收不到**这一类（请求层白名单）。
 - `Notification.type` 另增 **`GEN_TASK_REFUND`**（2026-10-07，失败退款）：**一发生成任务失败了，token 已经退回**。收件人 = 那一发的主人。
   `payload = { tokens, kind, taskId, provider }`（`kind` ∈ `video` / `draft` / `draftFinal` / `3d` / `blockout` / `minimax`，`provider` ∈ `ark` / `minimax`）；
   **不带** `actorId`、没有 deeplink（平台口径）。金额是 `payload.tokens`（数），句子由 App 按界面语言说。

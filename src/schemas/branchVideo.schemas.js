@@ -78,6 +78,9 @@ const pricingBody = z.object({
   partPrices: z.array(z.coerce.number().int().min(0).max(10_000_000)).max(60).optional().default([]),
 });
 
+// 套用过的模板 id 列表（发布体与回炉体共用同一份形状，铁律六）。上限 20 与 BranchVideo.templateIds 的注释、契约同一个数
+const templateIds = z.array(z.string().trim().regex(/^[a-f0-9]{24}$/i, "templateIds must be 24-hex ObjectIds")).max(20);
+
 // POST /api/branch/videos —— DraftVideo
 const publishBody = z.object({
   title: z.string().trim().min(1).max(120),
@@ -104,6 +107,11 @@ const publishBody = z.object({
   //   形状不对 / 那条作品不存在 / 这个人读不到它 → controller 里当没带，**不挡发布**（见 resolveRemixOf）。
   //   所以这里只管上限，不用正则把它钉成 24-hex：钉死的话一个脏值会让整条发布 400，而这一格只是署名。
   remixOf: z.string().trim().max(64).optional(),
+  // 这条作品套用过的模板 id（2026-10-30，模板作者奖励）。★ 必须显式声明（理由同上面 deck / clientId）。
+  //   形状在这里（≤ 20、每个 24-hex），**存在性**在 controller（resolveTemplateIds：不存在的丢掉、去重），不挡发布。
+  //   与 remixOf 不同的是这里钉成 24-hex（一个脏项 = 整条发布 400，是**有意的**）：App 发的是从服务端拿回来的模板 id，
+  //   不该有脏值；真有就是 App 那边拼错了，400 比静默丢掉更早被看见。「模板不存在 / 被删了」不是脏值，那一档 controller 静默丢。
+  templateIds: templateIds.optional(),
 });
 
 // PATCH /api/branch/videos/:id —— 作品编辑（仅作者）+ **回炉重做**（唯一的内容写入通道）
@@ -177,6 +185,9 @@ const updateBody = z
      *   兜住（判否定：没有这个字段 = 从没回炉过）。
      */
     baseRevision: z.coerce.number().int().min(0).max(100000).optional(),
+    // 回炉换内容时重报套用过的模板（整个覆盖；已经判过的 (作品, 模板) 不再判 —— TemplateReward 的唯一索引兜着）。
+    // ★ 不给 default：不带 = 库里那份不动。带 `[]` = 这一版没套模板（落空数组）
+    templateIds: templateIds.optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: "no fields to update" });
 

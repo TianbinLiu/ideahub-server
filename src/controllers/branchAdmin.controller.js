@@ -26,6 +26,7 @@ const BranchProject = require("../models/BranchProject");
 // 公开配方（制作过程）。与 BranchProject 同一条纪律：purgeVideo 与这里两处都落
 const BranchRecipe = require("../models/BranchRecipe");
 const RemixReward = require("../models/RemixReward");
+const TemplateReward = require("../models/TemplateReward");
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
@@ -320,6 +321,8 @@ async function unbanUser(req, res, next) {
  *      原作没了之后回包里自然不再带出这条归属（getVideo 现查原作，查不到就不发）。
  *   ⑦.9 RemixReward（同款奖励的判定记录）**他是原作者**的那些 → deleteMany（他收到的奖励，随他的 token 流水⑨一起没）。
  *      ★ **他是同款作者**的那些行不删，见下面「不删」那一份。
+ *   ⑦.9b TemplateReward（模板作者奖励的判定记录，2026-10-30）**他是模板作者**的那些 → deleteMany；**他是使用者**的行不删（同上）。
+ *      别人作品上「套过他的模板」那一格（BranchVideo.templateIds）**不动**：那是别人的作品；到期判定时查不到模板就记 template_gone。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
  *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
@@ -345,6 +348,7 @@ async function unbanUser(req, res, next) {
  *   不删（刻意的，不是遗漏）：
  *   · RemixReward 里**他是同款作者**的行 —— 那是别的原作者的上限计数（每条原作 50 次、每人每天 10 次）与平台印钱的审计。
  *     跟着他一起删的话，刷子号做完同款就注销，原作者的两道上限就被悄悄清零了。留下的只有几个 ObjectId，够不成个人信息。
+ *   · TemplateReward 里**他是使用者**的行 —— 同上（每个模板 200 次、每位模板作者每天 20 次的计数）。
  *   · 别人从他的老师人格「开始学」开出来的 TutorCourse / TutorRun —— 那是别人的学习过程与自用件，只标 sourceOrphanedAt
  *     （课程页说「这位老师已不在市场上」、合并新版 409），理由在 tutorPurge.service 头部。
  *   · PointsLedger —— 复式记账，硬不变量是「除 signup 外所有分录和为零」（I1，机器可查）。
@@ -485,6 +489,8 @@ async function purgeUserCascade(userId) {
 
   // ⑦.9 同款奖励的判定记录：只删**他是原作者**的（理由见函数头两份清单）
   removed.remixRewards = (await RemixReward.deleteMany({ author: uid })).deletedCount;
+  // ⑦.9b 模板作者奖励的判定记录（2026-10-30）：同一条纪律，只删**他是模板作者**的；「他是使用者」的行留着（别人的上限计数）
+  removed.templateRewards = (await TemplateReward.deleteMany({ author: uid })).deletedCount;
 
   // ⑧ 举报。
   // ★★ **儿童安全（csae）那些一条都不删** —— 这是删号权利的一个**法定义务例外**，
