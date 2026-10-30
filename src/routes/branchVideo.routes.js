@@ -16,6 +16,8 @@ const {
   likeVideo,
   collectVideo,
   uncollectVideo,
+  hideVideo,
+  unhideVideo,
   listMyCollects,
   unlikeVideo,
   listComments,
@@ -81,6 +83,10 @@ router.delete("/videos/:id/like", requireAuth, likeLimit, unlikeVideo);
 //   （列表口径不认「凭链接可见」，走列表会让那些作品在收藏页永远看不到，且零报错）。
 const collectLimit = userRateLimit({ windowMs: 60 * 1000, max: 60, scope: "branch:collect" });
 router.post("/videos/:id/collect", requireAuth, collectLimit, collectVideo);
+// 「不感兴趣」（2026-10-30，契约「不感兴趣」）：限流与收藏同档
+const hideLimit = userRateLimit({ windowMs: 60 * 1000, max: 60, scope: "branch:hide" });
+router.post("/videos/:id/hide", requireAuth, hideLimit, hideVideo);
+router.delete("/videos/:id/hide", requireAuth, hideLimit, unhideVideo);
 router.delete("/videos/:id/collect", requireAuth, collectLimit, uncollectVideo);
 router.get("/me/collects", requireAuth, listMyCollects);
 

@@ -658,7 +658,9 @@ function stripHandoffTags(text) {
   return String(text || "").replace(/\[\s*handoff[^\]]*\]\s*/gi, "");
 }
 
-function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false } = {}) {
+function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false, appVersion = null, caps = [] } = {}) {
+  const capGoto = Array.isArray(caps) && caps.includes("goto");
+  const capAsk = Array.isArray(caps) && caps.includes("ask");
   const who = userName ? `正在咨询的用户叫「${userName}」。` : "";
   // enNames（这一轮原话是英文）而 lang 不是 en 时把话说死：App 发的 lang 恒为 zh，「用户用英文就用英文」这句在 2026-10-20 的真模型复跑里
   // 一问短英文（「I want a refund.」）有一次回了整段中文（6 发里 1 发）
@@ -680,8 +682,14 @@ function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge
       ? "【英文界面叫法】用英文回答时，界面上的名字照这张表原样说（括号里是知识库里的中文名）：Fast（极速）、Standard（标准）、Lite（出片档位里的「草稿」，480p）、HD（高清）、Cinematic（电影级）、Real-person（真人档）、preview draft / finalize（样片 / 定稿）、Blockout（白模）；出图档 Sketch（速写）、Master（精绘）、Refined（定妆，2.63 撤了）；Card smith（铸卡师）；Recover（取回）、Undo（撤销）、Drafts（草稿箱）、Remake（回炉重做）、Merge & go to publish（合成并去发布）、Cancel merge（取消合成）、Save to device（保存到本地）；Public / Anyone with the link / Only me（公开 / 凭链接可见 / 仅自己可见）；Settings（设置）、Me（「我的」页）、Top up / Plans（充值 / 套餐）、Standard plan / Pro plan（标准套餐 / 专业套餐）、Deactivate account（注销账号）、Log out（退出登录）、Forgot password?（忘记密码？）、Edit profile（编辑资料）、Check for updates / Update now / Later（检查更新 / 立即更新 / 以后再说）；Workflow（工作流）、Workshop（工坊）、One-tap finish（一键成片）、QiMeng Tutor（启梦老师）。表里没有的名字照知识库原文的意思说，别自己起一个像按钮名的英文名。知识库里的「草稿」有两个意思：出片档位英文叫 Lite（例：「草稿、高清、电影级带 AI 环境音」说成「Lite, HD and Cinematic include AI ambient sound」），草稿箱英文叫 Drafts；英文回答里不要单独用 Draft 这个词。"
       : null;
   return [
-    `你是「${name}」，启梦 App（安卓端，包名 com.ideahub.branchvideo；官网叫「启梦创作」）的官方 AI 客服，形象是官网首页的看板娘：银白长发带薄荷绿挑染的少女，亲切、专业、不卖萌过头。`,
+    // ★ 「成年」（2026-10-30 补齐）：09-24 已定数字人一律成年，陪聊那一份写的是「一个成年、银白长发…」，这里漏改了一处（Play 合规相关）
+    `你是「${name}」，启梦 App（安卓端，包名 com.ideahub.branchvideo；官网叫「启梦创作」）的官方 AI 客服，形象是官网首页的看板娘：银白长发带薄荷绿挑染的成年女性，亲切、专业、不卖萌过头。`,
     who,
+    // ★ 版本号静默进上下文（2026-10-30）：Intercom / Zendesk 都把 App 版本当元数据带上、不显示。省掉「你用的是哪一版」那一轮；
+    //   知识库里按版本说的话（「2.75 起…」）让模型按这个版本挑。契约「X-App-Version」原来写「只进日志」，10-30 起多了这一个用处，仍不拿它做任何判断
+    appVersion && appVersion.name
+      ? `【用户版本】对方装的 App 是 ${appVersion.name}${appVersion.code ? `（${appVersion.code}）` : ""}。不要再问他用哪一版；知识库里按版本分开说的事，按这个版本答，也别把版本号念出来。`
+      : null,
     langLine,
     enNamesLine,
     "【依据】只根据下面「知识库」里的事实回答；知识库里没有的功能、价格、时限、政策一律说「这个我不确定，需要人工核实」，并按下面【转人工】第 5 条处理（回复开头写 [handoff:other]，告诉用户怎么提交），绝不编造。",
@@ -698,6 +706,16 @@ function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge
     `  类别只能是 ${CATEGORIES.join("/")}。不满足条件时绝不要输出 [handoff]。`,
     "【演出协议】除了可选的 [handoff] 标记外，每一句话开头都要带三个标签：[情绪][face:表情][action:动作]，然后紧跟正文。",
     `情绪只能取：${EMOTIONS.join("/")}。表情只能取：${FACES.join("/")}。动作只能取：${ACTIONS.join("/")}。`,
+    // ★ 动作白名单（2026-10-30）：用户要举手 / 抬腿 / 指按钮时，原来模型会拿别的动作顶替还嘴上答应；现在照实说做不到
+    "【动作】你能做的动作只有上面列的这几种。用户要你举手、抬腿、指按钮、转圈、跳舞这类不在列表里的动作时，如实说这个形象做不到，不要拿别的动作顶替、也不要答应。",
+    // ★ 「带我去」与「拿不准先问」（2026-10-30，只对声明了 caps 的新客户端说）：支付宝 / 店小蜜的答案里直接给站内入口；
+    //   Material 的 suggestion chips 是对等的 2～4 个。两种标记都写在整段回复的**最末尾**、各最多一个，路由在 done 之前解析成事件、字幕与语音里剥掉
+    capGoto
+      ? `【带我去】答案的下一步是让用户去 App 里某一页时，在整段回复的最末尾单独写一个 [goto:页面id]，用户会看到一颗能点的「带我去」键。页面 id 只能是：${Object.entries(GOTO_TARGETS).map(([id, v]) => `${id}（${v.zh}）`).join("、")}。一段回复最多一个，不是这几页的事不要写。`
+      : null,
+    capAsk
+      ? "【拿不准先问】用户的问题有两种以上可能、答下去会答错时，先用一句话说清为什么要问，然后在整段回复的最末尾写 [ask:你的问题|选项A|选项B]（2～4 个选项，每个不超过 12 字，推荐的放第一个，选项都必须是不花钱、能退回的）。用户点了选项等于把那个选项的字发给你。"
+      : null,
     "示例：[neutral][face:normal][action:explain] 这一发的钱在提交那一刻就扣掉了，取回不再花钱。 [happy][face:happy][action:acknowledge] 打开出片页点「取回」就行，方舟档的成片 24 小时内有效。",
     "转人工示例：[handoff:billing] [sad][face:sad][action:comfort] 退款要人工核对，我这边没法直接处理。 [neutral][face:normal][action:explain] 请点下面的「转人工」，写上任务号和下单时间。 [neutral][face:normal][action:explain] 再点「提交给人工客服」，提交了客服才看得到。",
     "标签只放在句首，不要在句中或句尾出现方括号。[handoff] 只能出现在整段回复的最开头，一段回复最多一次。",
@@ -788,9 +806,59 @@ async function summarizeTicket(transcript, { note = "" } = {}) {
   }
 }
 
+/**
+ * 「带我去」的落点白名单（2026-10-30）。★ 服务端只认 id 与给人看的名字，**不认路由**：路由是 App 的事（app `pages/SupportPage` 的 GOTO_ROUTES），
+ *   两边按 id 对；加一个落点两边一起加。模型写了不在表里的 id 一律丢。
+ */
+const GOTO_TARGETS = Object.freeze({
+  settings: { zh: "设置", en: "Settings" },
+  wallet: { zh: "钱包 / 套餐", en: "Wallet & plans" },
+  models: { zh: "数字人形象", en: "Avatars" },
+  personas: { zh: "数字人人格", en: "Personas" },
+  voice: { zh: "声音设置", en: "Voice" },
+  create: { zh: "创作中心", en: "Creator center" },
+  templates: { zh: "视频模板", en: "Templates" },
+  drafts: { zh: "草稿箱", en: "Drafts" },
+  storage: { zh: "本机缓存", en: "Storage" },
+  update: { zh: "检查更新", en: "Check for updates" },
+  tickets: { zh: "我的工单", en: "My tickets" },
+});
+const GOTO_RE = /\[\s*goto\s*[:：=]\s*([a-z_]{1,24})\s*\]/gi;
+const ASK_RE = /\[\s*ask\s*[:：=]\s*([^\]|]{1,80})((?:\|[^\]|]{1,24}){2,4})\s*\]/gi;
+
+/** 回复里的 [goto:id]：取**最后一个**、且 id 在白名单里的；回 null = 没有 */
+function parseGoto(text) {
+  let last = null;
+  for (const m of String(text || "").matchAll(GOTO_RE)) {
+    const id = m[1].toLowerCase();
+    if (GOTO_TARGETS[id]) last = id;
+  }
+  return last ? { id: last, label: GOTO_TARGETS[last] } : null;
+}
+
+/** 回复里的 [ask:问题|A|B]：取最后一个；选项去重、去空，剩不到两个就当没有 */
+function parseAsk(text) {
+  let last = null;
+  for (const m of String(text || "").matchAll(ASK_RE)) {
+    const question = m[1].trim();
+    const options = [...new Set(m[2].split("|").map((s) => s.trim()).filter(Boolean))].slice(0, 4);
+    if (question && options.length >= 2) last = { question, options };
+  }
+  return last;
+}
+
+/** 把两种动作标记从要念、要显示的文字里剥掉（字幕 / 语音 / 存进历史的那份都过它） */
+function stripActionTags(text) {
+  return String(text || "").replace(GOTO_RE, "").replace(ASK_RE, "");
+}
+
 module.exports = {
   agentName,
   QUICK_QUESTIONS,
+  GOTO_TARGETS,
+  parseGoto,
+  parseAsk,
+  stripActionTags,
   loadKnowledge,
   selectKnowledge,
   isEnglishAsk,

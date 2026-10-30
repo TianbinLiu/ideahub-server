@@ -200,7 +200,7 @@ async function getUserProfile(req, res, next) {
       await ensureUsersVisibleOrThrow(currentUserId, id);
     }
 
-    const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt uid');
+    const user = await User.findById(id).select('username displayName bio avatarUrl role createdAt uid ipRegion');
     if (!user) {
       throw new AppError('User not found', 404, 'USER_NOT_FOUND');
     }
@@ -227,6 +227,8 @@ async function getUserProfile(req, res, next) {
         avatarUrl: user.avatarUrl,
         role: user.role,
         createdAt: user.createdAt,
+        // IP 属地（2026-10-30，账号信息页面要展示）：只给粒度，没算过就是 null
+        ipRegion: user.ipRegion && user.ipRegion.at ? { country: user.ipRegion.country || "", region: user.ipRegion.region || "" } : null,
         followerCount,
         followingCount,
         isFollowing,

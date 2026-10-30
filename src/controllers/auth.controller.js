@@ -8,7 +8,7 @@ const CODES = require("../utils/errorCodes");
 const { signToken } = require("../utils/jwt");
 const { normalizeNewUsername, CI_COLLATION } = require("../utils/username");
 const { grantSignupBonus } = require("../services/points.service");
-const { countryOf } = require("../utils/geo");
+const { countryOf, regionOf } = require("../utils/geo");
 
 function serializeAuthUser(user) {
   return {
@@ -22,7 +22,23 @@ function serializeAuthUser(user) {
     // 同意到哪一版用户协议（空串 = 没同意过）。App 端登录/冷启动拿它对账：
     // 服务端已有当前版本就不再弹补签门（POST /api/me/accept-terms 是写入口）
     termsAcceptedVersion: user.termsAcceptedVersion || "",
+    // IP 属地（2026-10-30）：只给粒度（国家码 + 境内省名），没算过就是 null
+    ipRegion: user.ipRegion && user.ipRegion.at ? { country: user.ipRegion.country || "", region: user.ipRegion.region || "" } : null,
   };
+}
+
+/** IP 属地多久刷一次（GET /me 每次冷启动都会调；按天刷足够，也免得一个号在两地切换时每次都写库） */
+const IP_REGION_TTL_MS = 24 * 60 * 60 * 1000;
+/** 在 /me 上顺手把 IP 属地刷新进用户（即发即忘，失败只记日志：这不是登录成败的一部分） */
+function refreshIpRegion(user, req) {
+  const at = user.ipRegion?.at ? new Date(user.ipRegion.at).getTime() : 0;
+  if (Date.now() - at < IP_REGION_TTL_MS) return;
+  const { country, region } = regionOf(req);
+  if (!country) return; // 查不到就留着上一次的；从没算过的就继续不画
+  user.ipRegion = { country, region, at: new Date() };
+  User.updateOne({ _id: user._id }, { $set: { ipRegion: user.ipRegion } }).catch((e) =>
+    console.warn("[auth] ipRegion refresh failed:", (e && e.message) || e),
+  );
 }
 
 function parseBooleanEnv(value) {
@@ -175,7 +191,7 @@ async function login(req, res, next) {
 
 async function me(req, res, next) {
   try {
-    const user = await User.findById(req.user._id).select("_id username uid email role avatarUrl passwordHash termsAcceptedVersion");
+    const user = await User.findById(req.user._id).select("_id username uid email role avatarUrl passwordHash termsAcceptedVersion ipRegion");
     if (!user) {
       throw new AppError({
         code: CODES.UNAUTHORIZED,
@@ -183,6 +199,7 @@ async function me(req, res, next) {
         message: "User not found",
       });
     }
+    refreshIpRegion(user, req);
 
     res.json({ ok: true, user: serializeAuthUser(user) });
   } catch (err) {

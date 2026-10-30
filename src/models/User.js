@@ -100,6 +100,22 @@ const userSchema = new mongoose.Schema(
     // 老师人格（tutor）：v1 只做成人（tutor 仓 docs/08 #7），首次进 /tutor 要点一次成人声明；为空 = 没声明过
     tutorAdultDeclaredAt: { type: Date, default: null },
 
+    // IP 属地（2026-10-30，《互联网用户账号信息管理规定》第十二条：账号信息页面展示 IP 归属地）。
+    // 只存**粒度**（国家码 + 境内到省），不存 IP 本身；由 GET /api/auth/me 按 utils/geo.regionOf 定期刷新（登录 / 冷启动都会走它）。
+    // 没有这个键 = 还没算过（老用户第一次打开新服务端之前）；资料页上那一行就不画。
+    ipRegion: {
+      type: new mongoose.Schema(
+        {
+          country: { type: String, default: "" },
+          /** 省级行政区中文名（境内）；境外为空，展示时按 country 写国家 / 地区 */
+          region: { type: String, default: "" },
+          at: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+      required: false,
+    },
+
     // ✅ 平台封禁（管理员的开关，与 deactivatedAt 那把「用户自己的开关」是两回事）。
     // **没有这个键 = 没封**（与 BranchVideo.takedown 同一种给法：$set 整个子文档 = 封，
     // $unset = 解封；判据走 `banned.at` 的 dot 路径，绝不 $set null —— 理由见
