@@ -62,6 +62,10 @@ const TOKEN_REASONS = [
   //   也**不进** SPEND_REASONS（它不是哪次消费的退回，进了会把原作者当天的用量冲掉）。两条都钉在 tests/remixReward.spec.js。
   // ★ 没有对手方：同款作者的钱包不动。token 不许在用户之间流转（config/remixReward.js 的 ★★）。
   "remix_reward",
+  // 模板作者奖励（2026-10-30）：别人套用你的模板出片、公开发布满 24 小时 → **平台**印给模板作者（正）。与 remix_reward 同一条纪律：
+  // 唯一写入方 services/templateReward.service.js；memo 逐字是 `模板奖励 video:<作品 id> tpl:<模板 id>`，清扫器靠它判断这笔发没发过。
+  // ★ 不进 REPAY_REASONS、不进 SPEND_REASONS（两条都钉在 tests/templateReward.spec.js）；没有对手方（套模板的人的钱包不动）。
+  "template_reward",
   // 免费版的每日额度（2026-10-07，见上面 daily_grant 那行）。★ 「我们印了钱」：不进 REPAY_REASONS、不进 SPEND_REASONS
   "daily_grant",
   // 剪辑页的免费配音（2026-10-08，config/tokens.NARRATION_FREE_DAILY_CHARS）：与 admin_free 同一个形状 ——

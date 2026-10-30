@@ -176,6 +176,19 @@ const remixOfSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// 「这条作品还欠模板奖励的判定」（模板作者奖励，2026-10-30；设计正本 app 仓 docs/template-author-reward-design.md）。
+// 发布 / 回炉那一拍带了存在的 `templateIds` 才落（有 id 才落），满 24 小时后由 services/templateReward.service
+// 把每个 (作品, 模板) 各判一次、全判完才 $unset pending —— 不管判成发还是不发。
+// ★ 与 remixOfSchema.pending 同一套取舍：不给 default、判有值、必须写进 schema（strict 模式下没声明的路径会被无声丢掉）。
+const templateRewardSchema = new mongoose.Schema(
+  {
+    pending: { type: Boolean, default: undefined },
+    /** 最近一次写 pending 的时刻（回炉换模板会再落一次；只给人查，判定不认它 —— 到期认的是 createdAt） */
+    at: { type: Date, default: undefined },
+  },
+  { _id: false }
+);
+
 const branchVideoSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 120 },
@@ -272,6 +285,16 @@ const branchVideoSchema = new mongoose.Schema(
     recipe: { type: recipeFlagSchema, default: undefined },
     /** 同款归属（见上面 remixOfSchema）。★ 不给 default：没有 = 不是按谁的流程做的 */
     remixOf: { type: remixOfSchema, default: undefined },
+    /**
+     * 这条作品套用过的模板（模板作者奖励，2026-10-30）。发布体 / 回炉体里的 `templateIds` 经 controller 核过
+     * 「这个 id 上真有一个 BranchTemplate」才落（不存在的丢掉、去重、≤ 20）。回炉带了就**整个覆盖**。
+     * ★ 不给 default：老作品 / 老 App 发的作品没有这一格 = 没套过（判否定）。给 `[]` 的话每条老作品都凭空多一个空数组。
+     * ★ 只记 id，不记标题 / 作者：判定那一刻现查 BranchTemplate（作者 = ownerId）—— 模板被删了就判成 template_gone，
+     *   不替一个已经不在的模板发钱。
+     */
+    templateIds: { type: [{ type: mongoose.Schema.Types.ObjectId, ref: "BranchTemplate" }], default: undefined },
+    /** 模板奖励的待判记号（见上面 templateRewardSchema）。★ 不给 default：没有 = 不欠 */
+    templateReward: { type: templateRewardSchema, default: undefined },
   },
   { timestamps: true }
 );
@@ -298,6 +321,11 @@ branchVideoSchema.index(
 branchVideoSchema.index(
   { createdAt: 1 },
   { partialFilterExpression: { "remixOf.pending": true }, name: "remix_reward_pending" }
+);
+// 模板作者奖励的清扫器「到期了还没判的作品」那一查（services/templateReward.service 的 sweepTemplateRewards）。同上：partial
+branchVideoSchema.index(
+  { createdAt: 1 },
+  { partialFilterExpression: { "templateReward.pending": true }, name: "template_reward_pending" }
 );
 // 后台「下架列表」用。★ partial 索引：全站绝大多数作品没有这个字段，
 // 建全量索引等于给一张几乎全空的列建一棵树。条件与 controller 的 TAKEN_DOWN

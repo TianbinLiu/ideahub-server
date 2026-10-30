@@ -181,6 +181,9 @@ router.get("/health", (_req, res) => {
     minimaxFailRefund: taskRefund.minimaxRefundOn(),
     clientEvents: true,
     videoZone: true,
+    // templateReward：这台服务器认发布体里的 `templateIds`、有 GET /api/branch/template-reward（模板作者奖励，2026-10-30）。
+    //   App 见不到这一位就不说那一句、不发 templateIds（老服务端会把它 strip 掉，发了也无害）
+    templateReward: true,
     minimaxV2: minimaxV2Enabled(),
     minimaxV2FreeTextOnly: MINIMAX_V2_FREE_TEXT_ONLY,
   });
