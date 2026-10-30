@@ -30,7 +30,9 @@ const {
 
 const comments = makeCommentHandlers({
   targetType: "persona",
-  loadTarget: (id) => Persona.findById(id).select("_id author shared").lean(),
+  loadTarget: (id) => Persona.findById(id).select("_id author shared kind name").lean(),
+  // 老师人格（kind:tutor）下有人留言 → 作者收 TUTOR_COMMENT（tutor 仓 docs/02 9.6）。开关关着不 require 那棵树（D3）；陪聊人格的评论在钩子里原样跳过
+  onCreated: (args) => (process.env.TUTOR_ENABLED === "true" ? require("../services/tutorNotify.service").onPersonaComment(args) : null),
 });
 
 router.get("/", optionalAuth, listPersonas);

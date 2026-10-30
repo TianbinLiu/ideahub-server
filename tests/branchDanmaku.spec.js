@@ -165,6 +165,8 @@ describe("弹幕", () => {
     const res = await request(app).get(`/api/branch/videos/${id}/danmaku?limit=3`).expect(200);
     expect(res.body.items).toHaveLength(3);
     expect(res.body.truncated).toBe(true);
+    // total = 全部条数（详情页「弹幕 N」用它，截断时不再只能写「N+」）
+    expect(res.body.total).toBe(5);
     // 采样口径是"最新的 N 条"，不是"at 最小的 N 条" —— 一条爆火作品的开头
     // 被老弹幕占满、后发的永远看不见，那这个功能就废了
     expect(res.body.items.map((d) => d.text)).toEqual(["第2条", "第3条", "第4条"]);

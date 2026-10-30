@@ -35,6 +35,11 @@ const { requireAuth } = require("../middleware/auth");
 const { aiRateLimit } = require("../middleware/rateLimit");
 const { VOICE_CATALOG, MIXABLE_VOICES, MAX_MIX_VOICES } = require("../config/voices");
 const { parseMixEntries, normalizeWeights } = require("../utils/voiceSettings");
+const billing = require("../services/billing.service");
+const { priceOf, NARRATION_FREE_DAILY_CHARS } = require("../config/tokens");
+const { setWalletHeaders } = require("../services/arkGateway.service");
+const narrationFree = require("../services/narrationFree.service");
+const wallet = require("../services/tokenWallet.service");
 
 const router = express.Router();
 
@@ -44,6 +49,13 @@ const DEFAULT_VOICE = "zh_female_gaolengyujie_uranus_bigtts";
 const MAX_TEXT = 300;
 /** 上游卡住时不能让连接一直挂着——工坊每句台词都会调一次，堆几十条就把连接池吃干净 */
 const UPSTREAM_TIMEOUT_MS = 20_000;
+
+/**
+ * 请求体里的 `purpose`：这一句是**哪一种用途**。目前只有一种 —— 剪辑页的旁白（App `studio/cutNarration.synthLine`），
+ * 走每天限量的免费额度（config/tokens.NARRATION_FREE_DAILY_CHARS）。不带 = 照常按字计费（客服、看板娘、试听都是这条）。
+ * ★ 认不出的 purpose 整句 400，不当成「没带」：App 以为在用免费额度、服务端却悄悄按字扣钱，正是这一版要治的那种说错。
+ */
+const NARRATION = "cut-narration";
 
 const num = (v, lo, hi) => (typeof v === "number" && Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : null);
 /** 音色 id 只允许官方那套字符集，直接拼进上游 body 的东西一律先收口 */
@@ -73,6 +85,9 @@ router.get("/voices", (_req, res) => {
     mixable: MIXABLE_VOICES,
     defaultVoiceId: String(process.env.COMPANION_TTS_VOICE || "").trim() || DEFAULT_VOICE,
     maxMixVoices: MAX_MIX_VOICES,
+    // ★ 能力位：剪辑页旁白免费、每个账号每天几个字。App 的剪辑页取旁白音色时一并读到，
+    //   **只有看见它才说「免费」**（老服务端没有这一位 ⇒ 那里配音是按字扣钱的）。数字只在服务端这一处
+    narrationFree: { dailyChars: NARRATION_FREE_DAILY_CHARS },
   });
 });
 
@@ -87,9 +102,13 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
   const apiKey = process.env.TTS_API_KEY;
   if (!apiKey) return res.status(501).json({ message: "tts not configured" });
 
-  const { text, voice, emotion, instruct, mix, rate, pitch, expressive } = req.body || {};
+  const { text, voice, emotion, instruct, mix, rate, pitch, expressive, purpose } = req.body || {};
   const line = String(text ?? "").slice(0, MAX_TEXT);
   if (!line.trim()) return res.status(400).json({ message: "text required" });
+  if (purpose !== undefined && purpose !== null && purpose !== NARRATION) {
+    return res.status(400).json({ message: "unknown purpose", code: "TTS_PURPOSE" });
+  }
+  const narration = purpose === NARRATION;
 
   // ★ 混音只吃 **1.0** 音色，speaker 要固定写成 custom_mix_bigtts，真正的音色放进
   //   mix_speaker。2.0 的 uranus 混不进去（55000000）。
@@ -104,6 +123,12 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
   const speechRate = num(rate, -50, 100);
   const pitchShift = num(pitch, -12, 12);
   const wantsTags = Boolean(expressive) && !mixed;
+
+  // ★ 旁白只念字：免费额度只给剪辑页旁白那一种形状（App 只发 { text, voice, rate? }）。
+  //   混音 / 表现力 / 语调指令 / 情绪是客服、看板娘那几种嗓子 —— 那些按字计费，不许借这个标记白拿（标记谁都能带，见 NARRATION）。
+  if (narration && (mixed || expressive || (typeof instruct === "string" && instruct) || emotion)) {
+    return res.status(400).json({ message: "narration takes plain text only", code: "NARRATION_SHAPE" });
+  }
 
   const body = {
     user: { uid: String(req.user._id) },
@@ -143,42 +168,102 @@ router.post("/", requireAuth, aiRateLimit({ max: 30, scope: "tts" }), async (req
     },
   };
 
-  let up;
-  try {
-    up = await fetch(TTS_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": apiKey,
-        "X-Api-Resource-Id": is20 ? "seed-tts-2.0" : "seed-tts-1.0",
-        "X-Api-Connect-Id": crypto.randomUUID(),
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-  } catch (e) {
-    return res.status(504).json({ message: `tts upstream ${String(e && e.name) || "error"}` });
-  }
-
-  const sse = await up.text();
-  const parts = [];
-  let errCode = 0;
-  let errMsg = "";
-  for (const raw of sse.split("\n")) {
-    if (!raw.startsWith("data:")) continue;
-    let j;
+  // ★★ 计费（方案 §14.6 / 9.1 的 R1.5）。**这条链路此前一分钱不扣** ——
+  //   按它自己的闸门（30 次/分钟 × 300 字）算，单账号理论日上限约 ¥2,160/日。
+  //   报价按**截断后的 line**，与真正送去合成的文本同源（报价 ≠ 实扣是另一类事故）。
+  //   上游没出声（没拿到音频帧）＝ 没受理 ⇒ 自动退款，与方舟那条口径逐字相同。
+  // ★ 剪辑页旁白（purpose = NARRATION）不扣钱、走每天限量的免费额度：顺序与扣费同一个形状 ——
+  //   先占额度、再合成、没出声就还回去（narrationFree）；出了声照样落一笔 costTokens（narration_free），月底对得上账单。
+  //   额度用完是 429 NARRATION_DAILY_LIMIT，**不转成扣钱**（App 上写的是「免费」）。
+  let result;
+  if (narration) {
+    const held = await narrationFree.reserve(req.user._id, line.length);
+    if (!held.ok) {
+      // ★ 同一个 code 两种情况：今天一个字都不剩了，或者还剩一些、只是这一句放不下（短一点的还配得上）。
+      //   话分开说；数挂在 details 上（App 的 throwHttp / request 都只认 details），顶层那三个留着给 #111 那一版读
+      //   第三种（极罕见）：拒的那一刻余量不够、报数时别的句子刚把额度还回来，读到的余量反而够 —— 不能说「放不下」也不能说「用完了」
+      const left = Math.max(0, held.limit - held.used);
+      return res.status(429).json({
+        ok: false,
+        code: "NARRATION_DAILY_LIMIT",
+        message:
+          left <= 0
+            ? `今天的免费配音用完了（每天 ${held.limit} 字）。明天 0 点（UTC）重置。`
+            : left < line.length
+              ? `今天的免费配音还剩 ${left} 字，这一句 ${line.length} 字放不下 —— 改短一点，或者明天 0 点（UTC）重置之后再配。`
+              : `这一句刚才没占上今天的免费配音额度（同时在配的别的句子占着），再配一次就好。`,
+        details: { limit: held.limit, used: held.used, need: line.length },
+        limit: held.limit,
+        used: held.used,
+        need: line.length,
+      });
+    }
     try {
-      j = JSON.parse(raw.slice(5).trim());
-    } catch {
-      continue;
+      result = await synthesize();
+    } catch (e) {
+      await narrationFree.release(req.user._id, held);
+      throw e;
     }
-    // ★ 20000000 是**结束帧**（message "OK"），不是错误。每次成功合成的最后一帧都是它，
-    //   当成错误记下来的话，一旦真出问题、日志里报的就是这个无辜的码——线上自检时踩过。
-    if (j.code && j.code !== 0 && j.code !== 20000000) {
-      errCode = j.code;
-      errMsg = j.message || "";
+    if (result.accepted) await wallet.noteNarrationFree(req.user._id, priceOf("tts", { text: line }), `tts ${speaker} narration`);
+    else await narrationFree.release(req.user._id, held);
+  } else {
+    const charged = await billing.chargedCall({
+      user: req.user,
+      cost: priceOf("tts", { text: line }),
+      memo: `tts ${speaker}`,
+      refundTag: "ark_refund",
+      forward: () => synthesize(),
+    });
+    if (!charged.ok) {
+      setWalletHeaders(res, charged.wallet);
+      return res.status(charged.status).json(charged.body);
     }
-    if (typeof j.data === "string" && j.data) parts.push(Buffer.from(j.data, "base64"));
+    setWalletHeaders(res, charged.wallet);
+    result = charged.result;
+  }
+  const { up, parts, errCode, errMsg, failed } = result;
+  if (failed) return res.status(504).json({ message: failed });
+
+  async function synthesize() {
+    let up;
+    try {
+      up = await fetch(TTS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Api-Key": apiKey,
+          "X-Api-Resource-Id": is20 ? "seed-tts-2.0" : "seed-tts-1.0",
+          "X-Api-Connect-Id": crypto.randomUUID(),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+    } catch (e) {
+      return { accepted: false, failed: `tts upstream ${String(e && e.name) || "error"}` };
+    }
+
+    const sse = await up.text();
+    const parts = [];
+    let errCode = 0;
+    let errMsg = "";
+    for (const raw of sse.split("\n")) {
+      if (!raw.startsWith("data:")) continue;
+      let j;
+      try {
+        j = JSON.parse(raw.slice(5).trim());
+      } catch {
+        continue;
+      }
+      // ★ 20000000 是**结束帧**（message "OK"），不是错误。每次成功合成的最后一帧都是它，
+      //   当成错误记下来的话，一旦真出问题、日志里报的就是这个无辜的码——线上自检时踩过。
+      if (j.code && j.code !== 0 && j.code !== 20000000) {
+        errCode = j.code;
+        errMsg = j.message || "";
+      }
+      if (typeof j.data === "string" && j.data) parts.push(Buffer.from(j.data, "base64"));
+    }
+    // 没拿到任何音频帧 = 上游没受理这次合成（敏感词 / 资源未开通 / 鉴权失败都落在这里）
+    return { accepted: parts.length > 0, up, parts, errCode, errMsg };
   }
 
   if (!parts.length) {

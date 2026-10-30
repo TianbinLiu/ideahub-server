@@ -13,15 +13,24 @@
 //   多扣一笔和少退一笔在事后完全无法区分。
 const mongoose = require("mongoose");
 
-// grant       注册/首次触达发的免费额度
+// grant       注册/首次触达发的免费额度（2026-10-07 起免费版 = 新人一次 170,000 进 addon + 当天的 2,000 进 plan，一行记）
+// daily_grant 免费版每过一个 UTC 日往 plan 里补的那一份（补到上限为止，见 tokenWallet.ensureWallet 的 ③）
 // recharge    直充进 addon（模拟支付）
 // plan_buy    购/续套餐发放 plan 额度（模拟支付）
 // cycle_reset 月度刷新（plan 归位到当月额度，未用完的作废）—— delta 可正可负
 // ark_spend   花在方舟上（负）
-// ark_refund  方舟没受理，把 ark_spend 退回来（正）
+// ark_refund  方舟没受理，把 ark_spend 退回来（正）。2026-10-07 起按扣的那两桶原样退回（tokenWallet.refundSplit）
 // admin_free  管理员免单的方舟调用：**余额不动（delta=0），但这笔钱真花出去了**，
 //             实际金额记在 costTokens 里。见下面 costTokens 的说明与
 //             services/tokenWallet.service.js 的 noteAdminFree。
+// play_refund    渠道退款把已发的 token 收回来（负）
+// debt_incurred  收回时余额不够，差额转成欠额：**余额不动（delta=0）**，差额记在 costTokens
+// debt_repaid    下次充值抵扣欠额（负）
+// debt_forgiven  管理员免除欠额（delta=0，金额记 costTokens）
+// provider_failed 上游**受理之后**才失败（方舟 failed / cancelled / expired、MiniMax Fail）、按原桶退回的那一笔（正）。
+//                 与 ark_refund 分开，便于对账：ark_refund 是「我们没让它出门」，这一类是「方舟受理了、又明说没成」。
+// ★★ 这是 **mongoose enum**：没注册的 reason 会写入失败，而 writeEntry 把异常吞进
+//    console.error —— 表现是「回收做了、账本静默缺条」。加新 reason 必须先加这里。
 const TOKEN_REASONS = [
   "grant",
   "recharge",
@@ -30,6 +39,35 @@ const TOKEN_REASONS = [
   "ark_spend",
   "ark_refund",
   "admin_free",
+  "play_refund",
+  "debt_incurred",
+  "debt_repaid",
+  "debt_forgiven",
+  // MiniMax 真人档未受理时的退款。⚠ 它从 2026-08 就在 `minimax.routes.js` 里当 refundTag 传了，
+  //   却一直不在这张 enum 里 —— 于是余额 $inc 成功、账本那条撞 enum 被上面那个 catch 吞掉，
+  //   表现正是这个文件注释警告的「账本静默缺条」。2026-09-25 评审逮到。
+  //   ★ 加进 enum **只修了一半**：`spentToday` 的 $in 里也要有它，否则退款抵不掉当日用量，
+  //   免费档被敏感词拒两次就被日上限锁到次日，而余额栏还显示满格。
+  "minimax_refund",
+  // 受理之后才失败的退款（2026-10-07 主人拍板「做生成失败返回 token」）。唯一写入方 services/taskRefund.service.js；
+  // memo 逐字是 `provider_failed <ark|minimax> task:<任务号>`，搁浅续办时靠它判断「这一笔进没进过账」（别改形状）。
+  // ★ 在 tokenWallet.SPEND_REASONS 里（退款抵掉当日用量），**不在** REPAY_REASONS 里（退的是我们的钱，不抵欠额）。
+  "provider_failed",
+  // 老师人格（tutor）的一轮教学 / 蒸馏 / 生成没被上游受理时的退款（docs/05 §6.2）。与 minimax_refund 同一条纪律：
+  // 加进 enum 的同时也要进 tokenWallet.service 的 SPEND_REASONS，否则退款抵不掉当日用量。
+  "tutor_refund",
+  // 同款奖励（模板体系 P3b，2026-10-02）：别人按你的流程做了同款、公开发布满 24 小时 → **平台**印给原作者（正）。
+  // 唯一写入方 services/remixReward.service.js；memo 逐字是 `同款奖励 remix:<同款作品 id>`，清扫器靠它判断这笔发没发过。
+  // ★ 这是「我们印了钱」，不是「用户付了钱」：**不进** tokenWallet.service 的 REPAY_REASONS（印的钱不抵欠额），
+  //   也**不进** SPEND_REASONS（它不是哪次消费的退回，进了会把原作者当天的用量冲掉）。两条都钉在 tests/remixReward.spec.js。
+  // ★ 没有对手方：同款作者的钱包不动。token 不许在用户之间流转（config/remixReward.js 的 ★★）。
+  "remix_reward",
+  // 免费版的每日额度（2026-10-07，见上面 daily_grant 那行）。★ 「我们印了钱」：不进 REPAY_REASONS、不进 SPEND_REASONS
+  "daily_grant",
+  // 剪辑页的免费配音（2026-10-08，config/tokens.NARRATION_FREE_DAILY_CHARS）：与 admin_free 同一个形状 ——
+  // **余额不动（delta=0），但语音合成真花出去了**，按 priceOf("tts") 记在 costTokens。唯一写入方 tokenWallet.noteNarrationFree。
+  // ★ 不进 SPEND_REASONS（不是用户花的钱，不占他的每日用量上限）、不进 REPAY_REASONS。对账时与 tts 的 ark_spend 加在一起才是语音合成的账单。
+  "narration_free",
 ];
 
 const tokenLedgerSchema = new mongoose.Schema(
@@ -56,6 +94,11 @@ const tokenLedgerSchema = new mongoose.Schema(
      * ★ 老数据没有这一列（undefined）。读的时候按"没有"处理，别把它当 0 参与求和之外的判断。
      */
     costTokens: { type: Number, default: undefined },
+    /**
+     * 这一笔来自**测试购买**（Play 许可测试员）。所有营收 / 成本统计必须排除它，
+     * 否则测试员刷几次就把月报打成一条不存在的曲线。老数据没有这一列（undefined = 不是测试）。
+     */
+    isTest: { type: Boolean, default: undefined },
   },
   { timestamps: true }
 );

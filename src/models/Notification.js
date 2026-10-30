@@ -35,6 +35,21 @@ const NotificationSchema = new mongoose.Schema(
         //   放进查询。对未升级用户，观众知情为零 —— 这条写进了 docs/api-contract.md，
         //   不许说成「降级显示」。
         "BRANCH_REVISED",
+        // 同款奖励到账（模板体系 P3b，2026-10-02；写入只在 services/remixReward.service.js 一处）。收件人 = 原作者。
+        //   payload { tokens, originalId, originalTitle, videoId?, videoTitle? }；actorId = 同款作者、videoId = 那条同款
+        //   （deeplink 与其它 BRANCH_* 同口径，点进去看别人照着做出来的片子）。
+        // ★ 两人之间有拉黑、或那条同款已经不公开时**不带** actorId / videoId（App 画成「有人做了你的同款」）：
+        //   币已经进账了，不能不说；但也不能把一个被拉黑的人摆到眼前。
+        // ★ 金额在 payload.tokens（数），**不拼成一句话**放 commentText：句子由 App 按界面语言说。
+        // ⚠ 老 App（≤ 2.60）**收不到**这一类（请求层白名单，同 BRANCH_REVISED 那段）：币照到，只是没有那条通知。
+        "BRANCH_REMIX_REWARD",
+        // 生成失败、token 已退回（2026-10-07，写入只在 services/taskRefund.service.js 一处）。收件人 = 那一发的主人。
+        //   payload { tokens, kind: video|draft|draftFinal|3d|blockout|minimax, taskId, provider: ark|minimax }，不带 actorId（平台口径）。
+        // ★ 只在钱**不是**在本人那次轮询里退的时候发（清扫器、别人的轮询、并发的另一发）：本人轮询的响应里已经带着 refund，
+        //   再发一条是噪音；不发的话，App 里没有流水页 —— 一笔说不出来历的余额变动比一条通知糟（同 BRANCH_REMIX_REWARD 的理由）。
+        // ★ 金额在 payload.tokens（数），句子由 App 按界面语言说。
+        // ⚠ 老 App 收不到这一类（请求层白名单，同 BRANCH_REVISED 那段）：钱照退，只是没有那条通知。
+        "GEN_TASK_REFUND",
         // 平台通知（管理员手动发给某个用户的自由文本）。payload 形状：{ text }。
         // ★ **不带 actorId**（写入点在 branchAdmin.controller 的 notifyUser，传的就是
         //   undefined）：通知以**平台口径**发出，「具体是哪个管理员发的」不透给用户 ——
@@ -49,6 +64,14 @@ const NotificationSchema = new mongoose.Schema(
         //   两条都不带 actorId 之外的身份信息给对方：用户看不到是哪个管理员在处理（与 ADMIN_NOTICE 同口径）。
         "SUPPORT_TICKET",
         "SUPPORT_REPLY",
+        // 老师人格（/api/tutor，2026-09-29 M2 后半；写入只在 services/tutorNotify.service.js 一处）四类。deeplink 一律在 payload 里、
+        // **不加顶层字段**（加字段就要同时改 App 的映射，BRANCH_REVISED 那段说过为什么）：
+        //   TUTOR_RATING      → 作者：有人给你的老师评了分 { personaId, personaName, stars, text }（→ /tutor/market/:personaId）
+        //   TUTOR_COMMENT     → 作者：有人在你的老师下留言 { personaId, personaName, commentId, preview, parentId }
+        //   TUTOR_REVIEW_DUE  → 学习者：有阶段到了回访时间 { courseId, personaName, count, stages[], stageId }（→ /tutor/run/:courseId），不带 actorId
+        //   TUTOR_DOC_UPDATED → 学习者：作者发了新版可合并 { personaId, personaName, version, courseId, note }（→ /tutor/courses/:courseId）
+        // ⚠ 老 App 的 BRANCH_NOTIFICATION_TYPES 是请求层白名单，这四类它压根不查 —— App 用户**收不到**，契约里写的是「收不到」不是降级显示。
+        "TUTOR_RATING", "TUTOR_COMMENT", "TUTOR_REVIEW_DUE", "TUTOR_DOC_UPDATED",
       ],
       index: true,
     },

@@ -57,6 +57,14 @@ const userSchema = new mongoose.Schema(
     },
 
     avatarUrl: { type: String, default: "" },
+    /**
+     * 这个账号在 Play 那边的混淆 id（HMAC(userId) 前 32 位十六进制）。
+     * ★ 用它而不是 userId：官方要求 obfuscated，而且这个值会出现在 Play 的日志与回包里。
+     * 退款通知只带 purchaseToken 时，靠订单找人；这个字段是人工排查时的另一条线索。
+     */
+    playAccountId: { type: String, default: "", trim: true, maxlength: 64, index: true, sparse: true },
+    /** 退款次数（屡次退款的判定材料；阈值与处置方式待定，先只计数不处置） */
+    playRefundCount: { type: Number, default: 0, min: 0 },
 
     // ✅ 公开数字 UID（个人页展示的那个）。9 位随机数，出处只有 utils/uid.js。
     // ★ sparse+unique 且**绝不给 default**——与 phone 同一条理由：给 default 会让
@@ -89,6 +97,8 @@ const userSchema = new mongoose.Schema(
     // ✅ 账号注销（软删除）：只打时间戳标记，不删任何内容数据，可恢复。
     // null = 正常账号；有值 = 已注销，auth 中间件一律视为未授权。
     deactivatedAt: { type: Date, default: null },
+    // 老师人格（tutor）：v1 只做成人（tutor 仓 docs/08 #7），首次进 /tutor 要点一次成人声明；为空 = 没声明过
+    tutorAdultDeclaredAt: { type: Date, default: null },
 
     // ✅ 平台封禁（管理员的开关，与 deactivatedAt 那把「用户自己的开关」是两回事）。
     // **没有这个键 = 没封**（与 BranchVideo.takedown 同一种给法：$set 整个子文档 = 封，
@@ -146,8 +156,31 @@ const userSchema = new mongoose.Schema(
           plan: { type: Number, required: true, min: 0 },
           addon: { type: Number, required: true, min: 0 },
           planId: { type: String, default: "free" },
+          /**
+           * 退款欠额（**正数 = 欠多少**），>0 时冻结一切消费。
+           * ★★ 为什么不用「addon 记负数」：plan/addon 都是 `min:0`，`debit` 的
+           *   `$expr` 守卫与 `$min` 两桶管道都假设非负，而且跨月刷新会 `$set` 重写 plan，
+           *   负数会被**静默抹掉** —— 退款套利就此免费。所以欠额必须是独立的一桶。
+           * ★ 老账号没有这两个字段（undefined）：一律按 0 / null 读
+           *   （tokenWallet.service 的 debtOf 一处实现），别在这里加 required。
+           */
+          debt: { type: Number, default: 0, min: 0 },
+          /** 冻结起始时间；界面文案与账龄报表用 */
+          debtSince: { type: Date, default: null },
           /** 计费周期 "YYYY-MM"（UTC）。跨月刷新靠它做条件原子更新抢占 */
           cycle: { type: String, required: true },
+          /**
+           * 免费版每日额度最后补到哪一天 "YYYY-MM-DD"（UTC）。每日补发靠它做条件原子更新抢占（与 cycle 同一招）。
+           * ★ 老钱包没有它（undefined）：tokenWallet.service 按「今天第一次补」处理，别在这里加 required / default。
+           */
+          day: { type: String, default: undefined },
+          /**
+           * 付没付过钱（充值包 / 套餐 / Play 购买，任何一笔）。免费档门禁（config/tokens.isPaidUser）认它。
+           * ★ 只由支付入账那两处置真（tokenWallet.credit 的 recharge、buyPlan），**从不置回 false**。
+           * ★ 不给 default：老钱包没有它（undefined）= 「还没查过」，tokenWallet.ensureWallet 按账本回填一次；
+           *   给了 default:false 就分不清「没付过」和「还没查过」，充过钱的老用户会被当成免费版。
+           */
+          paidEver: { type: Boolean, default: undefined },
         },
         { _id: false },
       ),

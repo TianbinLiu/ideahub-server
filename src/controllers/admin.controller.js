@@ -15,6 +15,7 @@ const Bookmark = require("../models/Bookmark");
 const Comment = require("../models/Comment");
 const Interest = require("../models/Interest");
 const { invalidId, notFound, badRequest } = require("../utils/http");
+const { purgeUserChatData } = require("../services/chatMemory.service");
 
 // 可选模型：有就删，没有就跳过（避免 require 报错）
 let Notification, AiJob;
@@ -142,6 +143,12 @@ async function adminDeleteUser(req, res, next) {
 
     // 删除用户创建的 ideas
     await Idea.deleteMany({ author: user._id });
+
+    // 数字人对话数据（会话 / 消息 / 用量 / 记忆卡）
+    await purgeUserChatData(user._id);
+    // 老师人格那一线（tutor 仓 docs/04 S14，2026-09-29）：与 chat 数据同一条纪律，三条删账号入口都调、都在删 User 之前；
+    //   懒 require 的理由见 branchAdmin.purgeUserCascade ⑩.7（开关关着 tutor 树零加载，但删号不看开关）
+    await require("../services/tutorPurge.service").purgeTutorForUser(user._id);
 
     // 删除用户
     await User.deleteOne({ _id: user._id });

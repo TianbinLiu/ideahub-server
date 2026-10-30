@@ -63,12 +63,27 @@ app.use(cors({
     return cb(null, allowedOrigins.includes(origin.replace(/\/+$/, "")));
   },
   credentials: false,
+  // ★★ 刻意**不写 allowedHeaders**：不写 = 预检要什么请求头就放什么（cors 包原样反射 Access-Control-Request-Headers）。
+  //   App 跨域发的自定义请求头不止一个 —— Authorization、Content-Type: application/json、2.63 起每个请求都带的
+  //   `X-App-Version`（middleware/appVersion）。哪天要收紧成白名单，**这几个一个都不能漏**：漏了的症状是
+  //   App 的每一个请求预检被拒、整个连不上，而服务端日志里一行都没有（预检在这里就答完了）。
+  //   tests/appVersion.spec.js 钉着「带 x-app-version 的预检能过」。
+  // ★ 预检的结论让浏览器记 2 小时（Access-Control-Max-Age）。不写这个头，Chromium（App 的 WebView）只记 **5 秒**：
+  //   2.63 起每个请求都带 X-App-Version，原来不用预检的 GET（没登录刷首页、`/api/ark/health` 探能力）也要先发一发
+  //   OPTIONS，几乎每一发都变成两趟往返（CF → nginx → Node）；带 Authorization 的请求本来就每发都要预检，一并受益。
+  //   7200 是 Chromium 的上限（写得更大也按 7200 算）。缓存按「源 + 完整地址」记 —— 是每个地址两小时一次，不是整个会话一次。
+  //   代价只有一条：两小时内改了允许的请求头 / 方法，已经记住的地址不会立刻跟上；真请求的 Allow-Origin 仍然每一发现判，
+  //   源白名单收紧照样当场生效。tests/appVersion.spec.js 钉着预检带这个头。
+  maxAge: 7200,
   // ★ 跨域下自定义响应头默认对 JS **不可见**（只能读到那几个 CORS 安全头）。
   //   APK 里 WebView 的源是 https://localhost，打 api.ideahubs.org 是跨域的，
   //   不放行这两个头的话 /api/ark 回来的余额读不到，App 的钱包镜像就只能靠
   //   每次调用后再 GET 一次 —— 多一趟往返，还会在两次请求之间显示旧余额。
-  exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon"],
+  exposedHeaders: ["X-Wallet-Plan", "X-Wallet-Addon", "X-Wallet-Debt"],
 }));
+
+// App 的版本头 → req.appVersion（只进日志，不做任何判断；理由见 middleware/appVersion 文件头）
+app.use(require("./middleware/appVersion").appVersion);
 
 // 两处需要放宽 body 上限（默认 100kb 会 413），且必须排在全局 express.json() 之前
 // ——body-parser 解析过一次就不会重复解析，排在后面等于没挂：
@@ -76,12 +91,19 @@ app.use(cors({
 //   /api/ark     Seedance 任务创建请求带 base64 首尾帧（压到 720p 后仍有 2-3MB）
 // 「大 body 只对持有效签名 token 的请求开放」这条闸门的实现见 middleware/bigJson.js
 // （两处共用一份：改了阈值或判据要两边同时生效）。
-const { jsonGate } = require("./middleware/bigJson");
+const { jsonGate, jsonGateWith, smallJson } = require("./middleware/bigJson");
 app.use("/api/branch", jsonGate);
 app.use("/api/ark", jsonGate);
+// MiniMax H3（V2）出片**不要**大 body（2026-10-26 终审）：图片只收我们图床上的 https 地址（data: 内联图一律拒），
+// 一发合规的请求体也就几十 KB。给它 50MB 的话，任何登录用户都能让服务端在白名单之前先解析一整份 50MB 的 JSON（不花钱）。
+// ★ 必须排在下面 /api/minimax 那一道**之前**：先挂的解析器读完 body，后面的就跳过（body-parser 见请求已读完不再读）
+app.use("/api/minimax/v2", smallJson);
 // 真人视频档：创建体带 base64 首帧/参考图（与 /api/ark 同理，不放宽就是 413）
 app.use("/api/minimax", jsonGate);
 app.use("/api/runway", jsonGate);
+// 老师人格：教材直传 confirm 送来浏览器抽好的 pages、导入一份 .md 可到几百 KB —— 比 1mb 大、远比 50mb 小（tutor 仓 docs/05 §2.2）。
+// 与下面的挂载同一个开关：不开就连这道闸也不挂。
+if (process.env.TUTOR_ENABLED === "true") app.use("/api/tutor", jsonGateWith(process.env.TUTOR_TEXT_JSON_LIMIT || "8mb"));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(helmet({
@@ -117,6 +139,12 @@ app.use(passport.initialize());
 app.use("/api", healthRoutes);
 // 安卓 App 的版本清单（无需登录，检查更新发生在登录之前）
 app.use("/api/app", require("./routes/appRelease.routes"));
+// App 自报的客户端事件（白屏 / 更新失败 / IndexedDB 丢数据 …）：免登录、按 IP 限流、**只进日志**（理由见文件头）。
+// 挂在 /api/app 旁边：都是「登录之前就要能打」的 App 基础设施；App 先探 /api/ark/health 的 clientEvents 能力位再发
+app.use("/api/client-events", require("./routes/clientEvents.routes"));
+// 出片地区（2026-10-26）：GET /api/video/zone —— 这次请求按哪个地区算、这台服务器在这个地区给得出哪几家视频供应商。
+// 免登录（开机就要决定摆哪几档，在登录之前）、no-store；App 先看 /api/ark/health 的 videoZone 能力位再来问
+app.use("/api/video", require("./routes/videoZone.routes"));
 app.use("/api/ideas", ideaRoutes);
 app.use("/api/search", require("./routes/search.routes"));
 app.use("/api/feed", require("./routes/feed.routes"));
@@ -137,6 +165,11 @@ app.use("/api/notifications", notificationsRoutes);
 const reportRoutes = require("./routes/report.routes");
 app.use("/api/admin/branch/reports", reportRoutes.adminRouter);
 app.use("/api/branch/reports", reportRoutes.publicRouter);
+
+// NCII 移除请求（TAKE IT DOWN Act §3）。★ 公开那条**免登录**：受害者通常不是我们的用户。
+//   管理端这条同样要排在 `app.use("/api/admin", adminRoutes)` 之前，理由与上面逐字相同。
+app.use("/api/admin/takedown", require("./routes/takedown.routes").adminRouter);
+app.use("/api/takedown", require("./routes/takedown.routes").publicRouter);
 // 分支视频的其余管理端：下架 / 撤销下架 / 下架列表 / 平台统计。
 // ★ 与上面那条同一个 base（`/api/admin/branch`），后台控制台只用记一个前缀；
 //   同样必须排在 `app.use("/api/admin", adminRoutes)` **之前**，理由与上面逐字相同。
@@ -153,6 +186,8 @@ app.use("/api/blocks", require("./routes/blocks.routes"));
 app.use("/api/companion", require("./routes/companion.routes"));
 // App「AI 客服」：GET /config 游客可探测、POST /chat 流式问答、/tickets 转人工工单（用户侧）
 app.use("/api/support", require("./routes/support.routes").publicRouter);
+// 数字人对话的会话与记忆（陪聊 + 客服共用）：翻历史、手动整理、删会话、「记得的事」；全部需登录、只碰自己的
+app.use("/api/chat", require("./routes/chatThreads.routes"));
 // 语音识别代理（客服页按住说话）：收音频二进制，自己 express.raw，不占全局 1MB JSON 阈值
 app.use("/api/asr", require("./routes/asr.routes"));
 // Live2D 模型市场（数字人套装：模型包 + 推荐人格 + 推荐嗓子）；解压落在 uploads/live2d-market/
@@ -169,8 +204,16 @@ app.use("/api/standpoint", standpointRoutes);
 app.use("/api/bounties", bountyRoutes);
 app.use("/api/speaking-style", speakingStyleRoutes);
 app.use("/api/personas", personaRoutes);
+// 老师人格（tutor，tutor 仓 docs/04 §5 S1）：TUTOR_ENABLED=true 才 require —— 一个坏 import 就不会让 deploy.sh 的整树装载自检拦住启梦发布；
+// 关开关不回滚代码。挂在 /api/personas 之后：它自己的路径全在 /api/tutor 下，与人格市场不重叠（M2 发布时 Persona{kind:tutor} 再进 personas）。
+if (process.env.TUTOR_ENABLED === "true") app.use("/api/tutor", require("./routes/tutor.routes"));
 app.use("/api/memes", memeRoutes);
 app.use("/api/branch", require("./routes/branchVideo.routes"));
+// 已发布作品的「公开配方」（制作过程：别人能看、能按它复制一条流水线）。同一个 /api/branch base，
+// 路径在 /videos/:id/recipe 下（与 branchVideo.routes 的各条不重叠）外加模板市场的 /templates/workflows ——
+// ★ 所以必须挂在 branchTemplate.routes **之前**：那边的 `/templates/:id` 会把 "workflows" 当 id 吞掉（400）。
+// 配方最大 512KB，jsonGate 已经在上面对整个 /api/branch 生效
+app.use("/api/branch", require("./routes/branchRecipe.routes"));
 // 白模模板（blockout r2v）：同一个 /api/branch base（App 只记一个前缀），
 // 路径全在 /templates 下，与 /videos /cards /decks 不重叠
 app.use("/api/branch", require("./routes/branchTemplate.routes"));

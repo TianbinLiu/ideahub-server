@@ -21,6 +21,12 @@ const branchTemplateTrialSchema = new mongoose.Schema(
     /** 任务发起人。试炼闸比较的是它与模板 ownerId，**不是**轮询者是谁 ——
      *  轮询端点谁都能打，但这条记录只在创建任务被受理的那一刻由服务端写入 */
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    /**
+     * 这一发任务用的**出片模型**（请求体里的 model，受理前已过 ALLOWED_MODELS 与 r2v 价目表两道闸）。
+     * 试炼成功时写进模板的 provenModels —— 「这个模板在哪个模型上真实跑通过」的事实底账（2026-10-02）。
+     * ★ 不设 required：老版本落的追踪没有它（TTL 48h，上线两天后存量自然清空）；空串 = 不知道，那一发不记模型。
+     */
+    model: { type: String, trim: true, maxlength: 80, default: "" },
   },
   { timestamps: true, versionKey: false }
 );

@@ -588,7 +588,10 @@ describe("举报 · 儿童安全（csae）插队", () => {
     // ★ 跨仓契约：app 仓 src/api/admin.ts 的 REPORT_REASONS。两仓不在一个 CI 里，
     //   这里只能钉住**服务端这一侧**：csae 必须在枚举里、且必须被标成要插队的那一类。
     expect(Report.REASONS).toContain("csae");
-    expect(Report.URGENT_REASONS).toEqual(["csae"]);
+    // ncii（2026-09-24 加）与 csae 并列插队：TAKE IT DOWN Act §3 给的是 48 小时法定时限，
+    // 混在 porn 里等于没有时限。⚠ 法条要求的那条通道是**免登录**的 POST /api/takedown，
+    // 这个理由只是已登录用户的站内快捷入口（见 tests/nciiTakedown.spec.js）。
+    expect(Report.URGENT_REASONS).toEqual(["csae", "ncii"]);
     // porn 与 csae 是两个 key，不是父子：合并会让 csae 沉进刷屏举报里
     expect(Report.REASONS).toContain("porn");
     expect(Report.URGENT_REASONS).not.toContain("porn");
@@ -600,8 +603,10 @@ describe("举报 · 删号级联要放过儿童安全那些", () => {
   //   不因内容删除或账号注销一并清掉。而"注销"是产品里人人可点的一颗按钮 ——
   //   不留这个口子的话，被举报的人只要自己走一次删号，指向他的儿童安全举报就全没了。
   //   这是删号权利的**法定义务例外**，不是疏漏。
-  test("R18 URGENT_REASONS 是这条豁免的唯一判据，且它确实只放过 csae", () => {
-    expect(Report.URGENT_REASONS).toEqual(["csae"]);
+  test("R18 URGENT_REASONS 是这条豁免的唯一判据，且它只放过 csae 与 ncii", () => {
+    // ★ ncii 一并豁免的理由与 csae 同源：FTC 执法看的是「我们有没有在 48 小时内处理过」，
+    //   而被举报的人只要自己走一次删号就能把那条记录连同证据一起带走。
+    expect(Report.URGENT_REASONS).toEqual(["csae", "ncii"]);
     // 普通理由一个都不在豁免名单里 —— 否则删号权利会被悄悄架空
     for (const r of ["porn", "violence", "abuse", "spam", "infringe", "other"]) {
       expect(Report.URGENT_REASONS).not.toContain(r);

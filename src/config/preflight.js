@@ -19,6 +19,10 @@ function collectConfigProblems(env = process.env) {
   // 支付：假渠道没有验签，生产环境开着等于任何人都能给自己发 token
   problems.push(...require("./payment").collectPaymentProblems(env));
 
+  // 出片地区门禁（2026-10-26）：VIDEO_REGION_GATE 写了认不出的值（按 observe 跑 = 以为开了、其实只记日志）、
+  // 生产配了开发用的 VIDEO_ZONE_FORCE（写 cn = 对海外放开 Seedance）—— 都是「配错了但能跑起来」，规则在 config/videoRegion
+  problems.push(...require("./videoRegion").collectVideoRegionProblems(env));
+
   const secret = env.JWT_SECRET || "";
   if (!secret) problems.push("JWT_SECRET 未设置");
   else if (secret.length < 32) problems.push(`JWT_SECRET 过短（${secret.length} 字符，至少 32）`);
@@ -47,6 +51,15 @@ function collectConfigProblems(env = process.env) {
     problems.push(`火山 AK/SK 只配了一半（${volcAk ? "有 VOLC_AK 缺 VOLC_SK" : "有 VOLC_SK 缺 VOLC_AK"}）—— 真人肖像授权会签名失败`);
   }
 
+  // 老师人格（tutor）：TUTOR_ENABLED=true 才挂 /api/tutor。开了就要有模型与文件存储，否则又是「配了但能跑起来」——
+  // 生成 501、教材上传 503，用户点下去才知道。演示模式（确定性回复、不调模型）在生产必须是显式写下来的决定。
+  if (env.TUTOR_ENABLED === "true") {
+    const hasKey = env.AI_API_KEY || env.OPENAI_API_KEY;
+    if (!hasKey && env.TUTOR_ALLOW_DEMO !== "1") problems.push("TUTOR_ENABLED=true 但没配 AI_API_KEY：老师人格的生成 / 教学 / 蒸馏都要模型（确实要演示模式就显式写 TUTOR_ALLOW_DEMO=1）");
+    if (isProd && env.TUTOR_ALLOW_DEMO === "1") problems.push("生产环境不该开 TUTOR_ALLOW_DEMO=1：老师会是确定性演示回复而不报错");
+    if (isProd && !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET)) problems.push("TUTOR_ENABLED=true 但 Cloudinary 三项没配齐：教材直传会 503");
+  }
+
   if (isProd) {
     if (!env.OTP_PEPPER || env.OTP_PEPPER === "dev_pepper_change_me") {
       problems.push("OTP_PEPPER 未设置或仍是默认值（6 位验证码的 sha256 可离线暴破）");
@@ -57,17 +70,28 @@ function collectConfigProblems(env = process.env) {
     if (!env.CORS_ORIGINS && !env.CLIENT_BASE_URL) {
       problems.push("CORS_ORIGINS / CLIENT_BASE_URL 均未设置，CORS 将对所有来源开放");
     }
-    // Runway 至今是**纯代理**：runway.routes.js 里两处 fetch 直连上游，一次扣费调用都没有
-    // （对照方舟那条走的是 billedForward）。生产配上这把钥匙 = 任何拿得到我们 token 的人
-    // 都能无计量地烧钱，而账上一分不记 —— 这类"配了就能跑、错了没人知道"正是本文件存在的理由。
-    // ★ 这条以前只是 backlog 与 .env.example 里的一句警告。2026-09-03 核过：生产 .env 与
-    //   进程环境里都没有它（约束一直被遵守），所以现在把它钉成硬闸不会影响任何在跑的东西。
-    // ★ 接上计费之后要连这条一起删 —— 留着它会让"已经接好了"的那天起不来。
-    if (env.RUNWAY_API_KEY) {
-      problems.push(
-        "生产配了 RUNWAY_API_KEY，但 Runway 的计费链路还没接（纯代理、零扣费）——接上之前不许在生产开这条出网",
-      );
+    // ★★ 首次告知同意的开关（加州 SB 243 §22602(a)/§22604）。它是**合并之后的一个手工步骤**，
+    //   而「忘了打开」与「功能没上线」在系统里长得一模一样：服务照常跑、用户照常聊，
+    //   只是那道法定告知从来没出现过。所以在生产环境把「没打开」报出来 ——
+    //   真要暂时不开，显式写 COMPANION_REQUIRE_CONSENT=0，让它成为一个有人做过的决定。
+    if (!env.COMPANION_REQUIRE_CONSENT) {
+      problems.push("COMPANION_REQUIRE_CONSENT 未设置：陪聊的首次告知同意（SB 243）不会生效。确实不开就显式写 0");
     }
+    // ★★ MiniMax 两把 key 都配了却没写 MINIMAX_REGION：代码有确定答案（走国际站），
+    //   但「钱从哪个账户出、任务落在哪个站」这种事不该由默认值替人决定 ——
+    //   尤其任务是绑区域的，选错了那一批在途任务查不到而钱已经扣了。
+    if (env.MINIMAX_API_KEY && env.MINIMAX_INTL_API_KEY) {
+      const r = String(env.MINIMAX_REGION || "").trim().toLowerCase();
+      if (r !== "cn" && r !== "intl") {
+        problems.push("MiniMax 中国站与国际站的 key 都配了，但没写 MINIMAX_REGION（cn / intl）—— 不要让默认值替你决定钱从哪边出");
+      }
+    }
+    // ★ 这里原来还有一条硬闸：「生产配了 RUNWAY_API_KEY 但计费没接 → 拒绝启动」，并写明
+    //   「接上计费之后要连这条一起删 —— 留着它会让『已经接好了』的那天起不来」。
+    //   2026-09-24 那一批已经把 Runway 接进了 billing（`runway.routes.js` 走 chargedCall，
+    //   而且**查不到价直接 501、绝不降级成免费**），所以硬闸按当初的约定撤掉。
+    //   ⚠ 撤掉的是「不许出网」，不是「随便出网」：价目表 `RUNWAY_TOKENS_PER_SECOND` 里
+    //   只有三档有价，别的档位在路由层就被 501 挡住。往那张表里加档位时要拿真实账单校准。
   }
 
   return { problems, isProd };

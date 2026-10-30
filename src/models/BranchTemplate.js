@@ -292,6 +292,31 @@ const branchTemplateSchema = new mongoose.Schema(
      */
     markDescs: { type: [String], default: undefined },
     /**
+     * 每个位置上那个人在**原片**里的神态（「先平静，后惊讶张嘴，再大笑」），与 `markSlots`
+     * **按下标一一对应**、长度必须相等；单个元素是空串 = 那个人没有可用的神态。
+     * App 套用时按卡名拼一句「神态：凛先平静，后惊讶张嘴；…」—— 白模化把脸抹平了，
+     * 这句话把原片的表情补回来（2026-10-26 付费小验，白模保留神态的 D 方案）。
+     *
+     * ★★ 三点，各有各的理由：
+     *   ① **与 markSlots 下标对齐**（同 markBoxes / markDescs），长度不等出口整份不出 ——
+     *      少一个就不知道少的是谁，按顺序硬配等于把后面每个人的神态挂到下一个人身上；
+     *   ② **来自原片、只写表情不写外观**：只有 V2 白模化那条路写它（阶段一看的是原片，
+     *      取件凭据原样搬过来）。外观在清洗时就按分句丢掉了（blockoutize.sanitizeExpr），
+     *      它不含身份信息，所以作者与别人都看得到（toTemplatePayload 照出）；
+     *   ③ **说的是「人」，不是「位置」**：这一条与 markDescs 不同。作者核对时最常见的两种修法
+     *      —— 相邻两行对调、删掉一个画面上不存在的位子后右边整体左移 —— 改的是「哪个位置是谁」，
+     *      神态得跟着人走。所以 `PATCH /roles` 会**按 roles[].desc 认人、把神态搬到新位置上**
+     *      （判据只有下面的 static `markExprsAfterRolesEdit` 一处）；认不准的那一格清成空串
+     *      —— 少一句神态只是退回今天的样子，挂错人身上的神态会让卡上的人做出别人的表情。
+     *      ⚠ 别学 markSlots 写成「PATCH 不碰它」（审核抓到的高危那条：对调一次，神态就零报错地挂到别人身上）。
+     * ★ 判存在性、`default: undefined`：老模板、V1 模板、这一位上线前的在途凭据建出来的模板
+     *   都没有它，套用时不带神态句，与今天逐字相同。
+     * ★ 作者自带白模视频那条路（detect-roles）**不写**它，而且重认一次会把它**清掉**：
+     *   重认整份换掉 roles / markSlots，原片上的神态没法与白模视频上新认的人对齐
+     *   （人数一样时 markSlots 逐字相同、长度闸照样放行，于是零报错地错位）。
+     */
+    markExprs: { type: [String], default: undefined },
+    /**
      * 「这条模板正在认角色位」的**并发锁**（`POST /templates/:id/detect-roles` 抢它）。
      *
      * ★★ 必须在 schema 里声明：mongoose 默认 strict，**没声明的路径在 update 里会被
@@ -326,17 +351,58 @@ const branchTemplateSchema = new mongoose.Schema(
      *   所以公开列表用等值 { status: "published" } 是安全的；「否定式判存量字段」
      *   那条仓规针对的是往老数据上后加字段的场景，别在这里误用成理由。
      */
-    status: { type: String, enum: ["pending", "published", "blocked"], default: "pending" },
+    /**
+     * retired（2026-10-02 模板体系 P2）：**被公开流程引用着**的模板，作者点「下架 / 删除」时落到这一档 ——
+     * 不进市场、素材不回收、**所有人**照样能按 id 读到并用它出片（公开配方里回指的是它，复制的人要靠它）。
+     * 引用数降到 0 之后作者再删一次才真回收（branchTemplate.routes 的 DELETE 现算引用数）。
+     * ⚠ 与 pending（没发布 / 作者下架且无人引用，只有作者能用）和 blocked（平台处置，谁都不能用）是三件事。
+     */
+    status: { type: String, enum: ["pending", "published", "blocked", "retired"], default: "pending" },
     /**
      * 试炼闸：作者本人用这个模板真实出过一次片的时刻。null = 还没证明过。
      * ★ 只由服务端的 r2v 任务追踪写入（ark.routes.js 轮询到 succeeded 且任务发起人
      *   就是模板作者时），不信客户端一句「我跑通了」。发布（publish）以它非空为前置：
-     *   方舟受理后才失败不退费，坏模板的那次学费必须由作者自己付，不能摊给每个套用的人。
+     *   方舟受理后才失败的那一发（2026-10-07 起出片钱会自动退回）仍要每个套用的人白等一趟、白花前面推演 / 画帧的钱 ——
+     *   坏模板的那次学费必须由作者自己付，不能摊给每个套用的人。
      */
     provenAt: { type: Date, default: null },
+    /**
+     * 作者本人在**哪些出片模型**上用这个模板真实跑通过（模型 id，去重）。
+     * ★ 与 provenAt 同一条证据链、同一个写入方（ark.routes 的 noteR2vOutcome）：受理时追踪里记下 model，
+     *   轮询到 succeeded 且发起人就是作者时 `$addToSet`。客户端塞不进来（建模板 / 改角色位的 schema 都不收它）。
+     * ★ 为什么要记（2026-10-02，App 侧「模板 × 出片模型」统一口径）：模板对出片模型是硬要求。今天只有一个模型
+     *   做得了白模复刻，"在哪个模型上跑通"看似废话 —— 但开第二个模型的那一天，存量模板"只在旧模型上证明过"
+     *   这件事如果没有底账，就只能靠猜。事实只能从现在开始记，补不回来。
+     * ★ **读它只走 provenModelsOf**（下面的 static）：存量模板没有这一格，那边有一条推得死的兜底。
+     */
+    provenModels: { type: [String], default: undefined },
   },
   { timestamps: true, versionKey: false }
 );
+
+/**
+ * provenModels 上线之前，唯一开着 r2v 的模型（config/tokens 的 VIDEO_MULT_R2V 当时只有这一行，
+ * resolveR2v 对表外模型一律 400）。
+ * ★★ **写死字面量，不引用 `SEEDANCE_2_5` 常量**：这是一条历史事实（"那些模板当时是在这个模型上跑通的"），
+ *   不是"当前的 r2v 模型"。哪天那个常量换成新版本的 id、或者价目表里加了第二行，存量模板证明过的仍然只是这一个。
+ */
+const LEGACY_PROVEN_MODEL = "doubao-seedance-2-5-260628";
+
+/**
+ * 「这个模板在哪些出片模型上真实跑通过」—— 出口的**唯一实现**（toTemplatePayload 读它）。
+ *
+ *   · 记过（provenModels 非空）⇒ 原样出；
+ *   · 没记过但 provenAt 非空 ⇒ **存量**：那一发只可能跑在 LEGACY_PROVEN_MODEL 上（推论，但推得死 ——
+ *     那段时间里 r2v 价目表只有它一行，别的模型发 r2v 是 400、根本受理不了）；
+ *   · provenAt 为空 ⇒ 空数组（还没证明过）。
+ *
+ * ★ 兜底只在**读**这一侧做，不回写库：读写分开，哪天发现推错了，改这一个函数就全量纠正，库里没有脏数据要洗。
+ */
+branchTemplateSchema.statics.provenModelsOf = function provenModelsOf(doc) {
+  const stored = Array.isArray(doc?.provenModels) ? doc.provenModels.filter((m) => typeof m === "string" && m) : [];
+  if (stored.length) return stored;
+  return doc?.provenAt ? [LEGACY_PROVEN_MODEL] : [];
+};
 
 /**
  * 「判这个模板的视频合不合方舟窗口时，该拿哪个秒数」—— **这条口径的唯一实现**（铁律六）。
@@ -432,6 +498,69 @@ branchTemplateSchema.statics.rolesConfirmHint = function rolesConfirmHint(doc) {
     "AI 报的编号只是草稿（实测人偶编号稳定但不连续，可能是 1/2/4/5），" +
     "对不上的话，套用你模板的人会把角色卡挂到别人身上，而且不会有任何报错。"
   );
+};
+
+/**
+ * 作者核对角色位（PATCH /roles）之后，神态该落在哪几格 —— **这条规则的唯一实现**。
+ *
+ * 神态说的是**人**（原片里那个人的表情），而作者的修正改的是「哪个位置是谁」：
+ *   · 相邻两行对调（序数方案最常见的错）；
+ *   · 删掉一个画面上不存在的位子，它右边的人整体往左挪一位。
+ * 两种都表现为：同一句 `desc`（「红发红甲的女武士」）从一个 label 挪到了另一个 label 上。
+ * ⇒ 按 `desc` 认人：旧 roles 里那句 desc 所在的位置上的神态，搬到新 roles 里同一句 desc 所在的位置上。
+ *
+ * ★★ 认不准就清掉那一格（空串），绝不猜：
+ *   · 作者**改写过** desc（新旧对不上）—— 可能只是措辞改好认了，也可能这一格换了个人，分不清；
+ *   · 同一句 desc 在旧 roles 或新 roles 里**出现不止一次**（歧义）；
+ *   · desc 是空串（空串认不出人）；
+ *   · 新 label 不在 markSlots 里（存不下：markExprs 按 markSlots 下标对齐）。
+ *   少一句神态只是退回没有 D 之前的样子；搬错一句，卡上的人会做出别人的表情，而且零报错。
+ * ★ markSlots 上没有人认领的位置（被删掉的位子）一律空串 —— 不留旧值：哪天作者把那个位子
+ *   加回来，它带着的 desc 会在那一次重新认人，留着旧值只会多一种说不清的状态。
+ * ★ 「只改已有的、绝不凭空创建」（同 markDescs）：模板没有 markExprs、或长度与 markSlots
+ *   对不上（库里不该有，但写坏了也得往安全那边退）时回 null，调用方什么都不写。
+ *
+ * @param {{ markSlots?: unknown, markExprs?: unknown, roles?: Array<{label?: string, desc?: string}> }} doc
+ *        **改之前**的模板（旧 roles 从这里读，所以必须在 `doc.roles = 新的` 之前调）
+ * @param {Array<{ label: string, desc: string }>} nextRoles 作者这一次提交的 roles
+ * @returns {string[]|null} 与 markSlots 等长的新 markExprs；null = 这个模板没有这一位，别写
+ */
+branchTemplateSchema.statics.markExprsAfterRolesEdit = function markExprsAfterRolesEdit(doc, nextRoles) {
+  const slots = Array.isArray(doc?.markSlots) ? doc.markSlots.map((s) => String(s || "")) : null;
+  const exprs = Array.isArray(doc?.markExprs) ? doc.markExprs : null;
+  if (!slots || !slots.length || !exprs || exprs.length !== slots.length) return null;
+
+  const descOf = (r) => String(r?.desc || "").trim();
+  const countBy = (list) => {
+    const m = new Map();
+    for (const r of list) {
+      const d = descOf(r);
+      if (d) m.set(d, (m.get(d) || 0) + 1);
+    }
+    return m;
+  };
+  const prevRoles = Array.isArray(doc.roles) ? Array.from(doc.roles) : [];
+  const next = Array.isArray(nextRoles) ? nextRoles : [];
+  const prevCount = countBy(prevRoles);
+  const nextCount = countBy(next);
+
+  // 旧 desc → 那个人的神态（只收认得准的：desc 唯一、label 在 markSlots 里）
+  const exprOfDesc = new Map();
+  for (const r of prevRoles) {
+    const d = descOf(r);
+    if (!d || prevCount.get(d) !== 1) continue;
+    const at = slots.indexOf(String(r?.label || ""));
+    if (at >= 0) exprOfDesc.set(d, String(exprs[at] || ""));
+  }
+
+  const out = slots.map(() => "");
+  for (const r of next) {
+    const d = descOf(r);
+    if (!d || nextCount.get(d) !== 1 || !exprOfDesc.has(d)) continue;
+    const at = slots.indexOf(String(r?.label || ""));
+    if (at >= 0) out[at] = exprOfDesc.get(d);
+  }
+  return out;
 };
 
 // r2v 结算按参考视频 URL 反查登记（ark.routes.js 的 resolveR2v），一条 URL 只许一个模板。

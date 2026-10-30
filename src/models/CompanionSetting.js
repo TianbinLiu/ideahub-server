@@ -42,6 +42,11 @@ const companionSettingSchema = new mongoose.Schema(
     persona: { type: mongoose.Schema.Types.ObjectId, ref: "Persona", default: null },
     model: { type: mongoose.Schema.Types.ObjectId, ref: "Live2dModel", default: null },
     voice: { type: voiceSettingsSchema, default: null },
+    // 首次陪聊前的告知同意（加州 SB 243 §22602(a) 告知是 AI、§22604 未成年人提示）；version 变了要重新同意
+    consent: {
+      version: { type: String, default: "" },
+      at: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );

@@ -9,11 +9,27 @@
 // ★ 为什么不能只信客户端报的价：改客户端就能报 0。整个"把钱包搬到服务端"这件事，
 //   要害就在这里——余额判断与扣费必须发生在**服务端拿到请求体之后、转发出去之前**。
 
-/** 订阅套餐。plan 额度每月刷新（作废未用完的），addon 永不过期 */
+// 纯函数、不碰网络不连库（本文件顶层只许 require 这一类）：报不了价时把客户端给的值写进日志之前过一遍
+const { logSafe } = require("../utils/logSafe");
+
+/**
+ * 订阅套餐。付费套餐的 plan 额度每月刷新（作废未用完的），addon 永不过期。
+ *
+ * ★★ 免费版（2026-10-07 主人拍板）不再是「每月 300,000」，而是 **新人一次 170,000 + 每天 2,000（最多攒 7 天 = 14,000）**：
+ *   · `welcomeTokens` 只在**新建钱包**那一刻发一次，进 **addon**（不过期 —— 这是「送你的」，不该月底蒸发）；
+ *     已有钱包的老账号不补发（他们已经拿过改版前那份月度额度）。
+ *   · `dailyTokens` 每过一个 UTC 日往 **plan** 里加一次，加到 `dailyCapTokens` 为止；**从不往下削**一个已经更高的 plan
+ *     （老账号改版前剩下的月度额度原样留着，花到 14,000 以下才开始按天补）。
+ *   · 免费版**不再有**月度刷新（monthlyTokens 0）：刷新会把攒了几天的那点 plan 一把清零。付费套餐照旧按月刷新。
+ *   为什么这么改：300,000/月 的免费额度一段「标准」都出不了几段、却够把高价档试一遍 —— 新的额度配「免费版只能用极速 / 草稿」
+ *   （config/tokens.videoPlanDenial），够出几段几秒的片，又给升级一个理由。判据与发放的唯一实现在 tokenWallet.service.ensureWallet。
+ * ★ 付费套餐的额度按「约多少段 5 秒高清」定（标准 ≈ 10 段、专业 ≈ 35 段；一段 5 秒高清 = 165,600）。
+ * ★ 与 app 的 PLANS **逐条相等**（跨仓契约，钉在 tests/payOrder.spec.js「跨仓价目一致性」）。
+ */
 const PLANS = [
-  { id: "free", name: "免费版", price: 0, monthlyTokens: 300_000 },
-  { id: "std", name: "标准套餐", price: 30, monthlyTokens: 2_000_000 },
-  { id: "pro", name: "专业套餐", price: 98, monthlyTokens: 8_000_000 },
+  { id: "free", name: "免费版", price: 0, monthlyTokens: 0, welcomeTokens: 170_000, dailyTokens: 2_000, dailyCapTokens: 14_000 },
+  { id: "std", name: "标准套餐", price: 30, monthlyTokens: 1_660_000 },
+  { id: "pro", name: "专业套餐", price: 98, monthlyTokens: 5_800_000 },
 ];
 
 const DEFAULT_PLAN_ID = "free";
@@ -38,15 +54,18 @@ function planOf(id) {
 //   真实结算永远以账单为准；发现偏差改这一张表，并同步 app 的 IMAGE_TOKENS_BY_MODEL。
 
 /**
- * 三档铸卡（速写/定妆/精绘）用的出图模型与单价。
+ * App **当前版本**（2.63 起：速写 / 精绘两档）铸卡用的出图模型与单价。
  * ★ 与 app 仓 `src/data/economy.ts` 的 `IMAGE_TOKENS_BY_MODEL` **逐条相等**（跨仓契约）。
  *   对照钉在 `tests/arkProxy.spec.js`「跨仓出图价目一致性」，改一边不改另一边就会红。
+ * ★ 2026-10-10 主人拍板（方舟第十批下线，2026-11-24 14:00 停服）：速写换成 4.0 的新版本（20260415）；
+ *   「定妆」（4.5）这一档从 App 里撤掉。≤ 2.62 的两个老 id 挪进下面的 LEGACY_IMAGE_TOKENS —— 还在册、
+ *   还按老包的报价收，发给方舟时由出口换成接班型号（见下面的 IMAGE_MODEL_SUCCESSORS）。
  */
 const IMAGE_TOKENS_BY_MODEL = {
-  // 0.20 元/张 ÷ 15 元/M = 13,333。像素区间实测 [921,600, 16,777,216]
-  "doubao-seedream-4-0-250828": 13_333,
-  // 0.25 元/张 ÷ 15 元/M = 16,667。像素区间实测 [3,686,400, 16,777,216]
-  "doubao-seedream-4-5-251128": 16_667,
+  // 0.20 元/张 ÷ 15 元/M = 13,333。★ 单价按老 4.0 同价**推定**，等账单核对（发现偏差两仓一起改）。
+  // 像素区间 [921,600, 16,777,216]（与老 4.0 相同）；2026-10-10 付费验过：真人照片图生图放行、
+  // 卡面 1728×2304 约 12~15 秒、设定帧 1440×2560 约 34 秒。
+  "doubao-seedream-4-0-20260415": 13_333,
   // 0.60 元/张 ÷ 15 元/M = 40,000。
   // ★ 为什么按 0.60 不按 0.30：pro 的单价按**输出像素**分档（≤261 万 0.30、>261 万 0.60），
   //   而铸卡画布 CARD_SIZE = 1728×2304 = 3,981,312 像素，落在贵的那一档。
@@ -56,29 +75,38 @@ const IMAGE_TOKENS_BY_MODEL = {
 };
 
 /**
- * 老客户端还在发的出图模型。**不能从在册名单里删。**
+ * 老客户端（已经装机的 APK）还在发的出图模型。**不能从在册名单里删。**
  *
- * 新版 app 已经把 `arkClient.MODELS.image` 改成跟着默认档走
- * （`imageTierOf(DEFAULT_IMAGE_TIER).model` = 4.0），所以**新包不再发它**；
- * 但**已经装机的 APK 改不了** —— 它们补设定帧、推三套方案的首尾帧、出 AI 封面
- * 全都还在发这个 id。从白名单里删掉的表现不是"降级"，是那批用户**出图整条 400**
+ * 已经装机的 APK 改不了 model —— 它们补设定帧、推三套方案的首尾帧、出 AI 封面、铸卡、九宫格
+ * 全都还在发这几个 id。从白名单里删掉的表现不是"降级"，是那批用户**出图整条 400**
  * （而客户端把 400 当敏感词处理，连重试都不会做）。铁律七。
- *
- * ⚠⚠ 2026-08-13 **账单实测**：这个 id 在账单里的名字是 **Doubao-Seedream 5.0 Lite**，
- *   单价 **¥0.22/张**（文生图与图像编辑同价）⇒ 真值应是 0.22/15 = **14,667**。
- *   （此前这里写着"公开价目里查不到"—— 那句话是错的，查不到只是因为它在账单里
- *   叫另一个名字。app 的档位表当初把它排除在外，依据的正是那个错误前提。）
- *
- * ★★ 即便如此，这一格**仍然保持 13,300，不许改成 14,667**：
- *   老包的 `economy.IMAGE_TOKENS` 就是 13,300，它按这个数**给用户报价**。
- *   服务端改成 14,667 就成了"页面报 13,300、实际扣 14,667" —— 正是 CLAUDE.md 里
- *   「页面报 ¥25、实际扣 ¥15」那条事故，只是方向反过来、坑的是用户。
- *   老客户端改不了，所以只能让服务端迁就它。
- * ★ 代价是每张少收 1,367（约 10%），差价我们自己吃。**明知故犯，不是遗漏** ——
- *   多收才是骗人，少收只是我们亏钱；而且这批调用会随老版本淘汰而归零。
- * ★ 这张表的寿命 = 老版本的寿命。确认线上没有旧包在发它之后，连同白名单一起删。
+ * ★ 每一格都是**老包自己报的那个价**（「页面报多少就扣多少」）。方舟下线之后真发出去的是接班型号
+ *   （IMAGE_MODEL_SUCCESSORS），单价可能与这里不同 —— 照样按这一格收，不按接班型号的价收：
+ *   老包里的报价改不了，改服务端的价就成了"页面报 X、实际扣 Y"。差价由我们承担，随老版本淘汰归零。
+ * ★ 这张表的寿命 = 老版本的寿命。确认线上没有旧包在发之后，连同白名单、接班表里对应的那一行一起删
+ *   （哪些版本还在发：出口每个进程按「老 id → 接班型号 × App 版本」各记一行日志，见 arkGateway.noteImageAlias）。
  */
 const LEGACY_IMAGE_TOKENS = {
+  // ≤ 2.62 的「速写」（老 4.0）。0.20 元/张 ÷ 15 元/M = 13,333。像素区间实测 [921,600, 16,777,216]
+  "doubao-seedream-4-0-250828": 13_333,
+  // ≤ 2.62 的「定妆」（4.5；2.63 撤掉了这一档）。0.25 元/张 ÷ 15 元/M = 16,667。像素区间实测 [3,686,400, 16,777,216]
+  "doubao-seedream-4-5-251128": 16_667,
+  /*
+   * 更老的包（全站默认出图模型还是它的那几版）。
+   *
+   * ⚠⚠ 2026-08-13 **账单实测**：这个 id 在账单里的名字是 **Doubao-Seedream 5.0 Lite**，
+   *   单价 **¥0.22/张**（文生图与图像编辑同价）⇒ 真值应是 0.22/15 = **14,667**。
+   *   （此前这里写着"公开价目里查不到"—— 那句话是错的，查不到只是因为它在账单里
+   *   叫另一个名字。app 的档位表当初把它排除在外，依据的正是那个错误前提。）
+   *
+   * ★★ 即便如此，这一格**仍然保持 13,300，不许改成 14,667**：
+   *   老包的 `economy.IMAGE_TOKENS` 就是 13,300，它按这个数**给用户报价**。
+   *   服务端改成 14,667 就成了"页面报 13,300、实际扣 14,667" —— 正是 CLAUDE.md 里
+   *   「页面报 ¥25、实际扣 ¥15」那条事故，只是方向反过来、坑的是用户。
+   *   老客户端改不了，所以只能让服务端迁就它。
+   * ★ 代价是每张少收 1,367（约 10%），差价我们自己吃。**明知故犯，不是遗漏** ——
+   *   多收才是骗人，少收只是我们亏钱；而且这批调用会随老版本淘汰而归零。
+   */
   "doubao-seedream-5-0-260128": 13_300,
 };
 
@@ -136,18 +164,187 @@ function imageTokensOf(model) {
   return MAX_IMAGE_TOKENS;
 }
 
+// ── 组图（一次请求出一组内容关联的图，2026-10-05）─────────────────────
+//
+// ★★ 为什么单列：方舟的出图端点**不止一张**的出法有两种，都按**实际画出的张数**计费
+//   （官方：「仅对成功生成图片按张数进行计费」）——
+//     · `sequential_image_generation: "auto"`：组图，`max_images` 1~15（缺省 **15**）；
+//     · `layer_decomposition: true`（5.0 pro）：1 张底图 + 最多 16 个图层。
+//   而单张出图那条路（POST /api/ark/images/generations）是**按调用**收一张的钱。
+//   在 2026-10-05 之前，往那条路上带 `sequential_image_generation: "auto"` 就能用一张的钱换十五张 ——
+//   请求体原样转发、零症状，只有火山账单知道。现在那条路把这几个参数整句拒掉（routes/ark.routes 的
+//   pinSingleImage），组图只走 POST /api/ark/image-groups（按上限预扣、按实际张数结算，services/arkImageGroup）。
+
+/**
+ * 能出组图的在册模型（官方：Seedream 5.0 lite / 4.5 / 4.0 支持组图，5.0 pro / flash 不支持）。
+ * ★ 4.0 的新版本（20260415）能出组图是 **2026-10-07** 付费验的（两遍各 6 张、约 4 分钟一组；app 仓
+ *   docs/seedream-grid-fix-research.md 第七节）。10-10 那一次付费验的是真人照片图生图、卡面与设定帧尺寸，没验组图。
+ *   App 2.63 的九宫格发它。
+ * ★ 老 4.0 **留着**：已经装机的 2.62 九宫格发的就是它（2.62 的 `MODELS.image`；发给方舟时由出口换成 4.0 新版本，部署即切）。
+ * ★ 4.5 也**留着**，但**没有哪个已发的包往组图上发它**（2.62 的九宫格只发老 4.0，4.5 只用在铸卡「定妆」那条单张出图上）：
+ *   留着是因为组图 2026-10-05 上线起契约就收它，删掉 = 把契约里写着能用的值改成 400。它在组图这条路上 2026-11-24 13:00
+ *   之前原样发 4.5，之后接到 4.0 新版本、不接出不了组图的 5.0 pro（IMAGE_MODEL_SUCCESSORS 的 groupTo）。
+ * ★ 老客户端那一档（`doubao-seedream-5-0-260128`，账单名 5.0 lite）**刻意不放进来**：它按老包的 13,300 收、
+ *   真价 14,667（见 LEGACY_IMAGE_TOKENS），单张时每张亏 10% 是为了不坑老用户；组图是新功能，没有老用户要迁就，
+ *   放进来只是把那 10% 乘上十几张。
+ */
+const GROUP_IMAGE_MODELS = new Set([
+  "doubao-seedream-4-0-20260415",
+  "doubao-seedream-4-0-250828",
+  "doubao-seedream-4-5-251128",
+]);
+/** 一组最多几张（协议上限）；参考图 + 出图 ≤ 15 */
+const GROUP_MAX_IMAGES = 15;
+/** 组图最多带几张参考图（协议上限 14） */
+const GROUP_MAX_REFS = 14;
+
+/**
+ * 这一发出图**最多**会画几张 —— 报价按这个上界收（宁高不低）。
+ * ★ 单张出图那条路已经把组图 / 图层拆分整句拒了，这里是第二道保险：哪条路漏了闸，也只会按上界多收、
+ *   不会按一张的钱放走十几张。组图服务（arkImageGroup）的预扣也读它 —— 「一组值多少」只算这一处。
+ */
+function imageCountCap(body) {
+  if (body?.layer_decomposition !== undefined && body.layer_decomposition !== false) return 17;
+  if (body?.sequential_image_generation !== "auto") return 1;
+  const n = Number(body?.sequential_image_generation_options?.max_images);
+  // 缺省 15 是官方的默认值；不是整数 / 越界都按上限算
+  return Number.isInteger(n) && n >= 1 && n <= GROUP_MAX_IMAGES ? n : GROUP_MAX_IMAGES;
+}
+
+// ── 出图模型的接班（方舟第十批下线：2026-11-24 14:00 北京时间停服）──────────────
+//
+// ★★ 为什么在**出口**改写，而不是让老包改发新 id：已经装机的 App 改不了 model（铁律七），方舟下线之后
+//   老 id 一律被拒 —— 那批用户的补设定帧 / 推三套 / 铸卡 / 封面 / 九宫格会整条坏掉。所以服务端**只在发给方舟的
+//   那一刻**把老 id 换成接班型号；在册、价目、门禁、每日上限、流水、库里记的 `model` 一律还是**客户端发来的那个 id**
+//   （老包按自己的报价收钱，理由见 LEGACY_IMAGE_TOKENS），流水 memo 写成 `image <发来的>→<真发的>`，
+//   方舟账单上的型号对得上（arkGateway.withUpstreamImageModel / imageMemoModel）。
+// ★ 视频不归这张表管：1.0 两档是**停用**（RETIRED_MODELS_AT，新任务一律 400），不是接班 ——
+//   出片的画面与价钱都跟着模型走，悄悄换模型等于换了用户买的东西。出图的接班型号画的是同一类东西、按老价收。
+//
+// 三条接班（主人 2026-10-10 拍板）：
+//   · 老 4.0（250828）→ 4.0 新版本（20260415）：**部署即切**（「验过就切」：10-10 付费验过，见 IMAGE_TOKENS_BY_MODEL 那一格）。
+//     早切的好处是 11-24 之前就把它在真流量上跑熟，出问题还有一个多月可以退（ARK_IMAGE_ALIAS=off）。
+//   · 4.5（251128）→ 5.0 pro（260628）：**11-24 13:00 才切**，在那之前 4.5 照常用。**组图例外**：5.0 pro 出不了组图，
+//     组图那条路上的 4.5 接到 4.0 新版本（`groupTo`）。
+//   · 5.0 lite（260128，只有很老的包还在发）→ 4.0 新版本：11-24 13:00 切。
+// ★ 13:00 而不是 14:00：与 RETIRED_MODELS_AT（视频停用）同一个口径 —— 停服那一刻在路上的请求结局不可知，
+//   提前一小时切过去就不会有人撞上最后几分钟。
+// ★ 应急开关 `ARK_IMAGE_ALIAS=off`：整张表不生效、老 id 原样发出去（回滚用；每次现读 env，改完重启即生效）。
+//   ⚠ 11-24 14:00 之后还关着它 = 老 id 发给一个已经下线的模型 = 那批出图整条被方舟拒（钱按「没受理就退」退回，图出不来）。
+
+/** 4.0 的新版本：三条接班里两条接到它（也是 App 2.63 的速写） */
+const SEEDREAM_4_0_NEXT = "doubao-seedream-4-0-20260415";
+/** 方舟第十批下线那天我们切过去的时刻（北京时间，比停服早一小时） */
+const IMAGE_SUCCESSION_AT = "2026-11-24T13:00:00+08:00";
+
+/**
+ * 老 id → { to: 单张出图的接班型号, groupTo?: 组图的接班型号（缺省同 to）, from: 从哪一刻起（null = 部署即切） }。
+ * ★ 接班型号必须在册、有价（IMAGE_MODELS），组图的接班型号必须能出组图（GROUP_IMAGE_MODELS）——
+ *   tests/arkImageAlias.spec.js 钉着：接到一个方舟不认的 / 出不了组图的型号，症状是那一档整条 400、钱退回、图没有。
+ */
+const IMAGE_MODEL_SUCCESSORS = Object.freeze({
+  "doubao-seedream-4-0-250828": Object.freeze({ to: SEEDREAM_4_0_NEXT, from: null }),
+  "doubao-seedream-4-5-251128": Object.freeze({
+    to: "doubao-seedream-5-0-pro-260628",
+    groupTo: SEEDREAM_4_0_NEXT,
+    from: IMAGE_SUCCESSION_AT,
+  }),
+  "doubao-seedream-5-0-260128": Object.freeze({ to: SEEDREAM_4_0_NEXT, from: IMAGE_SUCCESSION_AT }),
+});
+
+/** 接班表的总开关：`ARK_IMAGE_ALIAS=off` 关掉（缺省开）。每次现读 env —— 运维改完重启即生效，测试也能切 */
+function imageAliasOn() {
+  return String(process.env.ARK_IMAGE_ALIAS ?? "").trim().toLowerCase() !== "off";
+}
+
+/**
+ * 这一发出图**真发给方舟**的型号。判据只有这一处（铁律六）—— 单张出图（arkGateway.chargedArkCall）与
+ * 组图（arkImageGroup.startImageGroup）两个出口都问它。不在表里 / 还没到时刻 / 开关关着 → 原样返回。
+ * ★ 只管出图：调用方只在出图的出口上调它（视频 id 不在表里，误调也是原样返回）。
+ * ★ `now` 可注入（测试按切换时刻前后各跑一遍；缺省现在）。model 是用户可控的字符串：查表用 Object.hasOwn。
+ * @param {string} model 客户端发来的 id（已过在册检查）
+ * @param {{group?: boolean, now?: number|Date}} [opts]
+ * @returns {string}
+ */
+function upstreamImageModel(model, { group = false, now = Date.now() } = {}) {
+  const key = String(model ?? "");
+  if (!imageAliasOn() || !Object.hasOwn(IMAGE_MODEL_SUCCESSORS, key)) return key;
+  const rule = IMAGE_MODEL_SUCCESSORS[key];
+  if (rule.from !== null && Number(now) < Date.parse(rule.from)) return key;
+  return group ? rule.groupTo ?? rule.to : rule.to;
+}
+
 /** 一次豆包对话往返（含人设与历史的保守值） */
 const CHAT_TURN_TOKENS = 400;
+/** 老师人格三个单价（docs/08 #4：tutor_turn 钉在 CHAT_TURN_TOKENS；其余按「相对一次教学轮花多少 token」按比例，建议值） */
+const TUTOR_PRICES = Object.freeze({ tutor_turn: CHAT_TURN_TOKENS, tutor_distill: 600, tutor_extract: 400 });
+
+/**
+ * 语音合成：**每个字符** 33 token（豆包 TTS，大陆价）。
+ *
+ * ★ 数的来历（方案 §14.6，2026-09-24）：豆包语音合成按字符计费，折进全仓的
+ *   token 锚（15 元/百万 = 系数 1）就是这个数。非大陆供应商是 27 token/字符 ——
+ *   等多模型目录落地后按地区取，现在只有大陆这一档。
+ * ⚠ **这条链路此前一分钱不扣**（`tts.routes.js` 里 priceOf / charge / wallet 零命中）。
+ *   按它自己的闸门（30 次/分钟 × 300 字）算，单账号理论日上限约 **¥2,160/日** ——
+ *   「把免费额度从 300,000 调小」对一个从来不扣款的链路一分钱都省不下来。
+ */
+const TTS_TOKENS_PER_CHAR = 33;
+
+/**
+ * 剪辑页配音的免费额度：每个账号每个 UTC 日 **1,000 个字符**（2026-10-08；主人 2026-09-30 定「配音免费 + 限量」）。
+ *
+ * ★ 只给带 `purpose: "cut-narration"` 的请求（routes/tts.routes 的旁白那一支，额度的占 / 还在 services/narrationFree）。
+ *   这个标记**谁都能带**，所以它不是凭证 —— 兜住敞口的是这个上限：标记只决定这一发从哪个桶出，桶每天就这么大。
+ *   旁白那一支另外只收「只念字」的请求（混音 / 表现力 / 语调指令 / 情绪一律拒），客服与看板娘那几种嗓子仍然按字计费。
+ * ★ 单位与计价同一把尺：截断后的 `text.length`（与 priceOf("tts") 一致，英文字母也算一个）。合成没成的那一发不算。
+ * ★ 1,000 的量法：一条八段 5 秒的片子旁白约 190 字，App 那边一句念不完会提语速再合成一次，最坏翻倍 ⇒ 一天够配两到五条片子。
+ * ★ 用完当天就不再免费（429 `NARRATION_DAILY_LIMIT`），**不悄悄转成扣钱**：界面上写的是「免费」，转成扣钱就是另一种说错。
+ */
+const NARRATION_FREE_DAILY_CHARS = 1000;
+
+/**
+ * 语音识别：**每分钟** 5,000 token（豆包 ASR，大陆价 ¥4.5/小时）。非大陆 2,800。
+ * ★ 计费口径是**上游认定的时长**，不是文件大小 —— 但时长要等识别完才知道，
+ *   所以路由先按字节数估一个**上界**预扣，拿到真实时长后多退（billing.settleOverCharge）。
+ */
+const ASR_TOKENS_PER_MINUTE = 5000;
+
+/**
+ * 预扣用的「每秒多少字节」下界表。**取下界是刻意的**：字节除以一个偏小的数
+ * ⇒ 秒数偏大 ⇒ 预扣偏多，再按真实时长退回来。反过来（预扣偏少）就是白送，
+ * 而白送不会有任何报错。
+ * ★★ 这里要的是**下界**，不是「我们自己的录音参数」（2026-09-25 评审：原来 wav 写 48,000、
+ *   mp3 写 8,000，取的是官方客户端的参数与 64kbps 的拍值 —— 而 16kHz WAV 是 32,000 B/s、
+ *   32kbps mp3 是 4,000 B/s，两者都**低于**它 ⇒ 秒数估少 ⇒ 预扣偏少 ⇒ 白送）。
+ *   取真正的下界之后典型 mp3 会预扣两倍，再由 settleOverCharge 按真实时长冲正回 plan。
+ *  · wav：16kHz / 16bit / 单声道 = 32,000 B/s（比我们自己的 24kHz 更低，够兜住手搓请求）
+ *  · mp3 / ogg：按 32kbps = 4,000 B/s
+ */
+const ASR_BYTES_PER_SECOND = Object.freeze({ wav: 32000, mp3: 4000, ogg: 4000 });
 /** 一次 Seed3D 建模（约 2.4 元/次 ⇒ 160k）。全站最贵的单次操作 */
 const MODEL3D_TOKENS = 160_000;
 
 /**
- * Seedance 2.5 的模型 id。单独提出来是因为它同时出现在三个地方
- * （档位系数、仅付费白名单、ark.routes 的 ALLOWED_MODELS），
+ * Seedance 2.5 的模型 id。单独提出来是因为它同时出现在好几个地方
+ * （档位系数、像素表、样片两步、ark.routes 的 ALLOWED_MODELS），
  * 写字面量的话改版本戳时必然漏一处，而漏掉的那处不会报错——
  * 只会表现成"这一档突然按 1 倍收费"或"付费门禁形同虚设"。
  */
 const SEEDANCE_2_5 = "doubao-seedance-2-5-260628";
+/** 同上的理由：2.0 mini 同时是「高清」（720p）与「草稿」（480p）两档 —— 两档只差分辨率，判据必须连分辨率一起看 */
+const SEEDANCE_MINI = "doubao-seedance-2-0-mini-260615";
+const SEEDANCE_FAST = "doubao-seedance-1-0-pro-fast-251015";
+const SEEDANCE_STD = "doubao-seedance-1-0-pro-250528";
+
+/**
+ * MiniMax H3 三个模型的 id（国际站 V2 出片，2026-10-26 起；对标「草稿 / 高清 / 电影级」，见 MINIMAX_SEC_COST）。
+ * 提到这里的理由与 SEEDANCE_2_5 相同：它们同时出现在价目表、时长窗口、免费档清单里，写字面量迟早漏一处。
+ * ★ 与 v1 真人档（MINIMAX_FLAT_COST 的海螺 2.3 系列）不是一回事：v1 按发一口价，H3 按秒计价、走另一个端点。
+ */
+const MINIMAX_H3_LITE = "MiniMax-H3-Lite";
+const MINIMAX_H3_HIGHSPEED = "MiniMax-H3-Highspeed";
+const MINIMAX_H3 = "MiniMax-H3";
 
 /** Seedance 档位系数（相对标准档 1-0-pro）。★ 与 app 的 VIDEO_TIERS 一一对应 */
 const VIDEO_MULT = {
@@ -209,19 +406,356 @@ function audioSupported(model) {
 }
 
 /**
- * 仅付费套餐可调用的模型。★ **"这一档对不对某个套餐开放"的判据只有 `paidOnlyDenial` 一处**，
- * 这个集合只是它的数据。
+ * 纯任务（文生 / 图生 / 参考图生视频）每个模型收的时长窗口 [最短, 最长]（秒，整数）——**模型能力 + 产品口径**，
+ * 结算（segTokens / materialRefTokens）与路由的时长钉子（ark.routes 的 pinPlainVideoTask、素材分支）读的都是这一张。
  *
- * 为什么 2.5 要挡住免费版：按上面的系数，**即使取最短的 3 秒**，
- * 一段 = 3×1280×720×24/1024 × 4.7 ≈ 304,560 token，已经超过免费版**整月**的
- * 300,000 额度。也就是说免费用户点下去必定 402——与其让他花几十秒填完需求、
- * 推演完方案、在最后一步被"余额不足"打回来（钱还真扣过 Seedream 的图），
- * 不如在提交的那一刻就把原因说清楚。
- *
- * ★ 客户端也会把这一档置灰，但那只是**提示**，不是安全边界：改一行前端就能绕过去，
- *   而绕过去的代价是我们替他付 70 元/M 的账单。真正的门在这里。
+ * ★ 2026-10-03 主人拍板「段时长放开」：高清（2.0-mini）放到 15 秒、电影级（2.5）放到 30 秒 —— 正好是这两个模型的协议上限
+ *   （方舟「创建视频生成任务」文档：Seedance 2.0 系列 [4,15]、2.5 [4,30]；下限 4 是 2026-09-30 直连探针量出来的：3 秒同步 400）。
+ *   1.0 两档仍是 [3,10]（产品口径，没动）。此前全表一刀切 [3,10]：app 只发 10 秒以内，所以没出过事；
+ *   但这一刀同时意味着「请求里写 15 秒、方舟照出 15 秒、我们按 10 秒收」，钉子见 ark.routes 的 pinPlainVideoTask。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 `VideoTier.minSec / maxSec` **逐条相等**（跨仓契约，钉在 tests/arkProxy.spec.js
+ *   「跨仓时长窗口一致性」）：app 报 15 秒的价、这边按 10 秒夹，就是"页面报 X、扣的是另一个数"。
+ * ★ 认不出的模型按 [3,10]（改版前所有模型的口径），往窄的一侧退是安全的。
+ * ★ MiniMax H3 三个模型（2026-10-26，V2 出片）：官方「Create Video Generation Task」（V2）的 duration 是**整数枚举 4~15**，
+ *   H3 / H3-Highspeed / H3-Lite 三个一样（H3-Max 是 5~15，我们不接）。这张表就是它们的「一段几秒」，
+ *   计价（minimaxV2Tokens）与 V2 路由的时长钉子读同一格；整数这一条由 minimaxV2Tokens 自己判（Seedance 那几格由 segTokens 取整夹窗）。
  */
-const PAID_ONLY_MODELS = new Set([SEEDANCE_2_5]);
+const VIDEO_SEC_WINDOW = {
+  "doubao-seedance-1-0-pro-fast-251015": [3, 10],
+  "doubao-seedance-1-0-pro-250528": [3, 10],
+  "doubao-seedance-2-0-mini-260615": [4, 15],
+  [SEEDANCE_2_5]: [4, 30],
+  [MINIMAX_H3_LITE]: [4, 15],
+  [MINIMAX_H3_HIGHSPEED]: [4, 15],
+  [MINIMAX_H3]: [4, 15],
+};
+
+/** 这个模型一段视频能选的时长窗口 [最短, 最长]。判据只有这一处（铁律六） */
+function videoSecWindow(model) {
+  // ★ model 是用户可控的字符串：查表用 Object.hasOwn，别让 `constructor` 顺着原型链拿到一个函数（解构它就抛）
+  const key = String(model || "");
+  return Object.hasOwn(VIDEO_SEC_WINDOW, key) ? VIDEO_SEC_WINDOW[key] : [3, 10];
+}
+
+// ── 分辨率与像素（2026-10-07，「草稿」档与电影级「样片」）────────────────
+//
+// ★★ 为什么价钱要跟着像素走：方舟的用量公式是 (输入时长 + 输出时长) × 宽 × 高 × 24 ÷ 1024（官方「创建视频生成任务」
+//   像素表 + 价目页的用量公式），而 2026-10-07 之前 segTokens 写死了 1280×720 —— 那时代理只放 720p，没出过事。
+//   一放开 480p 就是"按 720p 收 480p 的钱"（2.0 mini 480p 9:16 是 496×864，约 720p 的 46%，按 720p 收就是收了 2.15 倍的钱）；
+//   反过来 1080p 的像素是 720p 的 2.25 倍，按 720p 收就只收了不到一半。所以：720p 维持改版前一刀切的 21,600（价目一个字不变），
+//   其余分辨率一律**按官方像素表逐格查**。
+// ★ 与 app 仓 `src/data/economy.ts` 的像素表**逐格相等**（跨仓契约，钉在 tests/arkProxy.spec.js「跨仓像素表与 480p / 1080p 价目」）。
+
+/** 720p 一秒的 raw token（1280×720×24/1024）。720p 全档、全画幅都按它收（改版前的口径，一个字不变） */
+const SEC_720P_TOKENS = 21_600;
+
+/** 官方像素表：Seedance 2.0 系列（含 mini）的 480p */
+const PX_2_0_480P = Object.freeze({
+  "16:9": Object.freeze([864, 496]),
+  "9:16": Object.freeze([496, 864]),
+  "4:3": Object.freeze([752, 560]),
+  "3:4": Object.freeze([560, 752]),
+  "1:1": Object.freeze([640, 640]),
+  "21:9": Object.freeze([992, 432]),
+});
+/** 官方像素表：Seedance 2.5 的 480p（16:9 / 9:16 与 2.0 系列不同：854×480） */
+const PX_2_5_480P = Object.freeze({
+  "16:9": Object.freeze([854, 480]),
+  "9:16": Object.freeze([480, 854]),
+  "4:3": Object.freeze([752, 560]),
+  "3:4": Object.freeze([560, 752]),
+  "1:1": Object.freeze([640, 640]),
+  "21:9": Object.freeze([992, 432]),
+});
+/** 官方像素表：Seedance 2.5 的 1080p（只给「样片」第二步用：官方规定样片转成片只出 1080p） */
+const PX_2_5_1080P = Object.freeze({
+  "16:9": Object.freeze([1920, 1080]),
+  "9:16": Object.freeze([1080, 1920]),
+  "4:3": Object.freeze([1664, 1248]),
+  "3:4": Object.freeze([1248, 1664]),
+  "1:1": Object.freeze([1440, 1440]),
+  "21:9": Object.freeze([2206, 946]),
+});
+
+/** 分辨率 → 模型 → 画幅 → [宽, 高]。720p 不在表里（一刀切 SEC_720P_TOKENS） */
+const VIDEO_PIXELS = Object.freeze({
+  "480p": Object.freeze({ [SEEDANCE_MINI]: PX_2_0_480P, [SEEDANCE_2_5]: PX_2_5_480P }),
+  "1080p": Object.freeze({ [SEEDANCE_2_5]: PX_2_5_1080P }),
+});
+
+/**
+ * 查不到像素的组合（表外的分辨率 / 模型）按这个收：官方像素表里**最大的一格**（2.0 的 4k 21:9，4398×1886）。
+ * ★ 路由上够不着（pinPlainVideoTask 只放表内的组合），这是导出函数的第二道保险 ——
+ *   方向与 imageTokensOf 的兜底一样：少收是隐形的、多收当天就会被投诉出来。
+ */
+const MAX_SEC_TOKENS = (4398 * 1886 * 24) / 1024;
+
+/**
+ * 纯任务（没有参考视频）每个模型放哪几档分辨率 —— **产品口径**（判据在 ark.routes 的 pinPlainVideoTask）。
+ *   · 1.0 两档：只放 720p（方舟对 1.0 不传 resolution 的缺省是 **1080p**，所以钉子会把缺省补成 720p）；
+ *   · 2.0 mini：480p（「草稿」）与 720p（「高清」）；
+ *   · 2.5：只放 720p —— 480p 只在 `draft: true`（样片第一步）时放，1080p 只给样片第二步（resolveDraftFinal 另钉）。
+ * ★ 与 app 的 `VideoTier.resolution` 对得上（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
+ */
+const VIDEO_RESOLUTIONS = Object.freeze({
+  [SEEDANCE_FAST]: Object.freeze(["720p"]),
+  [SEEDANCE_STD]: Object.freeze(["720p"]),
+  [SEEDANCE_MINI]: Object.freeze(["480p", "720p"]),
+  [SEEDANCE_2_5]: Object.freeze(["720p"]),
+});
+/**
+ * 纯任务出 720p 时放哪几种画幅（判据在 ark.routes 的 pinPlainVideoTask；2026-10-07 评审）。
+ *
+ * ★★ 为什么要管：720p 一刀切按 1280×720 收（SEC_720P_TOKENS），而官方像素表里 720p 有几格**比它大**——
+ *   1.0 系列 21:9 = 1504×640（贵 4.4%）、4:3 = 1120×832（贵 1.1%）；2.0 / 2.5 的 4:3 / 3:4 = 1112×834（0.6%）、21:9 = 1470×630（0.5%）。
+ *   方舟按真实像素结算，手搓一个 21:9 的请求就能让我们倒贴（免费版的「极速」也够得着）。App 只发 16:9 / 9:16（2.5 的首帧任务发 adaptive），
+ *   所以只放不比 1280×720 大的几格：16:9 / 9:16 / 1:1（1.0 的 16:9 / 9:16 是 1248×704，更小）。
+ * ★ 2.0 / 2.5 另放 `adaptive`：2.5 的首帧 / 首尾帧任务**只收** adaptive（官方注意事项，App 的 arkClient.ratioFor），不放就出不了片。
+ *   代价写明：adaptive 落到 4:3 那一格时少收 ≤0.63%（1112×834 对 1280×720）—— 一个画幅的差，不值得为它把 720p 改成按表收
+ *   （720p 一刀切是两仓共用的口径，App 的报价逐条对着它）。1.0 不放 adaptive：它落到 21:9 那一格要少收 4.4%。
+ * ★ 1.0 不写画幅时方舟的缺省：文生视频 16:9（在名单里）、图生视频 adaptive（不在）—— 钉子对后一种整句拒，不替人猜一个画幅
+ *   （猜错了是一刀裁切）。
+ */
+const VIDEO_720P_RATIOS = Object.freeze({
+  [SEEDANCE_FAST]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_STD]: Object.freeze(["16:9", "9:16", "1:1"]),
+  [SEEDANCE_MINI]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+  [SEEDANCE_2_5]: Object.freeze(["16:9", "9:16", "1:1", "adaptive"]),
+});
+/** 样片第一步只能出 480p、第二步只能出 1080p（官方 Seedance 2.5「样片模式」两条注意事项） */
+const DRAFT_RESOLUTION = "480p";
+const DRAFT_FINAL_RESOLUTION = "1080p";
+
+/** 一行像素表里最大的那一格（画幅缺省 / adaptive / 认不出时按它收：宁高不低） */
+function largestCell(row) {
+  return Object.values(row).reduce((a, b) => (b[0] * b[1] > a[0] * a[1] ? b : a));
+}
+
+/**
+ * 一秒视频的 raw token（= 宽 × 高 × 24 ÷ 1024，还没乘档位系数）。**判据只有这一处**（铁律六）。
+ *
+ * ★ 画幅缺省 / `adaptive` / 认不出 → 按这一行**最大**的一格收：adaptive 的真实画幅要等方舟出完才知道，
+ *   按小的收就是少收（例：草稿 9:16 = 10,044/秒，21:9 = 992×432 也是 10,044；2.5 的 480p 9:16 是 9,607.5，最大格 10,044）。
+ * ★ resolution / ratio / model 都是**用户可控的字符串**：查表用 Object.hasOwn，别让 `constructor` 之类顺着原型链拿到函数
+ *   （同 imageTokensOf 那条的理由）。
+ */
+function perSecTokens(model, resolution = "720p", ratio) {
+  if (resolution === "720p") return SEC_720P_TOKENS;
+  const res = String(resolution);
+  const byModel = Object.hasOwn(VIDEO_PIXELS, res) ? VIDEO_PIXELS[res] : null;
+  const row = byModel && Object.hasOwn(byModel, String(model)) ? byModel[String(model)] : null;
+  if (!row) {
+    console.error(
+      `[tokens] 视频 ${String(model).slice(0, 64)} @ ${res.slice(0, 16)} 不在像素表里，按最大一格 ${MAX_SEC_TOKENS}/秒 收费（调用方该先钉住分辨率）`,
+    );
+    return MAX_SEC_TOKENS;
+  }
+  const cell = ratio !== undefined && Object.hasOwn(row, String(ratio)) ? row[String(ratio)] : largestCell(row);
+  return (cell[0] * cell[1] * 24) / 1024;
+}
+
+// ── MiniMax H3（国际站 V2 出片）的按秒价目（2026-10-26）──────────────────────
+//
+// ★★ 为什么有这一张：出片按地区下发之后，海外只给 MiniMax（主人原话「海外由于政策原因只能用 minimax」），
+//   「草稿 / 高清 / 电影级」在 MiniMax 上各对标一个 (模型, 分辨率)：
+//     草稿 → MiniMax-H3-Lite · 480P　高清 → MiniMax-H3-Highspeed · 768P　电影级 → MiniMax-H3 · 768P（2K 先不开）。
+//   与 v1 真人档（MINIMAX_FLAT_COST，海螺 2.3 按发一口价）不是一回事：H3 只走 V2 端点，官方按「输出秒数 × 每秒单价」计费
+//   （V2 查询回包的 usage.total_seconds）。2026-10-26 付费小验核过：成片实际比请求长 0.2~0.5 秒，usage 按**请求的整数秒**记 ——
+//   所以按请求里的 duration 收，与上游计费同一个数。
+//
+// ★ 数的来历（官方 Pay-as-you-go 价目页「H3 Series Flagship Models」的输出单价，2026-10-26 读）：
+//     MiniMax-H3-Lite       480P  $0.025 / 秒
+//     MiniMax-H3-Highspeed  768P  $0.06  / 秒
+//     MiniMax-H3            768P  $0.08  / 秒
+//   折算 = 美元刊例 × 6.71345（全仓汇率锚）÷ 15 元/百万 token（全仓的成本口径，见上「单次调用的 token 等价」）
+//        = 美元 × 447,563 token，取整到百位（与 RUNWAY_TOKENS_PER_SECOND、MINIMAX_FLAT_COST 同一把尺）：
+//     0.025 → 11,189 → 11,200　0.06 → 26,854 → 26,900　0.08 → 35,805 → 35,800。成本价 1.0x。
+// ★ 价钱只跟 (模型, 分辨率) 走：官方写明同模型同分辨率的各种任务（文生 / 首帧 / 尾帧 / 首尾帧 / 参考图）单价相同；
+//   价目表也没有画幅这一维（不像 Seedance 的 480p 要按像素表逐格查）。
+// ★ 图：官方「每个任务**前 5 张**图免费、之后按张另收」，这 5 张是首帧、尾帧、参考图**合在一起**数的
+//   （查询回包 usage.input_image_count 是合计）。我们一段最多发 5 张（MINIMAX_V2_MAX_IMAGES），正好都在免费额度里 ——
+//   所以价目里没有「每张图多少钱」；第 6 张起这张表报不了价（minimaxV2Tokens 回 null），路由要在扣费之前整句拒。
+//   输入视频（官方按时长另收）与参考音频这张表也不报价：V2 出片今天不收 video_url / audio_url。
+// ★ 只放三个 (模型, 分辨率)：H3-Lite 768P（$0.04）与 H3 2K（$0.13）**故意不在表里** —— 产品上没开这两格，
+//   这张表报不出价的请求 V2 路由在扣费之前整句拒。要开先有对标档位，两仓一起加。
+//   ⚠ 「报得出价」只是放行的**必要条件之一**，不是全部（2026-10-26 审核：原来这里写成「这张表报得出价就是放不放的判据」，
+//   而价钱只看得见 model / resolution / duration / 条目的 type —— 拿它当整张白名单，callback_url 之类的字段照样过得去）。
+//   字段名单在下面 MINIMAX_V2_BODY_KEYS 那几份（minimaxV2Tokens 把名单外的键一律判成报不了价）；每个字段**取什么值**
+//   （图片地址收哪些主机、role 怎么配、text 必填与长度、ratio 的取值）是 V2 路由白名单的事，见 minimaxV2Tokens 的 ⚠。
+// ★★ 跨仓契约：与 app 仓档位表里 MiniMax H3 那三行的 secCost **逐条相等**（报价 = 实扣；钉在 tests/arkProxy.spec.js
+//   「跨仓 MiniMax H3 价目」）。键是**发给上游的原样写法**（大写 P：480P / 768P，V2 API 的枚举）—— App 那三行按上游分辨率对。
+// ⚠ 汇率会动：调价时**两仓同一个提交**改（MINIMAX_FLAT_COST 那条 ⚠ 的同一个教训：锚偏了没有任何症状）。
+// ⚠ 官方写明视频资源包不覆盖 H3（只能按量付费）；按量付费的失败任务计不计费官方没有书面说法 —— 失败退款另见 taskRefund。
+
+/** (H3 模型, 上游分辨率) → token/秒。来历见上 */
+const MINIMAX_SEC_COST = Object.freeze({
+  [MINIMAX_H3_LITE]: Object.freeze({ "480P": 11_200 }),
+  [MINIMAX_H3_HIGHSPEED]: Object.freeze({ "768P": 26_900 }),
+  [MINIMAX_H3]: Object.freeze({ "768P": 35_800 }),
+});
+
+/** 一段（一个 V2 任务）最多几张图：首帧 + 尾帧 + 参考图**合计**。= 官方的免费张数（见上 ★），再多就要另收钱 */
+const MINIMAX_V2_MAX_IMAGES = 5;
+
+/**
+ * V2 出片请求体里**报得出价的字段名**：顶层几个键、每种条目几个键、image_url 对象里几个键。名单之外的键 ⇒ minimaxV2Tokens 回 null。
+ * ★ 为什么价目要管字段名（2026-10-26 审核）：上游同一个端点还收 callback_url（MiniMax 把任务数据 POST 到调用方指定的地址 ——
+ *   等于拿我们的 key 替别人发请求）、extra（H3-Max 的提示词扩写）、条目上的 video_url / audio_url（输入视频按时长另收）……
+ *   只看 model / resolution / duration 与条目的 type 的话，带着这些键的请求照样报得出价。
+ *   判否定：没列出来的一律报不了价（与 v1 真人档 CREATE_FIELDS「没列出来的字段就没有路能到上游」同一个取向；
+ *   那边是丢掉、这边是拒 —— 价钱问的是「这一发值多少」，带着没估过价的东西就答不出来）。
+ *   以后每放一个新字段都是一笔新的单价 / 一个新的攻击面，应该有人明确点头，两仓一起改。
+ * ★ ratio 在名单里：官方价目表没有画幅这一维（见上 ★），它不进价，但出片必须给（纯文生不许 adaptive，见 V2 路由）。
+ * ★ **这几份名单只在这里列一次**：V2 路由的白名单照它们建（别另抄一份字段名），而且路由最后还要拿重建好的那份请求体问
+ *   minimaxV2Tokens —— 两处对不上时报不了价、在扣费之前就拒，不会悄悄放过去。
+ */
+const MINIMAX_V2_BODY_KEYS = Object.freeze(["model", "resolution", "duration", "content", "ratio"]);
+const MINIMAX_V2_ITEM_KEYS = Object.freeze({
+  text: Object.freeze(["type", "text"]),
+  image_url: Object.freeze(["type", "image_url", "role"]),
+});
+const MINIMAX_V2_IMAGE_KEYS = Object.freeze(["url"]);
+
+/**
+ * obj 是普通对象，且每个**有值**的键都在 allowed 里。
+ * ★ 值是 undefined 的键不算：JSON.stringify 会丢掉它、发不到上游（代码里拼请求体时 `{ ...o, ratio: undefined }` 很常见）。
+ * ★ JSON.parse 出来的 `"__proto__"` 是自有键、值不是 undefined ⇒ 不在名单里 ⇒ 拒（不会顺原型链被当成「没有」）。
+ */
+function onlyKeys(obj, allowed) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  return Object.keys(obj).every((k) => obj[k] === undefined || allowed.includes(k));
+}
+
+/**
+ * 某个 H3 模型在某个**上游分辨率**（480P / 768P）下一秒多少 token；表外组合回 **null**（不是 0）。
+ * ★ null 的含义是「这个组合没有价」，调用方必须据此**拒绝** —— 当成 0 就是一条免费链路（同 minimaxFlatCost 的 ★）。
+ * ★ model / resolution 是用户可控的字符串：查表用 Object.hasOwn（`constructor` 不许顺原型链拿到东西）。
+ */
+function minimaxSecCost(model, resolution) {
+  const m = String(model ?? "");
+  const r = String(resolution ?? "");
+  if (!Object.hasOwn(MINIMAX_SEC_COST, m)) return null;
+  const row = MINIMAX_SEC_COST[m];
+  return Object.hasOwn(row, r) ? row[r] : null;
+}
+
+/**
+ * 一个 V2 出片请求体（{ model, resolution, duration, content, ratio }）值多少 token；这张表报不了价时回 **null**。
+ * **「H3 一段多少钱 / 报不报得出价」只在这一处判**（priceOf 与 V2 路由的扣费前校验都问它）。报得出价的条件：
+ *   · 请求体是普通对象，顶层只有 MINIMAX_V2_BODY_KEYS 里的键（callback_url / extra / 顶层的 first_frame_image 之类一律报不了价）；
+ *   · (model, resolution) 在 MINIMAX_SEC_COST 里（分辨率按上游原样的大写写法）；
+ *   · duration 是 **number 类型的整数**、落在 videoSecWindow(model) 里（4~15）—— 不取整、不夹窗：
+ *     上游只收整数枚举，5.5 或 "5" 发过去是上游的事，这里不替它猜按几秒收；
+ *   · content 缺省或是数组，条目只有 text 与 image_url 两种，每个条目只带 MINIMAX_V2_ITEM_KEYS 里它那一种的键
+ *     （text 条目挂着 video_url、image_url 条目里又塞一个 video_url，都报不了价），image_url 对象里只有 url；
+ *     image_url 合计 ≤ MINIMAX_V2_MAX_IMAGES（都在官方免费张数内）。
+ * 价 = duration × 每秒价（图不另收，见上 ★）。
+ * ⚠ 报得出价 ≠ 可以放行。这里只管**名单与价钱**；值上的规矩 —— 图片地址收哪些协议与主机（上游还认 mm_file:// 与 data:）、
+ *   role 收哪几种、首尾帧与参考图互斥、text 必填与长度上限、ratio 的取值 —— 在 V2 路由的白名单里（schemas/minimaxV2.schemas，
+ *   2026-10-26；它的形状照上面那几份名单建、加载时核对）。路由（routes/minimax.routes 的 POST /v2/video）按白名单**重建**一份请求体，
+ *   拿**那一份**来问这里、扣费、转发；别拿 req.body 原样问完再原样转发。
+ */
+function minimaxV2Tokens(body) {
+  if (!onlyKeys(body, MINIMAX_V2_BODY_KEYS)) return null;
+  const perSec = minimaxSecCost(body.model, body.resolution);
+  if (perSec === null) return null;
+  const d = body.duration;
+  const [lo, hi] = videoSecWindow(body.model);
+  if (typeof d !== "number" || !Number.isInteger(d) || d < lo || d > hi) return null;
+  const content = body.content;
+  if (content !== undefined && !Array.isArray(content)) return null;
+  let images = 0;
+  for (const item of content ?? []) {
+    const type = item && typeof item === "object" ? item.type : undefined;
+    const keys = typeof type === "string" && Object.hasOwn(MINIMAX_V2_ITEM_KEYS, type) ? MINIMAX_V2_ITEM_KEYS[type] : null;
+    // video_url / audio_url / 认不出的条目（输入视频官方另按时长收），或条目上挂着名单外的键：这张表报不了价
+    if (!keys || !onlyKeys(item, keys)) return null;
+    if (type === "image_url") {
+      if (!onlyKeys(item.image_url, MINIMAX_V2_IMAGE_KEYS)) return null;
+      images += 1;
+    }
+  }
+  if (images > MINIMAX_V2_MAX_IMAGES) return null;
+  return d * perSec;
+}
+
+/**
+ * 报不了价时 priceOf 按它收：表内最贵的一格 × 那个模型最长的一段（今天 = 35,800 × 15 = 537,000）。
+ * ★ 方向宁高不低（与 minimax_video 的兜底同一取向）。⚠ 它**不是**上游最贵那种请求的价（第 6 张起的图、输入视频另收）——
+ *   真正挡住表外请求的是 V2 路由在扣费之前的校验，这里只是第二道保险。
+ */
+const MINIMAX_V2_MAX_TOKENS = Math.max(
+  ...Object.entries(MINIMAX_SEC_COST).flatMap(([m, row]) => Object.values(row).map((perSec) => perSec * videoSecWindow(m)[1])),
+);
+
+// ── 免费版能用哪几档出片（2026-10-07 主人拍板）──────────────────────────
+//
+// ★★ 规则：**没付过钱的用户只能用「极速」（1.0 pro fast · 720p）与「草稿」（2.0 mini · 480p；MiniMax 上是 H3-Lite · 480P）出普通片**；
+//   标准 / 高清 / 电影级（含样片两步，以及它们在 MiniMax 上的对标 H3-Highspeed / H3）/ 真人档（MiniMax 海螺、Runway）/
+//   一切带参考视频的出片（白模、返修、延长、素材参考）都要付过钱。为什么这么划：免费额度（新人一次 + 每天一点）要够出几段几秒的片，
+//   而不是一段都出不来；同时把更好的档位留给付费的人，给升级一个理由。
+// ★ 「付过钱」= 有付费套餐（月费 > 0）**或者**付过任何一笔钱（充值包、套餐、Play 购买都算）—— 判据只有 isPaidUser 一处。
+// ★ 草稿与高清**是同一个模型**，只差分辨率 ⇒ 这张表必须按 (model, resolution) 认，只按 model 认就会把高清一起放给免费版。
+// ★ 与 app 仓 `VideoTier.freeOk` 一一对应（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。客户端置灰只是提示，门在这里。
+// ★ 2026-10-26 加 MiniMax H3-Lite · 480P（「草稿」在 MiniMax 上的对标）：出片按地区下发之后海外只有 MiniMax，
+//   免费档要是全在 Seedance 上，海外的免费用户（含 Google Play 的审核账号）一段都出不了。另外两个 H3 照会员档。
+//   它 4 秒 44,800（minimaxV2Tokens），比 Seedance 草稿 4 秒 61,603 还便宜，免费额度够得着。
+//   ⚠ 免费版在 H3 上**只能纯文字出片**（MINIMAX_V2_FREE_TEXT_ONLY，2026-10-26 终审）：这张表只回答「这一档开不开」，带不带图另判。
+// ★ 每一条带 `kind`（priceOf / videoPlanDenial 的 kind）：同一个 (模型, 分辨率) 只在它自己那条链路上算免费。
+// ★ `resolution` 是**发给上游的原样写法**：Seedance 小写（480p），MiniMax 大写（480P）—— 门禁拿钉子补齐之后请求体里那一格比，
+//   不归一大小写（归一就是同一条规则的第二种写法）。/api/ark/health 的 freeVideo 原样下发 ⇒ App 那一侧要按 (model, 上游分辨率) 认：
+//   MiniMax 那几行拿上游分辨率（480P）比，别拿档位表里的小写 resolution 比 —— 那样永远对不上，免费用户看见的是灰键、服务端其实放行。
+// ★ `label` 按档位**家族**起名（App 同一家族的几行同名），所以 H3-Lite 也叫「草稿」、label 会重复：
+//   给人看的档名清单（拒绝那句话、403 的 allowed）一律走 freeVideoLabels（去重），别直接 map(label) —— 会说成「草稿」「草稿」。
+
+/** 免费版能出普通片的 (kind, 模型, 上游分辨率)。label 是给人看的档名（拒绝那句话与 /health 里用，不出现模型 id） */
+const FREE_VIDEO_ALLOW = Object.freeze([
+  Object.freeze({ kind: "task", model: SEEDANCE_FAST, resolution: "720p", label: "极速" }),
+  Object.freeze({ kind: "task", model: SEEDANCE_MINI, resolution: "480p", label: "草稿" }),
+  Object.freeze({ kind: "minimax_v2", model: MINIMAX_H3_LITE, resolution: "480P", label: "草稿" }),
+]);
+
+/**
+ * 我们自己停用的模型与停用时刻。★ 方舟第十批下线公告：Seedance 1.0 pro / pro fast **2026-11-24 14:00（北京时间）**停服；
+ * 我们提前一小时（13:00）自己停 —— 停服那一刻还在排队的任务结局不可知，提前停掉就不会有人在最后几分钟付钱下单。
+ * ★ 与 app 仓 `VideoTier.retireAt` 逐条相等（跨仓钉在 arkProxy.spec「跨仓档位表一致性」）。
+ */
+const RETIRED_MODELS_AT = Object.freeze({
+  [SEEDANCE_STD]: "2026-11-24T13:00:00+08:00",
+  [SEEDANCE_FAST]: "2026-11-24T13:00:00+08:00",
+});
+
+/** 这个模型此刻是否已经停用。判据只有这一处（钉子拒新任务、免费档清单、/health 都问它） */
+function isRetired(model, now = Date.now()) {
+  const key = String(model || "");
+  if (!Object.hasOwn(RETIRED_MODELS_AT, key)) return false;
+  return Number(now) >= Date.parse(RETIRED_MODELS_AT[key]);
+}
+
+/**
+ * 停用模型的拒绝理由（整句，能直接显示）。null = 没停用。
+ * ★ 不在句子里写模型 id，也不写档名：同一句话会落到标准与极速两档上，而 App 侧有自己的档名。
+ */
+function retiredDenial(model, now = Date.now()) {
+  if (!isRetired(model, now)) return null;
+  // ★ 末尾那半句给旧版 App（2.61 及更早）：它们没有「草稿」，免费版用户在那些包里停用之后一档都没得用 ——
+  //   原样显示这句话的包里，这是他唯一能读到的出路。新版 App 看得到草稿，这半句对它也不算错话。
+  return "这一档用的 Seedance 1.0 已于 2026-11-24 停止服务（火山方舟下线了这一代模型），请换一档再出片（档位里没有「草稿」的话，请先更新 App）——当前请求未被受理，也没有扣费。";
+}
+
+/** 此刻免费版还能用的档（停用的那几档自动出局：11-24 之后只剩两家的「草稿」） */
+function freeVideoTiers(now = Date.now()) {
+  return FREE_VIDEO_ALLOW.filter((t) => !isRetired(t.model, now));
+}
+
+/**
+ * 此刻免费版能用的**档名**（去重，按清单顺序：11-24 之前「极速」「草稿」，之后「草稿」）。
+ * **给人看的那一份只走这里**：videoPlanDenial 的拒绝话与 403 回包的 allowed 都是它。
+ * ★ 为什么要去重：label 按档位家族起名，Seedance 草稿与 MiniMax 草稿同名（FREE_VIDEO_ALLOW 的 ★）。
+ */
+function freeVideoLabels(now = Date.now()) {
+  return [...new Set(freeVideoTiers(now).map((t) => t.label))];
+}
 
 /** 这个套餐是不是免费档。判据是**月费为 0**，不是 `id === "free"`——
  *  以后加一个 0 元的体验档，按 id 判会把它当付费用户放进来。 */
@@ -230,29 +764,252 @@ function isFreePlan(planId) {
 }
 
 /**
- * 免费套餐调用「仅付费」模型时的拒绝理由。
- *
- * @returns {string|null} null = 放行；字符串 = 直接显示给用户的原因
- *
- * ★ 返回的是**能直接显示的整句话**，不是错误码：全 app 没有任何地方监听
- *   `emitApiError`，服务端只回一个 `PLAN_REQUIRED` 的话，客户端要么显示成天书、
- *   要么自己再拼一遍文案（第二处实现，两边措辞一分叉就没人知道以哪份为准）。
- * ★ 与 402「余额不足」是**两件事**，不能合并：402 充值就能解决，这一条充多少钱
- *   都没用（要换套餐）。把它们做成同一个错误，用户会一直充值一直被拒。
+ * 「这个人算不算付费用户」—— **判据只有这一处**（铁律六）。
+ * 付费套餐（月费 > 0）**或者**付过任何一笔钱（`paidEver`，由支付入账那几处置真）。
+ * ★ 为什么不只看套餐：生产上至今只有充值包能买（Play 只卖消耗型充值包，买套餐的渠道还没接），
+ *   只认套餐的话「付费用户」这个集合在线上是空的 —— 充了钱的人也只能用免费档，规则成了纯降级。
+ * ★ 入参是 tokenWallet.getWallet 的返回（或同形状的对象）；拿不到钱包（null）按没付过钱处理（从严）。
  */
-function paidOnlyDenial(planId, model) {
-  if (!PAID_ONLY_MODELS.has(String(model || ""))) return null;
-  if (!isFreePlan(planId)) return null;
-  return `这一档（${model}）仅对付费套餐开放：单段消耗超过免费版整月额度，升级套餐后即可使用。`;
+function isPaidUser(wallet) {
+  if (!wallet) return false;
+  return planOf(wallet.planId).price > 0 || wallet.paidEver === true;
+}
+
+/**
+ * 没付过钱的人在 MiniMax H3 上**只能纯文字出片**（不带首帧 / 尾帧 / 参考图）。2026-10-26 终审定的，今天为真。
+ * ★ 为什么：服务端分不出一张图里是不是真人，而 H3 收不收真人照片还没有验过（契约「出片地区」→「等主人拍板」第 9 条）。
+ *   收的话，免费档里那一档 H3-Lite 就成了不花钱的真人出片 —— 绕开「真人档只给付过钱的人」。纯文字出片不带任何人的照片。
+ * ★ 付过钱的人带图照常：他们在真人档（v1）上本来就能拿一张图当首帧出片，H3 没有为他们多开一扇门。管理员同（billing 免套餐门禁）。
+ * ★ 不跟着 FREE_VIDEO_GATE 走：那是额度上的开关（关掉 = 退回改版前只挡电影级的口径，H3 三档对免费版都放开），这一条是内容安全上的 ——
+ *   关闸时 H3 三档对免费版都开着，带图照样要付过钱。
+ * ★ 放开 = 改成 false，要第 9 条的小验做完、主人点头（代码常量、不做环境变量：放开要过代码评审，不能在服务器上悄悄拨）。
+ *   /api/ark/health 的 minimaxV2FreeTextOnly 原样下发它：App 照它对没付过钱的人只发纯文字（不补画帧、不带参考图），
+ *   不然那些人每一发都在扣费之前吃一个 403。
+ */
+const MINIMAX_V2_FREE_TEXT_ONLY = true;
+
+/**
+ * 一发 H3（V2）请求体里有没有文字以外的条目（首帧 / 尾帧 / 参考图，或认不出的条目）。content 的形状认不出也算「有」（从严）。
+ * ★ 只有 arkGateway.chargedArkCall 调它（从**真要转发的那一份**请求体现算），交给 videoPlanDenial 的 media —— 不让路由自己传：
+ *   漏传是零症状的（免费用户带图照样过去）。
+ */
+function minimaxV2HasMedia(body) {
+  const c = body?.content;
+  if (c === undefined) return false;
+  if (!Array.isArray(c)) return true;
+  return c.some((it) => !it || typeof it !== "object" || it.type !== "text");
+}
+
+/**
+ * 「免费版在 H3 上只能纯文字」那一句（MINIMAX_V2_FREE_TEXT_ONLY）。null = 不归它管 / 放行。
+ * media 只认真值 true：不传（undefined）是在问「这一档对他开不开」（videoRegion.minimaxOpenTo），不是问某一发请求。
+ */
+function freeTextOnlyDenial(kind, media) {
+  if (kind !== "minimax_v2" || !MINIMAX_V2_FREE_TEXT_ONLY || media !== true) return null;
+  return {
+    message:
+      "免费版在 MiniMax 上只能用文字出片（不带首帧、尾帧和参考图）；带图出片需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。",
+    allowed: null,
+    freeTextOnly: true,
+  };
+}
+
+/** 免费档限制的总开关：`FREE_VIDEO_GATE=off` 关掉（缺省开）。每次现读 env —— 运维改完重启即生效，测试也能切 */
+function freeVideoGateOn() {
+  return String(process.env.FREE_VIDEO_GATE ?? "").trim().toLowerCase() !== "off";
+}
+
+/**
+ * 这一发是不是「出视频」：Seedance 任务、MiniMax（真人档 v1 `minimax_video`、H3 V2 `minimax_v2`）、Runway。出图 / 对话 / 语音 / Seed3D 都不是。
+ * ★ `minimax_v2` 不看 model：V2 端点只出视频；认不出的型号在 V2 路由的白名单（minimaxV2Tokens）那一关就拒了，
+ *   这里判成「是视频」= 免费档门禁照样管它（往从严的一侧退）。
+ */
+function isVideoGeneration(kind, model) {
+  if (kind === "minimax_video" || kind === "minimax_v2" || kind === "runway") return true;
+  return kind === "task" && Object.hasOwn(VIDEO_MULT, String(model || ""));
+}
+
+/**
+ * 免费版出视频的门禁。**「这一发对这个人开不开」的判据只有这一处**（铁律六）——
+ * arkGateway.chargedArkCall（/api/ark 代理、真人档 MiniMax、白模化的 r2v）、白模化的前置预检、Runway 都只调它。
+ *
+ * @param {object} o
+ * @param {boolean} o.paid       isPaidUser(钱包) 的结论（调用方读钱包，这里不碰库）
+ * @param {string}  o.kind       priceOf 的 kind：task / minimax_v2 / minimax_video / runway / image / chat …
+ * @param {string}  o.model
+ * @param {string}  [o.resolution] **钉子补齐之后**的分辨率，按上游原样的写法（pinPlainVideoTask 会把缺省补成 720p；
+ *   MiniMax V2 是大写的 480P / 768P —— 与 FREE_VIDEO_ALLOW 逐字比，不归一大小写）
+ * @param {object|null} [o.r2v]  resolveR2v 的结论；有它 = 带参考视频的出片
+ * @param {boolean} [o.draft]    样片第一步（draft: true）
+ * @param {object|null} [o.draftFinal] 样片第二步（resolveDraftFinal 的结论）
+ * @param {boolean} [o.media] 只给 MiniMax H3（minimax_v2）：这一发带不带图（minimaxV2HasMedia；chargedArkCall 从请求体现算）。
+ *   带图 + 没付过钱 → 拒（MINIMAX_V2_FREE_TEXT_ONLY）。**不传 = 只问「这一档对他开不开」**（不看图；videoRegion.minimaxOpenTo 就这么问）
+ * @returns {{message:string, allowed:string[]|null, freeTextOnly?:true}|null} null = 放行；否则 message 是能直接显示的整句、
+ *   allowed 是此刻免费版能用的档名（freeVideoLabels，去重；结构化给客户端：英文界面不显示服务端的中文句子，靠它自己说）；
+ *   freeTextOnly 为真 = 档位本身对他开着、拒的是「带图」（这时 allowed 为 null：说「只能用草稿」对一个正在用草稿的人是错话）
+ *
+ * ★ 「普通片」= 没有参考视频（r2v）、不是样片两步，且 (kind, 模型, 分辨率) 三样都对上 FREE_VIDEO_ALLOW 里的一条。
+ *   MiniMax V2 今天不收参考视频 / 音频，所以 V2 路由不传 r2v；哪天 V2 开了 video_url（H3 参考视频），
+ *   路由要像 resolveR2v 那样把「带参考视频」交进来（r2v 传真值）—— 否则 H3-Lite 480P 带参考视频也会被当成免费的普通片。
+ *
+ * ★ 只管「出视频」：出图 / 对话 / 语音 / Seed3D 一律放行（免费额度本来就该能做这些）。
+ * ★ 与 402「余额不足」是**两件事**，不能合并：402 充值就能解决（充了也就成了付费用户），
+ *   这一条在没付过钱之前怎么都过不去。做成同一个错误，用户会在错的地方找原因。
+ * ★ 返回整句话而不是错误码：全 app 没有任何地方监听 `emitApiError`，服务端只回一个码的话，
+ *   客户端要么显示成天书、要么自己再拼一遍文案（第二处实现）。句子里**不许有 ASCII 双引号**：
+ *   老 App 用 `"message"\s*:\s*"([^"]+)"` 抠这句话，带引号会被拦腰截断。
+ */
+function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, media, now = Date.now() }) {
+  const m = String(model ?? "");
+  if (!isVideoGeneration(kind, m)) return null;
+  if (paid) return null;
+  if (!freeVideoGateOn()) {
+    // 关闸 = 退回改版前的口径：只有 2.5 挡免费版（10 秒一段 ≈ 101 万 token，它从来就不是免费额度够得着的东西）
+    // ★ MiniMax H3（含对标电影级的 MiniMax-H3）关闸时照样放开：挡 2.5 的理由是「一段就远超免费额度」，
+    //   而 H3 768P 10 秒是 358,000，不是那个量级；App 关闸那一支（account.tierFreeOk 的 legacy）也只挡 Seedance 2.5 —— 两边一致。
+    if (kind === "task" && m === SEEDANCE_2_5) {
+      return { message: "「电影级」只对付费用户开放：单段消耗远超免费版的额度。开通任意付费套餐，或充值过任意一次，即可使用。", allowed: null };
+    }
+    // 档位放开了，带图照样要付过钱（MINIMAX_V2_FREE_TEXT_ONLY 的 ★：不跟着这个开关走）
+    return freeTextOnlyDenial(kind, media);
+  }
+  const open = freeVideoTiers(now);
+  const plain = !r2v && !draft && !draftFinal;
+  // 档位对他开着时才看「带没带图」：档位都不开的（H3-Highspeed / H3），先说「这一档要付费」—— 那才是根本原因
+  if (plain && open.some((t) => t.kind === kind && t.model === m && t.resolution === resolution)) return freeTextOnlyDenial(kind, media);
+  const allowed = freeVideoLabels(now);
+  // ★ 旧版 App（2.61 及更早）原样显示这句话，而它们的档位表里**没有「草稿」**（只有「极速」可用；11-24 之后连它都停了）——
+  //   只说「只能用草稿」，那些包里的人找不到这一档。所以点到草稿时补半句「看不到就更新 App」：新版 App 看得到，这半句对它不算错话。
+  //   请求里没有版本号可以分辨新旧包，只能一句话两边都成立。
+  const updateHint = allowed.includes("草稿") ? "（档位里看不到「草稿」的话，请先更新 App）" : "";
+  const head = allowed.length
+    ? `免费版只能用${allowed.map((l) => `「${l}」`).join("")}出普通片${updateHint}，参考视频、返修、延长、样片、真人档都不在内`
+    : "免费版暂时没有可用的出片档位";
+  return { message: `${head}；这一项需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。`, allowed };
+}
+
+/**
+ * Runway 的按秒价目（token/秒）。**每个数都能回溯到 Runway 自己的价目页**
+ * （docs.dev.runwayml.com/guides/pricing，2026-09-24 读）：credit 面值 $0.01，
+ * 按全仓锚 $1 = 447,563 token 折算、四舍五入到百位。
+ *   gen4_turbo  5 cr/秒  = $0.05/秒 → 22,400
+ *   h3_max      8 cr/秒  = $0.08/秒 → 35,800
+ *   hailuo3    10 cr/秒  = $0.10/秒 → 44,800（与方案 §14.6 的 rw_hailuo3_768p 对上）
+ *
+ * ★★ **查不到价的档位一律拒绝，绝不能降级成免费**：这条链路此前完全不计费，
+ *   而「没价就白跑」等于把那个口子原样留着。新增档位要先有出处再进表。
+ * ★ hailuo3 另按**每张参考图 2 cr**（$0.02 → 9,000）加收；image_to_video 必然带一张
+ *   promptImage，所以命中 hailuo3 时固定加一份。
+ * ⇒ 多模型目录（方案 §15.1）落地后这张表并进目录，这里只留委派。
+ */
+const RUNWAY_TOKENS_PER_SECOND = Object.freeze({ gen4_turbo: 22400, h3_max: 35800, hailuo3: 44800 });
+const RUNWAY_REF_IMAGE_TOKENS = Object.freeze({ hailuo3: 9000 });
+
+/**
+ * **每日 token 上限**（方案 §14.10）。余额是「一个月能花多少」，日上限是「一天能花多少」——
+ * 两者不能互相替代：
+ *  · 免费档：额度本身就小（新人一次 + 每天一点），日上限防的是「一天之内把整份新人额度喂给刷子」；
+ *  · **付费档：没有日上限就等于没有上限。** 一个被滥用（或被盗号）的订阅者一天能烧掉
+ *    这个订阅二百多个月的净收入，而账单要到月底才看得见。
+ *
+ * ★ 迎新期单独放宽：刚注册那几天日上限压到 15,000，用户连一段最短的视频都出不了
+ *   （最短一段 67,200），那是个**永远触发不到的死配置**，还正好毁掉第一印象。
+ * ★ 超限**只拒当天、不封号**，且返回的是能直接显示给用户的整句话（照 videoPlanDenial 的先例）。
+ *
+ * ★★ 判据是「**今天已经花掉的** ≥ 上限」，**刻意不把本次报价算进去**。
+ *   写成 `已花 + 这次 > 上限` 看着更严谨，实际会制造一个**永远点不动的按钮**：
+ *   一段 30 秒的 seedance-2.5 单发就是 3,045,600 token > 3,000,000 的硬线，
+ *   于是这个用户从第一发起就没法用这个功能 —— 而这正是 §14.10 自己点名要避免的死配置形状
+ *   （它举的例子是免费档 15,000/日 挡死 67,200 的视频，同一个错法）。
+ *   代价是单日最多溢出「一发的钱」，这个溢出有上界、且不会重复发生（下一发就被拒了）。
+ */
+const DAILY_LIMITS = Object.freeze({
+  // ⚠ 方案 §14.10 给的是 **15,000/日**，那个数配的是「月额度降到 30,000」之后的免费档。
+  //   2026-10-07 起免费档是「新人一次 170,000 + 每天 2,000」（`PLANS.free`），**没有走那条路**：
+  //   15,000/日会让新人那 170,000 一天只能出一段最短的「草稿」（61,603，判据不含本次报价、所以一天还能放一发），
+  //   等于把新人额度拆成十来天才用得完 —— 而它本来就是让人一进来能多试几段的。
+  //   ⇒ 维持 150,000/日：仍挡住「一天烧光整份新人额度」，又不把它锁死。
+  //   以后要再改免费额度的形状，这个数要一起重新算（两者是一对）。
+  freeDaily: 150000,
+  newcomerDaily: 150000,
+  newcomerDays: 7,
+  paidWarnDaily: 1_500_000,
+  paidHardDaily: 3_000_000,
+});
+
+/**
+ * 今天还能不能再花 `cost`。**判据只有这一处**（与 videoPlanDenial 同在 billing.preAuthorize 那一格起作用）。
+ * @param {boolean} [o.paid] isPaidUser(钱包) 的结论。★★ 2026-10-07 起「付费用户」= 付费套餐**或者付过任何一笔钱**
+ *   （config/tokens.isPaidUser）。日上限按同一个口径分档：只看套餐的话，一个充了 450 万 token 的免费版用户每天只能花 15 万 ——
+ *   一段 5 秒的电影级样片第二步（124 万）他一天里根本点不出来，而门禁刚刚才放他用这一档。不传时退回只看套餐（老调用点）。
+ * @returns {string|null} 整句拒绝理由；null = 放行
+ */
+function dailyCapDenial({ planId, paid, spentToday, cost, accountAgeDays }) {
+  const spent = Math.max(0, Number(spentToday) || 0);
+  void cost; // 见下面 ★★：判据刻意**不含**本次报价
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  if (!isPaid) {
+    const newcomer = Number(accountAgeDays) >= 0 && Number(accountAgeDays) < DAILY_LIMITS.newcomerDays;
+    const cap = newcomer ? DAILY_LIMITS.newcomerDaily : DAILY_LIMITS.freeDaily;
+    if (spent < cap) return null;
+    return `今天的免费额度用完了（每日上限 ${cap} token，已用 ${spent}）。明天 0 点（UTC）重置，或升级套餐提高上限。`;
+  }
+  if (spent < DAILY_LIMITS.paidHardDaily) return null;
+  return `今天的用量已达单日上限（${DAILY_LIMITS.paidHardDaily} token，已用 ${spent}）。这是防滥用的保护线，明天 0 点（UTC）重置；确有大批量需求请联系我们。`;
+}
+
+/** 到没到该提醒一声的线（只记日志/告警，不拒）。paid 的口径同 dailyCapDenial */
+function dailySoftWarn({ planId, paid, spentToday }) {
+  const isPaid = typeof paid === "boolean" ? paid : !isFreePlan(planId);
+  return isPaid && Number(spentToday) >= DAILY_LIMITS.paidWarnDaily;
 }
 
 const MODEL3D_ID = "doubao-seed3d-2-0-260328";
 
-/** 一段 720p 视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数） */
-function segTokens(durationSec, model) {
-  const d = Math.max(3, Math.min(10, Math.round(Number(durationSec) || 5)));
-  const base = (d * 1280 * 720 * 24) / 1024;
-  return Math.round(base * (VIDEO_MULT[model] ?? 1));
+/**
+ * 一段纯任务视频的 token（方舟公式：时长×宽×高×帧率/1024，×档位系数）= round(秒 × perSecTokens × 系数)。
+ * ★ 时长夹到这个模型的窗口（videoSecWindow；2026-10-03 之前一刀切 [3,10]）。路由层已经把窗口外的时长整句拒了
+ *   （pinPlainVideoTask），这里的夹取只是导出函数的第二道保险。缺省 5 = 钉子给缺省时长补的那个数。
+ * ★ resolution 缺省 720p、ratio 可不传：`segTokens(d, model)` 与改版前逐位相等（720p 一刀切 21,600/秒）。
+ *   写成带缺省值的位置参数而不是一个对象，是为了让 `segTokens.length` 仍是 2 —— arkProxy.spec 用它钉着
+ *   「计价公式里没有音频这个入参」，而 Function.length 不数带缺省值的参数。
+ * ★ 乘法顺序（秒 × 每秒 × 系数，再 round）与 app 的 economy.segTokens 一致：480p 的每秒是小数（9,607.5），
+ *   换个乘法顺序浮点尾数可能差到 round 的另一侧，表现就是两仓差 1 token。
+ */
+function segTokens(durationSec, model, resolution = "720p", ratio) {
+  const [lo, hi] = videoSecWindow(model);
+  const d = Math.max(lo, Math.min(hi, Math.round(Number(durationSec) || 5)));
+  const mult = Object.hasOwn(VIDEO_MULT, String(model)) ? VIDEO_MULT[String(model)] : 1;
+  return Math.round(d * perSecTokens(model, resolution, ratio) * mult);
+}
+
+/**
+ * 电影级「样片」第二步（把一条 480p 样片转成 1080p 成片）的系数：2.5 的 1080p「输入不含视频」刊例 **77 元/M** ÷ 15。
+ * ★ 出处：方舟价目页「按 token 单价」—— Seedance 2.5「输出视频分辨率为 1080p · 输入不含视频：77.00」；
+ *   样片两步「独立计费」，第二步「按目标分辨率计费」、「单价根据 Step 1 是否包含输入视频确定」。
+ *   我们的样片第一步不许带视频输入（pinPlainVideoTask），所以第二步只有这一个单价。
+ * ⚠ 还没有账单核对过（与 VIDEO_MULT 里 2.5 那一格同一个状况）。核出来不是 77 就两仓一起改（app economy 同名常量）。
+ */
+const DRAFT_FINAL_MULT = 77 / 15;
+
+/**
+ * 样片第二步扣多少：round(秒 × 2.5 的 1080p 每秒 × 77/15)。
+ * @param {number} durationSec **样片的时长**（服务端登记的那一份，见 ark.routes 的 resolveDraftFinal；请求体里一个数都不信）
+ * @param {string} [ratio]     样片的画幅（方舟查询回的那一份）；缺省 / adaptive / 认不出按 1080p 最大一格收
+ * ★ 方舟规定第二步**复用**第一步的时长与画幅、禁止重传 —— 所以这两个数只能来自我们自己记下的第一步。
+ * ★ 时长认不出时按 2.5 窗口的**上限**收并吼一嗓子（路由已经拒了这种情况，这里是第二道保险，方向宁高不低）。
+ */
+function draftFinalTokens(durationSec, ratio) {
+  const [lo, hi] = videoSecWindow(SEEDANCE_2_5);
+  const raw = Math.round(Number(durationSec));
+  let d;
+  if (Number.isFinite(raw) && raw > 0) {
+    d = Math.max(lo, Math.min(hi, raw));
+  } else {
+    console.error(`[tokens] 样片转成片的时长认不出（${String(durationSec)}），按上限 ${hi} 秒收费`);
+    d = hi;
+  }
+  return Math.round(d * perSecTokens(SEEDANCE_2_5, DRAFT_FINAL_RESOLUTION, ratio) * DRAFT_FINAL_MULT);
 }
 
 // ── r2v（参考视频生视频 / 白模模板）─────────────────────────────────
@@ -262,8 +1019,9 @@ function segTokens(durationSec, model) {
 // 输出是 720p 档（16:9 给 1280×720=921,600px；自适应给 1266×728=921,648px，
 // 都是 92 万 px 级）、fps=24 ⇒ 每秒 21,600 raw token。
 
-/** r2v 每秒 raw token（720p 档 92 万 px × 24fps ÷ 1024）。上面公式的落点 */
-const R2V_TOKENS_PER_SEC = 21_600;
+/** r2v 每秒 raw token（720p 档 92 万 px × 24fps ÷ 1024）。上面公式的落点。
+ *  ★ 就是 SEC_720P_TOKENS：r2v 各分支都把分辨率钉在 720p（resolveR2v），所以不查像素表 */
+const R2V_TOKENS_PER_SEC = SEC_720P_TOKENS;
 
 /**
  * r2v 档位系数（相对标准档 1-0-pro 的 15 元/M 折算口径，与 VIDEO_MULT 同一把尺子）。
@@ -281,10 +1039,60 @@ const VIDEO_MULT_R2V = {
   //   （同一份账单里 411.3 千token × ¥0.042 = ¥17.2746，原价 = 折后价 ——
   //    说明这是刊例价而不是促销价，可以直接当长期口径用。）
   [SEEDANCE_2_5]: 2.8,
+  // 高清（2.0-mini）的「有输入视频」档：官方刊例 14 元/M ⇒ 14/15（2026-10-05 主人「合」开高清的片段重拍 + 参考视频出片）。
+  //   付费探测（app 仓 design/video-input-probe.mjs，三发全成）：mini 认 omni_reference_task_type，参考 / 编辑 / 延长都一次受理，
+  //   用量与 2.5 同一个式子（(输入 + 输出) × 21,600，输入按整秒往下取）。⚠ 账单还没逐行核过：那三个任务（2026-10-06 10:43~10:50
+  //   北京时间）每个原价 ¥3.04 = 14 元/M、¥4.99 = 23 元/M；核出来不是 14 就两仓一起改（app economy 的 HD_R2V_MULT 同一个数）。
+  //   促销（4 折）不入表，理由见上。延长不开：mini 延长的第一帧接不上原片（app 的 VideoTier.extendOk 挡着），服务端只管价钱。
+  "doubao-seedance-2-0-mini-260615": 14 / 15,
 };
 
 /** 表里最贵的 r2v 系数。兜底方向与 imageTokensOf 同理：多收会被投诉、少收永远没人发现 */
 const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
+
+/**
+ * 参考视频的**输入**时长 → 计价秒数：取整，再夹到 [4,30]（方舟参考视频的输入窗口）。r2vTokens 与 materialRefTokens 共用，
+ * 「怎么取整、窗口多大、什么算异常」只在这一处（铁律六）。
+ *
+ * ★★ 什么算「异常」（2026-10-19 改）：只认**夹取改变了取整后的值**（时长越出 [4,30]，或者根本不是数）。
+ *   原来两处各写 `夹取后 !== 原值` 就 console.error「登记数据可能被弄坏了」，而 Cloudinary 回来的时长都是小数
+ *   （本人成片 4.096、示例视频 4.064）——于是每一发本人成片的重拍 / 延长 / 示例视频出片都吼一行「异常」，
+ *   真被弄坏的那一行会淹在里面。取整本来就是计价规则的一部分，不是异常。
+ * ★★ 原来那行 console.error 同时是**统计生产用量的唯一现成依据**（10-19 就是 grep 它数出「这几条路最近几乎没人用」；
+ *   流水 memo 只有 tpl / src / own 标记，看不出秒数，也看不出最低用量抬没抬）。所以两个调用方另打一行**不带「异常」字样**的
+ *   普通日志（console.log，进 pm2 的 out 日志），每次计价都打，前缀固定 `[tokens] 视频输入计价` —— 要统计就 grep 这个前缀。
+ *   ⚠ 计价发生在扣费之前（arkGateway 先 priceOf 再过余额 / 门禁），所以一行 = 一次计价，不一定 = 一发扣了钱的任务；
+ *   扣没扣以流水（TokenLedger 的 ark_spend memo）为准。
+ */
+function videoInputSec(given) {
+  const raw = Number(given);
+  const rounded = Math.round(Number.isFinite(raw) ? raw : 0);
+  const sec = Math.max(4, Math.min(30, rounded));
+  return { raw, sec, anomalous: !Number.isFinite(raw) || sec !== rounded };
+}
+
+/**
+ * 方舟「含输入视频时的最低 token 用量」折算成**输入秒数的下限**：输出 o 秒（整数）时，输入至少按 ⌈2o/3⌉ 秒算。
+ *
+ * ★★ 出处（2026-10-19 读）：官方价目页 https://docs.volcengine.com/docs/ark/model-pricing ——「对于 Seedance 2.0 系列、
+ *   Seedance 2.5 模型，当输入包含视频时，存在最低 token 用量限制」「如果估算 token 用量 ＜ 最低 token 用量，则按最低 token
+ *   用量计算视频价格」；页上链接的最低用量表（「火山方舟视频生成模型价格快查表」）2.5 · 720p 一栏：输出 4/5/6/7/8/10/15/23 秒
+ *   → 151,200 / 194,400 / 216,000 / 259,200 / 302,400 / 367,200 / 540,000 / 842,400 = ⌈5o/3⌉ × 21,600；2.0 · 480p 一栏
+ *   4/7/15 秒 → 70,308 / 120,528 / 251,100 = ⌈5o/3⌉ × 10,044（同一条规则）。估算用量 = (输入 + 输出) × 每秒数，所以
+ *   max(输入 + o, ⌈5o/3⌉) = o + max(输入, ⌈5o/3⌉ − o) = o + max(输入, ⌈2o/3⌉)（o 是整数时 ⌈5o/3⌉ − o = ⌈2o/3⌉）。
+ * ★★ 2026-10-19 付费实测（app 仓那条付费核账线，本机跑生产同一提交 58b934c、内存库）：
+ *   · 电影级延长 cgt-20261020074220-c7l9g：源 4.06 秒、延长 7 秒 → completion_tokens 259,200 = (5 + 7) × 21,600，
+ *     不是 (4 + 7) 的 237,600；我们按旧式子扣 665,280，比方舟少收 8.3%（¥0.91）。
+ *   · 高清示例视频出片 cgt-20261020074617-sxmps：示例视频 4.064 秒、出 7 秒（169 帧）→ 260,100 = (5 + 169/24) × 21,600，
+ *     不是 (4 + 7.04) 的 238,500；旧式子扣 221,760，少收 8.6%。
+ *   ⇒ 输出 ≤ 1.5 × 输入时这条下限够不着（⌈2o/3⌉ ≤ 输入），结果与旧式子一个数都不差；只有「短的源、长的输出」才会被抬。
+ * ★ 2o/3 在 o 是 3 的倍数时是精确整数（整数相除恰好整除时 IEEE 754 不丢精度），Math.ceil 不会多抬一秒。
+ * ★ 与 app 仓 `src/data/economy.ts` 的 materialRefCost **同一个式子**（报价 = 实扣，跨仓契约，钉在 tests/arkProxy.spec.js
+ *   「含输入视频的最低用量」）。
+ */
+function videoInputFloorSec(outputSec) {
+  return Math.ceil((2 * outputSec) / 3);
+}
 
 /**
  * 一次 r2v 出片扣多少 token。
@@ -304,13 +1112,18 @@ const MAX_R2V_MULT = Math.max(...Object.values(VIDEO_MULT_R2V));
  * ★★ 上限 2026-08-15 随白模 V2 从 15 放宽到 30，**必须与那套窗口同时改**：
  *   窗口放到 30 而这里还夹 15 的话，一段 20s 的模板会按 15s 计价 ——
  *   页面报价 < 实际扣费，正是 CLAUDE.md 里的头号事故形状（且只有账单知道）。
+ * ★ **不套「含输入视频的最低用量」**（materialRefTokens 头上那条，2026-10-19 付费核过）：方舟要求输入至少按
+ *   ⌈2×输出/3⌉ 秒算，而 edit 的输出跟随输入（≈ 输入），输入又在 [4,30] 里，⌈2×输入/3⌉ ≤ 输入恒成立 —— 这条下限永远够不着。
+ *   实测：片段重拍 cgt-20261020073613-4gq5v（输入 4 秒、出 97 帧）用量 173,700 = (4 + 97/24) × 21,600，没有被抬。
+ *   套上去结果一个数都不变，只会让「为什么这里没有最低用量」变成一个要去推导的问题，所以不套、写在这里。
  */
 function r2vTokens(inputDurationSec, model) {
-  const raw = Number(inputDurationSec);
-  const d = Math.max(4, Math.min(30, Math.round(Number.isFinite(raw) ? raw : 0)));
-  if (d !== raw) {
+  const { raw, sec: d, anomalous } = videoInputSec(inputDurationSec);
+  if (anomalous) {
     console.error(`[tokens] r2v 输入时长异常（${String(inputDurationSec)}），已按 ${d}s 计价 —— 模板登记数据可能被弄坏了`);
   }
+  // 统计用的普通日志（不是告警），理由见 videoInputSec 的 ★★
+  console.log(`[tokens] 视频输入计价 edit：输入 ${raw}s → 按 ${d}s，输出跟随输入（共计 ${d * 2}s）· ${String(model).slice(0, 64)}`);
   let mult = VIDEO_MULT_R2V[model];
   if (mult === undefined) {
     // 路由上够不着（resolveR2v 已把不在表的模型 400 掉），这是导出函数的第二道保险
@@ -324,27 +1137,39 @@ function r2vTokens(inputDurationSec, model) {
  * 素材参考出片（reference 子任务：用户素材视频 + 多图 + 提示词点名首中尾帧）扣多少 token。
  *
  * ★ 与 r2vTokens（edit 复刻）是**两个公式**：edit 输出≈输入所以是 输入×2；
- *   reference 的输出时长由用户选（3~10s），公式是 (输入 + 输出)×720p 锚×同一系数
+ *   reference 的输出时长由用户选（这个模型的窗口内，2.5 是 4~30s），公式是 (输入 + 输出)×720p 锚×同一系数
  *   ——(输入+输出)×W×H×fps÷1024 那条账单公式的直接代入，系数同 VIDEO_MULT_R2V
- *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）。
+ *   （方舟按"请求里有没有视频输入"分档，不按子任务分档）；输入另有最低用量的下限（下面第二个 ★★）。
  * ★★ 两个夹取区间必须与 app 的 economy.materialRefCost **逐字相等**（报价=实扣，
- *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹 [3,10]
- *   （resolveR2v 的素材钉子拒掉了区间外与 -1，这里的夹取只是导出函数的第二道保险）。
+ *   本仓头号事故形状）：输入夹 [4,30]（方舟 r2v 输入窗口），输出夹到这个模型的时长窗口（videoSecWindow，
+ *   2026-10-03 之前是 [3,10]；resolveR2v 的素材钉子拒掉了窗口外与 -1，这里的夹取只是导出函数的第二道保险）。
+ * ★★ 夹完之后输入再取 max(输入, ⌈2×输出/3⌉)（2026-10-19，方舟「含输入视频时的最低用量」，出处与付费实测见
+ *   videoInputFloorSec）：扣 round((计价输入 + 输出) × 21,600 × 系数)。延长（ownExtend）与示例视频出片（material）
+ *   都走这里，所以两条路一起改了；edit 那条（r2vTokens）不套，理由写在它头上。
+ *   ⚠ **上线顺序是 App 先、服务端后**（这条对延长 / 示例视频是涨价）：App 的报价只在本机算、不问服务端，服务端先换式子的话，
+ *   没升级的 App 在「输出 > 1.5 × 输入」时会报得比扣得少（电影级从 4 秒的源延长 30 秒：报 2,056,320、扣 3,024,000）。
+ *   App 先发时方向反过来（报价 ≥ 实扣），所以这一改等新 App（2.64）发出约一周后再上（2026-10-19 定的顺序，
+ *   主人「你来调研后决定」）。还没升级的老包在那之后照样会少报，拦不住 —— 只能靠这几条路本来就很少有人用（生产日志）。
  */
 function materialRefTokens(inputDurationSec, outputDurationSec, model) {
-  const ri = Number(inputDurationSec);
-  const i = Math.max(4, Math.min(30, Math.round(Number.isFinite(ri) ? ri : 0)));
-  if (i !== ri) {
+  const { raw: ri, sec: i, anomalous } = videoInputSec(inputDurationSec);
+  if (anomalous) {
     console.error(`[tokens] 素材参考输入时长异常（${String(inputDurationSec)}），已按 ${i}s 计价 —— 登记数据可能被弄坏了`);
   }
   const ro = Number(outputDurationSec);
-  const o = Math.max(3, Math.min(10, Math.round(Number.isFinite(ro) ? ro : 0)));
+  const [lo, hi] = videoSecWindow(model);
+  const o = Math.max(lo, Math.min(hi, Math.round(Number.isFinite(ro) ? ro : 0)));
+  const iEff = Math.max(i, videoInputFloorSec(o));
+  // 统计用的普通日志（不是告警），理由见 videoInputSec 的 ★★；被最低用量抬过的写出原来的秒数，统计时分得出抬了多少
+  console.log(
+    `[tokens] 视频输入计价 参考/延长：输入 ${ri}s → 按 ${iEff}s${iEff > i ? `（最低用量，原 ${i}s）` : ""} + 输出 ${o}s · ${String(model).slice(0, 64)}`,
+  );
   let mult = VIDEO_MULT_R2V[model];
   if (mult === undefined) {
     console.error(`[tokens] 素材参考模型 ${String(model).slice(0, 64)} 不在 VIDEO_MULT_R2V 里，按最贵档 ${MAX_R2V_MULT} 收费`);
     mult = MAX_R2V_MULT;
   }
-  return Math.round((i + o) * R2V_TOKENS_PER_SEC * mult);
+  return Math.round((iEff + o) * R2V_TOKENS_PER_SEC * mult);
 }
 
 /**
@@ -374,48 +1199,132 @@ function materialRefTokens(inputDurationSec, outputDurationSec, model) {
  *     报价函数（mintQuote / blockoutTemplateCost）必须一起改。
  */
 /**
- * 真人档（MiniMax 海螺 2.3 · 768P）按发一口价（token/发，键 = 时长秒）。
+ * 真人档（MiniMax 海螺 · 768P）按发一口价（token/发）。**键是 model，再按时长秒**。
+ *
+ * ★★ 为什么必须挂在 model 上（2026-09-26 改）：这张表原来只按时长开，而路由把模型
+ *   写死成一个常量 —— 多一个模型就变成「两种单价按同一个数收费」。本文件上方那段
+ *   `IMAGE_TOKENS` 的事故（priceOf 拿到请求体却不读 model ⇒ 顶档按最低档收费、
+ *   零症状每张白送 0.4 元）就是同一个形状，不要再犯第二遍。
  *
  * ★★ 跨仓钉子：app 的 src/data/economy.ts VIDEO_TIERS 里 id:"real" 的 flatCost
- *   必须与这张表**逐条相等**（报价=实扣；realPersonProxy.spec.js 末尾钉着）。
- * ★ 数的来历（2026-08-24）：MiniMax 官方 $0.28/发(768P·6s)、$0.56/发(768P·10s)，
- *   汇率 7.2 ⇒ ¥2.016/¥4.032；按全仓 token 锚（15 元/百万 = 系数 1）折算
- *   = 134,400 / 268,800，取整 135k / 270k。成本价 1.0x（仓库主人拍板）。
- * ⚠ 汇率会动：调价时**两仓同一个提交**改这两处，别让报价悄悄偏离实扣。
- * ★ 只有 768P 一档分辨率、6/10 两档时长 —— 路由在扣费**之前**把参数钉死在这
- *   张表能报价的范围内（计价参数与扣费同一拍，照 resolveR2v 的先例），
- *   表里查不到的组合根本走不到扣费。
+ *   必须与**它当前所用那个 model** 这一行逐条相等（报价=实扣；realPersonProxy.spec.js 钉着）。
+ *
+ * ★ 数的来历（2026-09-26 从 platform.minimax.io/docs/guides/pricing-paygo 读的官方价，
+ *   国际站与中国站同价 —— 已逐条核对）：
+ *     MiniMax-Hailuo-2.3        $0.28 / 768P·6s    $0.56 / 768P·10s
+ *     MiniMax-Hailuo-2.3-Fast   $0.19 / 768P·6s    $0.32 / 768P·10s
+ *   按全仓锚 **$1 = 447,563 token** 折算、取整到百位。成本价 1.0x。
+ *
+ * ⚠ **2026-09-26 更正了一处锚偏移**：2.3 那两个数原本是 135,000 / 270,000，
+ *   按的是**汇率 7.2 的旧锚**（隐含 482,142 token/$）。全仓 9/24 已改成 6.71345
+ *   （447,563 token/$），于是真人档每发**多收约 7.7%** —— 没有任何症状，
+ *   只有把两个锚摆在一起算才看得见。现在两处同源。
+ * ⚠ 汇率会动：调价时**两仓同一个提交**改，别让报价悄悄偏离实扣。
+ *
+ * ★ `MiniMax-Hailuo-2.3-Fast` **只支持图生视频**（2026-09-26 裸 API 实测：纯文生视频
+ *   回 `2013 does not support Text-to-Video mode`）。真人档首帧恒为真人照片，天然是图生视频，
+ *   所以这条限制对我们不构成问题 —— 但别把它开给别的链路。
+ * ★ 2.3 那一行**不能删**：已经发出去的 App（≤2.52）发的就是它，删了老用户真人档当场全挂。
+ * ★ 只有 768P 一档分辨率 —— 路由在扣费**之前**把参数钉死在这张表能报价的范围内
+ *   （计价参数与扣费同一拍，照 resolveR2v 的先例），表里查不到的组合根本走不到扣费。
  */
-const MINIMAX_FLAT_COST = Object.freeze({ 6: 135000, 10: 270000 });
-/** 真人档唯一在册的模型与分辨率（价目只锚了它们，别的组合没有价） */
+const MINIMAX_FLAT_COST = Object.freeze({
+  "MiniMax-Hailuo-2.3": Object.freeze({ 6: 125300, 10: 250600 }),
+  "MiniMax-Hailuo-2.3-Fast": Object.freeze({ 6: 85000, 10: 143200 }),
+});
+/** 在册的真人档模型（价目只锚了它们，别的没有价）。★ 判据只有这一处 */
+const MINIMAX_REAL_MODELS = Object.freeze(Object.keys(MINIMAX_FLAT_COST));
+/** App ≤2.52 发的那个模型；留作老客户端的兼容锚点，别拿它当"当前主力" */
 const MINIMAX_REAL_MODEL = "MiniMax-Hailuo-2.3";
 const MINIMAX_REAL_RESOLUTION = "768P";
 
-function priceOf(kind, body, r2v = null) {
+/**
+ * 某个模型某个时长要多少 token；表外组合返回 **null**（不是 0）。
+ * ★ null 的含义是「这个组合没有价」，调用方必须据此**拒绝**——返回 0 会让它变成
+ *   一条免费链路，正是 Runway 那条注释里点名的口子。
+ */
+function minimaxFlatCost(model, duration) {
+  const row = MINIMAX_FLAT_COST[String(model || "")];
+  if (!row) return null;
+  return row[Number(duration)] ?? null;
+}
+
+/**
+ * @param {{draftTaskId:string, durationSec:number, ratio?:string}|null} [draftFinal] 样片第二步的结论
+ *   （ark.routes 的 resolveDraftFinal 给的：时长与画幅取自第一步的服务端登记与方舟查询，请求体一个数都不信）。
+ *   有它 = 按 draftFinalTokens 计价。
+ */
+function priceOf(kind, body, r2v = null, draftFinal = null) {
   // ★ 必须读 body.model。写成常量就是"顶档按最低档收费"，而那种错零症状（见上面的表）。
-  if (kind === "image") return imageTokensOf(String(body?.model ?? ""));
+  // ★ 乘上「最多几张」：组图 / 图层拆分按实际张数计费，按一张收就是白送（见 imageCountCap 的 ★★）
+  if (kind === "image") return imageTokensOf(String(body?.model ?? "")) * imageCountCap(body);
   if (kind === "chat") return CHAT_TURN_TOKENS;
+  // 老师人格（tutor，docs/08 #4）：一轮教学 / 试教 = 一次 chat 的量纲；蒸馏与生成 / 扫描的每一块另有价。
+  //   ★ 三个数都是**建议值**（tutor 仓 docs/10：`npm run dogfood` 用真模型量过 p95 再改这里 + tutor 仓 pricing.js 两处同改）。
+  if (kind in TUTOR_PRICES) return TUTOR_PRICES[kind];
+  // 语音合成：按字符。★ 与路由里截断后的长度用同一个值（路由把 text 截到 MAX_TEXT
+  //   之后才报价），否则「报价按 5,000 字、实际只念 300 字」——报价与实扣必须同源。
+  if (kind === "tts") return Math.max(1, Math.ceil(String(body?.text ?? "").length * TTS_TOKENS_PER_CHAR));
+  // 语音识别：按秒（调用方把秒数算好递进来；预扣用字节估的上界，结算用上游给的真实时长）
+  if (kind === "asr") return Math.max(1, Math.ceil((Number(body?.seconds) || 0) * (ASR_TOKENS_PER_MINUTE / 60)));
+  // Runway：按秒 × 档位单价（+ 参考图）。**查不到价返回 null**，调用方据此拒绝这次调用 ——
+  // 返回 0 会让它变成一条免费链路，而那正是这次要封的口子。
+  if (kind === "runway") {
+    const perSec = RUNWAY_TOKENS_PER_SECOND[String(body?.model ?? "")];
+    if (!perSec) return null;
+    const seconds = Number(body?.duration);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return Math.ceil(seconds * perSec) + (RUNWAY_REF_IMAGE_TOKENS[String(body?.model ?? "")] || 0);
+  }
   // 真人档：按发查表。路由已把 duration 钉在表内（见 MINIMAX_FLAT_COST 的 ★）；
   // 万一有人绕过路由校验把别的时长带进来，兜底取表内最贵档 —— 报价宁高不低
   // （与 segmentCost 的 r2v 兜底同一取向），并 console.error 点名让人当场看见。
   if (kind === "minimax_video") {
-    const hit = MINIMAX_FLAT_COST[Number(body?.duration)];
+    // ★★ 必须同时读 model 与 duration（见 MINIMAX_FLAT_COST 的 ★★）：
+    //   只读 duration 就是"两种单价按同一个数收费"，而两个模型差 32%。
+    const hit = minimaxFlatCost(body?.model, body?.duration);
     if (hit) return hit;
-    console.error(`[tokens] minimax_video 计价表里没有 duration=${String(body?.duration)}（调用方该先校验）`);
-    return Math.max(...Object.values(MINIMAX_FLAT_COST));
+    console.error(`[tokens] minimax_video 计价表里没有 model=${String(body?.model)} duration=${String(body?.duration)}（调用方该先校验）`);
+    // ★ 兜底取**全表**最贵的一格（报价宁高不低）。★★ 表改成两层之后不能再写
+    //   `Math.max(...Object.values(表))` —— 那是在对一堆对象取 max，结果是 NaN，
+    //   而 NaN 一路流进扣费只会得到"不扣钱"，正好是兜底想防的反面。
+    return Math.max(...Object.values(MINIMAX_FLAT_COST).flatMap((row) => Object.values(row)));
+  }
+  // MiniMax H3（V2）：整数秒 × 每秒价，判据只在 minimaxV2Tokens。报不了价（表外的模型 / 分辨率、时长不是窗口内的整数、
+  // 第 6 张图、输入视频 / 音频、名单外的字段）→ 按表内最贵的一段收并吼一嗓子：V2 路由该在扣费之前就拒了，这里是第二道保险，方向宁高不低。
+  // ★ 不回 null：chargedArkCall 直接拿 priceOf 的结果去扣费，没有「null = 拒绝」那条出路（runway 是路由自己先判的 null）。
+  //   所以这一支**拦不住**名单外的字段被转发出去 —— 它只保证不少收；拦是路由在扣费之前问 minimaxV2Tokens 的那一道。
+  // ★ 这一支必须有：走到函数末尾的 `return 0` 就是一条免费出片的链路。
+  if (kind === "minimax_v2") {
+    const hit = minimaxV2Tokens(body);
+    if (hit !== null) return hit;
+    // 这几个值都是客户端给的：过 logSafe（一个换行就能伪造一整行日志）
+    const media = Array.isArray(body?.content) ? `${body.content.length} 条` : typeof body?.content;
+    const keys = body && typeof body === "object" ? Object.keys(body).join(",") : typeof body;
+    console.error(
+      `[tokens] minimax_v2 报不了价：model=${logSafe(body?.model, 64)} resolution=${logSafe(body?.resolution, 16)} ` +
+        `duration=${logSafe(body?.duration, 16)} content=${media} keys=${logSafe(keys, 120)}，按 ${MINIMAX_V2_MAX_TOKENS} 收（调用方该先校验）`,
+    );
+    return MINIMAX_V2_MAX_TOKENS;
   }
   if (kind === "task") {
     const model = String(body?.model ?? "");
     if (model === MODEL3D_ID) return MODEL3D_TOKENS;
+    // 样片第二步：时长 / 画幅由路由从第一步的登记里取（请求体里那一发根本不带这两个数）
+    if (draftFinal) return draftFinalTokens(draftFinal.durationSec, draftFinal.ratio);
     // r2v（白模出片）：输入时长计进 token，走单独的公式与系数表。
     // ★ 判据是「resolveR2v 解析出了结果」而不是自己再翻一遍 body.content ——
     //   「这个请求是不是 r2v」只在 resolveR2v 一处判（铁律六），这里只消费结论。
     if (r2v) {
-      // 素材参考（reference）与白模复刻（edit）各自的公式——kind 由 resolveR2v 定
-      if (r2v.kind === "material") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
+      // 两个公式，kind 由 resolveR2v 定：素材参考（reference）与延长（extend）的输出时长由用户选 ⇒ (输入 + 输出)，
+      // 输入不低于 ⌈2×输出/3⌉（方舟的最低用量，见 videoInputFloorSec）；
+      // 白模复刻与返修（edit）输出跟随输入 ⇒ 输入 × 2
+      if (r2v.kind === "material" || r2v.kind === "ownExtend") return materialRefTokens(r2v.durationSec, r2v.outputSec, model);
       return r2vTokens(r2v.durationSec, model);
     }
-    return segTokens(body?.duration, model);
+    // ★ 分辨率与画幅都要读（480p「草稿」/ 样片第一步按像素表计价）。resolution 在这里不会缺：
+    //   pinPlainVideoTask 已经把缺省补成 720p（方舟对 1.0 的缺省是 1080p，不补就是按 720p 收 1080p 的钱）。
+    return segTokens(body?.duration, model, body?.resolution, body?.ratio);
   }
   return 0;
 }
@@ -432,9 +1341,33 @@ function priceOf(kind, body, r2v = null) {
 //   留着它就等于在按 model 的价目表旁边放第二处"一张图的价"，而两者迟早分叉
 //   （今天这个缺口正是分叉的产物）。要一张图的价一律走 imageTokensOf(model)。
 module.exports = {
+  RUNWAY_TOKENS_PER_SECOND,
+  RUNWAY_REF_IMAGE_TOKENS,
+  DAILY_LIMITS,
+  dailyCapDenial,
+  dailySoftWarn,
+  TTS_TOKENS_PER_CHAR,
+  NARRATION_FREE_DAILY_CHARS,
+  ASR_TOKENS_PER_MINUTE,
+  ASR_BYTES_PER_SECOND,
   MINIMAX_FLAT_COST,
+  MINIMAX_REAL_MODELS,
+  minimaxFlatCost,
   MINIMAX_REAL_MODEL,
   MINIMAX_REAL_RESOLUTION,
+  MINIMAX_H3_LITE,
+  MINIMAX_H3_HIGHSPEED,
+  MINIMAX_H3,
+  MINIMAX_SEC_COST,
+  MINIMAX_V2_MAX_IMAGES,
+  MINIMAX_V2_MAX_TOKENS,
+  MINIMAX_V2_BODY_KEYS,
+  MINIMAX_V2_ITEM_KEYS,
+  MINIMAX_V2_IMAGE_KEYS,
+  minimaxSecCost,
+  minimaxV2Tokens,
+  MINIMAX_V2_FREE_TEXT_ONLY,
+  minimaxV2HasMedia,
   PLANS,
   DEFAULT_PLAN_ID,
   planOf,
@@ -442,20 +1375,52 @@ module.exports = {
   LEGACY_IMAGE_TOKENS,
   IMAGE_MODELS,
   imageTokensOf,
+  GROUP_IMAGE_MODELS,
+  GROUP_MAX_IMAGES,
+  GROUP_MAX_REFS,
+  imageCountCap,
+  IMAGE_MODEL_SUCCESSORS,
+  imageAliasOn,
+  upstreamImageModel,
   CHAT_TURN_TOKENS,
+  TUTOR_PRICES,
   MODEL3D_TOKENS,
   MODEL3D_ID,
   SEEDANCE_2_5,
+  SEEDANCE_MINI,
+  SEEDANCE_FAST,
+  SEEDANCE_STD,
   VIDEO_MULT,
+  SEC_720P_TOKENS,
+  VIDEO_PIXELS,
+  MAX_SEC_TOKENS,
+  VIDEO_RESOLUTIONS,
+  VIDEO_720P_RATIOS,
+  DRAFT_RESOLUTION,
+  DRAFT_FINAL_RESOLUTION,
+  perSecTokens,
+  DRAFT_FINAL_MULT,
+  draftFinalTokens,
+  FREE_VIDEO_ALLOW,
+  RETIRED_MODELS_AT,
+  isRetired,
+  retiredDenial,
+  freeVideoTiers,
+  freeVideoLabels,
+  isPaidUser,
+  freeVideoGateOn,
+  isVideoGeneration,
+  videoPlanDenial,
+  VIDEO_SEC_WINDOW,
+  videoSecWindow,
   VIDEO_AUDIO,
   audioSupported,
   VIDEO_MULT_R2V,
   R2V_TOKENS_PER_SEC,
   r2vTokens,
+  videoInputFloorSec,
   materialRefTokens,
-  PAID_ONLY_MODELS,
   isFreePlan,
-  paidOnlyDenial,
   segTokens,
   priceOf,
 };

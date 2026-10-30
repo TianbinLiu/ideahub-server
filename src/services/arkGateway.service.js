@@ -9,16 +9,25 @@
 //
 // ══ 这条序列的三条硬顺序（照抄 tokenWallet.service 的 W1/W2，不要改）══════
 //  ① 在册 → ② 套餐门禁 → ③ 扣费 → ④ 转发 → ⑤ 上游没受理就退回 addon。
-//  · ②必须排在③前：排后面的话，免费用户点一次 2.5 会先被扣掉一百万 token
+//  · ②必须排在③前：排后面的话，免费用户点一次高清 / 电影级会先被扣掉几十万 token
 //    （大概率直接 402），真正的原因（这一档不对你开放）被"余额不足"彻底盖住。
 //  · ③必须排在④前，且是**条件原子扣减**：先转发再扣钱的话钱已经花出去了；
 //    "先查余额、再转发、再扣"更糟 —— 查和扣之间的窗口正是并发双花的入口。
 //  · 管理员免单跳过②③，但**照实记一笔流水**（火山账单上是真花了钱的），
 //    且那笔账等转发回来、确认受理了才落 —— 敏感词 400 那种根本没被受理的调用
 //    记进去，等于自己给自己造对不上的账。
+//  · 出图在④那一刻才把方舟下线了的老 id 换成接班型号（withUpstreamImageModel，2026-10-10）：
+//    ①②③ 认的都是客户端发来的 id —— 老包按自己的报价收钱。组图那个出口（arkImageGroup）走同一个换法。
+//  · 出片地区门禁（2026-10-26，regionGate）排在②与③之间：海外不给 Seedance 出片，被拦的那一发一分钱不动。
+//    它在效果上先于套餐门禁生效（套餐那道真正拒人是在 billing 里、和扣费同一拍），理由见 chargedArkCall 里那一段。
 const wallet = require("./tokenWallet.service");
-const { priceOf, paidOnlyDenial } = require("../config/tokens");
-// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
+const billing = require("./billing.service");
+const { priceOf, videoPlanDenial, isPaidUser, VIDEO_MULT, upstreamImageModel, minimaxV2HasMedia } = require("../config/tokens");
+// ★ 顶层 require 不会半初始化：config/videoRegion 顶层只 require 纯配置，它要问本文件的 arkConfigured 时是用到才 require
+//   （见那个文件头）。经模块对象调（不解构）：测试要能 spyOn。
+const videoRegion = require("../config/videoRegion");
+const { logSafe } = require("../utils/logSafe");
+// 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）。这里只有地区门禁挑拒绝话时用它（regionGate 的 paid）
 const { isAdmin } = require("../utils/roles");
 
 const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
@@ -28,9 +37,157 @@ const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 const T_CREATE = 150_000;
 const T_POLL = 30_000;
 
+/**
+ * 每一发异步生成任务都由服务端钉死的字段（客户端传什么都不作数）。**只有这一处**（铁律六）——
+ * /api/ark 代理（纯任务、r2v、样片两步、Seed3D）与白模化自己发的那一发都经 chargedArkCall 转发，在那里套上。
+ *
+ * ★ execution_expires_after = 24 小时（方舟缺省 48 小时）：排队 / 运行超过这个时长方舟会把任务标成 `expired` ——
+ *   失败退款按这个终态退钱；而 App 能取回成片的窗口本来就只有 24 小时（产物地址 24 小时过期），
+ *   一发在队里卡到第 40 小时才出来的片，用户已经找不到它了。客户端传的值一律覆盖（官方取值范围 [3600, 259200]）。
+ * ★ callback_url 剥掉：方舟会把任务状态 POST 到那个地址 —— 等于拿我们的 key 替任何人往任意地址发请求。
+ * ★ service_tier 剥掉：`flex`（离线推理）只对 1.0 有、价格是在线的一半、排队以天计 —— 我们按在线价收，
+ *   放它过去就是多收用户、还让出片慢到看不见。
+ * ★ tools 剥掉（2026-10-07 评审）：2.x 的 `tools: [{ type: "web_search" }]` 让模型出片前联网搜索，搜索次数**另外计费**
+ *   （查询任务回包的 usage.tool_usage.web_search）—— 我们没给它定价，放过去就是让方舟替任何人白搜、账记在我们名下。
+ *   App 从没发过它（出图那条路的 pinSingleImage 也拒它）。
+ * ★ priority 剥掉（同上）：取值 0~9，数大的插到**同一个接入点**上所有低优先级任务的前面 —— 所有人的任务挂在同一把 key、
+ *   同一个接入点下，放它过去就是让一个人把别人的任务往 24 小时过期线上挤。缺省 0 = 先来先到。
+ * ⚠ 剥而不是拒：都是可选参数，剥掉上游按缺省办，不会让一发正常的请求失败；`safety_identifier`（给方舟的用户标识）
+ *   不花钱也不影响别人，不剥。
+ */
+const SERVER_TASK_FIELDS = Object.freeze({ execution_expires_after: 86_400 });
+const STRIPPED_TASK_FIELDS = Object.freeze(["callback_url", "service_tier", "tools", "priority"]);
+
+/**
+ * 给一发异步任务套上服务端钉死的字段（返回新对象，不改调用方的 body）。不是任务端点（出图 / 对话）原样返回。
+ * ★ 剥 STRIPPED_TASK_FIELDS 对**每一发**任务都做（含 Seed3D）：回调地址那个口子与模型无关 —— 同一个端点上
+ *   拿 Seed3D 也一样能让方舟替任何人往任意地址 POST；剥掉一个可选参数只会让上游用缺省值，不会让请求失败。
+ * ★ execution_expires_after 只套在 Seedance 上：Seed3D 收不收这个参数我们没核实过，硬塞一个它不认的参数可能整发 400
+ *   （它按方舟缺省 48 小时过期，过期同样会被失败退款按 expired 退回）。
+ */
+function withServerTaskFields(kind, body) {
+  if (kind !== "task" || !body || typeof body !== "object") return body;
+  const out = { ...body };
+  for (const k of STRIPPED_TASK_FIELDS) delete out[k];
+  if (!Object.hasOwn(VIDEO_MULT, String(body.model ?? ""))) return out;
+  return { ...out, ...SERVER_TASK_FIELDS };
+}
+
+/**
+ * 出图请求体换上**真发给方舟**的型号（方舟下线了的老 id → 接班型号；判据在 config/tokens.upstreamImageModel）。
+ * 返回新对象（不改调用方的 body），没换就原样返回同一个对象。
+ * ★ 两个出图出口（单张：chargedArkCall；组图：arkImageGroup.startImageGroup）都只经这一处换 ——
+ *   而且都排在在册、计价、门禁**之后**：那几样认的是客户端发来的 id（老包按自己的报价收钱）。
+ *   在计价之前换的话，4.5 的老包会按接班型号的价被扣钱，"页面报 X、实际扣 Y"。
+ * @returns {{ body: object, model: string, upstreamModel: string }}
+ */
+function withUpstreamImageModel(body, { group = false, now = Date.now() } = {}) {
+  const model = String(body?.model ?? "");
+  const upstreamModel = upstreamImageModel(model, { group, now });
+  return { body: upstreamModel === model ? body : { ...body, model: upstreamModel }, model, upstreamModel };
+}
+
+/**
+ * 出图流水 memo 里的型号：接了班就写成 `<发来的>→<真发的>`，没接班就是发来的那个。
+ * ★ 两半都要：前一半对得上**用户被收了多少**（价目按它），后一半对得上**方舟账单上的型号**。只写一半的话，
+ *   月底对账时这批调用要么在我们的流水里找不到账单上的型号，要么看不出是哪一档的老包按哪个价收的。
+ */
+function imageMemoModel(model, upstreamModel) {
+  return upstreamModel && upstreamModel !== model ? `${model}→${upstreamModel}` : model;
+}
+
+/** 每个进程记过的「老 id → 接班型号 × App 版本」组合（只为了不刷屏；上限防着伪造的版本头把它撑大） */
+const aliasSeen = new Set();
+const ALIAS_SEEN_MAX = 200;
+
+/**
+ * 记一行「这个版本的 App 还在发方舟下线了的出图 id」—— 同一组合每个进程只记一次。
+ * ★ 为什么要记：接班表与 LEGACY 价目的寿命 = 老版本的寿命，而在 App 2.63 带上版本头之前，
+ *   服务端根本分不出请求来自哪一版（见 middleware/appVersion）。没带版本头 = 2.62 及更早的包。
+ * ★ 只记日志，不影响这一发怎么走。
+ * @param {{raw?: string}|null} [appVersion] req.appVersion
+ */
+function noteImageAlias(model, upstreamModel, appVersion) {
+  if (!upstreamModel || upstreamModel === model) return;
+  const who = appVersion?.raw ? `App ${appVersion.raw}` : "没带版本头的 App（≤ 2.62）";
+  const key = `${model}→${upstreamModel}@${who}`;
+  if (aliasSeen.has(key) || aliasSeen.size >= ALIAS_SEEN_MAX) return;
+  aliasSeen.add(key);
+  console.info(`[ark] 出图接班：${model} → ${upstreamModel}（${who}；同一组合每个进程只记这一次）`);
+}
+
 /** 这台服务器配没配 key。健康端点与"要不要白跑一趟"都只问这一处 */
 function arkConfigured() {
   return Boolean(process.env.ARK_API_KEY);
+}
+
+/**
+ * 每个请求的地区结论与「这一发记过 would-deny 没有」。键是 req 对象本身（请求结束就跟着回收）。
+ * ★ 为什么按请求记：白模化一个请求要过两次门禁（看帧之前的预检 + Seedance 那一发本身），H3 出片也是（并发闸之前的预检 + chargedArkCall 里那一处）——
+ *   ① 两次必须是**同一个结论**（各算一遍的话，中途改了 VIDEO_ZONE_FORCE 之类就能一次放、一次拦）；
+ *   ② observe 档的 would-deny 一个请求只记一行，不然数日志时白模化 / H3 会被算成两发。
+ */
+const regionSeen = new WeakMap();
+
+/**
+ * 出片地区门禁的**执行** —— 唯一实现（铁律六）。chargedArkCall 每一发都过它；有付费步骤排在出视频之前的路由
+ * （白模化：先看帧、再 Seedance）在第一笔付费调用之前也调它预检一次；在 chargedArkCall 之前另有会拒人的闸的路由
+ * （H3 出片的两道并发闸）在那些闸之前预检一次（config/videoRegion.gatedProviderOf 的 ★★）。
+ * 「该不该拦、拦了说什么」只问 config/videoRegion.regionDenial（纯判定）；这里只决定**怎么执行**：
+ *   VIDEO_REGION_GATE = off     —— 什么都不做（不判、不记、连 req 都不看：急停开关要能把这道闸整个摘掉）；
+ *                       observe —— 判；该拦的记一行 `[region] would-deny`、照常放行（缺省，等主人拍板什么时候切 on）；
+ *                       on      —— 判；该拦的记一行 `[region] deny`，回 403 REGION_UNAVAILABLE（billed:false）。
+ * ★ 地区**从请求现算**（config/videoRegion.requestZone：cf-ipcountry → X-Real-IP 查 geoip → 开发用的 VIDEO_ZONE_FORCE），
+ *   调用方只把 req 交进来 —— 不让每个调用点各算一个 zone 再传（N 处各算一遍就是 N 份实现，漏一处零症状）。
+ * ★ 归这道闸管的调用（Seedance 出视频、MiniMax 出片：真人档与 H3）**必须**带 req：不带直接抛（扣钱之前，500）。
+ *   不给缺省值：缺省成「境外」是悄悄把人拦掉，缺省成「境内」是悄悄放行，两个方向都零症状；抛出来才看得见。
+ *   不归它管的（出图 / 对话 / Seed3D / 服务端自己发起、手上没有 req 的调用）不看 req。
+ * ★ 管理员**不豁免**：这是地区政策，不是计费（billing.preAuthorize 的免单与它是两件事）。测试账号要不要例外等主人定。
+ *
+ * @param {object} o
+ * @param {object|null} o.req  Express 请求（要读它的头与 IP）
+ * @param {object|null} [o.user] 只进日志（谁被拦 / 本该被拦）
+ * @param {string} o.kind  priceOf 的 kind
+ * @param {string} o.model
+ * @param {string} o.at    日志里的位置标签（上游路径 / "blockoutize"）
+ * @param {object|null} [o.r2v]        与 chargedArkCall 收的同一个；白模化的预检传 `{ kind: "blockout" }`（与它旁边的套餐预检同一个记号）
+ * @param {object|null} [o.draftFinal] 与 chargedArkCall 收的同一个
+ * @param {object|null} [o.wallet]     这个人的钱包（chargedArkCall 里已经读过的那一份）。没有就是 null（白模化的预检排在读钱包之前）
+ *   ★ 这三样**只决定拒绝话说哪一句**（videoRegion.regionDenial 的 swapVariant：指不指人去换 MiniMax），不影响拦不拦 ——
+ *   带参考视频 / 样片第二步在 MiniMax 上没有对应做法；这台服务器上的 MiniMax 没有一档对他开着的人被指过去只会再吃一个 403 PLAN_REQUIRED（2026-10-26 最终审核；
+ *   「有没有一档开着」连 H3 一起算，见 videoRegion.minimaxOpenTo）。
+ * @returns {null | { status: 403, body: { ok:false, code:"REGION_UNAVAILABLE", reason:"region", zone:string, providers:string[], message:string, billed:false } }}
+ *   null = 放行；否则调用方原样 `res.status(status).json(body)`（两处回同一个形状，body 只在这里拼）
+ */
+function regionGate({ req, user = null, kind, model, at, r2v = null, draftFinal = null, wallet: w = null }) {
+  const mode = videoRegion.gateMode();
+  if (mode === "off") return null;
+  if (!videoRegion.gatedProviderOf(kind, model)) return null;
+  if (!req || typeof req !== "object") {
+    throw new TypeError(`[region] ${at}: ${kind} ${logSafe(model, 64)} 归出片地区门禁管，调用方必须把 req 交进来（地区从请求现算）`);
+  }
+  let seen = regionSeen.get(req);
+  if (!seen) {
+    seen = { where: videoRegion.requestZone(req), noted: new Set() };
+    regionSeen.set(req, seen);
+  }
+  const { zone, country, source, forced } = seen.where;
+  // 按套餐门禁算这个人算不算付费：管理员算（billing.preAuthorize 对管理员免套餐门禁，真人档对他一样开着）；
+  // 没读钱包时不知道（null），由 regionDenial 按「不知道」说
+  const paid = isAdmin(user) ? true : w ? isPaidUser(w) : null;
+  const denial = videoRegion.regionDenial({ kind, model, zone, r2v, draftFinal, paid });
+  if (!denial) return null;
+  const key = `${kind} ${model}`;
+  // on 每次都记（每一次都真拦了一发）；observe 同一个请求同一个模型只记一行
+  if (mode === "on" || !seen.noted.has(key)) {
+    seen.noted.add(key);
+    console.warn(
+      `[region] ${mode === "on" ? "deny" : "would-deny"} at=${logSafe(at, 64)} ${kind} ${logSafe(model, 64)} ` +
+        `zone=${zone} country=${country || "-"} source=${source || "-"}${forced ? " forced" : ""} user=${String(user?._id ?? "-")}`,
+    );
+  }
+  if (mode !== "on") return null;
+  return { status: 403, body: { ok: false, ...denial, billed: false } };
 }
 
 /**
@@ -59,6 +216,37 @@ async function callArk({ method = "POST", path, body, timeoutMs = T_CREATE }) {
 }
 
 /**
+ * 流式转发（SSE）：2xx 时交回上游的 body 流由调用方边读边处理，其余与 callArk 同口径
+ * （非 2xx → `{ status, text }`，连不上 / 超时 → 504）。key 仍只在这个文件里出现（铁律三）。
+ *
+ * ★ 为什么组图要走流式（2026-10-05）：Node 自带的 fetch（undici）默认 **300 秒等不到响应头就断**
+ *   （headersTimeout），与我们给的 AbortSignal 无关；而非流式的组图要等**全部**画完才回响应头 ——
+ *   一组 6 张实测 249 秒，9 张就过线了。流式下响应头立刻到、每画好一张推一条事件，
+ *   两张之间的间隔（实测约 40 秒）远小于 undici 的 300 秒 body 间隔上限。
+ * ★ `timeoutMs` 管的是**整条流**：超时后读流会抛 TimeoutError，调用方按「中途断开」结算。
+ */
+async function openArkStream({ path, body, timeoutMs }) {
+  const apiKey = process.env.ARK_API_KEY;
+  if (!apiKey) return { status: 501, text: JSON.stringify({ message: "ark not configured" }) };
+  let up;
+  try {
+    up = await fetch(`${ARK_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    console.error(`[ark] upstream stream ${path} ${String((e && e.name) || e)}`);
+    return { status: 504, text: JSON.stringify({ message: `ark upstream ${String((e && e.name) || "error")}` }) };
+  }
+  if (up.status < 200 || up.status >= 300 || !up.body) {
+    return { status: up.status, text: await up.text().catch(() => "") };
+  }
+  return { status: up.status, stream: up.body, contentType: up.headers.get("content-type") || "" };
+}
+
+/**
  * 扣钱 → 转发 → 没受理就退。**代理与服务端自发的调用共用这一份**。
  *
  * @param {object} args
@@ -70,10 +258,15 @@ async function callArk({ method = "POST", path, body, timeoutMs = T_CREATE }) {
  * @param {{durationSec:number, templateId?:string|null, sourcePublicId?:string}|null} [args.r2v]
  *        resolveR2v / 白模化端点解析出的 r2v 结论。有它 = 按 r2vTokens 计价（定价规则
  *        仍只在 config/tokens.js 一处，这里只把结论递进去）。
+ * @param {{draftTaskId:string, durationSec:number, ratio?:string}|null} [args.draftFinal]
+ *        resolveDraftFinal 解析出的样片第二步结论。有它 = 按 draftFinalTokens 计价、免费版一律拒。
+ * @param {object|null} [args.req]      发起这一发的 Express 请求：出片地区门禁从它现算地区（regionGate）。
+ *        归门禁管的调用（Seedance 出视频、MiniMax 出片）不带就抛；路由里的调用点一律带（tests/regionGate.spec 扫源码钉着）。
  * @param {number} [args.timeoutMs]
  * @returns {Promise<
- *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean }
- *   | { ok:false, reason:"model"|"plan"|"funds", status:number, body:object, wallet:object|null }
+ *   | { ok:true,  status:number, text:string, accepted:boolean, wallet:object|null, cost:number, free:boolean,
+ *       took:{plan:number, addon:number}, memo:string, upstreamModel:string }
+ *   | { ok:false, reason:"model"|"region"|"plan"|"debt"|"funds", status:number, body:object, wallet:object|null }
  * >}
  */
 /**
@@ -86,6 +279,10 @@ function setWalletHeaders(res, w) {
   if (!w) return;
   res.setHeader("X-Wallet-Plan", String(w.plan));
   res.setHeader("X-Wallet-Addon", String(w.addon));
+  // ★ 欠额也要进镜像：App 的 canAfford 在镜像为空时一律放行，冻结状态不下发的话
+  //   被冻结的用户会看到正常报价、点下去才吃 403（§15.4.4 的实现坑之一）。
+  //   老客户端不认这个头，只是照旧显示余额 —— 不会坏。
+  if (w.debt) res.setHeader("X-Wallet-Debt", String(w.debt));
 }
 
 async function chargedArkCall({
@@ -95,6 +292,7 @@ async function chargedArkCall({
   path,
   body,
   r2v = null,
+  draftFinal = null,
   timeoutMs = T_CREATE,
   /**
    * 换上游用的钩子（2026-08-24 为 minimax 真人档参数化）：缺省走方舟（callArk）。
@@ -110,6 +308,16 @@ async function chargedArkCall({
   acceptedOf = null,
   /** 退款流水的类别标签：月底对账要分得出哪家上游退的钱 */
   refundTag = "ark_refund",
+  /** 出图接班表按哪一刻判（config/tokens.upstreamImageModel；测试注入用，缺省现在） */
+  now = Date.now(),
+  /** req.appVersion（middleware/appVersion）：只进「哪个版本还在发老 id」那一行日志，不影响这一发怎么走 */
+  appVersion = null,
+  /**
+   * 发起这一发的请求（出片地区门禁从它现算地区，见 regionGate）。
+   * ★ 收 req 而不是收算好的 zone：地区只在 config/videoRegion.requestZone 一处合（geo + VIDEO_ZONE_FORCE），
+   *   让每个调用点各算一个 zone 传进来，就是 N 份实现。归门禁管的调用不带它直接抛 —— 漏传要响。
+   */
+  req = null,
 }) {
   const model = String(body?.model ?? "");
   if (!modelAllowed(model)) {
@@ -118,81 +326,112 @@ async function chargedArkCall({
     return { ok: false, reason: "model", status: 400, body: { ok: false, message: "model not allowed" }, wallet: null };
   }
 
-  // 管理员免单。★ 判据来自 req.user.role，而 requireAuth **每次请求都从库里重读** role
-  //   （不信 JWT 里的快照）—— 撤掉某人的管理员身份立刻生效，不用等他的 token 过期。
-  const free = isAdmin(user);
-
-  // ★ 一趟读，三个用途：套餐门禁的判据、402 时报给用户的余额、顺带完成钱包初始化与跨月刷新。
-  //   故意选"每次都读"这种贵写法：换成"只有 paidOnly 的模型才去读套餐"就等于把门禁的判据
-  //   劈成两半，以后往 PAID_ONLY_MODELS 里加第二个模型时漏改任何一半都不报错，只会静默放行。
+  // ★ 一趟读，两个用途：套餐门禁的判据、顺带完成钱包初始化与跨月刷新。
+  //   故意选"每次都读"这种贵写法：换成"只有要挡的档才去读钱包"就等于把门禁的判据
+  //   劈成两半，以后改免费档清单时漏改任何一半都不报错，只会静默放行。
   const before = await wallet.getWallet(user._id);
-  const cost = priceOf(kind, body, r2v ?? null);
+  // ★ 计价读的是**客户端发来的** body（老包按自己的报价收钱）；出图的接班型号只换进下面转发的那一份（sent）
+  const cost = priceOf(kind, body, r2v ?? null, draftFinal ?? null);
+  // 出图：方舟下线了的老 id 换成接班型号（只换转发的那一份，见 withUpstreamImageModel）。其余 kind 一律不碰
+  const image = kind === "image" ? withUpstreamImageModel(body, { now }) : null;
+  const upstreamModel = image ? image.upstreamModel : model;
   // r2v 的流水 memo 带来源标记：不带的话 `task <model>` 与纯任务一模一样，
   // 月底对方舟账单时分不出哪些钱是白模花的。
   //  · 命中已登记模板 → `r2v tpl:<模板id>`
   //  · 白模化那一发（还没有模板）→ `r2v src:<原视频 public_id>`
-  let memo = `${kind} ${model}`;
+  // 出图接了班的写成 `image <发来的>→<真发的>`（imageMemoModel 的 ★）
+  let memo = `${kind} ${imageMemoModel(model, upstreamModel)}`;
   if (r2v?.templateId) memo += ` r2v tpl:${r2v.templateId}`;
+  // 本人成片（返修 / 延长）单独标子任务：对账时分得出「改自己的片」与「白模化那一发」
+  else if (r2v?.kind === "ownEdit" || r2v?.kind === "ownExtend") memo += ` r2v ${r2v.kind === "ownEdit" ? "edit" : "extend"} own:${String(r2v.sourcePublicId || "?")}`;
   else if (r2v) memo += ` r2v src:${String(r2v.sourcePublicId || "?")}`;
 
-  // ★ 管理员这一路的 w 保持 before（余额没动）。**不能给 null**：钱包头一个都不写的话，
-  //   App 的镜像就停在"本地先减过一次"的值上，界面显示的余额比真实值少 —— 一个不报错的假账。
-  let w = before;
+  // 免费档门禁。判据只有 config/tokens.js 的 videoPlanDenial 一处（客户端置灰是提示，不是边界）。
+  // ★ 读的是**钉子补齐之后**的 body.resolution（pinPlainVideoTask 把缺省补成 720p）：
+  //   草稿与高清是同一个模型，只差分辨率 —— 只看 model 就会把高清一起放给免费版。
+  //   真人档的 768P 由 minimax 路由在调这里之前钉好。管理员的豁免在 billing.preAuthorize 里（denyReason 对免单不生效）。
+  // ★ media（只给 H3）：带不带图在**这里**从 body 现算 —— H3 路由的 forward 转发的就是这同一个 body 对象。
+  //   不让路由传：漏传是零症状的（免费用户带图照样过去，tokens.MINIMAX_V2_FREE_TEXT_ONLY 的 ★）
+  const denied = videoPlanDenial({
+    paid: isPaidUser(before),
+    kind,
+    model,
+    resolution: body?.resolution,
+    r2v,
+    draft: body?.draft !== undefined && body?.draft !== false,
+    draftFinal,
+    ...(kind === "minimax_v2" ? { media: minimaxV2HasMedia(body) } : {}),
+  });
 
-  if (!free) {
-    // 套餐门禁。判据只有 config/tokens.js 的 paidOnlyDenial 一处（客户端置灰是提示，不是边界）
-    const denied = paidOnlyDenial(before?.planId, model);
-    if (denied) {
-      console.warn(`[ark] 套餐不足，拒绝 ${model}（planId=${before?.planId ?? "?"}）`);
-      // 403 而不是 402：402 的含义是"充值就能继续"，而这一条充多少都没用，得换套餐。
-      // 合并成同一个码，用户会一直充值一直被拒。
-      return {
-        ok: false,
-        reason: "plan",
-        status: 403,
-        body: { ok: false, code: "PLAN_REQUIRED", message: denied, planId: before?.planId ?? null, model },
-        wallet: before,
-      };
-    }
+  // 出片地区门禁（海外不给 Seedance；MiniMax 出片（真人档 / H3）海外只准国际站）。执行只在 regionGate 一处，地区从 req 现算。
+  // ★ 排在扣钱（billing.chargedCall）之前：被拦的这一发一分钱不动、不出网；回包带 billed:false、不写钱包头（余额没变）。
+  // ★ 效果上**先于**套餐门禁：套餐那道真正拒人是在 billing 里（与冻结、扣费同一拍），这里拦了就走不到那儿。
+  //   这是对的顺序 —— 地区不给的时候付钱也没用；先说「免费版只能用…去升级」，海外的人付完钱回来还是被拒
+  //   （与 ark.routes 那段「套餐门禁必须排在扣费之前」同一个理由：别让真正的原因被另一句话盖住）。
+  // ★ 管理员不豁免（regionGate 的 ★）。只读的轮询 / 取件 / 查询不经过这里，在途任务照常取得回来。
+  // r2v / draftFinal / 钱包只用来挑拒绝话（指不指人去换 MiniMax），不影响拦不拦（regionGate 的 ★）
+  const regionBlock = regionGate({ req, user, kind, model, at: path, r2v, draftFinal, wallet: before });
+  if (regionBlock) return { ok: false, reason: "region", status: regionBlock.status, body: regionBlock.body, wallet: null };
 
-    w = await wallet.debit(user._id, cost, memo);
-    if (!w) {
-      // 402 而不是 400：App 据此把用户引到充值页，而不是当成"参数写错了"
-      return {
-        ok: false,
-        reason: "funds",
-        status: 402,
-        body: {
-          ok: false,
-          code: "INSUFFICIENT_TOKENS",
-          message: "token 余额不足",
-          need: cost,
-          balance: before ? before.plan + before.addon : 0,
-        },
-        wallet: before,
-      };
-    }
+  if (denied) console.warn(`[ark] 免费档门禁，拒绝 ${kind} ${model} @ ${String(body?.resolution ?? "-")}（planId=${before?.planId ?? "?"}）`);
+  // 每一发 Seedance 出片任务套上服务端钉死的字段（见 SERVER_TASK_FIELDS）：转发的是这一份，不是调用方那份。
+  // 出图转发换了接班型号的那一份（在册、门禁、计价都已经按发来的 id 判完了）
+  const sent = image ? image.body : withServerTaskFields(kind, body);
+
+  // ★★ 「钱」的序列（冻结 → 门禁 → 原子扣 → 转发 → 没受理退 → 免单记账）搬到了
+  //   services/billing.service.js，**四条链路共用那一份**（铁律六）。这里只负责
+  //   方舟特有的两件事：模型白名单与 priceOf 报价。
+  let upstream = { status: 0, text: "" };
+  const r = await billing.chargedCall({
+    user,
+    cost,
+    memo,
+    refundTag,
+    denyReason: denied?.message || "",
+    // 结构化给 App 的两样（英文界面不显示服务端的中文句子，靠它们自己说）：allowed = 免费版能用哪几档；freeTextOnly = 档位开着、拒的是带图
+    denyExtra:
+      denied?.allowed || denied?.freeTextOnly
+        ? { ...(denied.allowed ? { allowed: denied.allowed } : {}), ...(denied.freeTextOnly ? { freeTextOnly: true } : {}) }
+        : null,
+    forward: async () => {
+      // 真要发出去了才记（被余额 / 冻结 / 上限挡下的那几发没到方舟，不算「还在发老 id」）
+      if (image) noteImageAlias(model, upstreamModel, appVersion);
+      upstream = forward ? await forward() : await callArk({ method: "POST", path, body: sent, timeoutMs });
+      const ok = acceptedOf ? acceptedOf(upstream.status, upstream.text) : upstream.status >= 200 && upstream.status < 300;
+      return { accepted: ok };
+    },
+  });
+
+  if (!r.ok) {
+    // 拒绝的三种形态（冻结 / 套餐 / 余额）在 billing 里已经拼好整句，这里只补回
+    // 调用方按 reason 分支时要的那个标签（既有测试按它断言）。
+    const reason = r.body.code === "WALLET_FROZEN" ? "debt" : r.body.code === "PLAN_REQUIRED" ? "plan" : "funds";
+    if (reason === "plan") r.body.model = model;
+    return { ok: false, reason, status: r.status, body: r.body, wallet: r.wallet };
   }
 
-  const { status, text } = forward ? await forward() : await callArk({ method: "POST", path, body, timeoutMs });
-  const accepted = acceptedOf ? acceptedOf(status, text) : status >= 200 && status < 300;
+  const { status, text } = upstream;
+  const { accepted, wallet: w, free, took } = r;
+  if (!accepted && !free) console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
 
-  // W2：方舟没受理 → 这次调用没产生任何产物，钱退回 addon。
-  // ★ 任务被受理之后才失败（Seedance 排队跑完报 failed）**不在这里退**：
-  //   那时算力已经消耗、方舟也已经向我们计费。刻意为之，不是遗漏。
-  if (!accepted && !free) {
-    const back = await wallet.credit(user._id, cost, refundTag, `${memo} 上游 ${status}`);
-    w = back ?? w;
-    console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
-  }
-
-  // ★★ 管理员那笔账记在转发之后、且只在上游受理时记，与扣费的顺序正好相反：
-  //   扣费必须在前（并发双花），而免单这一路不动余额，可以等"确实花出去了"再落账。
-  if (accepted && free) {
-    await wallet.noteAdminFree(user._id, cost, `admin ${memo}`, before);
-  }
-
-  return { ok: true, status, text, accepted, wallet: w, cost, free };
+  // took / memo：受理了的异步任务由调用方记进 GenTaskCharge（受理后失败按原桶退回，services/taskRefund）
+  // upstreamModel：真发给方舟的型号（出图接了班时与 body.model 不同；其余 kind 恒等于 body.model）
+  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo, upstreamModel };
 }
 
-module.exports = { ARK_BASE, T_CREATE, T_POLL, arkConfigured, callArk, chargedArkCall, setWalletHeaders };
+module.exports = {
+  ARK_BASE,
+  T_CREATE,
+  T_POLL,
+  arkConfigured,
+  callArk,
+  openArkStream,
+  chargedArkCall,
+  regionGate,
+  setWalletHeaders,
+  SERVER_TASK_FIELDS,
+  withServerTaskFields,
+  withUpstreamImageModel,
+  imageMemoModel,
+  noteImageAlias,
+};

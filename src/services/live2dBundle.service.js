@@ -13,6 +13,15 @@
  *   直接导航时以 image/svg+xml 渲染，内嵌 <script> 会执行。所以是白名单，不是黑名单。
  * ★ 市场只认 Cubism 4（.moc3 + model3.json）：前端运行时是 pixi-live2d-display 的 cubism4 构建，
  *   Cubism 2 的 .moc/.model.json 装上也画不出来 —— 上传时直接说清楚，别让用户装完才发现是空舞台。
+ * ★ model3.json 里的**每一处**文件引用都只许指向包内（2026-10-15，教材人格评审 owasp-security-6）：App 的 prefetch
+ *   （live2d/prefetch.ts）与 pixi 舞台拿每条引用做 `new URL(ref, base)` 然后 fetch —— 一条 `https://…` 的动作 / 声音引用就是
+ *   一枚追踪像素，装了这个模型的每个人每次开客服页都会向那台服务器报到（带 IP、带时间）；而原来只查 Moc 与 Textures 的
+ *   「不许 ../ 出包」，`https://` 根本不经过那道检查。所以 inspectModel3Json 把 Physics / Pose / DisplayInfo / UserData /
+ *   Expressions[].File / Motions[组][].File / .Sound 全部过同一个 resolveRef：带协议头（data: / https: / file:，Windows 的
+ *   C: 也落在这个形状里）、`//` 开头、绝对路径（/ 或 \ 开头）、出包的一律 400 并点名；引用的文件还得真在包里（缺 = 坏包，
+ *   与贴图同一口径）—— 唯独 Sound 只查「指向包内」不查存在：扩展名白名单不收 .wav / .mp3，声音文件从来落不了盘，
+ *   查存在等于拒掉所有带声音的包（Cubism 官方样例 Haru 就带）。缺声音的动作只是不出声，取的是我们自己域名下的 404，
+ *   不是别人的服务器。
  */
 const fs = require("fs/promises");
 const path = require("path");
@@ -31,6 +40,10 @@ const MAX_BUNDLE_SIZE_BYTES = 25 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 60 * 1024 * 1024;
 /** 条目数上限：几十万个空文件同样能把 inode 和目录遍历打死 */
 const MAX_ENTRIES = 500;
+/** model3.json 里文件引用的条数上限：真模型几十到两百条；超过的只会是故意塞的，别为它跑几十万次 fs.access */
+const MAX_MODEL_REFS = 5000;
+/** 带协议头的引用（https: / data: / file:，Windows 盘符 C: 也落在这个形状里）—— 判「出站」的唯一正则，理由见文件头 ★ */
+const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 
 // Live2D 运行时真正需要的文件类型。★这是白名单，不是黑名单 —— 新格式宁可报错也别放行。
 const LIVE2D_ALLOWED_EXTENSIONS = new Set([
@@ -228,12 +241,33 @@ async function inspectModel3Json(absoluteEntryPath) {
     );
   }
   const baseDir = path.dirname(absoluteEntryPath);
-  const resolveRef = (ref) => {
-    const target = path.resolve(baseDir, String(ref));
-    if (path.relative(baseDir, target).startsWith("..")) throw validationError(`model3.json references a file outside the bundle: ${ref}`);
+  let refCount = 0;
+  /**
+   * 「这条引用指不指向包内」只有这一处判定（理由见文件头 ★）；what = 它在 model3.json 里的位置，报错点名用。
+   * 带协议头（https: / data: / file:，Windows 盘符也算）、协议相对（//evil）、绝对路径（/ 或 \ 开头）：new URL(ref, base) 之后
+   * 都不再落在我们域名下 —— 不是「出包」是「出站」，先于 path.resolve 判掉（resolve 会把 "//evil/x" 当成普通路径吞进来）。
+   */
+  const resolveRef = (ref, what) => {
+    const s = String(ref);
+    if (++refCount > MAX_MODEL_REFS) throw validationError(`model3.json has too many file references (max ${MAX_MODEL_REFS})`);
+    if (URL_SCHEME_RE.test(s) || s.startsWith("//") || s.startsWith("/") || s.startsWith("\\")) {
+      throw validationError(`model3.json references a file outside the bundle: ${s} (${what})`);
+    }
+    const target = path.resolve(baseDir, s);
+    const rel = path.relative(baseDir, target);
+    // isAbsolute 兜 Windows：另一个盘符 relative 回来的是绝对路径、不以 .. 开头（extractZipToDirectory 同一招）
+    if (rel.startsWith("..") || path.isAbsolute(rel)) throw validationError(`model3.json references a file outside the bundle: ${s} (${what})`);
     return target;
   };
-  const mocPath = resolveRef(moc);
+  /** 引用的文件还得真在包里（缺 = 坏包：装上就是空舞台 / 不动的动作 / 缺的表情） */
+  const resolveExisting = async (ref, what) => {
+    const target = resolveRef(ref, what);
+    await fs.access(target).catch(() => {
+      throw validationError(`A file referenced by model3.json is missing (${what}): ${ref}`);
+    });
+    return target;
+  };
+  const mocPath = resolveRef(moc, "Moc");
   if (!/\.moc3$/i.test(mocPath)) throw validationError("FileReferences.Moc must point to a .moc3 file");
   await fs.access(mocPath).catch(() => {
     throw validationError(`The moc3 file referenced by model3.json is missing: ${moc}`);
@@ -250,10 +284,29 @@ async function inspectModel3Json(absoluteEntryPath) {
   const textures = Array.isArray(refs.Textures) ? refs.Textures.filter((t) => typeof t === "string") : [];
   if (!textures.length) throw validationError("model3.json lists no textures");
   for (const tex of textures) {
-    const texPath = resolveRef(tex);
+    const texPath = resolveRef(tex, "Textures");
     await fs.access(texPath).catch(() => {
       throw validationError(`A texture referenced by model3.json is missing: ${tex}`);
     });
+  }
+  // 其余种类的引用：同一道 resolveRef，并且文件要在包里（文件头 ★：App 会逐条 fetch）。不是字符串 / 空串 = 没引用，跳过
+  for (const key of ["Physics", "Pose", "DisplayInfo", "UserData"]) {
+    if (typeof refs[key] === "string" && refs[key]) await resolveExisting(refs[key], key);
+  }
+  const expressions = Array.isArray(refs.Expressions) ? refs.Expressions : [];
+  for (let i = 0; i < expressions.length; i++) {
+    const file = expressions[i] && expressions[i].File;
+    if (typeof file === "string" && file) await resolveExisting(file, `Expressions[${i}].File`);
+  }
+  const motions = refs.Motions && typeof refs.Motions === "object" && !Array.isArray(refs.Motions) ? refs.Motions : {};
+  for (const [group, list] of Object.entries(motions)) {
+    const items = Array.isArray(list) ? list : [];
+    for (let i = 0; i < items.length; i++) {
+      const m = items[i] && typeof items[i] === "object" ? items[i] : {};
+      if (typeof m.File === "string" && m.File) await resolveExisting(m.File, `Motions.${group}[${i}].File`);
+      // 声音只查「指向包内」不查存在：扩展名白名单不收 .wav / .mp3，声音文件从来落不了盘（文件头 ★）
+      if (typeof m.Sound === "string" && m.Sound) resolveRef(m.Sound, `Motions.${group}[${i}].Sound`);
+    }
   }
   return { moc, textures, json, entryAbs: absoluteEntryPath };
 }

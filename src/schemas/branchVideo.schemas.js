@@ -57,7 +57,8 @@ const deckCardBody = z
   })
   // ★★ `.loose()` 在这里是**有意的**，而且它比看起来重要：卡上还有 modelUrl/genPrompt
   //   这类"卡主私有、不入快照"的字段要收下丢掉；但**同时**还有几个 controller 真的要读、
-  //   却没在上面声明的键 —— `realPerson`、`views`、`idLine`（2026-08-31 补的第三个）。
+  //   却没在上面声明的键 —— `realPerson`、`views`、`idLine`（2026-08-31 补的第三个）、
+  //   `textDesc`、`startFrames`（2026-09-30 按模型适配）。
   //   ⚠ 所以别照着这张表判断"快照里有哪些字段"：真相在 controller 的 cards.push 与
   //   models/BranchVideo.deckCardSchema 两处，三处要一起改（漏了哪一处都零报错）。
   .loose();
@@ -99,6 +100,10 @@ const publishBody = z.object({
   pricing: pricingBody.optional(),
   // 幂等键（客户端生成，重试沿用）。z.object 默认 strip 未声明字段，不写这行就到不了 controller
   clientId: z.string().trim().min(1).max(120).optional(),
+  // 「按谁的流程做的同款」：原作品的 id（2026-10-02，公开配方）。★ 必须显式声明（理由同上面 deck / clientId）。
+  //   形状不对 / 那条作品不存在 / 这个人读不到它 → controller 里当没带，**不挡发布**（见 resolveRemixOf）。
+  //   所以这里只管上限，不用正则把它钉成 24-hex：钉死的话一个脏值会让整条发布 400，而这一格只是署名。
+  remixOf: z.string().trim().max(64).optional(),
 });
 
 // PATCH /api/branch/videos/:id —— 作品编辑（仅作者）+ **回炉重做**（唯一的内容写入通道）
@@ -263,6 +268,8 @@ const listQuery = z
     //   ⚠ 它**不是**可见性的替代品：拿到别人的 id 也只能看到对方的公开作品，
     //     私密作品由 visibilityFilter 那一条挡（见 controller 里的 $and 拼法）。
     author: z.string().trim().max(64).optional().default(""),
+    // 「照这条做的同款」：只列 remixOf.video 是这一条的作品（2026-10-29，作品详情页的同款列表）。形状同 author，合法性在 controller 里判
+    remixOf: z.string().trim().max(64).optional().default(""),
     // cursor 形如 "<ISO时间>_<ObjectId>"，由上一页 nextCursor 原样回传
     cursor: z.string().trim().max(80).optional().default(""),
     limit: z.coerce.number().int().min(1).max(50).default(12),

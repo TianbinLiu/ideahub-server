@@ -16,6 +16,7 @@ const request = require("supertest");
 let mongod;
 let app;
 let token;
+let freeToken;
 let fetchSpy;
 
 beforeAll(async () => {
@@ -23,7 +24,11 @@ beforeAll(async () => {
   process.env.MONGO_URI = mongod.getUri();
   process.env.JWT_SECRET = process.env.JWT_SECRET || "test-secret";
   // 明确：本套用例默认不带 key（开发机的 .env 可能配了，测试不吃环境的运气）
+  // ★ MiniMax 区域分流之后有**两把** key（中国站 / 国际站）：漏删一把，这套就会在
+  //   配了国际站 key 的机器上变成"带着 key 跑"——501 的用例当场翻脸，转发的用例真出网。
   delete process.env.MINIMAX_API_KEY;
+  delete process.env.MINIMAX_INTL_API_KEY;
+  delete process.env.MINIMAX_REGION;
   delete process.env.RUNWAY_API_KEY;
 
   const { connectDB } = require("../src/config/db");
@@ -36,14 +41,32 @@ beforeAll(async () => {
     .send({ username: name, email: `${name}@test.local`, password: "secret123" })
     .expect(201);
   token = res.body.token;
+  freeToken = await registerFree("realfree");
+  // ★ 2026-10-07 起真人档只对付过钱的人开放（config/tokens.videoPlanDenial）：这一套测的是转发与计费，
+  //   所以主账号先发一个付费套餐（绕开支付渠道）；「免费版被挡住」单独一组用 freeToken 测。
+  await require("../src/services/tokenWallet.service").buyPlan(res.body.user._id, "std");
 });
+
+/** 注册一个保持免费版的账号，返回 token */
+async function registerFree(tag) {
+  const name = `${tag}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const r = await request(app)
+    .post("/api/auth/register")
+    .send({ username: name, email: `${name}@test.local`, password: "secret123" })
+    .expect(201);
+  return r.body.token;
+}
 
 afterAll(async () => {
   await mongoose.disconnect();
   if (mongod) await mongod.stop();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // ★ 先清当天流水：2026-09-24 起有**每日 token 上限**（config/tokens.DAILY_LIMITS），
+  //   而真人档一发 135,000 —— 同一个用户在本文件里连发几次就会从某一条起集体变成 429。
+  //   这里测的是真人档的转发与退款口径，日上限自己的用例在 tests/billing.spec.js。
+  await require("../src/models/TokenLedger").deleteMany({});
   // 出网间谍：任何一次 fetch 都记下来。断言"没出网"靠它，不靠推理。
   fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async () => {
     throw new Error("测试里不应该有任何出网请求");
@@ -81,7 +104,9 @@ describe("未配 key：业务端点全部 501（App 据此把真人档置灰）"
 
   test("health 不需要登录、只说配没配、不真打上游（与 /api/ark/health 同口径）", async () => {
     const mm = await request(app).get("/api/minimax/health").expect(200);
-    expect(mm.body).toEqual({ ok: true, minimax: false });
+    // ★ region 是 2026-09-26 加的：两把 key 长得一样、域名不一样，出问题第一件事就是确认"在往哪打"。
+    //   没配 key 时是 null——注意它**不回 key、也不回完整 base**（对外没用，对攻击者是提示）。
+    expect(mm.body).toEqual({ ok: true, minimax: false, region: null });
     const rw = await request(app).get("/api/runway/health").expect(200);
     expect(rw.body).toEqual({ ok: true, runway: false });
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -150,6 +175,34 @@ describe("白名单转发（配假 key + 假上游，看真正发出去的是什
     }
   });
 
+  test("免费版（没付过钱）调真人档 → 403 PLAN_REQUIRED，带 allowed；不出网、不扣钱（MiniMax 与 Runway 同一道门）", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    process.env.RUNWAY_API_KEY = "test-key";
+    try {
+      const mm = await request(app)
+        .post("/api/minimax/video")
+        .set({ Authorization: `Bearer ${freeToken}` })
+        .send({ model: "MiniMax-Hailuo-2.3-Fast", prompt: "p", duration: 6, first_frame_image: "data:image/png;base64,QQ==" });
+      expect(mm.status).toBe(403);
+      expect(mm.body.code).toBe("PLAN_REQUIRED");
+      // 按「此刻」断言：极速 2026-11-24 13:00 停用之后清单只剩「草稿」（写死的话这条会在那一天变红）
+      // 档名去重走 freeVideoLabels（MiniMax H3-Lite 也叫「草稿」，2026-10-26）
+      expect(mm.body.allowed).toEqual(require("../src/config/tokens").freeVideoLabels());
+      const rw = await request(app)
+        .post("/api/runway/video")
+        .set({ Authorization: `Bearer ${freeToken}` })
+        .send({ model: "gen4_turbo", promptImage: "data:image/png;base64,QQ==", duration: 5 });
+      expect(rw.status).toBe(403);
+      expect(rw.body.code).toBe("PLAN_REQUIRED");
+      expect(rw.body.message).toMatch(/免费版/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await require("../src/models/TokenLedger").countDocuments({ reason: "ark_spend" })).toBe(0);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+      delete process.env.RUNWAY_API_KEY;
+    }
+  });
+
   test("任务 id 只收安全字符集（不许把路径拼进上游 URL）", async () => {
     process.env.MINIMAX_API_KEY = "test-key";
     process.env.RUNWAY_API_KEY = "test-key";
@@ -173,6 +226,7 @@ describe("真人档计费", () => {
   // ★ 本组用**专属账号**：白名单转发那组现在也走真扣费（假 key + 假上游照扣照退），
   //   共用账号的话余额随用例顺序漂移，断言全变成"看排期的运气"
   let billToken;
+  let billUserId;
   beforeAll(async () => {
     const name = `bill_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const r = await request(app)
@@ -180,8 +234,21 @@ describe("真人档计费", () => {
       .send({ username: name, email: `${name}@test.local`, password: "secret123" })
       .expect(201);
     billToken = r.body.token;
+    billUserId = r.body.user?.id || r.body.user?._id || null;
+    // 真人档只对付过钱的人开放（2026-10-07）：这一组测计费，先发套餐（余额在 beforeEach 里另行摆好）
+    if (billUserId) await require("../src/services/tokenWallet.service").buyPlan(billUserId, "std");
   });
   const bauth = () => ({ Authorization: `Bearer ${billToken}` });
+  // ★ 每条用例前把余额摆回一个够花的数：这一组里有好几发真扣钱的用例，
+  //   而免费档只发 300,000 —— 不回填的话从某一条起集体 402，
+  //   而 402 会把「受理判据」「退款口径」这些真正要测的东西挡在门外（症状还长得像"扣费坏了"）。
+  beforeEach(async () => {
+    const User = require("../src/models/User");
+    const wallet = require("../src/services/tokenWallet.service");
+    if (!billUserId) return;
+    await wallet.ensureWallet(billUserId);
+    await User.updateOne({ _id: billUserId }, { $set: { "tokenWallet.plan": 2_000_000, "tokenWallet.addon": 0, "tokenWallet.debt": 0 } });
+  });
   const walletOf = async () => {
     const r = await request(app).get("/api/me/wallet").set(bauth()).expect(200);
     return r.body.wallet; // 形状是 {ok, wallet:{plan,addon,…}, plans}
@@ -192,11 +259,40 @@ describe("真人档计费", () => {
       text: async () => JSON.stringify({ task_id: "42", base_resp: { status_code: 0, status_msg: "success" } }),
     }));
 
-  test("价目钉子：与 app 的 economy.ts real 档 flatCost 逐条相等", () => {
-    // ★★ 跨仓钉子：app/src/data/economy.ts VIDEO_TIERS id:"real" 的 flatCost = {6:135_000, 10:270_000}。
+  test("价目钉子：与 app 的 economy.ts real 档（2.3-Fast）flatCost 逐条相等", () => {
+    // ★★ 跨仓钉子：app/src/data/economy.ts VIDEO_TIERS id:"real" 现在是
+    //   model:"MiniMax-Hailuo-2.3-Fast"、flatCost = {6:85_000, 10:143_200}。
     //   改价必须两仓同一个提交（汇率变动也算改价）。这条红了 = 报价与实扣分家了。
     const { MINIMAX_FLAT_COST } = require("../src/config/tokens");
-    expect(MINIMAX_FLAT_COST).toEqual({ 6: 135000, 10: 270000 });
+    expect(MINIMAX_FLAT_COST["MiniMax-Hailuo-2.3-Fast"]).toEqual({ 6: 85000, 10: 143200 });
+  });
+
+  test("★ 老客户端发的 2.3 仍然在册且有价（App ≤2.52 发的就是它）", () => {
+    // 删掉这一行 = 所有还没更新的用户，真人档当场全挂。
+    const { MINIMAX_FLAT_COST } = require("../src/config/tokens");
+    expect(MINIMAX_FLAT_COST["MiniMax-Hailuo-2.3"]).toEqual({ 6: 125300, 10: 250600 });
+  });
+
+  test("★★ 价钱挂在 model 上：两个模型不能报同一个数", () => {
+    // 这正是本仓头号事故的形状（priceOf 拿到请求体却不读 model ⇒ 顶档按最低档收费）。
+    const { priceOf, minimaxFlatCost } = require("../src/config/tokens");
+    const fast = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3-Fast", duration: 6 });
+    const std = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3", duration: 6 });
+    expect(fast).toBe(85000);
+    expect(std).toBe(125300);
+    expect(fast).not.toBe(std);
+    // 表外组合没有价 —— null，不是 0（0 会让它变成一条免费链路）
+    expect(minimaxFlatCost("MiniMax-Hailuo-2.3-Fast", 7)).toBeNull();
+    expect(minimaxFlatCost("nope", 6)).toBeNull();
+  });
+
+  test("★ 表外时长的兜底取全表最贵一格，不是 NaN", () => {
+    // 表从一层变两层之后，`Math.max(...Object.values(表))` 会对一堆对象取 max ⇒ NaN，
+    // 而 NaN 流进扣费的结果是**不扣钱**——正好是"报价宁高不低"想防的反面。
+    const { priceOf } = require("../src/config/tokens");
+    const v = priceOf("minimax_video", { model: "MiniMax-Hailuo-2.3", duration: 7 });
+    expect(Number.isFinite(v)).toBe(true);
+    expect(v).toBe(250600);
   });
 
   test("表外时长整发 400，不出网不扣钱", async () => {
@@ -230,7 +326,9 @@ describe("真人档计费", () => {
     }
   });
 
-  test("受理即扣 135k（6s），响应头带扣后余额", async () => {
+  test("受理即扣（2.3 老客户端 6s = 125,300），响应头带扣后余额", async () => {
+    // ★ 125,300 而不是原来的 135,000：2026-09-26 把这一行的锚从旧汇率 7.2 对回全仓现行锚
+    //   （$1 = 447,563）。官方价没变（$0.28/发），变的是我们折算用的那把尺子。
     process.env.MINIMAX_API_KEY = "test-key";
     try {
       okUpstream();
@@ -241,8 +339,45 @@ describe("真人档计费", () => {
         .send({ model: "MiniMax-Hailuo-2.3", prompt: "p", duration: 6, resolution: "768P" });
       expect(res.status).toBe(200);
       const after = await walletOf();
-      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(135000);
+      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(125300);
       expect(Number(res.headers["x-wallet-plan"]) + Number(res.headers["x-wallet-addon"])).toBe(after.plan + after.addon);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+    }
+  });
+
+  test("★ 2.3-Fast 走同一条路，扣的是**它自己**的价（85,000），不是 2.3 的", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    try {
+      okUpstream();
+      const before = await walletOf();
+      const res = await request(app)
+        .post("/api/minimax/video")
+        .set(bauth())
+        .send({ model: "MiniMax-Hailuo-2.3-Fast", prompt: "p", duration: 6, resolution: "768P" });
+      expect(res.status).toBe(200);
+      const after = await walletOf();
+      expect(before.plan + before.addon - (after.plan + after.addon)).toBe(85000);
+    } finally {
+      delete process.env.MINIMAX_API_KEY;
+    }
+  });
+
+  test("★ 不在册的模型整发 400：不出网、不扣钱", async () => {
+    process.env.MINIMAX_API_KEY = "test-key";
+    try {
+      const before = await walletOf();
+      const res = await request(app)
+        .post("/api/minimax/video")
+        .set(bauth())
+        .send({ model: "MiniMax-H3", prompt: "p", duration: 6, resolution: "768P" });
+      expect(res.status).toBe(400);
+      // ★ 连「因为什么被拦」一起断言：只断 400 的话，这条判据被换成别的写法也测不出来。
+      //   H3 是真实存在但走 /v2 的模型 —— 正是最容易被误放行的那一类。
+      expect(String(res.body.message)).toContain("在册");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const after = await walletOf();
+      expect(after.plan + after.addon).toBe(before.plan + before.addon);
     } finally {
       delete process.env.MINIMAX_API_KEY;
     }

@@ -68,6 +68,23 @@ function isShareableViewUrl(raw) {
   return VIEW_URL_RE.test(String(raw || "").trim());
 }
 
+// ── 按模型适配（2026-09-30，主人点名）──────────────────────────────
+// 有的出片模型收不到卡片的参考图：标准 / 极速（Seedance 1.0）协议上没有参考图，卡片形象只能经由设定帧
+// 间接起作用，而且一段里只有第一张人物卡画得进帧；真人档（海螺 2.3-Fast）只认一张起拍画面。卡片为它们
+// 各存一份专用内容（跨仓镜像：app 的 types.Card.textDesc / startFrames）：
+//   · textDesc：收不到图时替代图片的文字版形象描述（app 写 ≤100 字；上限放到 200 兜住长文，与 idLine 同一把尺）
+//   · startFrames：真人档的起拍画面，按画幅各一张（portrait 9:16 / landscape 16:9 —— app 的 VideoAspect），
+//     URL 规则与 views 同一条（只收 http(s)，理由见 VIEW_URL_RE 那段）
+const TEXT_DESC_MAX = 200;
+const START_FRAME_ASPECTS = ["portrait", "landscape"];
+const startFrameUrl = z
+  .string()
+  .trim()
+  .min(1)
+  .max(2000)
+  .regex(VIEW_URL_RE, "start frame url must be an http(s) URL (dataURL / idb: 不收)");
+const startFrames = z.object({ portrait: startFrameUrl.optional(), landscape: startFrameUrl.optional() });
+
 const cardView = z.object({
   url: z
     .string()
@@ -112,6 +129,9 @@ const cardItem = z
     //   上限放宽到 200 兜住旧客户端塞长文）。不声明就会被 z.object strip 掉——
     //   与 genPrompt 当年"发得出、存不下"同一个坑，所以这里必须有名字。
     idLine: z.string().trim().max(200).optional().default(""),
+    // ★ 按模型适配的两份专用内容（见 TEXT_DESC_MAX 那段）。不声明就被 z.object strip 掉 ——「发得出、存不下」的老坑
+    textDesc: z.string().trim().max(TEXT_DESC_MAX).optional().default(""),
+    startFrames: startFrames.optional(),
     // ★ 真人声明（客户端圈选提取时用户勾的，肖像同意责任在协议那一步压给了用户）：
     //   真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
     //   缺省 = 老客户端/老卡 = 非真人（读侧判否定）——所以**不给 default**，
@@ -150,6 +170,17 @@ const updateCardBody = z
     name: z.string().trim().max(120).optional(),
     summary: z.string().trim().max(2000).optional(),
     tags: z.array(z.string().trim().max(40)).max(12).optional(),
+    // ★★ 出片句（2026-09-24 补）：**出片时真正读的就是它**（app 的 types.idLineOf），
+    //   而简介 2026-09-18 起一个字都不进提示词。于是这条 PATCH 不收它的后果是：
+    //   那天之前铸的卡（idLine 为空）在产品内**再没有任何把手**能补上 —— 出片时那个角色只剩一个名字，
+    //   形象由模型自己编，钱照花。客户端发过、被 z.object 静默 strip、回包一切正常（零报错）。
+    //   ⚠ 上限 200 与建卡（cardItem 的 idLine）、模型（BranchCard.idLine maxlength）逐字相同：
+    //     三处不等的话，用户能建出来的卡改不动、或者改完吃一个 400。
+    idLine: z.string().trim().max(200).optional(),
+    // ★ 按模型适配（2026-09-30）：textDesc 给空串 = 取消「标准/极速适用」（判类型不判真假值，理由同 idLine）；
+    //   startFrames 给 null = 取消「真人档适用」（$unset）、给对象 = 整份替换、不带 = 不动
+    textDesc: z.string().trim().max(TEXT_DESC_MAX).optional(),
+    startFrames: startFrames.nullable().optional(),
     // 真人声明可以跟着一起改（可选；不带就保留库里原值——controller 只在拿到布尔时 $set）。
     // ⚠ 当前客户端的 updateCardViews **不发**它（那条 PATCH 是 views 专用），这里声明
     //   是留门：将来真加"改声明"入口时，别再经历一次"发了、被 strip、零报错"。
@@ -218,10 +249,14 @@ module.exports = {
   assetKey,
   assetKind,
   cardView,
+  // 公开配方里随带的卡用同一份起拍画面形状（schemas/branchRecipe.schemas.js）
+  startFrames,
   CARD_TYPES,
   ASSET_KINDS,
   ASSET_ACTIONS,
   CARD_VIEW_KINDS,
   MAX_CARD_VIEWS,
   isShareableViewUrl,
+  TEXT_DESC_MAX,
+  START_FRAME_ASPECTS,
 };

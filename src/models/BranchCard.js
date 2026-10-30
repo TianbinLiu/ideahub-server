@@ -9,7 +9,7 @@ const mongoose = require("mongoose");
 // 类型枚举只在 schemas/branchAsset.schemas.js 定义一份，避免改一处漏一处（表现是整批加卡 400）
 const { CARD_TYPES } = require("../schemas/branchAsset.schemas");
 // 多图参考的子文档形状与 BranchDeck 的快照共用同一份（见那个文件的文件头）
-const { cardViewSchema } = require("./cardView.schema");
+const { cardViewSchema, startFramesSchema } = require("./cardView.schema");
 
 // 肖像授权绑定的子文档（字段释义见下面 portrait 那条注释）
 const portraitSchema = new mongoose.Schema(
@@ -44,6 +44,11 @@ const branchCardSchema = new mongoose.Schema(
      *  直接用它（业界通行做法：长设定不进视频 prompt）。strict 模式下漏声明 = 落库时
      *  被剥掉且零报错（modelUrl/genPrompt 的旧伤），所以必须有名字 */
     idLine: { type: String, default: "", trim: true, maxlength: 200 },
+    /** 按模型适配（2026-09-30）：收不到参考图的出片（标准/极速、真人档里不当起拍画面的卡）用的
+     *  文字版形象描述。缺省空串 = 没勾「标准/极速适用」。漏声明 = 落库时静默剥掉（modelUrl/idLine 的老坑） */
+    textDesc: { type: String, default: "", trim: true, maxlength: 200 },
+    /** 按模型适配：真人档的起拍画面，按画幅各一张。缺省 = 没勾「真人档适用」（读侧判有值） */
+    startFrames: { type: startFramesSchema, default: undefined },
     /** 画面里是真实人物——用户在圈选提取时自己勾的声明（像不像真人机器判不准，只能
      *  让当事人表态）。真人素材受供应商内容审核与深度合成法规约束，出片档位按它分流。
      *  缺省 false = 老卡/未声明 = 非真人（客户端读侧判否定，见 app 仓 types.Card.realPerson）。

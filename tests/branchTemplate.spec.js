@@ -28,6 +28,23 @@ function videoUrlOf(userId, ts) {
   return `${CLOUD_PREFIX}/ideahub/template-videos/${userId}-${ts}.mp4`;
 }
 
+/**
+ * 一个本文件里还没人用过的 `${userId}-<ts>` 编号（nextPid 也从这里取）。
+ * ★★ 不许拿 Date.now() 造：服务端自己也在这条时间轴上起名 —— 分段登记切出来的每一段是
+ *   `${userId}-${Date.now() + i}`（branchTemplate.routes）。用例拿 `Date.now() + k` 当源编号，
+ *   请求恰好跑到第 k-i 毫秒时，切出来的那段就与源**同名**。2026-09-30 实测：「切过段的源视频」
+ *   那条（k=6）在第 5 毫秒给第 2 段起名，孤儿口第一道 exists 先命中「已登记为白模模板」——
+ *   间歇性红（1/4～1/15，看机器快慢），报的错与真正原因毫不相干。
+ * 从 10^10 起数（11 位）：比文件里写死的编号都长（最长是 10 位的 1712000000），又比服务端
+ *   起名用的 13 位毫秒时间戳短 —— 三方永不相撞，看位数就知道是谁起的名。
+ *   库是每个文件独占的 MongoMemoryServer，文件内唯一就够了。
+ */
+let tsSeq = 10_000_000_000;
+function nextTs() {
+  tsSeq += 1;
+  return tsSeq;
+}
+
 /** Cloudinary 资源详情的假回执（服务端登记元数据的唯一来源） */
 function fakeResource(publicId, over = {}) {
   return {
@@ -83,7 +100,12 @@ afterAll(async () => {
   if (mongod) await mongod.stop();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // ★ 每条用例先清掉 token 流水：2026-09-24 起有**每日 token 上限**
+  //   （config/tokens.DAILY_LIMITS，付费档 3M/日），而本文件用同一个 owner 连发几十发
+  //   白模化，每发都是几十万 token —— 不清就会从某一条开始集体变成 429。
+  //   这里测的是模板链路，不是日上限；日上限自己的用例在 tests/billing.spec.js。
+  await require("../src/models/TokenLedger").deleteMany({});
   // 资源详情：按传入的 public_id 回一份合格回执（单条用例里再按需覆写）
   resourceSpy = jest
     .spyOn(cloudinary.api, "resource")
@@ -193,7 +215,7 @@ describe("videoUrl 三重白名单（host + 目录 + 归属）", () => {
 
 // ─────────────────────────────────────────────────────────────────────
 describe("zod strip 回归：未声明字段发得出、存不下，敏感字段改不动", () => {
-  test("客户端塞 status/provenAt/refVideo/ownerId → 全部被剥掉，服务端的值说了算", async () => {
+  test("客户端塞 status/provenAt/provenModels/refVideo/ownerId → 全部被剥掉，服务端的值说了算", async () => {
     const res = await request(app)
       .post("/api/branch/templates")
       .set(asOwner())
@@ -202,6 +224,8 @@ describe("zod strip 回归：未声明字段发得出、存不下，敏感字段
           // 这些都是「发得出」的：一个都不许「存得下」
           status: "published",
           provenAt: new Date().toISOString(),
+          // 「在哪个模型上跑通过」只由服务端的试炼追踪写，客户端自称不算数
+          provenModels: ["doubao-seedance-2-5-260628", "anything"],
           ownerId: other.id,
           authorName: "假冒者",
           refVideo: { durationSec: 1, width: 1, height: 1, bytes: 0, url: "https://evil.example.com/x.mp4" },
@@ -215,6 +239,7 @@ describe("zod strip 回归：未声明字段发得出、存不下，敏感字段
     const tpl = back.body.template;
     expect(tpl.status).toBe("pending"); // 不是 "published"
     expect(tpl.provenAt).toBeNull();
+    expect(tpl.provenModels).toEqual([]); // 没试炼过 = 空数组，客户端塞的那两个一个都没进来
     expect(tpl.ownerId).toBe(String(owner.id)); // 不是 other
     expect(tpl.refVideo.durationSec).toBe(10); // Cloudinary 的数，不是客户端报的 1
     expect(tpl.refVideo.url).toContain("res.cloudinary.com");
@@ -239,6 +264,14 @@ describe("试炼闸与发布状态机", () => {
     const ok = await request(app).patch(`/api/branch/templates/${tpl.id}/publish`).set(asOwner());
     expect(ok.status).toBe(200);
     expect(ok.body.template.status).toBe("published");
+    // 存量形状（有 provenAt、没记过模型）：出口按当时唯一开着 r2v 的模型出 —— 线上现有的已发布模板全是这个形状
+    expect(ok.body.template.provenModels).toEqual(["doubao-seedance-2-5-260628"]);
+
+    // 记过的原样出，而且**对别人也出**（市场上的人要拿它判断这个模板能在哪个模型上出片）
+    await BranchTemplate().updateOne({ _id: tpl.id }, { $set: { provenModels: ["model-a"] } });
+    const seen = await request(app).get(`/api/branch/templates/${tpl.id}`).set(asOther());
+    expect(seen.status).toBe(200);
+    expect(seen.body.template.provenModels).toEqual(["model-a"]);
   });
 
   test("非作者不能 publish / unpublish / delete（403，身份只认 ownerId）", async () => {
@@ -860,6 +893,8 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
   const BranchTemplate = () => require("../src/models/BranchTemplate");
   const BlockoutJob = () => require("../src/models/BlockoutJob");
   const walletSvc = require("../src/services/tokenWallet.service");
+  // 神态那一组要替换掉 detect-roles 的认人量框（路由按 `blockout.measureRosterBoxes(...)` 调，spyOn 接得住）
+  const blockoutSvc = require("../src/services/blockoutize.service");
   const { SEEDANCE_2_5, r2vTokens, CHAT_TURN_TOKENS } = require("../src/config/tokens");
 
   const ARK = "https://ark.cn-beijing.volces.com/api/v3";
@@ -874,11 +909,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
   // ★ 每条用例默认用一段**没用过**的素材：白模化对同一段素材只许做一次
   //   （第一次的 source 就占住它了）。共用同一个 id 的话，后面的用例全会撞上
   //   "这段素材已经做过"，而错误信息与它们要测的东西对不上 —— 排查起来极其误导。
-  // 8500 起：与下面几条用例里写死的 8002~8015 分开，免得撞成"这段素材已经做过"
-  let pidSeq = 8500;
+  // 编号取文件级的 nextTs()（11 位），与下面几条用例里写死的 8002~8015 天然分开
   function nextPid() {
-    pidSeq += 1;
-    return `ideahub/template-videos/${owner.id}-${pidSeq}`;
+    return `ideahub/template-videos/${owner.id}-${nextTs()}`;
   }
 
   function baseBody(over = {}) {
@@ -952,9 +985,11 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       }
       // ③ 方舟：看帧
       if (u === `${ARK}/chat/completions`) {
+        // net.visionFinish = 模拟方舟回包里的 finish_reason（"length" = 顶到 max_tokens 被截断）；不设 = 不带这一位
+        const choice = { message: { content: net.visionText }, ...(net.visionFinish ? { finish_reason: net.visionFinish } : {}) };
         return {
           status: 200,
-          text: async () => JSON.stringify({ choices: [{ message: { content: net.visionText } }] }),
+          text: async () => JSON.stringify({ choices: [choice] }),
         };
       }
       // ④ 方舟：建 r2v 任务
@@ -1187,6 +1222,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
       ratio: "adaptive",
       resolution: "720p",
     });
+    // ★ 不出声是显式发出去的（与 App 的 BLOCKOUT_TASK 同一个值）：edit 会连参考视频里的歌一起复刻，带歌的素材会被方舟在输出端整发拒。
+    //   判「严格等于 false」而不是「不是 true」：缺省（不传）就是把这件事交给方舟的缺省值，那正是这一行要钉死的东西
+    expect(body.generate_audio).toBe(false);
     // F4：白模化提示词必须**点名**（"包括…在内"），泛指会漏掉主角
     const text = body.content.find((c) => c.type === "text").text;
     expect(text).toContain("包括");
@@ -1561,29 +1599,96 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
   });
 
   // ── ⑥ 受理后失败 / 转存失败 ──────────────────────────────────────────
-  test("方舟受理后 failed（F11 真人脸）→ 取回时整句说明**不退费**，不落库", async () => {
+  test("方舟受理后 failed（F11 真人脸）→ 取回时 r2v 那一笔按原桶退回、看帧那一笔不退，两笔分开说；再取不再退", async () => {
+    // ★★ 2026-10-07 起（主人「做生成失败返回 token」）：方舟明说失败 → r2v 那一笔退回（services/taskRefund，恰好一次）。
+    //   看帧那一笔是受理了的 chat，照旧不退 —— 两笔结论相反，话要分开说（VISION_BILLED_NOTE 那条规矩）。
+    const TokenLedger = require("../src/models/TokenLedger");
     net.taskStatus = "failed";
     const pid = `ideahub/template-videos/${owner.id}-8009`;
+    const w0 = await walletSvc.getWallet(owner.id);
     const started = await post(baseBody({ publicId: pid }));
     expect(started.status).toBe(202); // 受理是真的：钱就是在这一步花掉的
+    const r2v = r2vTokens(8, SEEDANCE_2_5);
     const res = await finish(started.body.jobId);
     expect(res.status).toBe(502);
-    // ★★ 两阶段之后 billed 分两件事说：**这一次调用**没花钱（false），
-    //   但开炼那一笔**什么都没剩**（lost:true）。合成一位的话必然有一半是假话。
+    // ★★ 两阶段之后 billed 分两件事说：**这一次调用**没花钱（false）；开炼那一笔退了，所以 lost:false
     expect(res.body.billed).toBe(false);
-    expect(res.body.lost).toBe(true);
+    expect(res.body.lost).toBe(false);
     expect(res.body.state).toBe("failed");
-    // ★ 这句话必须说出口：方舟受理后失败不退费，含糊其辞等于骗人
-    expect(res.body.message).toMatch(/不退/);
+    expect(res.body.refund).toEqual({ state: "refunded", tokens: r2v });
+    expect(res.body.message).toMatch(/退回/);
+    expect(res.body.message).toMatch(/看画面那一步的费用不退/);
     expect(res.body.message).toMatch(/真人/);
+    expect(res.body.message).toMatch(/内容审核未通过/); // 方舟的原话带进来
+    // 余额头随响应回来（App 的钱包镜像据此同步）
+    expect(Number(res.headers["x-wallet-plan"]) + Number(res.headers["x-wallet-addon"])).toBe(w0.plan + w0.addon - CHAT_TURN_TOKENS);
+    // 钱：只剩看帧那一笔；退款流水恰好一行，memo 带任务号
+    const w1 = await walletSvc.getWallet(owner.id);
+    expect(w0.plan + w0.addon - (w1.plan + w1.addon)).toBe(CHAT_TURN_TOKENS);
+    const refunds = await TokenLedger.find({ user: owner.id, reason: "provider_failed", memo: `provider_failed ark task:${started.body.taskId}` }).lean();
+    expect(refunds).toHaveLength(1);
+    expect(refunds[0].delta).toBe(r2v);
     expect(await BranchTemplate().findOne({ "source.publicId": pid }).lean()).toBeNull();
-    // 凭据钉成终局：再点一次不会又去问方舟，而是原样把那句话再说一遍
+    // 凭据钉成终局：再点一次不会又去问方舟，原样把那句话再说一遍 —— 也**不会再退一次**
     const job = await BlockoutJob().findById(started.body.jobId).lean();
     expect(job.status).toBe("failed");
-    expect(job.failMessage).toMatch(/不退/);
+    expect(job.failMessage).toMatch(/退回/);
     const again = await finish(started.body.jobId);
     expect(again.status).toBe(502);
-    expect(again.body.message).toMatch(/不退/);
+    expect(again.body.message).toMatch(/退回/);
+    expect(again.body.lost).toBe(false);
+    expect(again.body.refund).toEqual({ state: "refunded", tokens: r2v });
+    expect(await TokenLedger.countDocuments({ user: owner.id, reason: "provider_failed", memo: `provider_failed ark task:${started.body.taskId}` })).toBe(1);
+    // 本人这次的响应里已经说了退款 —— 不再另发一条通知
+    const Notification = require("../src/models/Notification");
+    expect(await Notification.countDocuments({ userId: owner.id, type: "GEN_TASK_REFUND", "payload.taskId": started.body.taskId })).toBe(0);
+  });
+
+  test("App 的真实顺序：先经 /api/ark 轮询看见 failed（退款落在这一拍），再调 finish —— 方舟的失败原因照样说出来", async () => {
+    // ★ App 的 waitBlockoutTask 先轮询任务、看见 failed 才调 finish（data/templates.ts）。轮询那一拍结账时不带方舟的原话，
+    //   取件单的 failMessage 就没有原因，finish 照它回话 ⇒「内容审核未通过」永远到不了用户眼前（2026-10-07 评审）。
+    //   上面那条直接调 finish，测不出这条路。
+    net.taskStatus = "failed";
+    const started = await post(baseBody({ publicId: `ideahub/template-videos/${owner.id}-8010` }));
+    expect(started.status).toBe(202);
+    const polled = await request(app).get(`/api/ark/contents/generations/tasks/${started.body.taskId}`).set(asOwner());
+    expect(polled.status).toBe(200);
+    expect(polled.body.refund).toMatchObject({ state: "refunded" });
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.status).toBe("failed");
+    expect(job.failMessage).toMatch(/内容审核未通过/);
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(502);
+    expect(res.body.message).toMatch(/内容审核未通过/);
+    expect(res.body.message).toMatch(/退回/);
+  });
+
+  test("★ 方舟失败、没人来取回：清扫器退了钱，取件单跟着钉成 failed（列表不再说「无法挽回」），并发一条通知", async () => {
+    const taskRefund = require("../src/services/taskRefund.service");
+    const GenTaskCharge = require("../src/models/GenTaskCharge");
+    const Notification = require("../src/models/Notification");
+    net.taskStatus = "failed";
+    const started = await post(baseBody());
+    expect(started.status).toBe(202);
+    // 让这一笔账到点（清扫器只问受理 10 分钟之后的）
+    await GenTaskCharge.updateOne({ provider: "ark", taskId: started.body.taskId }, { $set: { nextCheckAt: new Date(Date.now() - 1000) } });
+    const out = await taskRefund.sweepTaskRefunds();
+    expect(out.settled).toBeGreaterThanOrEqual(1);
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.status).toBe("failed");
+    expect(job.failMessage).toMatch(/已经自动退回/);
+    // 列表（pending 那条路读的是同一个 stateOf）
+    const st = BlockoutJob().stateOf(job);
+    expect(st.state).toBe("failed");
+    expect(st.message).not.toMatch(/无法挽回/);
+    const notes = await Notification.find({ userId: owner.id, type: "GEN_TASK_REFUND", "payload.taskId": started.body.taskId }).lean();
+    expect(notes).toHaveLength(1);
+    expect(notes[0].payload).toMatchObject({ kind: "blockout", provider: "ark", tokens: r2vTokens(8, SEEDANCE_2_5) });
+    // 用户这时再来取回：照实说已经退了，不再退第二次
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(502);
+    expect(res.body.refund).toMatchObject({ state: "refunded" });
+    expect(res.body.lost).toBe(false);
   });
 
   test("方舟受理**前** 400（敏感词/输入不合格）→ 出片那笔退回、看帧那笔不退，两笔分开说", async () => {
@@ -1610,10 +1715,13 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     // ★ 造一个"付得起看帧、付不起出片"的余额：这条路走的是 chargedArkCall 的
     //   `ok:false / reason:funds` 分支 —— 它自己那一笔一分钱没动，但看帧那笔已经花了。
     //   审查前这里回的是 billed:false，与「roles 为空」那条（同样在看帧之后）自相矛盾。
-    const pid = `ideahub/template-videos/${owner.id}-8015`;
+    const pid = nextPid();
     const w = await walletSvc.getWallet(owner.id);
     // 只留下"够看一次帧、不够出片"的额度（r2v 那一笔是几十万级）
+    // ★ 压余额用 debit 会写一行 ark_spend，于是这一发先撞**每日上限**（429）而不是余额不足（402）。
+    //   这条用例要的是「钱不够」，所以直接改库压余额，不经过流水。
     await walletSvc.debit(owner.id, w.plan + w.addon - CHAT_TURN_TOKENS * 2, "测试：压到看帧够、出片不够");
+    await require("../src/models/TokenLedger").deleteMany({});
     const res = await post(baseBody({ publicId: pid }));
     expect(res.status).toBe(402);
     expect(res.body.billed).toBe(true);
@@ -1745,6 +1853,9 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
         height: 512,
         bytes: 1_000_000,
       }));
+      // 一发 30 秒的 2.5 就是 3,045,600 token，刚好越过付费档 3M/日的硬线 ⇒ 第二发起会被日上限拒。
+      // 这条用例连发四次，测的是「锚点取整」，所以每轮先清当天流水（日上限自己的用例在 billing.spec）。
+      await require("../src/models/TokenLedger").deleteMany({});
       const started = await post(baseBody({ durSec: 30, startSec: 0 }));
       const res = await finish(started.body.jobId);
       expect(res.status).toBe(201);
@@ -1812,7 +1923,125 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     expect(res.status).toBe(403);
     expect(res.body.code).toBe("PLAN_REQUIRED");
     expect(res.body.billed).toBe(false);
+    // 判据与 /api/ark 同一处（config/tokens.videoPlanDenial）：白模化是 r2v，免费版能用的只有极速 / 草稿的普通片
+    // （按「此刻」断言：极速 2026-11-24 13:00 停用之后清单只剩「草稿」，写死的话这条会在那一天变红）
+    // 档名去重走 freeVideoLabels（MiniMax H3-Lite 也叫「草稿」，2026-10-26）
+    expect(res.body.allowed).toEqual(require("../src/config/tokens").freeVideoLabels());
+    expect(res.body.message).toMatch(/免费版/);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── 出片地区门禁前置（2026-10-26：海外不给 Seedance）──────────────────
+  // ★ 这条路先花一发看帧（豆包 chat，地区门禁不管对话）、再发 Seedance 2.5。门禁只挂在 chargedArkCall 上的话，
+  //   海外用户先被扣掉看帧那笔钱、再在 r2v 那一步吃 403 —— 而 403 那句话说的是「没有扣费」。所以预检必须排在看帧之前。
+  describe("出片地区门禁的前置预检（排在看帧之前）", () => {
+    const blockoutJobsOf = () => BlockoutJob().countDocuments({ ownerId: owner.id });
+    const balanceOf = async () => {
+      const w = await walletSvc.getWallet(owner.id);
+      return w.plan + w.addon;
+    };
+    let savedGate;
+    let warnSpy;
+    beforeEach(() => {
+      savedGate = process.env.VIDEO_REGION_GATE;
+      warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      if (savedGate === undefined) delete process.env.VIDEO_REGION_GATE;
+      else process.env.VIDEO_REGION_GATE = savedGate;
+      warnSpy.mockRestore();
+    });
+    const regionLines = () => warnSpy.mock.calls.map((c) => String(c[0])).filter((s) => s.startsWith("[region]"));
+
+    test("★ 门禁 on、海外 → 403 REGION_UNAVAILABLE + billed:false；根本不发看帧（一发都不出网、连 Cloudinary 都不问）、不扣钱、不留取件单", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const before = await balanceOf();
+      const jobs = await blockoutJobsOf();
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(403);
+      // 与 /api/ark 被拦时逐字同一个形状（body 只在 arkGateway.regionGate 一处拼）
+      expect(Object.keys(res.body).sort()).toEqual(["billed", "code", "message", "ok", "providers", "reason", "zone"]);
+      expect(res.body).toMatchObject({ ok: false, code: "REGION_UNAVAILABLE", reason: "region", zone: "intl", billed: false });
+      expect(fetchSpy).not.toHaveBeenCalled(); // 没有看帧、没有预热、没有 r2v
+      expect(resourceSpy).not.toHaveBeenCalled();
+      expect(await balanceOf()).toBe(before);
+      expect(await blockoutJobsOf()).toBe(jobs);
+      expect(regionLines()).toEqual([expect.stringMatching(/^\[region\] deny at=blockoutize task doubao-seedance-2-5-/)]);
+    });
+
+    test("门禁 on、境内（CN）→ 照常受理（看帧 + Seedance 都发了）", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "CN" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(net.calls.some((c) => c.url === `${ARK}/chat/completions`)).toBe(true);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(true);
+      expect(regionLines()).toEqual([]);
+    });
+
+    test("门禁 observe（缺省）、海外 → 照常受理；would-deny 一个请求只记一行（预检与 Seedance 那一发不重记）", async () => {
+      delete process.env.VIDEO_REGION_GATE;
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(true);
+      const lines = regionLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^\[region\] would-deny at=blockoutize task doubao-seedance-2-5-.* zone=intl country=US source=cf /);
+    });
+
+    test("门禁 off：海外照常受理、一行都不记", async () => {
+      process.env.VIDEO_REGION_GATE = "off";
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(202);
+      expect(regionLines()).toEqual([]);
+    });
+
+    // 2026-10-26 最终审核：海外给得出 MiniMax 时，拒绝话原来照样叫人「换成 MiniMax」—— 可白模化在 MiniMax 上没有对应做法
+    test("门禁 on、海外、这台服务器的 MiniMax 走国际站 → 拒绝话说「没有可换的」，不指人去换 MiniMax", async () => {
+      process.env.VIDEO_REGION_GATE = "on";
+      const savedKey = process.env.MINIMAX_INTL_API_KEY;
+      process.env.MINIMAX_INTL_API_KEY = "mm-intl-test";
+      try {
+        const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+        expect(res.status).toBe(403);
+        expect(res.body).toMatchObject({ code: "REGION_UNAVAILABLE", providers: ["minimax"], billed: false });
+        expect(res.body.message).not.toMatch(/MiniMax/);
+        expect(res.body.message).toMatch(/no other model here/);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        if (savedKey === undefined) delete process.env.MINIMAX_INTL_API_KEY;
+        else process.env.MINIMAX_INTL_API_KEY = savedKey;
+      }
+    });
+
+    // ★ 地区按请求记着、门禁档位每次现读：看帧之前的预检在 observe 下放行，看帧那几秒里有人把门禁拨到 on，⑥ 那一发就被拦 ——
+    //   这时看帧那笔已经花了。原来拿 `${why}。出片那一笔…` 接，接在以「。」结尾的双语拒绝话后面成了「。。」、英文那半也不知道看帧花了钱。
+    test("看帧之后才被拦（两次之间门禁从 observe 拨到 on）→ 403 REGION_UNAVAILABLE + billed:true + visionFrames；两半各补一句看帧的钱、没有「。。」", async () => {
+      delete process.env.VIDEO_REGION_GATE;
+      const impl = fetchSpy.getMockImplementation();
+      fetchSpy.mockImplementation(async (url, init) => {
+        if (String(url) === `${ARK}/chat/completions`) process.env.VIDEO_REGION_GATE = "on";
+        return impl(url, init);
+      });
+      const jobs = await blockoutJobsOf();
+      const res = await request(app).post("/api/branch/templates/blockoutize").set(asOwner()).set({ "cf-ipcountry": "US" }).send(baseBody());
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ ok: false, code: "REGION_UNAVAILABLE", reason: "region", zone: "intl", billed: true });
+      expect(res.body.visionFrames).toBeGreaterThan(0);
+      const m = res.body.message;
+      expect(m).not.toMatch(/。。/);
+      const [en, zh] = m.split(" / ");
+      expect(m.split(" / ")).toHaveLength(2);
+      expect(en).toMatch(/not accepted, not charged\..*The frame check that ran first was charged and cannot be refunded\.$/);
+      expect(zh).toMatch(/没有受理、也没有扣费。.*不过看画面那一步的费用已经产生、无法退回。$/);
+      // 老 App 照样抠得出整句（不含 JSON 要转义的字符）
+      expect(JSON.stringify(m)).toBe(`"${m}"`);
+      // 看帧发了，Seedance 那一发没发；没留取件单
+      expect(net.calls.some((c) => c.url === `${ARK}/chat/completions`)).toBe(true);
+      expect(net.calls.some((c) => c.url === `${ARK}/contents/generations/tasks`)).toBe(false);
+      expect(await blockoutJobsOf()).toBe(jobs);
+      // 预检记一行 would-deny，⑥ 那一发记一行 deny
+      expect(regionLines().map((s) => s.split(" ")[1])).toEqual(["would-deny", "deny"]);
+    });
   });
 
   test("未登录 → 401（这条链路每一发都真花钱，不许裸奔）", async () => {
@@ -2062,6 +2291,208 @@ describe("白模化两阶段（POST …/blockoutize + POST …/blockoutize/finis
     // ★ 重复判据仍然只有服务端这一处（label 装的就是标记 token，所以它**自动**
     //   就是位置重复闸，一行代码都不用加）—— 库里一个字没动
     expect((await BranchTemplate().findById(id).lean()).roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
+  });
+
+  // ── 神态（2026-10-26，白模保留神态的 D 方案）────────────────────────
+  //
+  // ★★ 看帧那一发顺带记下每个人的神态 → 凭据 / 模板的 markExprs（与 markSlots 下标对齐）。
+  //   这一组钉四件事：① 真实回话的形状（行尾多一个「|」）认得出；② 前四列一个字不变、
+  //   白模化提示词一个字不变；③ 作者改 roles 时神态跟着**人**走；④ 重新识别把它清掉。
+  const EXPR_VISION =
+    // ★ 行尾那个「|」是 2026-10-26 付费小验里真实回话的样子（模型常在神态列后面多写一个）
+    "1|50|画面正中央|白发、黑金色长袍的少年|神态：先平静，后惊讶张嘴，再大笑|\n" +
+    "2|15|左侧靠前|红发红甲的女武士|神态：一直皱眉，中途摇头|";
+  const GIRL = "左侧靠前，红发红甲的女武士";
+  const BOY = "画面正中央，白发、黑金色长袍的少年";
+
+  test("★★ 神态列（行尾还多一个「|」）→ 凭据与模板都带 markExprs，按画面从左到右与 markSlots 对齐", async () => {
+    net.visionText = EXPR_VISION;
+    const started = await post(baseBody());
+    expect(started.status).toBe(202);
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    // ★ 重要度序（少年在前）与左右序（女武士 x=15 在左）相反：神态必须跟着**人**排到左右序上
+    expect(job.markSlots).toEqual(["最左边", "最右边"]);
+    expect(job.markExprs).toEqual(["一直皱眉，中途摇头", "先平静，后惊讶张嘴，再大笑"]);
+    // ★★ 前四列一个字不变：desc 与没有神态列时逐字相同（神态一个字都没并进去）
+    expect(job.roles.map((r) => r.desc)).toEqual([GIRL, BOY]);
+    // ★ 受理回执不出它（App 读凭据的那一份不认，见 markExprsPayload 的注释）
+    expect(started.body.markExprs).toBeUndefined();
+    // ★★ 神态**不进白模化提示词**：那份提示词说的是「没有表情」
+    const create = net.calls.find((c) => c.url === `${ARK}/contents/generations/tasks`);
+    const text = JSON.parse(create.body).content.find((c) => c.type === "text").text;
+    expect(text).not.toMatch(/神态|惊讶|皱眉/);
+    expect(text).toContain(`\n1. ${GIRL}\n`);
+
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(201);
+    expect(res.body.template.markExprs).toEqual(["一直皱眉，中途摇头", "先平静，后惊讶张嘴，再大笑"]);
+    const id = res.body.template.id;
+    expect((await BranchTemplate().findById(id).lean()).markExprs).toEqual(job.markExprs);
+
+    // ★ 作者与别人都看得到：照原样核对（不改）→ 神态原样留着 → 发布之后别人读详情也带着
+    await BranchTemplate().updateOne({ _id: id }, { $set: { provenAt: new Date() } });
+    const confirmed = await request(app)
+      .patch(`/api/branch/templates/${id}/roles`)
+      .set(asOwner())
+      .send({ roles: [{ label: "最左边", desc: GIRL }, { label: "最右边", desc: BOY }] });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.template.markExprs).toEqual(["一直皱眉，中途摇头", "先平静，后惊讶张嘴，再大笑"]);
+    await request(app).patch(`/api/branch/templates/${id}/publish`).set(asOwner()).expect(200);
+    const seen = await request(app).get(`/api/branch/templates/${id}`).set(asOther());
+    expect(seen.status).toBe(200);
+    expect(seen.body.template.markExprs).toEqual(["一直皱眉，中途摇头", "先平静，后惊讶张嘴，再大笑"]);
+  });
+
+  test("★★ 老回话（四列，没有神态列）→ 一切照旧：desc 逐字不变，凭据与模板都**没有** markExprs", async () => {
+    // 默认 fixture 就是老形状（`序号|横向位置|位置|外观特征`）
+    const { started, finished } = await run(baseBody());
+    const job = await BlockoutJob().findById(started.body.jobId).lean();
+    expect(job.roles.map((r) => r.desc)).toEqual([expect.stringContaining("红发"), expect.stringContaining("白发")]);
+    expect(job.markExprs).toBeUndefined();
+    expect(finished.body.template.markExprs).toBeUndefined();
+    expect((await BranchTemplate().findById(finished.body.template.id).lean()).markExprs).toBeUndefined();
+  });
+
+  test("★ 一个神态都没认出（全是「看不清」）→ 不写这一位（全空串与没有它要做的事一样）", async () => {
+    net.visionText = "1|50|画面正中央|白发少年|神态：看不清|\n2|15|左侧靠前|红发女武士|神态：无";
+    const { started, finished } = await run(baseBody());
+    expect((await BlockoutJob().findById(started.body.jobId).lean()).markExprs).toBeUndefined();
+    expect(finished.body.template.markExprs).toBeUndefined();
+  });
+
+  test("★ 看帧回话被截断（finish_reason=length）→ 认人照旧、被切的最后一行神态不取，并响亮记一笔", async () => {
+    // ★ max_tokens 还是 1200，神态列让每行长了约一半：群像更早顶到上限。半截的「先惊」不许当神态存下
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      net.visionText = "1|50|画面正中央|白发少年|神态：先平静，后大笑\n2|15|左侧靠前|红发女武士|神态：先惊";
+      net.visionFinish = "length";
+      const started = await post(baseBody());
+      expect(started.status).toBe(202);
+      const job = await BlockoutJob().findById(started.body.jobId).lean();
+      // 认人一个字不受影响：两个人都在、desc 与没截断时一样（被切的那一行照样算一个人）
+      expect(job.roles.map((r) => r.desc)).toEqual(["左侧靠前，红发女武士", "画面正中央，白发少年"]);
+      // 女武士那一行是被切的（最后一行），她排在最左边 —— 她那一格空着，少年的照常带
+      expect(job.markExprs).toEqual(["", "先平静，后大笑"]);
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/看帧回话被截断/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("★★ 在途的老凭据（这一位上线前落的，没有 markExprs）→ finish 出来的模板也没有，不凭空造", async () => {
+    net.visionText = EXPR_VISION;
+    const started = await post(baseBody());
+    await BlockoutJob().collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(started.body.jobId) },
+      { $unset: { markExprs: "" } },
+    );
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(201);
+    expect(res.body.template.markExprs).toBeUndefined();
+    expect((await BranchTemplate().findById(res.body.template.id).lean()).markExprs).toBeUndefined();
+  });
+
+  test("★ 凭据里的 markExprs 长度与 markSlots 对不上（写坏了）→ finish 不搬，宁缺不错位", async () => {
+    net.visionText = EXPR_VISION;
+    const started = await post(baseBody());
+    await BlockoutJob().collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(started.body.jobId) },
+      { $set: { markExprs: ["只有一条"] } },
+    );
+    const res = await finish(started.body.jobId);
+    expect(res.status).toBe(201);
+    expect((await BranchTemplate().findById(res.body.template.id).lean()).markExprs).toBeUndefined();
+  });
+
+  test("★★★ 作者对调两行 → 神态**跟着人走**（按 desc 认人），不留在原来的位置上", async () => {
+    // ★★★ 审核抓到的高危那条：按 markSlots 下标存、PATCH 又不碰它的话，对调之后
+    //   「最左边」挂的卡会照着另一个人的神态演，而且零报错。
+    net.visionText = EXPR_VISION;
+    const { finished } = await run(baseBody());
+    const id = finished.body.template.id;
+    const res = await request(app)
+      .patch(`/api/branch/templates/${id}/roles`)
+      .set(asOwner())
+      .send({ roles: [{ label: "最左边", desc: BOY }, { label: "最右边", desc: GIRL }] });
+    expect(res.status).toBe(200);
+    expect(res.body.template.markExprs).toEqual(["先平静，后惊讶张嘴，再大笑", "一直皱眉，中途摇头"]);
+    const doc = await BranchTemplate().findById(id).lean();
+    expect(doc.markSlots).toEqual(["最左边", "最右边"]); // 方案位照旧一个字不动
+    expect(doc.markExprs).toEqual(["先平静，后惊讶张嘴，再大笑", "一直皱眉，中途摇头"]);
+  });
+
+  test("★★★ 删位后右边整体左移 → 神态跟着搬、空出来的位置清空；desc 改写过的那一格清空", async () => {
+    net.visionText = [
+      "1|50|画面正中央|白发少年|神态：先平静，后大笑",
+      "2|10|左侧靠前|红发女武士|神态：一直皱眉",
+      "3|90|右侧靠后|黑衣剑客|神态：先惊讶，后冷笑",
+    ].join("\n");
+    const { finished } = await run(baseBody());
+    const id = finished.body.template.id;
+    const A = "左侧靠前，红发女武士";
+    const B = "画面正中央，白发少年";
+    const C = "右侧靠后，黑衣剑客";
+    expect(finished.body.template.roles.map((r) => r.desc)).toEqual([A, B, C]);
+    expect(finished.body.template.markExprs).toEqual(["一直皱眉", "先平静，后大笑", "先惊讶，后冷笑"]);
+    const patch = (roles) => request(app).patch(`/api/branch/templates/${id}/roles`).set(asOwner()).send({ roles });
+
+    // ① 画面上中间那个人没被做出来：删掉他，右边的剑客往左挪一位
+    const shifted = await patch([
+      { label: "最左边", desc: A },
+      { label: "从左数第2个", desc: C },
+    ]);
+    expect(shifted.status).toBe(200);
+    expect((await BranchTemplate().findById(id).lean()).markExprs).toEqual(["一直皱眉", "先惊讶，后冷笑", ""]);
+    // 出口照样出（长度等于 markSlots、有非空的）
+    expect(shifted.body.template.markExprs).toEqual(["一直皱眉", "先惊讶，后冷笑", ""]);
+
+    // ② 再核对一次：作者改写了女武士那句 desc —— 认不准是不是同一个人，那一格清空（不猜）
+    const rewritten = await patch([
+      { label: "最左边", desc: "穿红甲、拿长枪的女武士" },
+      { label: "从左数第2个", desc: C },
+    ]);
+    expect(rewritten.status).toBe(200);
+    expect((await BranchTemplate().findById(id).lean()).markExprs).toEqual(["", "先惊讶，后冷笑", ""]);
+  });
+
+  test("★★ 重新识别角色位（detect-roles）→ markExprs 整份清掉（人数一样时 markSlots 逐字相同，不清就错位）", async () => {
+    net.visionText = EXPR_VISION;
+    const { finished } = await run(baseBody());
+    const id = finished.body.template.id;
+    expect(finished.body.template.markExprs).toHaveLength(2);
+    const spy = jest.spyOn(blockoutSvc, "measureRosterBoxes");
+    try {
+      // ① 这一次没认出来 → 模板一个字不动（失败不留痕），神态还在
+      spy.mockResolvedValueOnce({ roles: [], boxes: [], markDescs: [], atSec: 0, tries: 1, why: "测试：没认出", verified: 0, verifyWhy: "" });
+      const miss = await request(app).post(`/api/branch/templates/${id}/detect-roles`).set(asOwner()).send({});
+      expect(miss.status).toBe(200);
+      expect((await BranchTemplate().findById(id).lean()).markExprs).toHaveLength(2);
+
+      // ② 认出来了、而且恰好也是两个人 → 新 markSlots 与旧的**逐字相同**（标签只由人数决定）——
+      //    正因为长度闸拦不住，这里必须无条件清
+      spy.mockResolvedValueOnce({
+        roles: [
+          { label: "最左边", desc: "白色、抬手", labelConfirmed: false },
+          { label: "最右边", desc: "白色、蹲下", labelConfirmed: false },
+        ],
+        boxes: [],
+        markDescs: ["白色、抬手", "白色、蹲下"],
+        atSec: 2,
+        tries: 1,
+        why: "",
+        verified: 2,
+        verifyWhy: "",
+      });
+      const hit = await request(app).post(`/api/branch/templates/${id}/detect-roles`).set(asOwner()).send({});
+      expect(hit.status).toBe(200);
+      expect(hit.body.template.markSlots).toEqual(["最左边", "最右边"]);
+      expect(hit.body.template.markExprs).toBeUndefined();
+      const doc = await BranchTemplate().findById(id).lean();
+      expect(doc.markExprs).toBeUndefined();
+      expect(doc.markDescs).toEqual(["白色、抬手", "白色、蹲下"]); // 其余照旧写
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("jobId 是编的 / 形状不对 → 404 整句（不泄露任何凭据的存在性）", async () => {
@@ -2567,6 +2998,17 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     expect(text).not.toContain("甲".repeat(61));
   });
 
+  test("★ 点名清单里有人戴眼镜 / 帽子时才加配饰 / 侧脸那一句，排在「不许保留原有的发型…」之后（2026-10-29 付费对照：没有它戴眼镜的侧脸男孩两发都没换头）；别的模板逐字节不变", () => {
+    const plain = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
+    expect(plain).not.toMatch(/戴在头上的东西/);
+    expect(plain).toMatch(/任何一个人物都不许保留原有的发型、发色、面部或衣服。\n点名清单/);
+    const roster = ["1|27|左侧靠前|深棕短发，穿白色短袖", "2|74|右侧靠前|深棕短发，戴黑框眼镜，穿白色衬衫"].join("\n");
+    const lines = blockout.blockoutPrompt(blockout.parseRoles(roster)).split("\n");
+    const keep = lines.findIndex((l) => l.startsWith("任何一个人物都不许保留"));
+    expect(lines[keep + 1]).toBe("眼镜、帽子、耳机这类戴在头上的东西一并去掉；侧脸、低头或背对镜头的人同样整个头都换成光滑的白色人偶头。");
+    expect(lines[keep + 2]).toMatch(/^点名清单/);
+  });
+
   test("★★ 全白版的四句要害都在（少一句就有一种挂错卡的路子）", () => {
     const text = blockout.blockoutPrompt(blockout.parseRoles(visionLines(2)));
     // ① 全白 + **完全相同**：这一版的全部机制就是"不要有任何区分"，不需要维持任何绑定
@@ -2583,6 +3025,456 @@ describe("角色位上限（单元）—— BLOCKOUT_ROLE_MAX 是这条规则的
     expect(text).toContain("包括下面点名清单里的每一个人在内");
     expect(text).toContain("\n1. 位置1，第 1 个人\n");
     expect(text).toContain("\n2. 位置2，第 2 个人\n");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+describe("神态列（单元）—— parseRoles 的 meta.exprs 与 sanitizeExpr", () => {
+  // ★★ 白模保留神态的 D 方案（2026-10-26 付费小验后定的）：看帧那一发在每行末尾多写一列
+  //   「神态：…」，解析时从行尾摘走、进 markExprs。两条硬约束都在这一组里钉：
+  //   ① 实测模型常在神态列后面多写一个「|」—— 不先去行尾空列就一个神态都认不出；
+  //   ② 前四列（认人 / 横向位置 / 位置 / 外观）一个字都不许变 —— 它们是序数与挂卡的全部输入。
+  const blockout = require("../src/services/blockoutize.service");
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+
+  let warnSpy;
+  beforeEach(() => {
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warnSpy.mockRestore());
+
+  /** 去掉每行末尾的神态列（连同行尾空列），得到"同一份回话的老形状" —— 拿它对照前四列 */
+  const withoutExpr = (text) =>
+    text
+      .split("\n")
+      .map((l) => l.replace(/[|｜]\s*神态\s*[:：][^|｜]*[|｜]?\s*$/, ""))
+      .join("\n");
+  const parse = (text) => {
+    const meta = {};
+    const roles = blockout.parseRoles(text, meta);
+    return { roles, exprs: meta.exprs, allSlots: meta.allSlots };
+  };
+
+  // 2026-10-26 付费小验里看帧那一发的真实回话（逐字，含行尾那个「|」）
+  const REAL =
+    "1|75|右侧靠前|深棕短发，戴黑框眼镜，穿浅灰翻领衬衫|神态：先惊讶张嘴，后垂眼抿唇|\n" +
+    "2|27|左侧靠前|深棕短发，穿印黑猫图案的白色短袖|神态：先平静，后惊讶张嘴，再大笑|";
+
+  test("★★ 真实回话（神态列后面还多一个「|」）→ 两个神态都认得出，且跟着人排到左右序上", () => {
+    const { roles, exprs } = parse(REAL);
+    expect(roles.map((r) => r.label)).toEqual(["最左边", "最右边"]);
+    expect(roles.map((r) => r.desc)).toEqual([
+      "左侧靠前，深棕短发，穿印黑猫图案的白色短袖",
+      "右侧靠前，深棕短发，戴黑框眼镜，穿浅灰翻领衬衫",
+    ]);
+    // ★ 重要度序（男孩在前）与左右序相反：神态必须与 roles **同序**，不是按解析原序
+    expect(exprs).toEqual(["先平静，后惊讶张嘴，再大笑", "先惊讶张嘴，后垂眼抿唇"]);
+  });
+
+  test("★★ 前四列一个字不变：带神态列与不带神态列的同一份回话，roles 逐字段相等", () => {
+    const visionLines = (n) =>
+      Array.from({ length: n }, (_, i) => `${i + 1}|${(i * 37) % 100}|位置${i + 1}|第 ${i + 1} 个人|神态：表情${i + 1}|`).join("\n");
+    const fixtures = [
+      REAL,
+      visionLines(2),
+      visionLines(5),
+      visionLines(12), // 截断到 9 + 序数按 12 个人算
+      // 没有横向位置的老格式也带了神态列（退回按重要度序）
+      "1|画面正中央|白发少年|神态：一直微笑\n2|左侧靠前|红发女武士|神态：先皱眉，后大笑",
+    ];
+    for (const text of fixtures) {
+      const a = parse(text);
+      const b = parse(withoutExpr(text));
+      expect(withoutExpr(text)).not.toMatch(/神态/); // 对照组确实是老形状
+      expect(a.roles).toEqual(b.roles);
+      expect(a.allSlots).toEqual(b.allSlots);
+      expect(a.exprs).toHaveLength(a.roles.length);
+      expect(b.exprs).toEqual(b.roles.map(() => ""));
+    }
+  });
+
+  test("★★ 截断 + 排序之后神态仍跟着本人（exprs[i] 就是 roles[i] 那个人的）", () => {
+    // 12 个人，重要度序与左右序**反着**来（第 i 个人 x = 100 - i×8）
+    const text = Array.from(
+      { length: 12 },
+      (_, i) => `${i + 1}|${100 - i * 8}|位置${i + 1}|第 ${i + 1} 个人|神态：表情${i + 1}`,
+    ).join("\n");
+    const { roles, exprs } = parse(text);
+    expect(roles).toHaveLength(9);
+    expect(exprs).toHaveLength(9);
+    roles.forEach((r, k) => {
+      const who = /第 (\d+) 个人/.exec(r.desc)[1];
+      expect(exprs[k]).toBe(`表情${who}`);
+    });
+  });
+
+  test("★ 老回话（四列 / 三列，没有神态列）→ roles 与今天逐字相同，exprs 全是空串", () => {
+    const four = "1|50|画面正中央|白发、黑金色长袍的少年\n2|15|左侧靠前|红发红甲的女武士";
+    expect(parse(four)).toEqual({
+      roles: [
+        { label: "最左边", desc: "左侧靠前，红发红甲的女武士", labelConfirmed: false },
+        { label: "最右边", desc: "画面正中央，白发、黑金色长袍的少年", labelConfirmed: false },
+      ],
+      exprs: ["", ""],
+      allSlots: ["最左边", "最右边"],
+    });
+    // 四列老回话也带了行尾「|」：照旧（desc 本来就跳过空列）
+    expect(parse(four.replace(/\n/, "|\n") + "|").roles).toEqual(parse(four).roles);
+    const three = "1|画面正中央|白发少年\n2|左侧靠前|红发女武士\n3|右后方|黑衣人";
+    const t = parse(three);
+    expect(t.roles.map((r) => r.desc)).toEqual(["画面正中央，白发少年", "左侧靠前，红发女武士", "右后方，黑衣人"]);
+    expect(t.exprs).toEqual(["", "", ""]);
+  });
+
+  test("★ 漏写「神态：」前缀：认出横向位置、后面恰好 3 列、末列像神态 → 当神态摘走，不并进 desc", () => {
+    // ★ 不摘的话「惊讶张嘴」会并进 desc，再经点名清单写进白模化提示词 —— 而那份提示词说的是「没有表情」
+    const { roles, exprs } = parse("1|75|右侧靠前|白衬衫男孩|先惊讶张嘴，后垂眼抿唇|\n2|27|左侧靠前|短袖女孩|先平静，后大笑");
+    expect(roles.map((r) => r.desc)).toEqual(["左侧靠前，短袖女孩", "右侧靠前，白衬衫男孩"]);
+    expect(exprs).toEqual(["先平静，后大笑", "先惊讶张嘴，后垂眼抿唇"]);
+    // 不以「先 / 一直」起头、但含表情词的也算（正向证据）
+    const face = parse("1|30|左侧|白发少年|面带微笑");
+    expect(face.roles[0].desc).toBe("左侧，白发少年");
+    expect(face.exprs).toEqual(["面带微笑"]);
+  });
+
+  test("★ 漏写前缀但末列说不清是神态（外观里多了一个「|」）/ 多出不止一列 / 没有横向位置 → 照旧并进 desc", () => {
+    const look = parse("1|30|左侧|白发少年|黑金色长袍");
+    expect(look.roles[0].desc).toBe("左侧，白发少年，黑金色长袍");
+    expect(look.exprs).toEqual([""]);
+    // ★★ 复核抓到的那两句：原来兜底只问「不像外观」，这两句都被当神态摘走、desc 少了半句认人的依据
+    const umbrella = parse("1|30|左侧|白发少年|手里拿伞");
+    expect(umbrella.roles[0].desc).toBe("左侧，白发少年，手里拿伞");
+    expect(umbrella.exprs).toEqual([""]);
+    const tall = parse("1|70|右侧|黑衣人|身材高大");
+    expect(tall.roles[0].desc).toBe("右侧，黑衣人，身材高大");
+    expect(tall.exprs).toEqual([""]);
+    const many = parse("1|30|左侧|白发少年|手里拿剑|在笑");
+    expect(many.roles[0].desc).toBe("左侧，白发少年，手里拿剑，在笑");
+    expect(many.exprs).toEqual([""]);
+    const noX = parse("1|左侧|白发少年|一直在笑");
+    expect(noX.roles[0].desc).toBe("左侧，白发少年，一直在笑");
+    expect(noX.exprs).toEqual([""]);
+  });
+
+  test("★★ 带前缀的列在哪一列都摘、「表情：」也算前缀 —— 一个字都不并进 desc", () => {
+    // 复核抓到：原来只看末列，`…|神态：大笑|多写一列` 整行并进 desc，带着「神态：大笑」进了白模化提示词
+    const tail = parse("1|30|左侧|白发少年|神态：大笑|多写一列");
+    expect(tail.roles[0].desc).toBe("左侧，白发少年，多写一列");
+    expect(tail.exprs).toEqual(["大笑"]);
+    const mid = parse("1|50|画面正中央|神态：先笑|白发少年");
+    expect(mid.roles[0].desc).toBe("画面正中央，白发少年");
+    expect(mid.exprs).toEqual(["先笑"]);
+    // 「表情：」—— 原来走漏写前缀那条，存下来的是「表情：大笑」
+    const syn = parse("1|30|左侧|白发少年|表情：大笑");
+    expect(syn.roles[0].desc).toBe("左侧，白发少年");
+    expect(syn.exprs).toEqual(["大笑"]);
+    // 模型把提示词示例的「」一起抄了
+    const quoted = parse("1|30|左侧|白发少年|「神态：先平静，后大笑」");
+    expect(quoted.roles[0].desc).toBe("左侧，白发少年");
+    expect(quoted.exprs).toEqual(["先平静，后大笑"]);
+    // ⚠ 「神态自若」开头的两个字不是前缀（冒号必须有）：没有横向位置的老格式里它照旧是描述
+    expect(parse("1|画面正中央|神态自若的老者").roles[0].desc).toBe("画面正中央，神态自若的老者");
+  });
+
+  test("★ 看不清 / 看不见 / 被遮住 / 无 / NONE / 只剩符号 → 空串；「无表情」「背对镜头」留着", () => {
+    const { exprs } = parse(
+      [
+        "1|10|左|甲|神态：看不清",
+        "2|30|左中|乙|神态：看不清脸|",
+        "3|50|中|丙|神态：无",
+        "4|70|右中|丁|神态：NONE",
+        "5|90|右|戊|神态：一直面无表情",
+        "6|95|最右|己|神态：无表情",
+      ].join("\n"),
+    );
+    expect(exprs).toEqual(["", "", "", "", "一直面无表情", "无表情"]);
+    const s = blockout.sanitizeExpr;
+    // ★ 复核补的几种说法：原来原样留下，App 写成「神态：凛看不见脸」进付费提示词
+    for (const raw of [
+      "神态：看不见脸",
+      "神态：无法看到正脸",
+      "神态：看不出表情",
+      "神态：被遮挡",
+      "神态：脸被头发遮住",
+      "神态：被前面的人挡住",
+      "神态：不可见",
+      "神态：—",
+      "神态：……",
+    ]) {
+      expect(s(raw)).toBe("");
+    }
+    // 只丢那一截
+    expect(s("神态：先笑，后被头发遮住")).toBe("先笑");
+    // 「背对镜头」是白模视频里本来就有的姿态，留着
+    expect(s("神态：背对镜头")).toBe("背对镜头");
+  });
+
+  test("★★ 一行里只剩神态那一列（没有位置 / 外观）→ 行留着、desc 记占位：人数不变，神态也不进白模化提示词", () => {
+    const { roles, exprs } = parse("1|30|神态：笑\n2|70|右边|黑衣人|神态：皱眉");
+    expect(roles.map((r) => r.label)).toEqual(["最左边", "最右边"]); // 两个人都还在，序数不挪
+    expect(roles[0].desc).toBe(blockout.EXPR_ONLY_DESC);
+    expect(exprs).toEqual(["笑", "皱眉"]);
+    // ★ 复核抓到的那一处：原来 desc 是「神态：笑」，点名清单里出现「1. 神态：笑」
+    const prompt = blockout.blockoutPrompt(roles);
+    expect(prompt).toContain(`\n1. ${blockout.EXPR_ONLY_DESC}\n`);
+    expect(prompt).not.toMatch(/神态|笑|皱眉/);
+    // 没有横向位置、行尾多一个「|」也一样
+    const noX = parse("1|神态：笑|\n2|右边|黑衣人");
+    expect(noX.roles.map((r) => r.desc)).toEqual([blockout.EXPR_ONLY_DESC, "右边，黑衣人"]);
+    expect(noX.exprs).toEqual(["笑", ""]);
+    // ⚠ 占位只给「摘走了神态列」的行：一列都没有的行照旧丢（与没有神态列时一样）
+    expect(parse("1|30|\n2|70|右边|黑衣人").roles).toHaveLength(1);
+  });
+
+  test("★★ 不管模型怎么写，认出来的神态都进不了白模化提示词（人数也不变）", () => {
+    const fixtures = [
+      REAL,
+      "1|50|画面正中央|神态：先惊讶张嘴|白发少年\n2|15|左侧靠前|红发女武士|神态：一直皱眉|多写一列",
+      "1|30|神态：冷笑|\n2|70|右边|黑衣人|表情：大笑",
+      "1|75|右侧靠前|白衬衫男孩|先惊讶张嘴，后垂眼抿唇|\n2|27|左侧靠前|短袖女孩|一直皱眉",
+    ];
+    for (const text of fixtures) {
+      const roles = blockout.parseRoles(text);
+      expect(roles).toHaveLength(2);
+      expect(blockout.blockoutPrompt(roles)).not.toMatch(/神态|表情：|惊讶|张嘴|皱眉|冷笑|大笑|垂眼/);
+    }
+  });
+
+  test("★ 回话被截断（opts.truncated）→ 只有被切的最后一行神态记空串、半截列名不进 desc；认人与没截断时一样", () => {
+    const cutParse = (text) => {
+      const meta = {};
+      const roles = blockout.parseRoles(text, meta, { truncated: true });
+      return { roles, exprs: meta.exprs };
+    };
+    const text = "1|50|画面正中央|白发少年|神态：先平静，后大笑\n2|15|左侧靠前|红发女武士|神态：先惊";
+    // 对照：不知道被截断时，半截的「先惊」被当真（这正是要挡的）；也不记截断警告
+    const full = parse(text);
+    expect(full.exprs).toEqual(["先惊", "先平静，后大笑"]);
+    expect(warnSpy.mock.calls.flat().join(" ")).not.toMatch(/看帧回话被截断/);
+    const cut = cutParse(text);
+    expect(cut.roles).toEqual(full.roles); // 认人一个字不变（被切的那一行照样算一个人）
+    expect(cut.exprs).toEqual(["", "先平静，后大笑"]);
+    expect(warnSpy.mock.calls.flat().join(" ")).toMatch(/看帧回话被截断/);
+    // 切在列名上（冒号还没写出来）/ 漏写前缀的半截神态：都不进 desc、也不当神态
+    for (const tail of ["神", "神态", "表情", "一直皱"]) {
+      const r = cutParse(`1|50|画面正中央|白发少年|神态：先平静\n2|15|左侧靠前|红发女武士|${tail}`);
+      expect(r.roles.map((x) => x.desc)).toEqual(["左侧靠前，红发女武士", "画面正中央，白发少年"]);
+      expect(r.exprs).toEqual(["", "先平静"]);
+    }
+    // 切在描述中间（还没写到神态列）：认人与以前逐字相同
+    const midDesc = cutParse("1|50|画面正中央|白发少年|神态：先平静\n2|15|左侧靠前|红发女");
+    expect(midDesc.roles.map((x) => x.desc)).toEqual(["左侧靠前，红发女", "画面正中央，白发少年"]);
+    expect(midDesc.exprs).toEqual(["", "先平静"]);
+    // 行尾还有空行：切的仍是最后一个非空行
+    expect(cutParse(text + "\n\n").exprs).toEqual(["", "先平静，后大笑"]);
+  });
+
+  test("visionReply：读出模型那段话与 finish_reason（length = 被截断）；回包不是 JSON 照旧抛", () => {
+    const body = (choice) => JSON.stringify({ choices: [choice] });
+    expect(blockout.visionReply(body({ message: { content: "1|50|中|甲" }, finish_reason: "length" }))).toEqual({
+      content: "1|50|中|甲",
+      truncated: true,
+    });
+    expect(blockout.visionReply(body({ message: { content: "x" }, finish_reason: "stop" }))).toEqual({ content: "x", truncated: false });
+    expect(blockout.visionReply(body({ message: { content: "x" } }))).toEqual({ content: "x", truncated: false });
+    expect(blockout.visionReply("")).toEqual({ content: "", truncated: false });
+    expect(() => blockout.visionReply("<!doctype html>")).toThrow();
+  });
+
+  test("sanitizeExpr：绑定分隔符清掉、分号顿号换逗号、外观分句丢掉、截到 EXPR_MAX（落在分句边界）、幂等", () => {
+    const s = blockout.sanitizeExpr;
+    expect(blockout.EXPR_MAX).toBe(16);
+    // 括号 / = / @ / 换行去掉；；与顿号换成「，」（App 套用句里「；」分人、「=」绑定、@ 点名）
+    expect(s("神态：先平静、后惊讶张嘴；再（大笑）=@")).toBe("先平静，后惊讶张嘴，再大笑");
+    expect(s("神态:先平静;后大笑")).toBe("先平静，后大笑");
+    // 外观混进神态列：按分句丢掉（套用时会和卡图打架）
+    expect(s("神态：戴眼镜，先皱眉，穿红衣服")).toBe("先皱眉");
+    // ★ 表情里的「眼」「发」不误伤（眯眼 / 发呆 / 脸红都是神态）
+    expect(s("神态：先发呆，后眯眼，脸红")).toBe("先发呆，后眯眼，脸红");
+    // 混着看不清的那一截只丢那一截
+    expect(s("神态：先笑，后背过身看不清")).toBe("先笑");
+    // 超长：退到上一个「，」，不留半截词
+    expect(s("神态：先平静，后惊讶张嘴，再眯眼大笑然后哭")).toBe("先平静，后惊讶张嘴");
+    // 一个「，」都没有才硬切
+    const long = s("神态：" + "笑".repeat(30));
+    expect(long).toBe("笑".repeat(16));
+    for (const raw of ["神态：先平静、后惊讶张嘴；再（大笑）=@", "神态：先平静，后惊讶张嘴，再眯眼大笑然后哭", "神态：" + "笑".repeat(30)]) {
+      const once = s(raw);
+      expect(once.length).toBeLessThanOrEqual(blockout.EXPR_MAX);
+      expect(once).not.toMatch(/[（）()=＝；;@＠\n]/);
+      expect(s(once)).toBe(once); // 幂等
+    }
+  });
+
+  test("★★ sanitizeExpr：常见神态短语不误伤（发色 / 胡子那几个词带了闸），真外观照样丢", () => {
+    const s = blockout.sanitizeExpr;
+    // 复核实跑：原来这几句分别中了「直发」「白发」「红发」「胡子」，整句或半句被清空
+    for (const [raw, want] of [
+      ["神态：一直发呆", "一直发呆"],
+      ["神态：一直发抖", "一直发抖"],
+      ["神态：先笑，后一直发抖", "先笑，后一直发抖"],
+      ["神态：脸红发烫", "脸红发烫"],
+      ["神态：吓得脸色煞白发抖", "吓得脸色煞白发抖"],
+      ["神态：急得直发愣", "急得直发愣"],
+      // 下面两句各自只有一道闸挡得住：前一个字的闸（「一」）/ 后一个字的闸（「抖」）—— 两道都得留着
+      ["神态：一直发闷", "一直发闷"],
+      ["神态：面色苍白发抖", "面色苍白发抖"],
+      ["神态：吹胡子瞪眼", "吹胡子瞪眼"],
+      // ★ 冒号必须有：「神态自若」开头那两个字不是前缀（原来被剥成「自若」，再洗一遍又变了）
+      ["神态：神态自若", "神态自若"],
+      ["神态自若", "神态自若"],
+    ]) {
+      expect(s(raw)).toBe(want);
+    }
+    // 反例：真是外观的分句照样丢
+    expect(s("神态：白发苍苍，先皱眉")).toBe("先皱眉");
+    expect(s("神态：金发碧眼，一直微笑")).toBe("一直微笑");
+    expect(s("神态：一头短发，一直微笑")).toBe("一直微笑");
+    expect(s("神态：胡子拉碴，一直冷笑")).toBe("一直冷笑");
+    expect(s("神态：身材高大，先皱眉")).toBe("先皱眉");
+    expect(s("神态：穿白色T恤")).toBe("");
+  });
+
+  test("★ sanitizeExpr：「表情：」前缀与叠写的前缀一次剥完、分句开头的前缀也剥", () => {
+    const s = blockout.sanitizeExpr;
+    expect(s("表情：大笑")).toBe("大笑");
+    expect(s("神态：表情：大笑")).toBe("大笑");
+    expect(s("神态：先笑，表情：大哭")).toBe("先笑，大哭");
+    expect(s("神态 ： 先平静")).toBe("先平静");
+  });
+
+  test("★★ sanitizeExpr：引号连同里面说的话一起去掉（App 里引号是台词的判据），整句被一对引号包着只拆那一对", () => {
+    const s = blockout.sanitizeExpr;
+    // 口型那半句模型很自然地写出台词：话去掉、动词留着（口型靠它）
+    expect(s("神态：先平静，后喊“快跑”")).toBe("先平静，后喊");
+    expect(s("神态：先说「快跑」，后大笑")).toBe("先说，后大笑");
+    expect(s('神态："别走"，一直哭')).toBe("一直哭");
+    expect(s("神态：先笑，后念叨『怎么会』")).toBe("先笑，后念叨");
+    expect(s("神态：做出‘嘘’的口型")).toBe("做出的口型");
+    // 整句被包着（提示词示例本身就套着「」，模型会照抄）：只拆那一对，神态留着
+    expect(s("神态：「先平静，后大笑」")).toBe("先平静，后大笑");
+    expect(s("「神态：先平静，后大笑」")).toBe("先平静，后大笑");
+    expect(s("神态：“先平静，后大笑”")).toBe("先平静，后大笑");
+    // 不成对的引号单个去掉
+    expect(s("神态：先笑，后喊“快")).toBe("先笑，后喊快");
+    // ★★ App 的台词判据（与 app 仓 segmentGen.hasDialogue / shotScript.LINE_QUOTE 同一条正则）一条都不许命中
+    const APP_DIALOGUE = /[「『“"].{1,}?[」』”"]/;
+    for (const raw of [
+      "神态：先平静，后喊“快跑”",
+      "神态：先说「快跑」，后大笑",
+      '神态："别走"，一直哭',
+      "神态：「先平静，后大笑」",
+      "神态：先笑，后喊“快",
+      "神态：“快”，“跑”，一直笑",
+      "神态：先平静、后惊讶张嘴；再（大笑）=@",
+      "神态：神态：神态自若",
+      "神态：吓得脸色煞白发抖",
+    ]) {
+      const once = s(raw);
+      expect(once).not.toMatch(APP_DIALOGUE);
+      expect(once).not.toMatch(/[“”‘’"＂「」『』]/);
+      expect(s(once)).toBe(once); // 幂等
+    }
+  });
+
+  test("★★ 看帧提示词：只在末尾接了神态列，前四列那几句**逐字不变**；字数上限从 EXPR_MAX 来", () => {
+    const text = blockout.visionPrompt();
+    expect(text).toContain("每个人物给一条，格式严格为：`序号|横向位置|位置|外观特征|神态：…`。");
+    // 前四列的三句说明一个字没动
+    expect(text).toContain(
+      "横向位置写一个 0~100 的整数：0 = 紧贴画面左边缘，100 = 紧贴画面右边缘，按这个人**身体中心**的水平位置估；走动的人按他大部分时间所在的位置；",
+    );
+    expect(text).toContain("位置写他在画面里的大致位置（如「画面正中央」「左侧靠前」）；");
+    expect(text).toContain("外观特征写发色、发型、服装颜色与款式、明显道具，控制在 30 字内。");
+    // 神态那一句（与付费小验逐字相同）
+    expect(text).toContain(
+      `最后一列以「神态：」开头，按先后写这个人在这几帧里的表情、口型和视线，${blockout.EXPR_MAX} 字内（如「神态：先平静，后惊讶张嘴，再大笑」）；看不清脸就写「神态：看不清」。`,
+    );
+    // 神态那一句排在外观那一句之后（说明紧跟着它要说明的那一列）
+    expect(text.indexOf("最后一列以「神态：」开头")).toBeGreaterThan(text.indexOf("外观特征写发色"));
+  });
+
+  test("★★ 白模化提示词一个字不变：神态不进点名清单", () => {
+    const a = blockout.blockoutPrompt(blockout.parseRoles(REAL));
+    const b = blockout.blockoutPrompt(blockout.parseRoles(withoutExpr(REAL)));
+    expect(a).toBe(b);
+    expect(a).not.toMatch(/神态|垂眼|大笑/);
+  });
+
+  describe("markExprsAfterRolesEdit（作者改 roles 时神态怎么跟着走）", () => {
+    const slots = ["最左边", "从左数第2个", "最右边"];
+    const doc = (over = {}) => ({
+      markSlots: slots,
+      markExprs: ["皱眉", "大笑", "冷笑"],
+      roles: [
+        { label: "最左边", desc: "红发女武士" },
+        { label: "从左数第2个", desc: "白发少年" },
+        { label: "最右边", desc: "黑衣剑客" },
+      ],
+      ...over,
+    });
+    const after = (d, roles) => BranchTemplate().markExprsAfterRolesEdit(d, roles);
+
+    test("原样核对 → 原样留着", () => {
+      expect(after(doc(), doc().roles)).toEqual(["皱眉", "大笑", "冷笑"]);
+    });
+    test("对调 → 跟着 desc 走", () => {
+      expect(
+        after(doc(), [
+          { label: "最左边", desc: "白发少年" },
+          { label: "从左数第2个", desc: "红发女武士" },
+          { label: "最右边", desc: "黑衣剑客" },
+        ]),
+      ).toEqual(["大笑", "皱眉", "冷笑"]);
+    });
+    test("删位 + 左移 → 搬过去，空出来的位置清空", () => {
+      expect(
+        after(doc(), [
+          { label: "最左边", desc: "红发女武士" },
+          { label: "从左数第2个", desc: "黑衣剑客" },
+        ]),
+      ).toEqual(["皱眉", "冷笑", ""]);
+    });
+    test("★ 认不准就清空：desc 改写过 / 新旧任一边重复 / 空 desc / label 不在 markSlots 里", () => {
+      // 改写过
+      expect(after(doc(), [{ label: "最左边", desc: "红甲女武士" }])).toEqual(["", "", ""]);
+      // 新提交里同一句 desc 出现两次（两个位子都写成同一句）
+      expect(
+        after(doc(), [
+          { label: "最左边", desc: "白发少年" },
+          { label: "最右边", desc: "白发少年" },
+        ]),
+      ).toEqual(["", "", ""]);
+      // 旧 roles 里本来就重复
+      const dupOld = doc({
+        roles: [
+          { label: "最左边", desc: "白人偶" },
+          { label: "从左数第2个", desc: "白人偶" },
+          { label: "最右边", desc: "黑衣剑客" },
+        ],
+      });
+      expect(after(dupOld, dupOld.roles)).toEqual(["", "", "冷笑"]);
+      // ★★ 旧 roles 里重复、作者把其中一个改写了 —— 剩下那句「白人偶」在**新** roles 里变成唯一，
+      //   新侧那道闸拦不住；只有旧侧那道（同一句 desc 在旧 roles 里出现不止一次就不认）挡得住。
+      //   不挡的话，「最左边」拿到的是旧 roles 里**最后写进去**的那个白人偶的神态（大笑），零报错。
+      //   （复核实测：撤掉旧侧那道闸，原来 263 条全绿 —— 上面那条用例新旧两边一样重复，被新侧那道顶掉了。）
+      expect(
+        after(dupOld, [
+          { label: "最左边", desc: "白人偶" },
+          { label: "从左数第2个", desc: "白人偶乙" },
+          { label: "最右边", desc: "黑衣剑客" },
+        ]),
+      ).toEqual(["", "", "冷笑"]);
+      // 空 desc
+      expect(after(doc(), [{ label: "最左边", desc: "" }])).toEqual(["", "", ""]);
+      // label 不在 markSlots 里（存不下）
+      expect(after(doc(), [{ label: "从左数第7个", desc: "白发少年" }])).toEqual(["", "", ""]);
+    });
+    test("★ 不凭空创建：没有 markExprs / 长度对不上 / 不是序数方案 → null（调用方什么都不写）", () => {
+      expect(after(doc({ markExprs: undefined }), doc().roles)).toBeNull();
+      expect(after(doc({ markExprs: ["皱眉"] }), doc().roles)).toBeNull();
+      expect(after(doc({ markSlots: undefined }), doc().roles)).toBeNull();
+    });
   });
 });
 
@@ -3404,6 +4296,69 @@ describe("人偶描述 markDescs（与 roles[].desc 是两件事）", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+describe("神态 markExprs 的出口（与 markSlots 下标对齐，真有才出）", () => {
+  const BranchTemplate = () => require("../src/models/BranchTemplate");
+  const slots = ["最左边", "从左数第2个", "最右边"];
+
+  async function withExprs(markExprs, extra = {}) {
+    const tpl = await createTemplate(nextTs());
+    await BranchTemplate().updateOne(
+      { _id: tpl.id },
+      {
+        $set: {
+          roles: slots.map((label, i) => ({ label, desc: `第${i + 1}个人`, labelConfirmed: false })),
+          markSlots: slots,
+          ...(markExprs ? { markExprs } : {}),
+          ...extra,
+        },
+      },
+    );
+    return tpl;
+  }
+  const detailOf = async (id, who = asOwner) => (await request(app).get(`/api/branch/templates/${id}`).set(who())).body.template;
+
+  test("真有就出，部分空串原样留着（长度是承重的）", async () => {
+    const tpl = await withExprs(["一直皱眉", "", "先笑后哭"]);
+    expect((await detailOf(tpl.id)).markExprs).toEqual(["一直皱眉", "", "先笑后哭"]);
+  });
+
+  test("★ 长度与 markSlots 不等 → 整份不出（少一条就不知道少的是谁，按下标硬配 = 挂到下一个人身上）", async () => {
+    const tpl = await withExprs(["一直皱眉"]);
+    expect((await detailOf(tpl.id)).markExprs).toBeUndefined();
+  });
+
+  test("★ 全是空串 → 不出（与没有这一位要做的事完全相同）", async () => {
+    const tpl = await withExprs(["", "", ""]);
+    expect((await detailOf(tpl.id)).markExprs).toBeUndefined();
+  });
+
+  test("★★ 没有这一位的模板（老模板 / V1）→ 作者核对**不会凭空造出它**", async () => {
+    const tpl = await withExprs(undefined);
+    await request(app)
+      .patch(`/api/branch/templates/${tpl.id}/roles`)
+      .set(asOwner())
+      .send({ roles: slots.map((label, i) => ({ label, desc: `第${i + 1}个人` })) })
+      .expect(200);
+    const doc = await BranchTemplate().findById(tpl.id).lean();
+    expect(doc.markExprs).toBeUndefined();
+    expect((await detailOf(tpl.id)).markExprs).toBeUndefined();
+  });
+
+  test("★ 客户端塞 markExprs 进 PATCH /roles → 被 strip，神态只由服务端按人搬", async () => {
+    const tpl = await withExprs(["一直皱眉", "大笑", "冷笑"]);
+    const res = await request(app)
+      .patch(`/api/branch/templates/${tpl.id}/roles`)
+      .set(asOwner())
+      .send({
+        roles: slots.map((label, i) => ({ label, desc: `第${i + 1}个人` })),
+        markExprs: ["被改了", "被改了", "被改了"],
+      });
+    expect(res.status).toBe(200);
+    expect((await BranchTemplate().findById(tpl.id).lean()).markExprs).toEqual(["一直皱眉", "大笑", "冷笑"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
 describe("分段登记（splits：长视频物理切段，group 归组）", () => {
   /** 分段路的 uploader.upload 假回执：按 so_/du_ 子片段地址回一份"切好的独立资产" */
   function mockPartUpload() {
@@ -3416,7 +4371,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   }
 
   it("34.2s + splits=[17] → 两段独立模板，group 齐全，标题带第 N/M 段", async () => {
-    const ts = Date.now();
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3452,7 +4407,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("分出 <4s 的段整单 400，一个资产都不切", async () => {
-    const ts = Date.now() + 1;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3469,7 +4424,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("分出 >30s 的段整单 400（服务端只验不修）", async () => {
-    const ts = Date.now() + 2;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 40 }));
     const up = mockPartUpload();
     try {
@@ -3486,7 +4441,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("第二段切失败 → 已切资产回收、库里零残留、502 可重试", async () => {
-    const ts = Date.now() + 3;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     let n = 0;
     const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {
@@ -3518,7 +4473,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("低于像素硬门的源（836×480=401,280）→ 切段变换自动放大过门，c_scale 接在 so_/du_ 之后", async () => {
-    const ts = Date.now() + 4;
+    const ts = nextTs();
     // 作者手上那段真实素材的形状：34.18s、836×480 —— 只差 1.6% 就过 407,696 的门
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18, width: 836, height: 480 }));
     const seen = [];
@@ -3562,7 +4517,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("切过段的源视频：孤儿回收口整句拒；删到最后一段时连组源一起回收", async () => {
-    const ts = Date.now() + 6;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 }));
     const up = mockPartUpload();
     try {
@@ -3591,7 +4546,7 @@ describe("分段登记（splits：长视频物理切段，group 归组）", () =
   });
 
   it("像素够的源切段时不带 c_scale（放大只在不够时做）", async () => {
-    const ts = Date.now() + 5;
+    const ts = nextTs();
     resourceSpy.mockImplementation(async (pid) => fakeResource(pid, { duration: 34.18 })); // 720×1280，过门
     const seen = [];
     const up = jest.spyOn(cloudinary.uploader, "upload").mockImplementation(async (subUrl, opts) => {

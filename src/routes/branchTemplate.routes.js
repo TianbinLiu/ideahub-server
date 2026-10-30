@@ -25,6 +25,7 @@ const {
   setCategoryBody,
 } = require("../schemas/branchTemplate.schemas");
 const BranchTemplate = require("../models/BranchTemplate");
+const BranchRecipe = require("../models/BranchRecipe");
 // 白模 V2 的**取件凭据**（两阶段的分界线）。为什么非拆不可见该文件的文件头
 const BlockoutJob = require("../models/BlockoutJob");
 const { cloudinary } = require("../config/cloudinary");
@@ -52,9 +53,13 @@ const {
   buildOutFrameUrl,
   OUT_FRAME_W_ROSTER,
 } = require("../utils/templateVideoAsset");
-const { callArk, chargedArkCall, T_CREATE } = require("../services/arkGateway.service");
+const { callArk, chargedArkCall, regionGate, T_CREATE, setWalletHeaders } = require("../services/arkGateway.service");
+// 地区拒绝话后面补一句钱上的实情：拒绝话的格式（英文 / 中文一行）只有 videoRegion 知道，补话只经它
+const { withDenialNote } = require("../config/videoRegion");
+// 受理之后失败的退款：唯一实现（白模化 r2v 受理时记账、取回时看见 failed 就结账，见 ⑥ 与 finish）
+const taskRefund = require("../services/taskRefund.service");
 const blockout = require("../services/blockoutize.service");
-const { SEEDANCE_2_5, VIDEO_MULT_R2V, paidOnlyDenial } = require("../config/tokens");
+const { SEEDANCE_2_5, VIDEO_MULT_R2V, videoPlanDenial, isPaidUser } = require("../config/tokens");
 const wallet = require("../services/tokenWallet.service");
 // 「谁是管理员」全仓只有 utils/roles 一处判据（铁律六）
 const { isAdmin } = require("../utils/roles");
@@ -126,6 +131,23 @@ function markDescsPayload(doc) {
   return out.some((d) => d) ? { markDescs: out } : {};
 }
 
+/**
+ * 神态那一位的出口（2026-10-26，白模保留神态的 D 方案）。★ 与 `markDescsPayload` 同一条纪律：
+ * **真有才出、长度必须等于 markSlots、全是空串就当没有**。长度对不上就整份不出 ——
+ * 少一条就不知道少的是谁，按下标硬配等于把后面每个人的神态挂到下一个人身上，零报错。
+ * ★ 对所有人都出（不只作者）：它是从原片读出来的表情，清洗时外观已经按分句丢掉，不含身份信息；
+ *   套用的人正要靠它把表情补回来。
+ * ★ 受理回执（startedPayload）与待取回列表**不出**：App 读取件凭据的那一份（jobOf）不认它，
+ *   核对面板与套用都读模板；两处一起接之前先别出（审核那条「要么一起接，要么别出」）。
+ */
+function markExprsPayload(doc) {
+  const exprs = Array.isArray(doc?.markExprs) ? doc.markExprs : null;
+  const slots = Array.isArray(doc?.markSlots) ? doc.markSlots.length : 0;
+  if (!exprs || exprs.length !== slots || !slots) return {};
+  const out = exprs.map((e) => String(e || ""));
+  return out.some((e) => e) ? { markExprs: out } : {};
+}
+
 /** 响应形状。cloudinaryPublicId 刻意不出（纯内部回收记账，客户端拿它没有正当用途） */
 function toTemplatePayload(doc, viewer) {
   if (!doc) return null;
@@ -177,6 +199,8 @@ function toTemplatePayload(doc, viewer) {
     // 人偶描述（写进套用提示词、给 r2v 指认用）。★ 与上面两位同一条纪律：真有才出。
     //   ⚠ 它**不是** roles[].desc 的副本，两者回答的是不同的问题，理由写在 model 里。
     ...markDescsPayload(doc),
+    // 神态（原片里每个人的表情，套用时补回来）。★ 同一条纪律：真有才出、长度等于 markSlots。
+    ...markExprsPayload(doc),
     // ★ source **刻意不出**：它指向作者自己上传的原始素材（可能是有版权的片子），
     //   把 public_id 发给每个逛市场的人没有任何正当用途（同 cloudinaryPublicId）。
     // 分段归组（长视频切段登记）。真有才出；sourcePublicId 不出（同上隐私理由），
@@ -194,6 +218,9 @@ function toTemplatePayload(doc, viewer) {
       : {}),
     status: doc.status,
     provenAt: doc.provenAt ?? null,
+    // 「在哪些出片模型上真实跑通过」（模型 id 数组，没证明过 = 空数组）。存量模板的兜底在 provenModelsOf 一处。
+    // ★ 对所有人都出（不只作者）：它是这个模板的公开事实，App 拿它回答"这个模板能在哪个模型上出片"
+    provenModels: BranchTemplate.provenModelsOf(doc),
     // 身份判定只认 ownerId 对当前账号，绝不拿显示名（CLAUDE.md「拿名字当身份」坑）
     isOwner: viewer ? String(doc.ownerId) === String(viewer._id) : false,
     createdAt: doc.createdAt,
@@ -239,7 +266,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
     //   不是上传口那套 —— V2 起两者不同：上传口收的是"任意原始素材"（(0,600]s、不校比例），
     //   而这条 V1 登记路把**整段原片直接当参考视频**用，它必须满足方舟 edit 的硬约束。
     //   拿上传口那套松窗口复核的话，一段 300s 的素材会被登记成模板，然后每个套用它的人
-    //   在付费出片那一步撞 400 —— 而方舟受理后失败是不退费的。
+    //   在付费出片那一步撞 400（同步 400 会退款，但他白等一趟、前面推演 / 画帧的钱也花了）。
     const meta = templateVideoMeta(resource);
     // ★★ 重复登记的门要在**任何一次付费/转存调用之前**（2026-08-17 加；2026-08-20 又
     //   挪到窗口检查之前）：一段已经分段登记过的长视频再来一次，先撞窗口会得到
@@ -466,7 +493,7 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 //
 // ══ 为什么要拆（2026-08-16，拆之前是一条同步长请求）══════════════════
 // 拆之前这九步在**同一条 HTTP 请求**里跑完，中间含最长 5 分钟的服务端轮询。而这条链路的
-// 钱是在**中途**花掉的（看帧一笔 + r2v 受理一笔，受理后失败不退，F11）—— 于是手机切后台、
+// 钱是在**中途**花掉的（看帧一笔 + r2v 受理一笔，F11）—— 于是手机切后台、
 // 弱网断线、App 进程被系统回收、nginx 超时掐断，任何一条都会让用户**丢掉这一发的结果，
 // 而钱已经花了**，我们这边的日志里却是一次成功。一条要等五分钟的请求本身就是脆的：
 // 它把"钱已经付了"和"东西拿到了"绑在同一个 TCP 连接的命上。
@@ -478,8 +505,10 @@ router.post("/templates", requireAuth, createLimit, validate({ body: createTempl
 //
 // ★★ 这条路**花两次真钱**：⑤ 一次 chat（看帧）+ ⑥ 一次 r2v 出片。两笔都走
 //   services/arkGateway 的同一条计费序列（与 /api/ark 代理**同一份实现**）。
-//   ⑥ 一旦被方舟受理，**失败也不退费**（F11：含真人人脸的视频创建时不拒、
-//   跑到一半才 failed）—— 所以 App 必须在开炼前就把这句话整句写给用户看。
+//   ⑥ 一旦被方舟受理，钱就扣了（F11：含真人人脸的视频创建时不拒、跑到一半才 failed）。
+//   2026-10-07 起方舟明说失败（failed / cancelled / expired）时 **r2v 那一笔自动退回**（services/taskRefund，
+//   按扣的那两桶、恰好一次）；看帧那一笔照旧不退；方舟出成了但产物我们用不了（太短、元数据缺失）也不退 ——
+//   那几种方舟收了钱。所以 App 开炼前仍要把「看帧不退、真人面孔容易失败」写给用户看。
 const BLOCKOUT_MODEL = SEEDANCE_2_5;
 /** 看帧用的对话模型。与 app 的 MODELS.chat 同一个 id（看图说话走同一个模型） */
 const VISION_MODEL = "doubao-seed-2-1-turbo-260628";
@@ -520,6 +549,11 @@ const BOX_TIMEOUT_MS = 60_000;
  *   免得三处各写一句、改一处漏两处（2026-08-15 对抗审查 #4/#9 的起因就是各写各的）。
  */
 const VISION_BILLED_NOTE = "看画面那一步的费用已经产生、无法退回";
+/**
+ * 同一句话的英文（只有地区门禁拒在 ⑥ 那一处用：那句拒绝话是中英双语，英文那半也得知道看帧这笔花了）。
+ * ★ 与上面那句同一个意思，改一句就改另一句。不许有 ASCII 双引号 / 反斜杠（videoRegion.withDenialNote 会抛）。
+ */
+const VISION_BILLED_NOTE_EN = "The frame check that ran first was charged and cannot be refunded.";
 
 // ★ 限流比建模板更严：一发要打 1 次 Cloudinary Admin API（免费档全局 500 次/小时）、
 //   3~8 次抽帧（帧数按时长算或由用户自选，见 blockout.visionFrameTimes）、1 次 chat、1 次 r2v，
@@ -538,13 +572,13 @@ const blockoutPendingLimit = userRateLimit({ max: 30, windowMs: 60 * 1000, scope
 /** 整句失败 —— 全 app 没有任何地方监听 emitApiError，只回错误码等于让用户对着转圈干等（铁律八）。
  *
  * ★★ `billed` 的语义在两阶段里必须**分得开**，别把两件事混成一位：
- *   · 阶段一（开炼）：r2v 一旦被方舟受理就是 `billed:true` —— 受理后失败不退（F11）；
+ *   · 阶段一（开炼）：r2v 一旦被方舟受理就是 `billed:true` —— 钱这一刻就扣了（方舟明说失败时 r2v 那一笔会自动退回）；
  *   · 阶段二（取回结果）：**它自己一分钱都不花**（核实任务、转存、建模板都不计费），
  *     所以它的失败一律 `billed:false` —— 那是「这次没取到」，不是「又花了一笔」。
  *     写成 true 的话，用户会以为每点一次「取回结果」就再扣一笔钱，于是不敢重试 ——
  *     而重试恰恰是我们拆两阶段给他的那条活路。
- *   · 钱确实没了的那两种终局（产物过期、方舟受理后 failed）另有 `lost:true` 一位，
- *     并且**话要说满**（见 BlockoutJob.stateOf 的整句）。
+ *   · 钱确实没了的终局（产物过期没取回、产物不合格）另有 `lost:true` 一位，并且**话要说满**（见 BlockoutJob.stateOf 的整句）；
+ *     方舟受理后 failed 那一种 2026-10-07 起 r2v 那一笔会退回 —— 退了（或正在退）就 `lost:false` 并带 `refund:{state,tokens}`。
  */
 function fail(res, status, message, extra = {}) {
   return res.status(status).json({ ok: false, message, ...extra });
@@ -607,15 +641,29 @@ router.post(
         console.error(`[blockoutize] ${BLOCKOUT_MODEL} 不在 VIDEO_MULT_R2V 价目表里，白模化整条不可用`);
         return fail(res, 503, "白模功能暂时不可用（服务端价目未就绪），本次没有扣费，请稍后再试。", { billed: false });
       }
+      // ★★ 出片地区门禁前置（2026-10-26）：与下面的套餐预检同一个理由 —— 排在**任何一次付费调用之前**。
+      //   门禁挂在 chargedArkCall 上只管那一发本身，而这条路先花一发看帧（⑤，豆包 chat，地区门禁不管对话）、
+      //   再发 Seedance 2.5（⑥）：只靠那一处的话，海外用户先被扣掉看帧那笔钱、再在 r2v 那一步吃 403 ——
+      //   而 403 那句话说的是「没有扣费」。这里拦下就一发都不出网（连 Cloudinary 都不问）。
+      // ★ 执行（off 不判 / observe 只记 would-deny / on 回 403 + billed:false）只在 arkGateway.regionGate 一处，回包形状与
+      //   /api/ark 被拦时逐字相同；⑥ 那一发经 chargedArkCall 还会再过同一道门，结论按请求记着、与这里相同，would-deny 也不重记。
+      // ★ 排在套餐预检**之前**、管理员不豁免：理由同 chargedArkCall 里那一段（地区不给时付钱也没用；这是地区政策不是计费）。
+      // r2v 记号与下面套餐预检的同一个：只用来挑拒绝话（白模化在 MiniMax 上没有对应做法，不指人去换），不影响拦不拦
+      const regionBlock = regionGate({ req, user: req.user, kind: "task", model: BLOCKOUT_MODEL, at: "blockoutize", r2v: { kind: "blockout" } });
+      if (regionBlock) return res.status(regionBlock.status).json(regionBlock.body);
       const w0 = await wallet.getWallet(req.user._id);
       // ★ 管理员免单那一路要跳过套餐门禁 —— 判据只有 utils/roles 一处，
       //   与 services/arkGateway 里那一段逐字同理：那道门守的是"钱"，
       //   对一个根本不花钱的人守它没有意义。不跳的话，挂在免费档上的管理员账号
       //   在这里被 403，而同一发走 /api/ark 却是通的（两处行为分家）。
-      const denied = isAdmin(req.user) ? null : paidOnlyDenial(w0?.planId, BLOCKOUT_MODEL);
+      // ★ 判据与 /api/ark 同一处（config/tokens.videoPlanDenial）：白模化那一发是 r2v，免费版一律不开。
+      //   这里只是**提前**问一次（排在看帧那笔钱之前）；r2v 那一发走 chargedArkCall 时还会再过同一道门。
+      const denied = isAdmin(req.user)
+        ? null
+        : videoPlanDenial({ paid: isPaidUser(w0), kind: "task", model: BLOCKOUT_MODEL, resolution: "720p", r2v: { kind: "blockout" } });
       if (denied) {
-        // 403 而不是 402：充值解决不了，得换套餐（与 /api/ark 同一条口径）
-        return fail(res, 403, denied, { code: "PLAN_REQUIRED", planId: w0?.planId ?? null, billed: false });
+        // 403 而不是 402：没付过钱之前怎么都过不去（与 /api/ark 同一条口径）
+        return fail(res, 403, denied.message, { code: "PLAN_REQUIRED", planId: w0?.planId ?? null, billed: false, ...(denied.allowed ? { allowed: denied.allowed } : {}) });
       }
 
       // ── ④ 前置：现查原片元数据（四组数要靠它校）──────────────────────
@@ -689,8 +737,12 @@ router.post(
       //   报计划数就会出现"报价 3 帧、实际只看了 1 帧、却按 3 帧对上账"，把一次降级藏起来。
       const visionFrames = images.length;
 
+      // ★ 这一发是**豆包 chat**（VISION_MODEL，kind "chat"），不是 Seedance —— 出片地区门禁不管对话（范围等主人拍板，
+      //   见 config/videoRegion 文件头 ①），所以海外的拦截只能靠上面那道预检排在它之前。
       const visionOut = await chargedArkCall({
         user: req.user,
+        // 地区从请求现算（arkGateway.regionGate）。对话今天不归门禁管；照传，判据扩到对话那天不用回来补
+        req,
         // ★ 服务端自己发起的调用：白名单收成**恰好一个** model（比代理那份更严）。
         //   model 不是用户可控的，写成 `() => true` 也不会被利用，但那样一来
         //   "这次调用打的是哪个模型"就没有任何代码表达了。
@@ -728,8 +780,11 @@ router.post(
       //   就再也说不出"画面里到底有几个人偶"了，而量框那一步必须知道（见 BlockoutJob.visionSlots）
       const roleMeta = {};
       try {
-        const parsed = JSON.parse(visionOut.text || "{}");
-        roles = blockout.parseRoles(parsed?.choices?.[0]?.message?.content ?? "", roleMeta);
+        // ★ 回包读法只在 blockout.visionReply（复核后收的）：它顺带读 finish_reason ——
+        //   max_tokens 还是 1200，神态列让每行长了约一半，群像更早顶到上限。截断时认人照旧
+        //   （不拒、不丢行），只是最后那一行的神态不取，并由 parseRoles 响亮记一笔。
+        const reply = blockout.visionReply(visionOut.text);
+        roles = blockout.parseRoles(reply.content, roleMeta, { truncated: reply.truncated });
       } catch (e) {
         console.error("[blockoutize] 视觉回包解析失败:", e.message);
       }
@@ -749,8 +804,11 @@ router.post(
       }
 
       // ── ⑥ 点名：发 r2v edit（这一发是真实付费出片）──────────────────
+      // ★ 这条路上**唯一**一发 Seedance（BLOCKOUT_MODEL = 2.5，kind "task"）：chargedArkCall 里的地区门禁会再判一遍，
+      //   地区结论与看帧之前那道预检相同（regionGate 按请求记着）；门禁档位每次现读 —— 两次之间被拨到 on 的那个窗口见下面 region 那一支。
       const taskOut = await chargedArkCall({
         user: req.user,
+        req,
         modelAllowed: (m) => m === BLOCKOUT_MODEL,
         kind: "task",
         path: "/contents/generations/tasks",
@@ -768,6 +826,11 @@ router.post(
           ratio: "adaptive",
           resolution: "720p",
           watermark: false,
+          // ★ 不出声，显式写出来（2026-10-26）：与 App 的 BLOCKOUT_TASK（app 仓 ai/arkClient.ts，同一个模型、同一个 edit 子任务）
+          //   同一个值 —— edit 会把参考视频里的歌一起复刻，带歌的素材会被方舟在输出端整发拒，片子出不来。
+          //   线上 7 个已发布的白模模板实测都没有音轨，这一行是把一直以来隐含的行为钉死，不跟着方舟的缺省值走。
+          //   出声与否不进价（config/tokens.VIDEO_AUDIO 头上：有声无声同价），edit 路上方舟认这个参数（同一处 2026-08-15 实测）。
+          generate_audio: false,
         },
         // ★ 计价输入时长 = **服务端自己拼 URL 时用的那个 durSec**，不是客户端报的数。
         //   公式仍只在 config/tokens.r2vTokens 一处（这里只把结论递进去）。
@@ -779,9 +842,22 @@ router.post(
       //   那条（同样发生在看帧之后）标的是 true —— 两条自相矛盾，客户端照 false 会告诉
       //   用户"一分钱没动"，用户按虚高的余额再开一发，第二次照样被扣看帧那笔钱。
       if (!taskOut.ok) {
+        if (taskOut.reason === "region") {
+          // ★ 地区门禁拒在这一发，而看帧之前那道预检放行了：两次之间有人把 VIDEO_REGION_GATE 从 observe（或 off）拨到了 on ——
+          //   地区按请求记着，gate 每次现读，看帧那一发要好几秒，这个窗口是真的（2026-10-26 最终审核）。
+          //   拒绝话（双语一行、code REGION_UNAVAILABLE）原样留着，钱上的实情两种语言各补一句（经 videoRegion.withDenialNote，
+          //   不在这里拼：拒绝话的格式只有那一处知道）。那句「没受理、没扣费」说的是视频那一发，补的这句说看帧那一笔。
+          return res.status(taskOut.status).json({
+            ...taskOut.body,
+            message: withDenialNote(taskOut.body.message, { en: VISION_BILLED_NOTE_EN, zh: `不过${VISION_BILLED_NOTE}。` }),
+            billed: true,
+            visionFrames,
+          });
+        }
         // r2v 那一笔连发都没发出去（套餐门禁 / 余额不足 / 不在册）：它一分钱没动，
         // 但看帧那一笔已经花了。把服务层的整句理由原样留着，后面缀上钱的实情。
-        const why = String(taskOut.body?.message || "白模出片这一步没能开始");
+        // ★ 理由多半自带句末标点（套餐门禁那句以「即可使用。」收尾）：先摘掉再接「。」，不然接出「。。」
+        const why = String(taskOut.body?.message || "白模出片这一步没能开始").replace(/[。.!！]+$/u, "");
         return res.status(taskOut.status).json({
           ...taskOut.body,
           message: `${why}。出片那一笔一分钱没动，但${VISION_BILLED_NOTE}。`,
@@ -812,14 +888,28 @@ router.post(
         /* 见下：拿不到任务 id 与"任务没受理"是两件事 */
       }
       if (!taskId) {
-        // 已受理却读不到任务 id：钱已经花出去了，只能照实说（不退是事实，不许粉饰）
+        // 已受理却读不到任务 id：钱已经花出去了，只能照实说（没有任务号就没法记账、也没法在失败时退 —— 不许粉饰）
         console.error("[blockoutize] r2v 任务受理但响应里没有任务 id");
         return fail(res, 502, "AI 已经开始生成，但我们没能拿到任务编号，无法跟进这一发的结果。这一发的费用已经产生、无法退回。", { billed: true, visionFrames });
       }
 
+      // ★★ 先记账再落取件单（services/taskRefund）：这一发的钱（多少、从哪两桶扣的、是不是免单）要在
+      //   方舟明说失败时原样退回 —— 记账只吼不抛；排在取件单前面，取件单落不下去的那条路上失败了也照样能退。
+      await taskRefund.recordCharge({
+        provider: "ark",
+        taskId,
+        kind: "blockout",
+        user: req.user._id,
+        model: BLOCKOUT_MODEL,
+        cost: taskOut.cost,
+        free: taskOut.free,
+        took: taskOut.took,
+        memo: taskOut.memo,
+      });
+
       // ── ⑦ 落取件凭据：**两阶段的分界线就在这里** ──────────────────────
       //
-      // ★★ 到这一行为止钱已经全花掉了（看帧一笔 + r2v 受理一笔，受理后失败不退）。
+      // ★★ 到这一行为止钱已经全花掉了（看帧一笔 + r2v 受理一笔；r2v 那一笔方舟明说失败时会自动退回）。
       //   凭据落不下去 = 用户付了钱却拿不到任何能取回结果的句柄 —— 所以它必须在返回
       //   之前落库成功，落不下要**响亮到能人工兜底**（把 taskId 交给用户），
       //   绝不能只在日志里叹口气然后回 500（那就是把一笔钱静默扔了，铁律八）。
@@ -849,6 +939,13 @@ router.post(
           ...(Array.isArray(roleMeta.allSlots) && roleMeta.allSlots.length
             ? { visionSlots: roleMeta.allSlots }
             : {}),
+          // ★ 神态（看帧这一发顺带记下的，与 markSlots 下标对齐）。与 markSlots **同一批**写：
+          //   它说的是"原片里这几个人"，到 finish 时手上只有白模产物，再也读不出来了。
+          //   只在**长度对得上、且至少有一个人有神态**时写 —— 全是空串与没有这一位要做的事一样，
+          //   长度对不上（不该发生）就宁可不写，也不留一份按下标会错位的数组。
+          ...(Array.isArray(roleMeta.exprs) && roleMeta.exprs.length === roles.length && roleMeta.exprs.some(Boolean)
+            ? { markExprs: roleMeta.exprs }
+            : {}),
           // ★ 存下来只为**回执能重放**：阶段一重试撞上既有凭据时走的是 startedPayload(exist)，
           //   不存的话那条路回出来的帧数是空的，而 App 拿它对账 —— 一条路对得上、另一条对不上，
           //   两边看着都没错（这正是"同一件事两处各说各的"的形状）。
@@ -873,7 +970,7 @@ router.post(
         return fail(
           res,
           500,
-          `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生、无法退回。请把这个任务编号发给我们：${taskId}`,
+          `白模生成已经交给 AI 了，但我们没能记下这一发的取件凭据，暂时没法帮你把结果取回来。这一发的费用已经产生（AI 中途失败的话出片那一笔会自动退回）。请把这个任务编号发给我们：${taskId}`,
           { billed: true, taskId, visionFrames },
         );
       }
@@ -889,7 +986,7 @@ router.post(
 );
 
 /** 阶段一的受理回执 —— **一处实现**（首次受理与"撞上既有凭据"两条路共用）。
- *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经花了、失败也不退（F11）。
+ *  ★ `billed: true`：r2v 已经被方舟受理，这笔钱就已经扣了（方舟明说失败时 r2v 那一笔自动退回，F11）。
  *    这一位在阶段一是"钱花了没有"，在阶段二是"这一次调用花钱了没有"（恒 false），
  *    两边的措辞都要写满，别让 App 自己去猜。
  *
@@ -915,7 +1012,7 @@ function startedPayload(job) {
     billed: true,
     ...(Number.isFinite(frames) && frames > 0 ? { visionFrames: frames } : {}),
     message:
-      "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 受理之后失败也不退费）。" +
+      "白模生成已经交给 AI 了，费用在这一步就已经产生（AI 中途失败的话，出片那一笔会自动退回；看画面那一步不退）。" +
       `出片之后回来点「取回结果」才会建成模板；产物只保 ${BlockoutJob.TTL_HOURS} 小时，过期这一发就没法挽回了。`,
   };
 }
@@ -945,12 +1042,25 @@ async function releaseJob(jobId) {
 }
 
 /** 判定这一发**终局失败**（方舟明说没成 / 产物不合格）。整句理由存下来：
- *  用户可能几小时后才回来看列表，那时再去问方舟已经问不到了，而"为什么没了"必须还说得出口。 */
+ *  用户可能几小时后才回来看列表，那时再去问方舟已经问不到了，而"为什么没了"必须还说得出口。
+ *  @returns {Promise<boolean>} 这一次是不是真的把它改成了 failed（false = 别人先改了：失败退款那条路
+ *    会顺手把它钉成 failed、写上退款那句话 —— 这时要回**库里那句**，别拿自己这句盖过去） */
 async function failJob(jobId, message) {
-  await BlockoutJob.updateOne(
+  const r = await BlockoutJob.updateOne(
     { _id: jobId, status: { $in: ["pending", "claimed"] } },
     { $set: { status: "failed", failMessage: message, claimedAt: null } },
   );
+  return r.modifiedCount > 0;
+}
+
+/** 这一发的 r2v 那一笔退了没有（取回结果时说话用）。查不到账 = null（上线之前的老凭据）；查账本身出错 = undefined（不知道） */
+async function refundOfJob(job) {
+  try {
+    return taskRefund.refundView(await taskRefund.chargeByTask("ark", job.taskId));
+  } catch (e) {
+    console.error(`[blockoutize] 查退款失败 task=${job.taskId}:`, e.message);
+    return undefined;
+  }
 }
 
 /** 「这一发已经取回过了」的回法 —— 幂等路径与首次成功共用同一个形状。
@@ -985,8 +1095,12 @@ async function respondNonFinishable(req, res, job, st) {
   }
   if (st.state === "failed") {
     // ★ lost:true = 钱确实没了且拿不回任何东西。与 billed 分开两位：
-    //   billed 说的是"这一次调用花钱没有"（没有），lost 说的是"开炼那笔还剩什么"（什么都没剩）。
-    fail(res, 502, st.message, { billed: false, lost: true, state: "failed" });
+    //   billed 说的是"这一次调用花钱没有"（没有），lost 说的是"开炼那笔还剩什么"。
+    // ★ 2026-10-07 起方舟明说失败的那一种 r2v 那一笔会退回：退了 / 正在退就 lost:false 并带 refund
+    //   （产物不合格那几种没有退款 ⇒ lost 照旧为真）
+    const refund = await refundOfJob(job);
+    const back = !!refund && (refund.state === "refunded" || refund.state === "refunding");
+    fail(res, 502, st.message, { billed: false, lost: !back, state: "failed", ...(refund ? { refund } : {}) });
     return true;
   }
   if (st.state === "expired") {
@@ -1084,9 +1198,33 @@ router.post(
         });
       }
       if (verdict.state === "failed") {
-        // 终局：方舟明说这一发没成（含 F11 真人脸）。钱不退，照实说，凭据钉成 failed
-        await failJob(claimed._id, verdict.message);
-        return fail(res, 502, verdict.message, { billed: false, lost: true, state: "failed" });
+        // 终局：方舟明说这一发没成（含 F11 真人脸）。
+        // ★ r2v 那一笔按扣的那两桶退回（services/taskRefund，唯一实现、恰好一次 —— 清扫器 / 别人的轮询可能已经退过了，
+        //   它会照实回「已经退了」）。退款没办成（查库抖了）不挡这一步：账还是 open，清扫器会接着退，这里说「会退」。
+        let refund;
+        try {
+          refund = taskRefund.refundView(
+            await taskRefund.settleTask({
+              provider: "ark",
+              taskId: claimed.taskId,
+              status: verdict.upstreamStatus,
+              code: verdict.code,
+              detail: verdict.detail,
+              viewerId: req.user._id,
+            }),
+          );
+        } catch (e) {
+          console.error(`[blockoutize] 失败退款没办成 task=${claimed.taskId}（清扫器会接着办）:`, e.message);
+          refund = undefined;
+        }
+        // 凭据钉成 failed。★ 退款那条路会顺手把它钉成 failed、写上同一句话（BlockoutJob.failedMessage 一处措辞）——
+        //   这里改不动的话就回库里那句（别拿自己这句盖过去）
+        const msg = BlockoutJob.failedMessage({ detail: verdict.detail, refund });
+        const moved = await failJob(claimed._id, msg);
+        const finalMsg = moved ? msg : (await BlockoutJob.findById(claimed._id).select("failMessage").lean())?.failMessage || msg;
+        const back = !!refund && (refund.state === "refunded" || refund.state === "refunding");
+        if (back) setWalletHeaders(res, await wallet.getWallet(req.user._id));
+        return fail(res, 502, finalMsg, { billed: false, lost: !back, state: "failed", ...(refund ? { refund } : {}) });
       }
       if (verdict.state !== "succeeded") {
         // unknown：我们**没问清楚**（上游抖动/回包读不懂）。不替方舟宣判 ——
@@ -1171,9 +1309,9 @@ router.post(
           : `${outIssue}（这一发的费用已经产生、无法挽回，请换一段素材重做。）`;
         // ★★ 结构化告警：修完之后这条分支**只可能在"方舟改了裁短行为"时触发** ——
         //   它是一个需要人工补偿并重新校准 BLOCKOUT_MIN_INPUT_SEC 的信号，不是日常事件。
-        //   （钱维持"不退"，与 blockoutize.service 里 F11 真人脸那条同一口径：方舟受理并
-        //   交付了算力，成本真实发生。要不要改成自动退费是产品决策，wallet.credit 是现成的、
-        //   幂等靠 failJob 那个条件原子更新抢占 —— 工程上这里就是那个挂点。）
+        //   （钱维持"不退"：方舟算它**出成了**，成本真实发生 —— 2026-10-07 的失败退款只退方舟明说失败的那一种
+        //   （services/taskRefund），这里不是。要不要也退是另一个产品决策；真要退，按原桶退走 taskRefund 那一份实现，
+        //   别在这里另写一套。）
         console.error(
           `[blockoutize:bad-output] job=${claimed._id} task=${claimed.taskId} inputSec=${inSec} ` +
             `outSec=${outMeta.duration} trimmed=${Number.isFinite(trimmed) ? trimmed.toFixed(3) : "?"} reason=${outIssue}`,
@@ -1307,6 +1445,13 @@ router.post(
           // ★ 在途的老凭据没有这一位 → 这里也不写 → 建出编号方案模板 → **正确**
           //   （它的白模视频上印的确实是数字）。所以用存在性展开，绝不 `|| []`。
           ...(BranchTemplate.isOrdinalMark(claimed) ? { markSlots: claimed.markSlots } : {}),
+          // 神态：从凭据原样搬（阶段一看原片时记下的）。★ 只在序数方案、且长度与 markSlots
+          //   相等时搬 —— 在途的老凭据没有这一位 → 模板也没有 → 套用不带神态句，与今天逐字相同。
+          ...(BranchTemplate.isOrdinalMark(claimed) &&
+          Array.isArray(claimed.markExprs) &&
+          claimed.markExprs.length === claimed.markSlots.length
+            ? { markExprs: claimed.markExprs }
+            : {}),
           // 画面位置框（⑧b 量出来才有；量不出来就整份没有 → 拖拽层关着，点列表照常）
           ...boxPatch,
           blockoutJobId: claimed._id,
@@ -1481,7 +1626,8 @@ router.get("/templates/:id", optionalAuth, async (req, res, next) => {
     // 403 等于承认「这个 id 存在但你不能看」，把私有模板的存在性泄露成可枚举的事实
     if (!doc) notFound("Template not found");
     const isOwner = req.user && String(doc.ownerId) === String(req.user._id);
-    if (doc.status !== "published" && !isOwner) notFound("Template not found");
+    // retired（被公开流程引用着、作者下了架）对所有人可读：按配方复制的人要靠它铺白模段（model 的 ★）
+    if (doc.status !== "published" && doc.status !== "retired" && !isOwner) notFound("Template not found");
     res.json({ ok: true, template: toTemplatePayload(doc, req.user) });
   } catch (err) {
     next(err);
@@ -1518,8 +1664,8 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
     }
     // ★★ 试炼闸：provenAt 由服务端在「作者本人的 r2v 任务真实出片成功」时写入
     //   （ark.routes.js 的轮询追踪），这里只认它非空。为什么必须有这道门：
-    //   方舟任务**受理后**才失败（含真人人脸、内容审核）是不退费的 ——
-    //   没这道门，一个坏模板会让每个套用的人各赔一次；有这道门，坏在作者自己那一次。
+    //   方舟任务**受理后**才失败（含真人人脸、内容审核）—— 2026-10-07 起出片那一笔会自动退回，但每个套用的人
+    //   都要白等一趟、白花前面推演 / 画帧的钱；有这道门，坏在作者自己那一次。
     if (!doc.provenAt) {
       badRequest("发布前请先用这个模板成功出一段片（在自己的工程里套用它跑通一次）——这一步能确保套用你模板的人不会白花钱。");
     }
@@ -1554,7 +1700,7 @@ router.patch("/templates/:id/publish", requireAuth, async (req, res, next) => {
 //
 // ★★ 可重试是这条路存在的**全部意义**，所以它必须是**幂等且能反复调**的：
 //   · 失败不留痕（模板上什么都不写）——下一次调用面对的状态与第一次完全相同；
-//   · 成功则整份覆盖 roles/markSlots/markBoxes/markBoxAtSec（四位同批写）；
+//   · 成功则整份覆盖 roles/markSlots/markBoxes/markBoxAtSec（四位同批写；V2 留下的 markExprs 同批清掉）；
 //   · **作者已经核对过的（labelConfirmed）一律拒**：再认一遍会把他逐个改过的措辞
 //     整份冲掉，而那是他花时间对着画面做的事，没有任何东西找得回来。
 //
@@ -1610,9 +1756,12 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       console.warn(`[branchTemplate] detect-roles 读不到资源版本 ${publicId}`);
     }
 
+    // ★ 认人这条路上只有**豆包 chat**（VISION_MODEL，kind "chat"：认人 + 量框），一发 Seedance 都没有 ——
+    //   出片地区门禁今天不管它（对话不拦，范围等主人拍板）。req 照传：判据扩到对话那天不用回来补。
     const send = (body, timeoutMs) =>
       chargedArkCall({
         user: req.user,
+        req,
         modelAllowed: (m) => m === VISION_MODEL,
         kind: "chat",
         path: "/chat/completions",
@@ -1682,6 +1831,12 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
     if (roles.length) {
       update.$set.roles = roles;
       update.$set.markSlots = roles.map((x) => x.label);
+      // ★★ 神态（markExprs）**一律清掉**：它是 V2 白模化看**原片**时记下的、与旧 markSlots 对齐的，
+      //   而这一次是在白模视频上重新认人 —— 新旧两份对不齐，也没有原片可以重读。
+      //   ⚠ 不清的话最坏的情况零报错：人数一样时 markSlots 逐字相同（标签只由人数决定），
+      //   出口那道长度闸照样放行，神态整份挂到别人身上。V2 模板作者还没核对时 App 会摆
+      //   「重新识别角色位」，所以这条路对 V2 模板是真走得到的（审核抓到的那条）。
+      update.$unset = { markExprs: "" };
       // ★★ 人偶描述与 markSlots **同生同死**（一起写、长度必然相等，都来自同一个 kept）。
       //   这条路（自己传白模视频）上传的**就是**白模视频，所以这份描述在产物里成立 ——
       //   V2 白模化那条路不写这一位，它的认人看的是原片（理由写在 model 的 markDescs 上）。
@@ -1693,7 +1848,7 @@ router.post("/templates/:id/detect-roles", requireAuth, detectLimit, async (req,
       } else {
         // ★ 上一次可能留着一份框：这次没量出来就必须**清掉**，否则新 roles 会配着旧框。
         //   长度还可能正好相等（人数没变），于是出口那道长度校验也放行 —— 零报错的整份错位。
-        update.$unset = { markBoxes: "", markBoxAtSec: "" };
+        update.$unset = { ...update.$unset, markBoxes: "", markBoxAtSec: "" };
       }
     }
     const saved = await BranchTemplate.findByIdAndUpdate(found._id, update, { returnDocument: "after" }).lean();
@@ -1750,9 +1905,12 @@ router.patch("/templates/:id/unpublish", requireAuth, async (req, res, next) => 
     if (doc.status === "blocked") {
       badRequest("这个模板已被平台下架，状态由平台管理。");
     }
-    doc.status = "pending";
+    // ★ 被公开流程引用着的只能「退役」不能回 pending（主人 2026-10-02 拍板：只能下架、素材保留到没人引用）：
+    //   pending 对别人不可读也不可用，复制了那条流程的人下一段就出不了片
+    const refs = await BranchRecipe.refsOfTemplate(doc._id);
+    doc.status = refs > 0 ? "retired" : "pending";
     await doc.save();
-    res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
+    res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user), ...(refs > 0 ? { retired: true, refs } : {}) });
   } catch (err) {
     next(err);
   }
@@ -1952,6 +2110,19 @@ router.patch(
         // **静默不落库** —— 又是同一个形状）
         doc.markModified("markDescs");
       }
+      // ★★★ 神态（markExprs）**跟着人走**，与上面 markDescs「跟着位置上的文字走」不是一回事：
+      //   神态说的是原片里那个人，作者对调两行 / 删位后整体左移，改的正是「哪个位置是谁」。
+      //   PATCH 不碰它的话，对调一次神态就零报错地挂到别人身上（审核抓到的高危那条）。
+      //   规则（按 desc 认人、认不准清成空串、没有这一位就不凭空造）只在
+      //   BranchTemplate.markExprsAfterRolesEdit 一处；⚠ 必须在 `doc.roles = …` **之前**调 ——
+      //   它要读改之前的 roles 才知道每句 desc 原来在哪个位置。
+      // ★ 老 App 的 PATCH 不带任何神态字段，这里也不收（zod 那边没声明）：神态只由服务端搬，
+      //   作者能做的是改 roles，神态随之移动或清空。
+      const nextExprs = BranchTemplate.markExprsAfterRolesEdit(doc, roles);
+      if (nextExprs) {
+        doc.markExprs = nextExprs;
+        doc.markModified("markExprs");
+      }
       doc.roles = roles.map((r) => ({ ...r, labelConfirmed: true }));
       await doc.save();
       res.json({ ok: true, template: toTemplatePayload(doc.toObject(), req.user) });
@@ -1970,6 +2141,15 @@ router.delete("/templates/:id", requireAuth, async (req, res, next) => {
     const doc = await BranchTemplate.findById(id).lean();
     if (!doc) notFound("Template not found");
     if (String(doc.ownerId) !== String(req.user._id)) forbidden("Forbidden");
+
+    // ★★ 被公开流程引用着的模板**不删素材**（主人 2026-10-02 拍板）：快照抄的是字段，示例视频还是这个地址，
+    //   回收了就是每一条嵌它的流程指向一个死地址，而出片受理即扣费。这里把「删除」降级成「退役」：
+    //   不进市场、对所有人可读可用、引用数降到 0 之后再删一次才真回收。回包说清引用数，App 照实说。
+    const refs = await BranchRecipe.refsOfTemplate(doc._id);
+    if (refs > 0) {
+      if (doc.status !== "blocked") await BranchTemplate.updateOne({ _id: doc._id }, { $set: { status: "retired" } });
+      return res.json({ ok: true, retired: true, refs });
+    }
 
     // ★ 回收模板视频 —— 全仓第一个 uploader.destroy 调用（此前上传即永久占配额）。
     //   为什么必须删：不删的话热门模板删除后视频还挂在公网上，方舟侧任何拿到 URL 的人

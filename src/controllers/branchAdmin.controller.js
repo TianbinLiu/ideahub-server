@@ -23,6 +23,9 @@ const BranchCollect = require("../models/BranchCollect");
 // 工坊工程（画布快照）。★★ 新表**必须两处都落**：purgeVideo（删一条作品）与这里
 //   （删号）。漏了哪一处都零症状，模板那次就是这么漏的。
 const BranchProject = require("../models/BranchProject");
+// 公开配方（制作过程）。与 BranchProject 同一条纪律：purgeVideo 与这里两处都落
+const BranchRecipe = require("../models/BranchRecipe");
+const RemixReward = require("../models/RemixReward");
 const BranchTemplate = require("../models/BranchTemplate");
 const BranchTemplateTrial = require("../models/BranchTemplateTrial");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
@@ -33,6 +36,11 @@ const BranchAssetStat = require("../models/BranchAssetStat");
 const Report = require("../models/Report");
 const TokenLedger = require("../models/TokenLedger");
 const TokenOrder = require("../models/TokenOrder");
+const GenTaskCharge = require("../models/GenTaskCharge");
+const ArkVideoTask = require("../models/ArkVideoTask");
+const BlockoutJob = require("../models/BlockoutJob");
+const ArkImageGroup = require("../models/ArkImageGroup");
+const NarrationFreeUsage = require("../models/NarrationFreeUsage");
 const Follow = require("../models/Follow");
 const Notification = require("../models/Notification");
 const SearchHistory = require("../models/SearchHistory");
@@ -57,6 +65,7 @@ const {
 const { recountAssetStat } = require("./branchAsset.controller");
 // 通知写入一律走 service（全站唯一入口），不在这里 create
 const { createNotification } = require("../services/notification.service");
+const { purgeUserChatData } = require("../services/chatMemory.service");
 
 function isValidId(id) {
   return mongoose.isValidObjectId(id);
@@ -306,16 +315,38 @@ async function unbanUser(req, res, next) {
  *      随①的 purgeVideo 一起删。
  *   ⑦.7 BranchProject（他留存的工坊工程画布）→ deleteMany（按 owner 兜底：
  *      挂在还在的作品上的那些已随①删掉，这里收的是孤儿）。
+ *   ⑦.8 BranchRecipe（他公开过的制作过程）→ deleteMany（同上，按 owner 兜底）。
+ *      别人作品上「按他的流程做的」那条归属（BranchVideo.remixOf）**不动**：那是别人的作品，
+ *      原作没了之后回包里自然不再带出这条归属（getVideo 现查原作，查不到就不发）。
+ *   ⑦.9 RemixReward（同款奖励的判定记录）**他是原作者**的那些 → deleteMany（他收到的奖励，随他的 token 流水⑨一起没）。
+ *      ★ **他是同款作者**的那些行不删，见下面「不删」那一份。
  *   ⑧ Report（他提交的 + 指向他内容的）→ deleteMany，**但 `URGENT_REASONS`（儿童安全）那些留下**
  *      （法定义务例外，理由见下面那段 ★★）。指向的内容随①②③一起没了，
  *      留着只会是一队 target.exists=false 的死举报，谁也处理不了。
  *   ⑨ TokenLedger / TokenOrder（token 钱包流水与订单）→ deleteMany。
  *      token 是对外采购的算力额度，**没有对手方**，删他自己的流水不破坏任何不变量。
+ *   ⑨.5 GenTaskCharge（他那几发生成任务的账，失败退款的底账，2026-10-07）→ deleteMany。
+ *      人没了钱也退不进去（refundSplit 找不到钱包 → 记 skipped），留着只会让清扫器替一个不存在的人去问上游。
+ *      顺带三张**带 TTL** 的生成登记（2026-10-07 补进清单：此前它们既不在「删」也不在「不删」里，是纯遗漏）：
+ *      ArkVideoTask（视频任务登记，里面有提示词前 300 字）、BlockoutJob（白模化取件单）、ArkImageGroup（组图）→ deleteMany。
+ *      它们一两天就会自己过期，但等过期期间是这个人的提示词与产物地址 —— 删号就该当场没。
+ *      ⚠ 在画的那一组被删掉之后，它的后台结算会找不到这一行、什么都不做（钱包也没了，没有可退的人）。
+ *      还有剪辑页免费配音的计数器 NarrationFreeUsage（2026-10-08）→ deleteMany：只是当天用了几个字，3 天自己过期，删号就当场没。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
+ *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
+ *      （硬删 + DeletionLog；记忆卡没有 TTL，账号没了就再没人能删它们，所以必须在这里删）
+ *   ⑩.7 老师人格那一线（2026-09-29，tutor 仓 docs/04 S14）→ services/tutorPurge.service.purgeTutorForUser：
+ *      十二张 Tutor* 表 + 他发布的老师人格及其发布版 / 评分 / 安装 / 评论 / 举报；教材原件句柄进 PendingAssetPurge（raw）。
+ *      ★ 懒 require：TUTOR_ENABLED=false 时 tutor 树一个模块都不装，但删号不看开关（开关管功能挂不挂，不管数据在不在）。
+ *      两份清单在那个文件头部（新表必须落在其中一份，tests/tutorPurge.spec.js 钉住）。
  *   ⑪ User 本体（最后删：中途挂了还能重来，先删 User 就再也找不到线索了）
  *
  *   不删（刻意的，不是遗漏）：
+ *   · RemixReward 里**他是同款作者**的行 —— 那是别的原作者的上限计数（每条原作 50 次、每人每天 10 次）与平台印钱的审计。
+ *     跟着他一起删的话，刷子号做完同款就注销，原作者的两道上限就被悄悄清零了。留下的只有几个 ObjectId，够不成个人信息。
+ *   · 别人从他的老师人格「开始学」开出来的 TutorCourse / TutorRun —— 那是别人的学习过程与自用件，只标 sourceOrphanedAt
+ *     （课程页说「这位老师已不在市场上」、合并新版 409），理由在 tutorPurge.service 头部。
  *   · PointsLedger —— 复式记账，硬不变量是「除 signup 外所有分录和为零」（I1，机器可查）。
  *     删掉他那一侧的分录，对手方的分录就永远配不平，整本账从此说不清 ——
  *     账本是只追加的审计记录，人没了账也得在。
@@ -449,6 +480,12 @@ async function purgeUserCascade(userId) {
   //     按 owner 兜底删干净，否则库里会留下一批谁也查不到、也再删不掉的画布。
   removed.projects = (await BranchProject.deleteMany({ owner: uid })).deletedCount;
 
+  // ⑦.8 他公开过的制作过程（公开配方）。挂在还在的作品上的那些已随①的 purgeVideo 删掉，这里按 owner 兜底
+  removed.recipes = (await BranchRecipe.deleteMany({ owner: uid })).deletedCount;
+
+  // ⑦.9 同款奖励的判定记录：只删**他是原作者**的（理由见函数头两份清单）
+  removed.remixRewards = (await RemixReward.deleteMany({ author: uid })).deletedCount;
+
   // ⑧ 举报。
   // ★★ **儿童安全（csae）那些一条都不删** —— 这是删号权利的一个**法定义务例外**，
   //   不是疏漏。对外承诺写在 <https://ideahubs.org/child-safety>：
@@ -482,6 +519,12 @@ async function purgeUserCascade(userId) {
   // ⑨ 钱包流水与订单
   removed.tokenLedger = (await TokenLedger.deleteMany({ user: uid })).deletedCount;
   removed.tokenOrders = (await TokenOrder.deleteMany({ user: uid })).deletedCount;
+  // ⑨.5 生成任务的账与三张带 TTL 的生成登记
+  removed.genTaskCharges = (await GenTaskCharge.deleteMany({ user: uid })).deletedCount;
+  removed.arkVideoTasks = (await ArkVideoTask.deleteMany({ userId: uid })).deletedCount;
+  removed.blockoutJobs = (await BlockoutJob.deleteMany({ ownerId: uid })).deletedCount;
+  removed.arkImageGroups = (await ArkImageGroup.deleteMany({ userId: uid })).deletedCount;
+  removed.narrationFreeUsage = (await NarrationFreeUsage.deleteMany({ userId: uid })).deletedCount;
 
   // ⑩ 关注、通知、搜索记录
   removed.follows = (await Follow.deleteMany({ $or: [{ follower: uid }, { following: uid }] })).deletedCount;
@@ -489,6 +532,14 @@ async function purgeUserCascade(userId) {
     await Notification.deleteMany({ $or: [{ userId: uid }, { actorId: uid }] })
   ).deletedCount;
   removed.searchHistory = (await SearchHistory.deleteMany({ user: uid })).deletedCount;
+
+  // ⑩.5 数字人对话：会话 / 消息 / 用量 / 记忆卡（回执每项都是数字，App 管理页按数字汇总）
+  const chat = await purgeUserChatData(uid);
+  removed.chatThreads = chat.threads;
+  removed.chatMemories = chat.memories;
+
+  // ⑩.7 老师人格那一线（清单与理由在 services/tutorPurge.service.js 头部；懒 require 的理由见函数头）
+  Object.assign(removed, await require("../services/tutorPurge.service").purgeTutorForUser(uid));
 
   // ⑪ 用户本体
   removed.user = (await User.deleteOne({ _id: uid })).deletedCount;

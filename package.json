@@ -22,21 +22,23 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "adm-zip": "^0.6.0",
-    "axios": "^1.13.6",
+    "adm-zip": "^0.6.1",
+    "axios": "^1.20.0",
     "bcryptjs": "^3.0.3",
     "cheerio": "^1.2.0",
     "cloudinary": "^2.9.0",
     "cookie-session": "^2.1.1",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
-    "express": "^5.2.1",
+    "express": "^5.3.0",
     "express-mongo-sanitize": "^2.2.0",
     "geoip-lite": "^2.0.3",
     "helmet": "^8.1.0",
+    "js-yaml": "^4.3.2",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^9.1.5",
-    "multer": "^2.2.0",
+    "jszip": "^3.10.2",
+    "mongoose": "^9.9.1",
+    "multer": "^2.5.0",
     "openai": "^6.19.0",
     "passport": "^0.7.0",
     "passport-github2": "^0.1.12",
@@ -54,5 +56,11 @@
     "roots": [
       "<rootDir>/tests"
     ]
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  },
+  "engines": {
+    "node": ">=20.18.1"
   }
 }

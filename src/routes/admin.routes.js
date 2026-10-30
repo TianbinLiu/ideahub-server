@@ -34,4 +34,24 @@ router.delete("/leaderboards/:id", ctrl.adminDeleteLeaderboard);
 // 删除任意用户（含清理该用户所有数据）
 router.delete("/users/:id", ctrl.adminDeleteUser);
 
+/**
+ * 免除某个用户的退款欠额（§15.4 R-13）。
+ * ★ 存在的理由：欠额是自动产生的（渠道退款 - 当时余额），而退款的成因可能是
+ *   我们自己的错（发重了、慢卡扣了两次）。没有这条口子，唯一的解法是去库里手改
+ *   —— 那既不留痕，又绕过了账本。
+ * ★ 免除会落一条 `debt_forgiven`（delta=0、金额记 costTokens），余额不动。
+ */
+router.post("/users/:id/forgive-debt", async (req, res, next) => {
+  try {
+    const mongoose = require("mongoose");
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ ok: false, message: "user not found" });
+    const wallet = require("../services/tokenWallet.service");
+    const w = await wallet.forgiveDebt(req.params.id, `管理员 ${req.user.username || req.user._id} 免除`);
+    if (!w) return res.status(404).json({ ok: false, message: "user not found" });
+    res.json({ ok: true, wallet: w });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

@@ -110,6 +110,8 @@ function loose(id) {
 function stripExpExt(name) {
   return String(name || "").trim().replace(/\.exp3\.json$/i, "").replace(/\.exp3$/i, "");
 }
+// 这里只是「指向包外就跳过」的宽松版：硬闸在 live2dBundle.service 的 inspectModel3Json（它先跑，外链 / 出包 / 缺文件整句 400），
+// 到这里的引用都已经过了那一道。别把这一份改成第二处判定（铁律六）—— 要收紧去改那边的 resolveRef
 function resolveInside(baseDir, ref) {
   const target = path.resolve(baseDir, String(ref));
   if (path.relative(baseDir, target).startsWith("..")) return null;

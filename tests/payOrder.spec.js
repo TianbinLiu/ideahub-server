@@ -22,7 +22,9 @@ let TokenOrder;
 let User;
 let orders;
 
-const FREE = 300_000;
+/** 新钱包的余额：免费版新人一次 170,000（addon）+ 当天的 2,000（plan）（2026-10-07） */
+const FREE_PLAN = 2_000;
+const FREE = 170_000 + FREE_PLAN;
 
 beforeAll(async () => {
   mongod = await MongoMemoryServer.create();
@@ -126,6 +128,11 @@ describe("回调结算", () => {
       .expect(200);
     const entry = led.body.items.find((x) => x.reason === "recharge");
     expect(entry.memo).toContain(orderNo);
+    // ★ 充过一次钱 = 付费用户（免费档门禁认它，config/tokens.isPaidUser）：套餐还是免费版也一样
+    const w = await request(app).get("/api/me/wallet").set("Authorization", `Bearer ${u.token}`).expect(200);
+    expect(w.body.wallet.planId).toBe("free");
+    expect(w.body.wallet.paidEver).toBe(true);
+    expect(w.body.paid).toBe(true);
   });
 
   test("O1 重复回调只发一次币（渠道重推是常态，必须回 ok 否则它会一直推）", async () => {
@@ -165,6 +172,9 @@ describe("回调结算", () => {
     const o = await TokenOrder.findOne({ orderNo });
     expect(o.status).toBe("failed");
     expect(o.settledAt).toBeNull();
+    // 钱没付成 ⇒ 不算付过钱
+    const w = await request(app).get("/api/me/wallet").set("Authorization", `Bearer ${u.token}`).expect(200);
+    expect(w.body.paid).toBe(false);
   });
 
   test("O2 回调里夹带商品信息不作数：发的是【订单快照】里的量", async () => {
@@ -222,9 +232,12 @@ describe("回调结算", () => {
 
     const r = await request(app).get("/api/me/wallet").set("Authorization", `Bearer ${u.token}`).expect(200);
     expect(r.body.wallet.planId).toBe("std");
-    // ★ 是 FREE + 2M 而不是 2M：buyPlan 用的是 $inc，买套餐**叠加**在没花完的额度上，
+    // ★ 是「剩下的 plan + 1.66M」而不是 1.66M：buyPlan 用的是 $inc，买套餐**叠加**在没花完的额度上，
     //   不没收用户已有的余额（tokenWallet.service 的既定口径，那边也有用例）
-    expect(r.body.wallet.plan).toBe(FREE + 2_000_000);
+    expect(r.body.wallet.plan).toBe(FREE_PLAN + 1_660_000);
+    // 买了套餐 = 付过钱（免费档门禁认它，config/tokens.isPaidUser）
+    expect(r.body.wallet.paidEver).toBe(true);
+    expect(r.body.paid).toBe(true);
     expect((await TokenOrder.findOne({ orderNo })).status).toBe("settled");
   });
 
@@ -361,10 +374,12 @@ describe("跨仓价目一致性", () => {
     { tokens: 1_000_000, price: 25 },
     { tokens: 5_000_000, price: 98 },
   ];
+  // ★ 2026-10-07 主人拍板：标准 ¥30 → 1,660,000（约 10 段 5 秒高清）、专业 ¥98 → 5,800,000（约 35 段）；
+  //   免费版不再按月发，改成「新人一次 170,000 + 每天 2,000、最多攒 14,000」（app 的 PLANS 同形）
   const APP_PLANS = [
-    { id: "free", price: 0, monthlyTokens: 300_000 },
-    { id: "std", price: 30, monthlyTokens: 2_000_000 },
-    { id: "pro", price: 98, monthlyTokens: 8_000_000 },
+    { id: "free", price: 0, monthlyTokens: 0, welcomeTokens: 170_000, dailyTokens: 2_000, dailyCapTokens: 14_000 },
+    { id: "std", price: 30, monthlyTokens: 1_660_000 },
+    { id: "pro", price: 98, monthlyTokens: 5_800_000 },
   ];
 
   test("直充包的价与 app/src/data/economy.ts 逐条相等", () => {
@@ -375,6 +390,11 @@ describe("跨仓价目一致性", () => {
 
   test("套餐的价与月额度与 app 一致", () => {
     const { PLANS } = require("../src/config/tokens");
-    expect(PLANS.map((p) => ({ id: p.id, price: p.price, monthlyTokens: p.monthlyTokens }))).toEqual(APP_PLANS);
+    expect(
+      PLANS.map((p) => {
+        const { name: _name, ...rest } = p;
+        return rest;
+      }),
+    ).toEqual(APP_PLANS);
   });
 });

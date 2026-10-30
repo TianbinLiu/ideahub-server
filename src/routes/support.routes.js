@@ -8,8 +8,10 @@
  *
  * 用户侧:
  * @endpoint GET  /config                 - 客服叫什么、AI/TTS 有没有配、快捷问题（游客可查）
- * @endpoint POST /chat                   - SSE 流式问答。事件与 /api/companion/chat 相同（sentence/token/done/error），
- *                                          多一个 `handoff` {category, reason}：模型判定该转人工时发出（且 done.handoff 为真）
+ * @endpoint POST /chat                   - SSE 流式问答。请求体与事件都与 /api/companion/chat 相同（{message, threadId?} 按会话 /
+ *                                          {messages[]} 旧写法；thread/sentence/token/done/error），
+ *                                          多一个 `handoff` {category, reason}：模型判定该转人工时发出（且 done.handoff 为真）。
+ *                                          客服会话保留 30 天；记忆卡只在本会话内有效（见 chatMemory.service）
  * @endpoint POST /tickets                - 转人工：带上对话记录建工单 → 通知所有管理员 + 邮件；10 分钟内已有未结工单则复用
  * @endpoint GET  /tickets/mine           - 我的工单（含人工回复）
  * @endpoint POST /tickets/:id/messages   - 在自己的工单里追加一条消息（会再通知管理员，10 分钟去重）
@@ -26,6 +28,7 @@
  * @uses {services/support.service.js} - 知识检索 / 提示词 / 转人工标记 / 工单归纳
  * @uses {services/companion.service.js} - 切句与演出标签解析（与首页看板娘同一套协议）
  * @uses {services/aiClient.js} - aiChatStream / hasAiKey
+ * @uses {services/chatMemory.service.js} - 会话持久化 / 上下文组装 / 用量 / 提纯
  * @uses {services/notification.service.js} - createNotification
  * @uses {services/email.service.js} - sendEmail
  * @registered_in src/app.js（adminRouter 必须挂在 /api/admin 之前）
@@ -35,9 +38,13 @@ const mongoose = require("mongoose");
 const { z } = require("zod");
 const { requireAuth, optionalAuth, requireRole } = require("../middleware/auth");
 const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
 const support = require("../services/support.service");
+const chatSafety = require("../services/chatSafety.service");
+const chatMemory = require("../services/chatMemory.service");
 const { loadCompanionSetup, personaPromptLine, defaultVoiceId } = require("../services/companionSetting.service");
 const { resolveVoiceSettings } = require("../utils/voiceSettings");
 const SupportTicket = require("../models/SupportTicket");
@@ -63,10 +70,18 @@ const messageSchema = z.object({
   content: z.string().trim().min(1).max(MAX_MESSAGE_CHARS),
 });
 
-const chatBodySchema = z.object({
-  messages: z.array(messageSchema).min(1).max(MAX_HISTORY),
-  lang: z.enum(["zh", "en"]).optional(),
-});
+const chatBodySchema = z
+  .object({
+    // 旧写法：客户端自带历史（服务端不存；已发布的旧版 App 还在用）
+    messages: z.array(messageSchema).min(1).max(MAX_HISTORY).optional(),
+    // 按会话：只发新的一句
+    message: z.string().trim().min(1).max(MAX_MESSAGE_CHARS).optional(),
+    threadId: z.string().trim().max(64).nullable().optional(),
+    lang: z.enum(["zh", "en"]).optional(),
+  // 客户端声明自己认识哪些新事件；不声明的老客户端会收到退化形式（求助卡走 sentence）
+  caps: z.array(z.enum(["safety", "notice"])).max(4).optional(),
+  })
+  .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
 
 const ticketBodySchema = z.object({
   transcript: z
@@ -231,25 +246,95 @@ publicRouter.get("/config", optionalAuth, async (req, res, next) => {
   }
 });
 
-publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" }), async (req, res) => {
+publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" }), async (req, res, next) => {
   const parsed = chatBodySchema.safeParse(req.body || {});
   if (!parsed.success) return invalid(res, "invalid messages", parsed.error.issues);
   if (!hasAiKey()) return res.status(501).json({ ok: false, message: "AI not configured", code: "AI_NOT_CONFIGURED" });
 
   const history = parsed.data.messages;
-  if (history[history.length - 1].role !== "user") return invalid(res, "last message must be from user");
+  if (history && history[history.length - 1].role !== "user") return invalid(res, "last message must be from user");
+
+  // 装了人格 → 语气跟人设走、每句 TTS 指令带上人设的语调；客服的事实与红线不受影响
+  let setup;
+  let thread = null;
+  let userTurns;
+  try {
+    setup = await loadCompanionSetup({ userId: req.user._id, req });
+    if (history) {
+      userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
+    } else {
+      // 按会话：先存下用户这句（threadId 不是自己的 → 404，此时还没开始 SSE）
+      ({ thread } = await chatMemory.beginTurn({
+        userId: req.user._id,
+        scene: "support",
+        threadId: parsed.data.threadId,
+        text: parsed.data.message,
+        personaId: setup.persona && setup.persona._id,
+      }));
+      userTurns = await chatMemory.recentUserTexts(thread, 2);
+    }
+  } catch (e) {
+    return next(e);
+  }
 
   // 检索用最近两条用户消息：追问往往只有"那要多久"三个字，单看这一句什么都召回不到
-  const userTurns = history.filter((m) => m.role === "user").map((m) => m.content);
   const knowledge = support.selectKnowledge(userTurns.slice(-2).join("\n"));
-  // 装了人格 → 语气跟人设走、每句 TTS 指令带上人设的语调；客服的事实与红线不受影响
-  const setup = await loadCompanionSetup({ userId: req.user._id, req });
   const system = support.buildSupportSystemPrompt({
     userName: req.user.displayName || req.user.username || "",
     knowledge,
     lang: parsed.data.lang || "zh",
+    // 英文界面叫法表看这一轮的原话，不看 lang：App 客服页发的 lang 写死 "zh"（v2.63），只认 lang 的话这张表一次都发不出去。
+    // 别直接把 lang 改成 "en"：求助卡（crisisCard）与回复语言那一行也读 lang
+    // 判据见 support.isEnglishAsk：至少两个实词才算英文（2026-10-20 起，中文对话里追问一句「ok」「QQ」「token」、贴一个任务号 / 邮箱不算）；
+    // 没汉字、自己又判不了的短追问（「Why?」「Refund」）跟着上一问走（support.replyInEnglish）—— 英文用户的短追问照旧说死英文
+    enNames: support.replyInEnglish(userTurns),
     personaLine: personaPromptLine(setup.persona),
   });
+  // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
+  const prefix = [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona)];
+  let messages;
+  let estPrompt = 0;
+  if (thread) {
+    try {
+      ({ messages, estPrompt } = await chatMemory.buildContextMessages({ thread, prefix }));
+    } catch (e) {
+      return next(e);
+    }
+  } else {
+    messages = [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))];
+  }
+
+  // ★★ 客服也要有闸（2026-09-25 评审）。原来只有官网陪聊接了协议，而**客服是 Google Play
+  //   上唯一的通用对话入口**：同一位看板娘、同一套人格、同一个模型。SB 243 的「companion
+  //   chatbot」豁免能不能罩住纯客服还没拍板，而在拍板之前，这条链路一道闸都没有。
+  //   口径与陪聊逐字相同：用户这句命中 → **不调模型**（0 token）、直接回求助卡。
+  const country = chatSafety.countryOf(req);
+  const lang = parsed.data.lang || "zh";
+  const caps = Array.isArray(parsed.data.caps) ? parsed.data.caps : [];
+  const lastUserText = thread ? parsed.data.message : history[history.length - 1].content;
+  const verdict = chatSafety.detectSelfHarm(lastUserText);
+  if (verdict.hit) {
+    const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+    if (thread) {
+      await chatMemory.clearTitleIfEquals(thread, lastUserText);
+      await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) });
+    }
+    await chatSafety.recordReferral({ scene: "support", trigger: "input", country });
+    const sendCrisis = companion.openSse(res);
+    if (thread) sendCrisis("thread", { threadId: String(thread._id), title: thread.title || "" });
+    for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct })) sendCrisis(e.event, e.data);
+    sendCrisis("done", { text: "", handoff: false, category: "", ...(thread ? { threadId: String(thread._id) } : {}), safety: true });
+    return res.end();
+  }
+
+  // ★★ 计费（方案 9.1 的 R1.5）：客服此前也**一分钱不扣**。价钱与陪聊同一个常量
+  //   （`CHAT_TURN_TOKENS`）——方案 §14.6 建议把两者分别提到 4,500 / 2,300，
+  //   那是一次**定价**决定，留给仓库主人拍板；这里只把架构缺口补上。
+  //   注意扣费必须在 SSE 开始之前：一旦响应头发出去，402/403 就只能变成一条 error 事件了。
+  //   ★ 也必须排在上面那道危机闸**之后**：那一轮 early-return 会跳过下面的退款与结算，
+  //   先扣就成了「扣了 400 既不退也不记账」，而 #76 对外宣称那一轮是 0 token。
+  const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat support" });
+  if (!pre.ok) return res.status(pre.status).json(pre.body);
 
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -263,6 +348,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     if (closed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+  if (thread) send("thread", { threadId: String(thread._id), title: thread.title || "" });
   const abort = new AbortController();
   // ★ 监听 res 而不是 req 的 close：理由见 companion.routes.js（Node ≥16 里 req 的 close 在请求体读完就触发）
   res.on("close", () => {
@@ -270,6 +356,11 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     closed = true;
     abort.abort();
   });
+  // 客户端在前面查库的 await 期间就断了 → 'close' 已经错过，直接当断开处理（理由见 companion.service.streamCompanionReply）
+  if (res.destroyed) {
+    closed = true;
+    abort.abort();
+  }
 
   let index = 0;
   const plainParts = [];
@@ -279,17 +370,35 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     handoff = { category, reason };
     send("handoff", handoff);
   };
+  // 输出侧守卫：与陪聊同一套判据（chatSafety.detectHarmfulOutput），命中即不发这句、
+  // abort 上游、改发求助卡。★ 客服比陪聊更需要它：它的回答会被当成「平台的说法」。
+  let blocked = null;
   const splitter = companion.createSentenceSplitter((sentence) => {
+    if (blocked) return;
     const p = companion.parseTags(sentence);
     // 模型有时把 [handoff:x] 写在某一句的句首而不是整段开头（实测 doubao-seed-2.0-mini 三成概率）：
     // 剥掉已知演出标签后再查一次，标记不能念出来也不能进字幕
     const h = support.parseHandoff(p.text);
     if (h.handoff) markHandoff(h.category, h.reason);
-    const text = h.text.replace(/\[handoff[^\]]*\]\s*/gi, "").trim();
+    const text = support.stripHandoffTags(h.text).trim();
     if (!text) return;
+    const out = chatSafety.detectHarmfulOutput(text);
+    if (out && out.hit) {
+      blocked = { category: out.category };
+      const card = chatSafety.crisisCard({ trigger: "output", country, lang });
+      const wasClosed = closed;
+      closed = false;
+      for (const e of companion.crisisCardEvents({ card, caps, ttsInstruct: setup.voice.instruct, index: index++ })) send(e.event, e.data);
+      closed = wasClosed;
+      abort.abort();
+      referral = chatSafety.recordReferral({ scene: "support", trigger: "output", country });
+      return;
+    }
     plainParts.push(text);
     send("sentence", { index: index++, ...p, text, tts: companion.ttsParamsFor(p.emotion, setup.voice.instruct) });
   });
+  // 计数的写库在 done 之前 await 掉（切句回调是同步的，这里只能先接住 promise）
+  let referral = null;
 
   // 回复开头可能是 [handoff:xxx]：攒到能判定为止（有 "]" 或已经不像这个前缀），再决定是标记还是正文
   let pending = "";
@@ -300,7 +409,8 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       return;
     }
     pending += delta;
-    const lower = pending.trimStart().toLowerCase();
+    // 「[ handoff=…]」（方括号里先空一格）也算这个前缀：parseHandoff 认这种写法，这里不等的话开头那句的演出标签会丢
+    const lower = pending.trimStart().toLowerCase().replace(/^\[\s+/, "[");
     const looksLikePrefix = "[handoff".startsWith(lower.slice(0, 8));
     if (looksLikePrefix && !lower.includes("]") && lower.length < 80) return; // 还没写完标记，继续等
     decided = true;
@@ -314,16 +424,38 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     pending = "";
   };
 
+  const rawParts = [];
+  let usage = null;
+  let failed = false;
   try {
-    const stream = aiChatStream(
-      // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
-      [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona), ...history.map((m) => ({ role: m.role, content: m.content }))],
-      { maxTokens: MAX_REPLY_TOKENS, temperature: 0.3, signal: abort.signal },
-    );
+    const stream = aiChatStream(messages, {
+      maxTokens: MAX_REPLY_TOKENS,
+      temperature: 0.3,
+      // ★★ 客服这一发关思考（2026-10-20，只关这一条；陪聊 / 老师 / 工单归纳照旧，所以不用全站 AI_EXTRA_BODY）：
+      //   ① 生产走 DeepSeek 官方 deepseek-v4-flash，思考默认开，而它的 max_tokens **连思维链一起算**
+      //      （生产接口实测：max_tokens 8 → reasoning 8、finish=length、正文为空）。方舟上同家族模型带真客服提示词的
+      //      88 发里，思维链 + 回答超过 700 的 38 发（中文问 2/17、英文问 36/71），光思维链就 ≥ 700 的 28 发 ——
+      //      放到生产上就是回答被拦腰截断，或者一个字都没有（没字就走下面的退款，用户只看到客服没说话）；
+      //   ② 首句慢：同一批开思考 p50 5.0 秒 / p90 11.7 秒 / 最慢 73 秒，关掉 p50 1.8 秒 / 最慢 3.6 秒；
+      //   ③ 思考模式下 temperature 不生效（DeepSeek 文档），关掉之后上面那个 0.3 才真起作用。
+      //   关思考后模型更爱把标签写成 [action=explain]（同批 26% 对 18%），companion.parseTags 已认等号，两件要一起上。
+      thinking: false,
+      signal: abort.signal,
+      onUsage: (u) => {
+        usage = u;
+      },
+      // 被 max_tokens 截断要在日志里看得见：原来没有任何地方记，生产上截了多少只能猜
+      onFinish: (fin, m) => {
+        if (fin === "length") console.warn(`[support] reply cut by max_tokens (${MAX_REPLY_TOKENS}, ${m})`);
+      },
+    });
     for await (const delta of stream) {
-      if (closed) break;
+      if (closed || blocked) break;
       feed(delta);
-      send("token", { t: delta });
+      rawParts.push(delta);
+      // ★★ 接了输出守卫之后就**不能再发 token**（2026-09-25 评审在客服这条链路上逮到）：
+      //   token 是**未经检查的原始增量**，发出去等于把守卫刚刚拦下的那句话原样送到客户端。
+      //   两端 UI 都没用它（只定义了类型），所以直接不发。
     }
     if (!decided && pending) {
       decided = true;
@@ -331,17 +463,57 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       if (parsedHandoff.handoff) markHandoff(parsedHandoff.category, parsedHandoff.reason);
       splitter.push(parsedHandoff.text);
     }
+    // 客户端断开时也 flush：send 已是空操作，但最后半句要进 plainParts 好存下半截回复
     splitter.flush();
-    send("done", { text: plainParts.join(" "), handoff: Boolean(handoff), category: handoff ? handoff.category : "" });
   } catch (e) {
     if (!closed) {
+      failed = true;
       console.error("[support] stream failed:", (e && e.message) || e);
-      send("error", { message: "support upstream failed" });
     }
-  } finally {
+    // 上游半路出错：把还没判定的开头与缓冲里的半句静默收进 plainParts（存半截回复用），不发事件
+    const wasClosed = closed;
     closed = true;
-    res.end();
+    if (!decided && pending) {
+      decided = true;
+      splitter.push(support.parseHandoff(pending).text);
+    }
+    splitter.flush();
+    closed = wasClosed;
   }
+
+  // 按会话：存下这句回复（半截的也存，标 partial）并记用量；失败只记日志，不吞掉已经说完的回复
+  const text = plainParts.join(" ");
+  if (referral) await referral;
+  if (blocked && thread) {
+    // 被拦下时求助卡也要进历史，用户翻回来还看得到（与陪聊同口径）
+    const card = chatSafety.crisisCard({ trigger: "output", country, lang });
+    await chatMemory.appendMessage(thread, { role: "system", kind: "safety", displayText: chatSafety.crisisPlainText(card) }).catch(() => {});
+  }
+  let extra = {};
+  if (thread) {
+    try {
+      extra = await chatMemory.finishTurn({
+        thread,
+        displayText: text,
+        // 转人工标记不进历史：模型看到自己上一轮的 [handoff:x] 容易每句都再标一次
+        modelText: support.stripHandoffTags(rawParts.join("").replace(/\s*\[[^\]]*$/, "")),
+        usage,
+        estPrompt,
+        aborted: closed || failed,
+      });
+    } catch (e) {
+      console.error("[support] finish failed:", (e && e.message) || e);
+    }
+  }
+  // 一个字都没出来 = 上游没受理 ⇒ 退款（受理后才失败的不退：算力已经花掉了）
+  // ★ 输出侧被拦（blocked）同样算「受理了」—— 模型已经调过、钱已经花出去，照 text 判。
+  if (!text) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat support", took: pre.took });
+  else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat support", snapshot: pre.before });
+  if (failed && !blocked) send("error", { message: "support upstream failed", ...extra });
+  else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
+  closed = true;
+  res.end();
+  if (thread) chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[support] compact failed:", (e && e.message) || e));
 });
 
 publicRouter.post("/tickets", requireAuth, userRateLimit({ max: 5, scope: "support-ticket" }), async (req, res) => {

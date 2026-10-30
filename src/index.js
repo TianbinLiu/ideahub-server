@@ -144,8 +144,65 @@ async function start() {
     const instanceId = process.env.NODE_APP_INSTANCE;
     if (instanceId === undefined || instanceId === "0") {
       startAiWorker();
+      // ArkVideoTask 的 TTL 从 createdAt 搬到每行自带的 expireAt（2026-10-07，样片要活 8 天）：删老索引 + 回填老行。
+      // ★ 一次性、幂等；只在 0 号实例跑（两个实例同时删同一条索引只会让其中一个白报一句）。失败只记日志，不挡启动。
+      require("./services/arkVideoTask.service")
+        .migrateExpiry()
+        .catch((e) => console.error("[ark] ArkVideoTask 迁移失败:", (e && e.message) || e));
+      // 老师人格的长活（生成作业 + 30 分钟无动作蒸馏）：与模块同一个开关 TUTOR_ENABLED，只在 0 号实例（同上面的理由）
+      if (process.env.TUTOR_ENABLED === "true") require("./workers/tutor.worker").startTutorWorker();
+      // NCII 移除请求的到期提醒（TAKE IT DOWN Act §3 的 48 小时是**法定上限**）。
+      // ★ 同样只在 0 号实例跑：每个实例各跑一份 = 管理员每次收到 N 封同样的信。
+      // ★ 15 分钟一轮：时限以小时计，更密没有意义，更疏则「剩 12 小时」这一档会失真。
+      // ★ 失败只记日志，绝不让它把进程带崩 —— 它是提醒，不是主链路（铁律八）。
+      const { sweepDueReminders } = require("./services/nciiTakedown.service");
+      const takedownTimer = setInterval(() => {
+        sweepDueReminders().catch((e) => console.error("[takedown] 到期清扫失败:", (e && e.message) || e));
+      }, 15 * 60 * 1000);
+      takedownTimer.unref?.(); // 别因为它让进程退不出去（优雅退出时 server.close 之后还在等定时器）
+      // 同款奖励：发布满 24 小时的同款判一次发不发（services/remixReward.service，模板体系 P3b）。
+      // ★ 只在 0 号实例：两道上限是「数一下 → 占位」，两个实例同时跑会多发出一两条（同一条同款仍只发一次）。
+      // ★ 10 分钟一轮：规则是以天计的，到期之后晚几分钟到账没人在意；更密只是白查库。
+      // ★ 开关（REMIX_REWARD_ENABLED=false）关着也照跑 —— 那时它把到期的一律记成不发，不攒着（见 config/remixReward）。
+      const { sweepRemixRewards } = require("./services/remixReward.service");
+      const remixRewardTimer = setInterval(() => {
+        sweepRemixRewards().catch((e) => console.error("[remix-reward] 清扫失败:", (e && e.message) || e));
+      }, 10 * 60 * 1000);
+      remixRewardTimer.unref?.();
+      // 受理之后失败的生成任务：替没人再来问的那些（App 被杀 / 卸载）向上游问一次结局，失败的按原桶退钱（services/taskRefund）。
+      // ★ 只在 0 号实例：两个实例各扫一遍不会多退（open → claimed 是条件原子抢占），但会把上游查询翻倍（方舟查询的 QPS 上限没有公开数）。
+      // ★ 5 分钟一轮、一轮最多问 30 次、问不出结局就退避（10 → 60 分钟）；同实例不重入（一轮可能跨过下一个 5 分钟）。
+      // ★ 失败只记日志：它是兜底，主链路是轮询端点与白模化取回那两处（看见失败当场退）。
+      const { sweepTaskRefunds } = require("./services/taskRefund.service");
+      const taskRefundTimer = setInterval(() => {
+        sweepTaskRefunds().catch((e) => console.error("[task-refund] 清扫失败:", (e && e.message) || e));
+      }, 5 * 60 * 1000);
+      taskRefundTimer.unref?.();
+      // Play 的「已作废购买」每小时拉一次。★ 它是 RTDN 的**兜底**，不是替代：
+      //   RTDN 可能丢、也可能我们正好在重启，而漏一条退款 = 用户白拿一整包 token。
+      //   ⚠ 两条路必然重叠 ⇒ 回收本身必须幂等（revokedAt 的条件原子抢占）。
+      // ★ 只在 0 号实例：每个实例各拉一遍只是把同一批通知重复处理 N 次。
+      const play = require("./services/payment/play.service");
+      const { playConfigured } = require("./config/play");
+      if (playConfigured()) {
+        const playTimer = setInterval(
+          () => {
+            // 回看 6 小时：比轮询周期宽出一大截，重启/网络抖动漏掉的那几条下一轮还能捞回来
+            play.pollVoided({ sinceMs: Date.now() - 6 * 3600_000 }).catch((e) => console.error("[play] 轮询失败:", (e && e.message) || e));
+          },
+          60 * 60 * 1000,
+        );
+        playTimer.unref?.();
+        // ★★ 没跑完的订单每分钟接着跑（consume 重试 + 崩在发币中间的补发）。
+        //   一分钟这个频率是被 Play 逼出来的：许可测试员的购买 **3 分钟**不 acknowledge
+        //   就会被自动退款，而 consume 蕴含 acknowledge。
+        const playSweep = setInterval(() => {
+          play.sweepUnconsumed().catch((e) => console.error("[play] 清扫失败:", (e && e.message) || e));
+        }, 60 * 1000);
+        playSweep.unref?.();
+      }
     } else {
-      console.log(`实例 ${instanceId}：跳过 AI worker（只在 0 号实例运行）`);
+      console.log(`实例 ${instanceId}：跳过 AI worker、ArkVideoTask 迁移、NCII 到期清扫、同款奖励清扫、失败退款清扫与 Play 轮询/清扫（只在 0 号实例运行）`);
     }
 
     setupGracefulShutdown(server);

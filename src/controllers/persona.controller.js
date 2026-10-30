@@ -4,6 +4,7 @@
 const mongoose = require("mongoose");
 const Persona = require("../models/Persona");
 const PersonaInstall = require("../models/PersonaInstall");
+const { personaKindFilter } = require("../services/personaKind");
 const PersonaLike = require("../models/PersonaLike");
 const PersonaEquip = require("../models/PersonaEquip");
 const PersonaPurchase = require("../models/PersonaPurchase");
@@ -11,6 +12,9 @@ const { generatePersonaDraft, analyzeMaterials } = require("../services/personaA
 const { styleDescriptorOf } = require("../services/personaAccess.service");
 const { personaPromptLine } = require("../services/companionSetting.service");
 const companion = require("../services/companion.service");
+const billing = require("../services/billing.service");
+const { priceOf } = require("../config/tokens");
+const chatSafety = require("../services/chatSafety.service");
 const { hasAiKey } = require("../services/aiClient");
 const { purchasePersonaTransfer, personaFee } = require("../services/points.service");
 const { badRequest, forbidden, notFound, invalidId } = require("../utils/http");
@@ -225,6 +229,8 @@ async function listPersonas(req, res, next) {
       filter = { shared: true, takenDown: { $ne: true } };
     }
     if (tag) filter.tags = tag;
+    // 老师人格的列表过滤只在 services/personaKind.js 那一处：缺省不带、查询参数点名要老师才给（老 App 会把列表里任何一条装成客服人格）
+    Object.assign(filter, personaKindFilter(req.query.kind));
     // 2026-09-05 起搜索 / 排序 / 分页都在数据库做（此前是全量 find 再 JS 过滤，市场一长就先死在这）
     if (q) {
       const re = new RegExp(escapeRegex(q), "i");
@@ -355,21 +361,63 @@ async function previewChat(req, res, next) {
     const history = req.body.messages;
     if (history[history.length - 1].role !== "user") badRequest("last message must be from user");
     const draft = req.body.draft;
+    const lang = req.body.lang || "zh";
+    const caps = Array.isArray(req.body.caps) ? req.body.caps : [];
+    const country = chatSafety.countryOf(req);
+    // ★ 试聊也是一条真的聊天链路（用户对着草稿人格说话），输入侧一样要查：
+    //   命中就不调模型、直接给求助卡。输出侧由 streamCompanionReply 默认守卫兜着。
+    const previewVerdict = chatSafety.detectSelfHarm(history[history.length - 1].content);
+    if (previewVerdict.hit) {
+      const card = chatSafety.crisisCard({ trigger: "input", country, lang });
+      await chatSafety.recordReferral({ scene: "persona_preview", trigger: "input", country });
+      const send = companion.openSse(res);
+      for (const e of companion.crisisCardEvents({ card, caps })) send(e.event, e.data);
+      send("done", { text: "", safety: true });
+      res.end();
+      return;
+    }
     const style = normalizeStyle(draft.style);
     const system = companion.buildSystemPrompt({
       userName: req.user.displayName || req.user.username || "",
       lang: req.body.lang || "zh",
       personaLine: personaPromptLine({ name: String(draft.name || "").trim().slice(0, 120), styleDescriptor: styleDescriptorOf(draft.name, style) }),
     });
+    // ★★ 计费（R1.5）：试聊也是一条真的模型调用，此前一分钱不扣，而它的闸门是 20 次/分钟。
+    const pre = await billing.preAuthorize({ user: req.user, cost: priceOf("chat", {}), memo: "chat persona-preview" });
+    if (!pre.ok) return res.status(pre.status).json(pre.body);
+    let produced = false;
     await companion.streamCompanionReply({
       res,
       messages: [
         { role: "system", content: system },
         ...companion.personaExampleMessages({ examples: style.examples }),
+        // 安全底线在 few-shot 之后再发一次（草稿人格的示例对话同样会稀释它）
+        companion.safetySystemMessage(),
         ...history.map((m) => ({ role: m.role, content: m.content })),
       ],
       tag: "persona-preview",
+      country,
+      lang,
+      caps,
+      scene: "persona_preview",
+      // 试聊也是真的在和 AI 说话，同样要告知（这条链路服务端不存历史，所以每轮都发）
+      prelude: [
+        {
+          event: "notice",
+          data: {
+            kind: "ai_disclosure",
+            text: lang === "en" ? "You're previewing an AI persona. It is not a real person and can be wrong." : "你正在试聊一个 AI 人格，不是真人，回答可能出错。",
+          },
+        },
+      ],
+      // ★★ 计费的命根子（#78 正文第 ① 条点名的第二处）：丢了它每轮扣 400 再退 400。
+      finish: ({ text }) => {
+        produced = Boolean(text);
+        return {};
+      },
     });
+    if (!produced) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat persona-preview", took: pre.took });
+    else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat persona-preview", snapshot: pre.before });
   } catch (err) {
     next(err);
   }
@@ -414,7 +462,16 @@ async function updatePersona(req, res, next) {
     if (req.body.coverEmoji !== undefined) doc.coverEmoji = normalizeEmoji(req.body.coverEmoji);
     if (req.body.coverImageUrl !== undefined) doc.coverImageUrl = normalizeSafeUrl(req.body.coverImageUrl);
     if (req.body.tags !== undefined) doc.tags = toTags(req.body.tags);
-    if (req.body.style !== undefined) doc.style = normalizeStyle(req.body.style);
+    if (req.body.style !== undefined) {
+      // ★★ PATCH 语义：只改请求里**真的带了**的键，没带的保持库里的值（2026-09-18 线上 bug，
+      //   理由见 persona.schemas.js 的 stylePatchBody）。显式发 "" / [] 照常算"清空"。
+      //   合并之后仍整份过一遍 normalizeStyle —— 库里的老数据未必合今天的上限，一并归一。
+      const prev = (doc.toObject().style) || {};
+      const sent = Object.fromEntries(Object.entries(req.body.style).filter(([, v]) => v !== undefined));
+      doc.style = normalizeStyle({ ...prev, ...sent });
+    }
+    // 被平台下架（举报处置）的人格，作者不能自己再翻成公开；想申诉走工单。原因给作者看，处置人不给（docs/02 6.6）
+    if (req.body.shared && doc.takenDown) forbidden(`这个人格已被平台下架（${doc.takenDownReason || "原因见站内通知"}），不能再公开`);
     if (req.body.shared !== undefined) doc.shared = Boolean(req.body.shared);
     if (req.body.voice !== undefined) doc.voice = await expandVoiceInput(req.body.voice, req.user._id);
     // 调价只影响后续购买：已购用户是永久解锁（PersonaPurchase 记录成交价快照）

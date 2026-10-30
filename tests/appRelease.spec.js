@@ -202,5 +202,58 @@ describe("安装包镜像的可缓存性", () => {
       .expect(206);
     expect(res.headers["content-range"]).toBe("bytes 0-99/1024");
   });
+
+  // ★★ 同一个包只有一个缓存键。CF 按整条 URL 认缓存，而 Express 5 路由不分大小写、不严格认末尾斜杠、
+  //   `:name` 先解码 —— 下面每一种写法在没有守卫时都回 200 + 整包，在 CF 那里各是一个缓存键、
+  //   各回源一次整包。源站改按流量计费之后这就是「付钱的放大器」。
+  const CANON = "/api/app/file/qimeng-9.99.apk";
+  const NON_CANON = [
+    `${CANON}?cb=123`,
+    `${CANON}?`,
+    `${CANON}?a=1&b=2`,
+    "/API/app/file/qimeng-9.99.apk",
+    "/api/App/File/qimeng-9.99.apk",
+    "/api/APP/FILE/qimeng-9.99.apk",
+    `${CANON}/`,
+    "/API/app/file/qimeng-9.99.apk/?x=1",
+    "/api/app/file/qimeng-9.99.%61pk",
+    "/api/app/file/qimeng%2D9.99.apk",
+  ];
+
+  test("F3 不是正名的写法（查询串 / 大小写 / 末尾斜杠 / 百分号编码）一律 301 回正名、不发文件本体", async () => {
+    const app = appWithCors();
+    for (const method of ["get", "head"]) {
+      for (const url of NON_CANON) {
+        const res = await request(app)[method](url).set("Origin", "https://example.com");
+        // 把 url 带进断言：哪一种写法漏了，失败信息里直接看得见
+        expect([method, url, res.status, res.headers.location]).toEqual([method, url, 301, CANON]);
+        // 301 不进缓存：存进正名缓存键就是正名跳到自己（见路由里的 ★）
+        expect(res.headers["cache-control"]).toBe("no-store");
+        expect(res.headers.vary).toBeUndefined();
+        expect(Number(res.headers["content-length"] || 0)).toBeLessThan(1024);
+      }
+    }
+    // 文件不在也是 301（不先 stat：不给"这个版本在不在"另开一个探针），坏名字照旧 400
+    await request(app).get("/api/app/file/qimeng-0.01.apk?x=1").expect(301);
+    await request(app).get("/API/app/file/qimeng-0.01.apk").expect(301);
+    await request(app).get("/api/app/file/a..b?x=1").expect(400);
+    // 连写的斜杠、点段在 Express 那里本来就落不到这条路由（404、几十字节），钉一下别哪天变成整包
+    for (const url of ["/api//app/file/qimeng-9.99.apk", "/api/app//file/qimeng-9.99.apk", "/api/app/x/../file/qimeng-9.99.apk"]) {
+      const res = await request(app).get(url);
+      expect([url, res.status]).toEqual([url, 404]);
+    }
+  });
+
+  test("F4 正名照旧 200 + 整包（F1 的口径不变），而且每一条 301 跟过去都落在 200 上、不会转圈", async () => {
+    const app = appWithCors();
+    const res = await request(app).get(CANON).expect(200);
+    expect(res.headers["content-length"]).toBe("1024");
+    await request(app).head(CANON).expect(200);
+    for (const url of NON_CANON) {
+      const first = await request(app).get(url).expect(301);
+      const landed = await request(app).get(first.headers.location);
+      expect([url, landed.status, landed.headers["content-length"]]).toEqual([url, 200, "1024"]);
+    }
+  });
 });
 
