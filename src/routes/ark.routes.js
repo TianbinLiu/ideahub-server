@@ -169,6 +169,10 @@ router.get("/health", (_req, res) => {
     ok: true,
     ark: arkConfigured(),
     imageGroups: true,
+    // videoHide：有 POST/DELETE /api/branch/videos/:id/hide（「不感兴趣」，2026-10-30）；App 见不到这一位不摆那一行
+    videoHide: true,
+    // ipRegion：用户资料带 ipRegion（IP 属地，2026-10-30）；App 见不到这一位不画那一行
+    ipRegion: true,
     res480: true,
     draftMode: true,
     failRefund: true,

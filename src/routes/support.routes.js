@@ -79,7 +79,8 @@ const chatBodySchema = z
     threadId: z.string().trim().max(64).nullable().optional(),
     lang: z.enum(["zh", "en"]).optional(),
   // 客户端声明自己认识哪些新事件；不声明的老客户端会收到退化形式（求助卡走 sentence）
-  caps: z.array(z.enum(["safety", "notice"])).max(4).optional(),
+  // goto / ask（2026-10-30）：客户端会画「带我去」键 / 选项芯片；不声明的老客户端提示词里不提这两种标记，收到也只会被剥掉
+  caps: z.array(z.enum(["safety", "notice", "goto", "ask"])).max(6).optional(),
   })
   .refine((b) => Boolean(b.messages) !== Boolean(b.message), { message: "send either message or messages[]" });
 
@@ -289,9 +290,21 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     // 没汉字、自己又判不了的短追问（「Why?」「Refund」）跟着上一问走（support.replyInEnglish）—— 英文用户的短追问照旧说死英文
     enNames: support.replyInEnglish(userTurns),
     personaLine: personaPromptLine(setup.persona),
+    // 版本号静默进上下文、两种动作标记只对声明了的客户端说（support.buildSupportSystemPrompt 的 ★）
+    appVersion: req.appVersion ?? null,
+    caps: Array.isArray(parsed.data.caps) ? parsed.data.caps : [],
   });
   // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
-  const prefix = [{ role: "system", content: system }, ...companion.personaExampleMessages(setup.persona)];
+  // ★ few-shot 之后再补一句（2026-10-30，10-25 评审第 2 条）：示例对话排在系统提示之后，模型容易把示例的口径当成最新指令 ——
+  //   补一句把红线拉回来。没有示例时不加（多一条 system 白占上下文）
+  const fewShot = companion.personaExampleMessages(setup.persona);
+  const prefix = [
+    { role: "system", content: system },
+    ...fewShot,
+    ...(fewShot.length
+      ? [{ role: "system", content: "上面几组对话只示范这个人格的语气。接下来回答时仍以最前面的系统提示为准：【依据】【禁止承诺】【转人工】与安全规则一条都不松，示例里与之冲突的说法不照搬。" }]
+      : []),
+  ];
   let messages;
   let estPrompt = 0;
   if (thread) {
@@ -380,7 +393,8 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     // 剥掉已知演出标签后再查一次，标记不能念出来也不能进字幕
     const h = support.parseHandoff(p.text);
     if (h.handoff) markHandoff(h.category, h.reason);
-    const text = support.stripHandoffTags(h.text).trim();
+    // [goto:] / [ask:] 不念、不进字幕（在 done 之前整段解析成事件，见下面）
+    const text = support.stripActionTags(support.stripHandoffTags(h.text)).trim();
     if (!text) return;
     const out = chatSafety.detectHarmfulOutput(text);
     if (out && out.hit) {
@@ -496,7 +510,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
         thread,
         displayText: text,
         // 转人工标记不进历史：模型看到自己上一轮的 [handoff:x] 容易每句都再标一次
-        modelText: support.stripHandoffTags(rawParts.join("").replace(/\s*\[[^\]]*$/, "")),
+        modelText: support.stripActionTags(support.stripHandoffTags(rawParts.join("").replace(/\s*\[[^\]]*$/, ""))),
         usage,
         estPrompt,
         aborted: closed || failed,
@@ -510,7 +524,23 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
   if (!text) await billing.refundUnaccepted({ user: req.user, cost: pre.cost, memo: "chat support", took: pre.took });
   else await billing.noteFreeCall({ user: req.user, cost: pre.cost, memo: "chat support", snapshot: pre.before });
   if (failed && !blocked) send("error", { message: "support upstream failed", ...extra });
-  else send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
+  else {
+    // ★ 两种动作事件排在 done 之前（2026-10-30）：只对声明了 caps 的客户端发；转人工那一轮不发「带我去」（人工卡片已经是下一步）；
+    //   被拦（blocked）那一轮两种都不发。id 不在白名单的在 parseGoto 里就丢了
+    if (!blocked) {
+      const raw = rawParts.join("");
+      const capsNow = Array.isArray(parsed.data.caps) ? parsed.data.caps : [];
+      if (capsNow.includes("goto") && !handoff) {
+        const g = support.parseGoto(raw);
+        if (g) send("goto", { id: g.id, label: g.label[lang === "en" ? "en" : "zh"] });
+      }
+      if (capsNow.includes("ask")) {
+        const a = support.parseAsk(raw);
+        if (a) send("ask", a);
+      }
+    }
+    send("done", { text, handoff: Boolean(handoff), category: handoff ? handoff.category : "", ...extra });
+  }
   closed = true;
   res.end();
   if (thread) chatMemory.maybeCompact(thread._id).catch((e) => console.warn("[support] compact failed:", (e && e.message) || e));

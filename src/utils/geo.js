@@ -119,4 +119,44 @@ function videoZoneOf(country) {
   return "intl";
 }
 
-module.exports = { countryOf, videoZoneOf, normCountry, CN_ZONE_COUNTRIES, BLOCKED_COUNTRIES };
+/**
+ * 境内省级行政区：ISO 3166-2:CN 代码 → 中文名。geoip-lite 的 `region` 与 Cloudflare 的 `cf-region-code`（开了「Add visitor location headers」
+ * 那条托管转换才有）给的都是这套代码；`cf-region` 给英文名，所以也按英文名反查一次。
+ */
+const CN_REGIONS = Object.freeze({
+  BJ: "北京", TJ: "天津", HE: "河北", SX: "山西", NM: "内蒙古", LN: "辽宁", JL: "吉林", HL: "黑龙江", SH: "上海", JS: "江苏",
+  ZJ: "浙江", AH: "安徽", FJ: "福建", JX: "江西", SD: "山东", HA: "河南", HB: "湖北", HN: "湖南", GD: "广东", GX: "广西",
+  HI: "海南", CQ: "重庆", SC: "四川", GZ: "贵州", YN: "云南", XZ: "西藏", SN: "陕西", GS: "甘肃", QH: "青海", NX: "宁夏", XJ: "新疆",
+});
+const CN_REGION_BY_EN = Object.freeze({
+  beijing: "BJ", tianjin: "TJ", hebei: "HE", shanxi: "SX", "inner mongolia": "NM", "nei mongol": "NM", liaoning: "LN", jilin: "JL",
+  heilongjiang: "HL", shanghai: "SH", jiangsu: "JS", zhejiang: "ZJ", anhui: "AH", fujian: "FJ", jiangxi: "JX", shandong: "SD",
+  henan: "HA", hubei: "HB", hunan: "HN", guangdong: "GD", guangxi: "GX", hainan: "HI", chongqing: "CQ", sichuan: "SC", guizhou: "GZ",
+  yunnan: "YN", tibet: "XZ", xizang: "XZ", shaanxi: "SN", gansu: "GS", qinghai: "QH", ningxia: "NX", xinjiang: "XJ",
+});
+
+/**
+ * IP 属地（2026-10-30）：国家 + 境内到省。国家只问 countryOf（同一把尺）；省：cf-region-code / cf-region 优先，没有再按 clientIp 查 geoip。
+ * 港澳台按行业做法（抖音 / 微博）写成地区：country 回 HK / MO / TW、region 为空，展示方按 country 写名字。
+ * @returns {{ country: string, region: string }} 都可能为空串（Tor / 查不到）
+ */
+function regionOf(req) {
+  const { country } = countryOf(req);
+  if (country !== "CN") return { country, region: "" };
+  const h = req?.headers || {};
+  const code = typeof h["cf-region-code"] === "string" ? h["cf-region-code"].trim().toUpperCase() : "";
+  if (CN_REGIONS[code]) return { country, region: CN_REGIONS[code] };
+  const en = typeof h["cf-region"] === "string" ? h["cf-region"].trim().toLowerCase() : "";
+  if (en && CN_REGION_BY_EN[en]) return { country, region: CN_REGIONS[CN_REGION_BY_EN[en]] };
+  try {
+    const ip = String(clientIp(req) || "").trim().replace(/^::ffff:/i, "");
+    const hit = ip ? geoip.lookup(ip) : null;
+    const r = String(hit?.region || "").toUpperCase();
+    if (CN_REGIONS[r]) return { country, region: CN_REGIONS[r] };
+  } catch (e) {
+    console.warn("[geo] region lookup failed:", logSafe(e?.message || e, 200));
+  }
+  return { country, region: "" };
+}
+
+module.exports = { countryOf, regionOf, videoZoneOf, normCountry, CN_ZONE_COUNTRIES, BLOCKED_COUNTRIES, CN_REGIONS };

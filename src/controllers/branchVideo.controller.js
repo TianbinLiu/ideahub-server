@@ -23,6 +23,7 @@ const { uploadToCloudinary } = require("../middleware/upload");
 const { cloudinary } = require("../config/cloudinary");
 const PendingAssetPurge = require("../models/PendingAssetPurge");
 const BranchCollect = require("../models/BranchCollect");
+const BranchHide = require("../models/BranchHide");
 // 工坊工程（画布快照）。这里只用于**级联删除**与回炉后对齐版次；
 // 读写端点在 controllers/branchProject.controller.js。
 const BranchProject = require("../models/BranchProject");
@@ -920,6 +921,12 @@ async function listVideos(req, res, next) {
     // 拉黑：与上面那条 ★★ 同一个理由 —— 首页/分区/搜索/他人主页全走这一个查询，加在这里就够
     const blockPart = await blockedAuthorFilter(req.user);
     if (blockPart) parts.push(blockPart);
+    // 「不感兴趣」（2026-10-30，models/BranchHide）：本人点过的不再出现在首页 / 分区 / 搜索 / 关注流；作者主页（authorFilter）不滤 ——
+    //   人点进主页是主动要看他的全部。与拉黑同一个位置加，理由同上面那条 ★★：全部列表只有这一个查询
+    if (req.user && !authorFilter) {
+      const hidden = await BranchHide.find({ user: req.user._id }).select("video").lean();
+      if (hidden.length) parts.push({ _id: { $nin: hidden.map((h) => h.video) } });
+    }
     const query = { $and: parts };
 
     const docs = await BranchVideo.find(query)
@@ -1848,6 +1855,30 @@ async function uncollectVideo(req, res, next) {
   }
 }
 
+/** POST /videos/:id/hide —— 「不感兴趣」：这条从此不进本人的列表（models/BranchHide 文件头）。不查可见性：对一条已经看到的东西说不想看，没有门槛可言 */
+async function hideVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    await BranchHide.updateOne({ user: req.user._id, video: id }, { $setOnInsert: { user: req.user._id, video: id } }, { upsert: true });
+    res.json({ ok: true, hidden: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** DELETE /videos/:id/hide —— 撤回「不感兴趣」（App 的轻提示上那颗「撤销」） */
+async function unhideVideo(req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) invalidId("Invalid video id");
+    await BranchHide.deleteOne({ user: req.user._id, video: id });
+    res.json({ ok: true, hidden: false });
+  } catch (err) {
+    next(err);
+  }
+}
+
 /**
  * GET /me/collects —— 我收藏了哪些作品的 **id 列表**（按收藏时间倒序）。
  *
@@ -2673,6 +2704,8 @@ module.exports = {
   likeVideo,
   collectVideo,
   uncollectVideo,
+  hideVideo,
+  unhideVideo,
   listMyCollects,
   unlikeVideo,
   listComments,

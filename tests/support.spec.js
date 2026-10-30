@@ -908,3 +908,42 @@ describe("满意度 👍👎", () => {
     expect((await request(app).get("/api/admin/support/feedback?rating=nope").set("Authorization", `Bearer ${admin.token}`)).status).toBe(400);
   });
 });
+
+// 2026-10-30：「带我去」/「拿不准先问」两种标记 + 版本号 / 动作白名单进提示词（docs/decisions-2026-10-30.md 第三节）
+describe("support.service 动作标记（2026-10-30）", () => {
+  const svc = require("../src/services/support.service");
+
+  it("parseGoto 只认白名单里的 id、取最后一个；大小写与冒号写法都认", () => {
+    expect(svc.parseGoto("去钱包看看。[goto:wallet]")).toEqual({ id: "wallet", label: svc.GOTO_TARGETS.wallet });
+    expect(svc.parseGoto("[goto:settings] 先这样 [GOTO：wallet]").id).toBe("wallet");
+    expect(svc.parseGoto("[goto:nowhere] 没有这一页")).toBeNull();
+    expect(svc.parseGoto("没有标记")).toBeNull();
+  });
+
+  it("parseAsk 要 2～4 个非空选项，选项去重；不够就当没有", () => {
+    expect(svc.parseAsk("先问一句。[ask:你想退哪一笔？|最近一笔|更早的]")).toEqual({ question: "你想退哪一笔？", options: ["最近一笔", "更早的"] });
+    expect(svc.parseAsk("[ask:只有一个|A]")).toBeNull();
+    expect(svc.parseAsk("[ask:重复|A|A|B]").options).toEqual(["A", "B"]);
+    expect(svc.parseAsk("[ask:太多|A|B|C|D|E]")).toBeNull();
+  });
+
+  it("stripActionTags 把两种标记剥干净、别的字一个不动", () => {
+    expect(svc.stripActionTags("去钱包看看。[goto:wallet] [ask:哪一笔？|A|B]")).toBe("去钱包看看。 ");
+    expect(svc.stripActionTags("[handoff:billing] 保留别的标记")).toBe("[handoff:billing] 保留别的标记");
+  });
+
+  it("系统提示：成年女性；版本号只在带了时写；goto / ask 两段只对声明了 caps 的客户端写", () => {
+    const plain = svc.buildSupportSystemPrompt({ knowledge: "k" });
+    expect(plain).toContain("成年女性");
+    expect(plain).not.toContain("少女");
+    expect(plain).not.toContain("【用户版本】");
+    expect(plain).not.toContain("【带我去】");
+    expect(plain).not.toContain("【拿不准先问】");
+    expect(plain).toContain("【动作】");
+    const withAll = svc.buildSupportSystemPrompt({ knowledge: "k", appVersion: { name: "2.75", code: 87 }, caps: ["goto", "ask"] });
+    expect(withAll).toContain("2.75（87）");
+    expect(withAll).toContain("【带我去】");
+    expect(withAll).toContain("wallet（钱包 / 套餐）");
+    expect(withAll).toContain("【拿不准先问】");
+  });
+});
