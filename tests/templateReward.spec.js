@@ -332,6 +332,70 @@ describe("模板作者奖励", () => {
     expect(await svc.sweepTemplateRewards({ now: due() })).toMatchObject({ scanned: 1, paid: 1 });
   });
 
+  test("W5 到期锚点是挂上那一刻：给几周前发布的作品用改壳 PATCH 挂上模板 id，要等 PATCH 之后满 24 小时才判，不是下一轮就发", async () => {
+    const author = await registerUser();
+    const user = await registerUser();
+    const tpl = await seedTemplate(author);
+    const video = await publish(user);
+    const weeksAgo = new Date(Date.now() - 21 * 24 * HOUR);
+    await BranchVideo.updateOne({ _id: video }, { $set: { createdAt: weeksAgo } }, { timestamps: false });
+    const before = Date.now();
+    await request(app).patch(`/api/branch/videos/${video}`).set(auth(user)).send({ templateIds: [tpl] }).expect(200);
+    const doc = await BranchVideo.findById(video).lean();
+    expect(doc.templateReward.pending).toBe(true);
+    expect(new Date(doc.templateReward.at).getTime()).toBeGreaterThanOrEqual(before - 1000); // at = 挂上那一刻，不是发布那一刻
+    const b0 = await balanceOf(author);
+    // 发布早就满 24 小时了，但挂上才一个小时：不判
+    const early = await svc.sweepTemplateRewards({ now: new Date(Date.now() + HOUR) });
+    expect(early).toMatchObject({ scanned: 0, paid: 0 });
+    expect(await TemplateReward.countDocuments({ video })).toBe(0);
+    expect((await BranchVideo.findById(video).lean()).templateReward.pending).toBe(true);
+    expect(await balanceOf(author)).toEqual(b0);
+    // 挂上满 24 小时：判
+    const late = await svc.sweepTemplateRewards({ now: due() });
+    expect(late).toMatchObject({ scanned: 1, paid: 1 });
+    expect((await balanceOf(author)).addon).toBe(b0.addon + 10_000);
+    expect((await BranchVideo.findById(video).lean()).templateReward.pending).toBeUndefined();
+  });
+
+  test("W5 PATCH templateIds: [] 把清单清空、pending 原样留着；下一轮零行结案、摘掉 pending", async () => {
+    const author = await registerUser();
+    const user = await registerUser();
+    const tpl = await seedTemplate(author);
+    const video = await publish(user, { templateIds: [tpl] });
+    const at0 = (await BranchVideo.findById(video).lean()).templateReward.at;
+    await request(app).patch(`/api/branch/videos/${video}`).set(auth(user)).send({ templateIds: [] }).expect(200);
+    const doc = await BranchVideo.findById(video).lean();
+    expect(doc.templateIds).toEqual([]);
+    expect(doc.templateReward.pending).toBe(true); // 不碰
+    expect(new Date(doc.templateReward.at).getTime()).toBe(new Date(at0).getTime()); // at 也不碰
+    const b0 = await balanceOf(author);
+    const out = await svc.sweepTemplateRewards({ now: due() });
+    expect(out).toMatchObject({ scanned: 1, paid: 0, skipped: 0, busy: 0, failed: 0 });
+    expect(await TemplateReward.countDocuments({ video })).toBe(0);
+    expect((await BranchVideo.findById(video).lean()).templateReward.pending).toBeUndefined();
+    expect(await balanceOf(author)).toEqual(b0);
+  });
+
+  test("W5 不是作者的 PATCH 带 templateIds：403，作品上一个字都没写（改壳 / 回炉两条路）", async () => {
+    const author = await registerUser();
+    const owner = await registerUser();
+    const stranger = await registerUser();
+    const tpl = await seedTemplate(author);
+    const video = await publish(owner);
+    await request(app).patch(`/api/branch/videos/${video}`).set(auth(stranger)).send({ templateIds: [tpl] }).expect(403);
+    await request(app)
+      .patch(`/api/branch/videos/${video}`)
+      .set(auth(stranger))
+      .send({ segments: [{ title: "成片", plot: "p", videoUrl: "https://cdn.example.com/x.mp4", durationSec: 10 }], baseRevision: 0, templateIds: [tpl] })
+      .expect(403);
+    const doc = await BranchVideo.findById(video).lean();
+    expect(doc.templateIds).toBeUndefined();
+    expect(doc.templateReward).toBeUndefined();
+    expect(doc.revision || 0).toBe(0);
+    expect(await svc.sweepTemplateRewards({ now: due() })).toMatchObject({ scanned: 0 });
+  });
+
   test("W2 崩在占位之后：账本里没有这一笔 → 续办时补发一次；账本里已经有 → 只补状态不再发", async () => {
     const author = await registerUser();
     const user = await registerUser();
@@ -494,7 +558,12 @@ describe("模板作者奖励", () => {
     expect(mine.body.mine.count).toBe(cfg.PER_AUTHOR_PER_DAY);
 
     const later = await publish(await registerUser(), { templateIds: [tpl] });
-    await BranchVideo.updateOne({ _id: later }, { $set: { createdAt: new Date(now.getTime() - cfg.HOLD_MS) } }, { timestamps: false });
+    // 到期锚点是 max(createdAt, templateReward.at)：两个一起拨
+    await BranchVideo.updateOne(
+      { _id: later },
+      { $set: { createdAt: new Date(now.getTime() - cfg.HOLD_MS), "templateReward.at": new Date(now.getTime() - cfg.HOLD_MS) } },
+      { timestamps: false }
+    );
     const out2 = await svc.sweepTemplateRewards({ now: new Date(now.getTime() + 2 * HOUR) });
     expect(out2).toMatchObject({ scanned: 1, paid: 1 });
     expect(await rowOf(twentyFirst, tpl)).toMatchObject({ status: "skipped", reason: "day_cap" });

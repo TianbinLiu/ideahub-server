@@ -183,7 +183,11 @@ const remixOfSchema = new mongoose.Schema(
 const templateRewardSchema = new mongoose.Schema(
   {
     pending: { type: Boolean, default: undefined },
-    /** 最近一次写 pending 的时刻（回炉换模板会再落一次；只给人查，判定不认它 —— 到期认的是 createdAt） */
+    /**
+     * 套用记录最近一次挂上的时刻（每次 (re)set pending 都写：发布 / 改壳 PATCH / 回炉）。**到期的锚点**：
+     * dueAt = max(createdAt, at) + HOLD_MS（services/templateReward.service 的 sweep）。
+     * ★ 不能只认 createdAt：改壳 PATCH 能给几周前的作品挂上 templateIds，那样下一轮就发（#145 评审）。
+     */
     at: { type: Date, default: undefined },
   },
   { _id: false }
@@ -322,9 +326,10 @@ branchVideoSchema.index(
   { createdAt: 1 },
   { partialFilterExpression: { "remixOf.pending": true }, name: "remix_reward_pending" }
 );
-// 模板作者奖励的清扫器「到期了还没判的作品」那一查（services/templateReward.service 的 sweepTemplateRewards）。同上：partial
+// 模板作者奖励的清扫器「挂上满 24 小时还没判的作品」那一查（services/templateReward.service 的 sweepTemplateRewards）。
+// 同上：partial；键是 templateReward.at（到期锚点），不是 createdAt
 branchVideoSchema.index(
-  { createdAt: 1 },
+  { "templateReward.at": 1 },
   { partialFilterExpression: { "templateReward.pending": true }, name: "template_reward_pending" }
 );
 // 后台「下架列表」用。★ partial 索引：全站绝大多数作品没有这个字段，

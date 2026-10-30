@@ -459,7 +459,7 @@ App 上那句「每次 N token、每天最多 M 次…」读的是这里，**不
 
 ### 模板作者奖励（`template_reward`，2026-10-30）
 
-别人**套用了你的模板**出片、**公开发布满 24 小时还公开着** → **平台**印一笔 token 给模板作者（主人 10-30 拍板；设计正本在 app 仓
+别人**套用了你的模板**出片、**套用记录挂上之后满 24 小时、那一刻作品还公开着** → **平台**印一笔 token 给模板作者（主人 10-30 拍板；设计正本在 app 仓
 `docs/template-author-reward-design.md`）。**形状照抄同款奖励**（上一节），只换触发源与几个数；钱的红线同一条：平台印钱、不在用户之间流转。
 
 | 数 | 值 | 在哪儿 |
@@ -485,8 +485,9 @@ App 上那句话读的是这里，**不在 App 里另抄一份数**（`holdMs` �
 **一条作品的一生**（唯一实现 `services/templateReward.service.js`）：
 1. 发布 / 回炉认下了 `templateIds` → 作品上落 `templateReward.pending`。**写入时不排除作者自己的模板、不看模板状态**：谁是模板作者
    （`BranchTemplate.ownerId`）、模板还在不在，都是判定那一刻的事。
-2. 满 24 小时（按 `createdAt`，回炉不重新起算）后清扫器（`index.js`，只在 0 号实例，每 10 分钟一轮）把这条作品套过的**每一个**模板各判**一次**，
-   各写一行 `TemplateReward`；一对都不 busy 才摘掉作品上的 pending。不发的原因（`reason`）：`disabled` / `video_not_public`（私密、凭链接可见、
+2. **套用记录挂上之后满 24 小时、那一刻作品还公开着才判**（锚点是 `templateReward.at`：dueAt = max(`createdAt`, `at`) + 24h；
+   回炉 / 改发布体重新挂 id 的，新的那几对从挂上那一刻起算，早判过的对不受影响）。清扫器（`index.js`，只在 0 号实例，每 10 分钟一轮）
+   把这条作品套过的**每一个**模板各判**一次**，各写一行 `TemplateReward`；一对都不 busy 才摘掉作品上的 pending。不发的原因（`reason`）：`disabled` / `video_not_public`（私密、凭链接可见、
    被下架）/ `template_gone`（模板删了）/ `template_blocked`（平台下架的模板；`retired` 照发）/ `author_inactive`、`user_inactive` /
    `self`（自己套自己的）/ **`blocked`（两人之间有拉黑 —— 与同款不同：那边币照发只是通知匿名，这边规则写明「没有拉黑才发」）** /
    `user_cap`、`template_cap`、`day_cap` / `budget`（保险丝，排在最后判）。**判一次就定案**、发了**不追回**。

@@ -5,8 +5,9 @@
 // **照抄** remixReward.service：那边的 R1~R4 四条「做错了不报错的事」逐条适用，这里只记与同款不同的几处。
 //
 // 一条作品的一生：
-//   发布 / 回炉那一拍（branchVideo.controller 的 resolveTemplateIds）→ 作品上落 `templateIds` + `templateReward.pending: true`
-//   → 满 24 小时后清扫器（index.js，只在 0 号实例，每 10 分钟一轮）把它套过的**每一个**模板各判一次：发 / 不发，各写一行 TemplateReward
+//   发布 / 改壳 PATCH / 回炉那一拍（branchVideo.controller 的 resolveTemplateIds）→ 作品上落 `templateIds` + `templateReward.{pending, at}`
+//   → 挂上满 24 小时后（锚点是 `at`，见 sweep 里的 ★★）清扫器（index.js，只在 0 号实例，每 10 分钟一轮）把它套过的**每一个**模板各判一次：
+//     发 / 不发，各写一行 TemplateReward
 //   → 发：`wallet.credit(模板作者, N, "template_reward")` + 一条 BRANCH_TEMPLATE_REWARD 通知
 //   → 这条作品的每一个模板都有了行（且都办完了）才摘掉作品上的 pending。
 //   之后作品被删、被设成私密、被下架都**不追回**。
@@ -309,12 +310,18 @@ async function sweepTemplateRewards({ now = new Date(), limit = 200 } = {}) {
       }
     }
 
-    // ★ 到期认的是 createdAt（发布那一刻），不是 templateReward.at：回炉重报模板不重新起算 24 小时（作品本来就公开挂着）
-    const due = await BranchVideo.find({ "templateReward.pending": true, createdAt: { $lte: new Date(now.getTime() - cfg.HOLD_MS) } })
-      .sort({ createdAt: 1 })
-      .limit(limit)
-      .select("_id title author visibility linkOnly takedown templateIds createdAt")
-      .lean();
+    // ★★ 到期的锚点是**套用记录挂上的那一刻**（`templateReward.at`，每次 (re)set pending 都写：发布 / 改壳 PATCH / 回炉），
+    //   不是发布那一刻：改壳 PATCH 能给几周前发布的作品挂上 templateIds，按 createdAt 算的话下一轮就发（#145 评审抓到）。
+    //   dueAt = max(createdAt, at) + HOLD_MS —— 发布那一拍 at 比 createdAt 早几毫秒，取 max 让「发布时就带」的那一档仍按发布起算；
+    //   回炉 / 改发布体重新挂 id 的，新的那几对从挂上那一刻起算，早判过的对是 done、不受影响。
+    const cutoff = new Date(now.getTime() - cfg.HOLD_MS);
+    const due = (
+      await BranchVideo.find({ "templateReward.pending": true, "templateReward.at": { $lte: cutoff } })
+        .sort({ "templateReward.at": 1 })
+        .limit(limit)
+        .select("_id title author visibility linkOnly takedown templateIds templateReward createdAt")
+        .lean()
+    ).filter((v) => new Date(v.createdAt).getTime() <= cutoff.getTime());
     for (const video of due) {
       out.scanned += 1;
       try {

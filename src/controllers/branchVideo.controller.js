@@ -995,6 +995,7 @@ async function resolveRemixOf(raw, user) {
  *   （services/templateReward.service 的 verdictFor 回 self / template_blocked）。写入时排除的话，模板在这 24 小时里换主 / 被下架
  *   就会判成另一个结果，而且 `templateIds` 这一格本身是「这条作品用了哪些模板」的事实，与发不发钱无关。
  * ★ `templateReward.pending` 只在真有 id 时落（契约「有 id 才落」）：没套模板的作品不该在清扫器的 partial 索引里占一行。
+ *   `templateReward.at` 跟着一起写 = 这批 id 挂上的时刻，是到期的锚点（挂上满 24 小时才判；改壳 PATCH 给老作品挂 id 不会下一轮就发）。
  *   带了 `[]`（回炉说「这一版没套模板」）就只落空数组、不碰 pending —— 上一版欠着的判定照旧由清扫器收口（它见 templateIds 为空会直接摘掉 pending）。
  */
 async function resolveTemplateIds(raw, now = new Date()) {
@@ -1599,8 +1600,16 @@ async function updateVideo(req, res, next) {
     const body = { ...req.body };
     const baseRevision = body.baseRevision;
     delete body.baseRevision;
+    // ★ 归属先判、再去查别的表：带 templateIds 的 PATCH 会去 BranchTemplate 查一遍存在性，不该替一个不是作者的人跑那一查
+    //   （回炉那条路 reviseVideoContent 自己还会再判一次 —— 它要带着别的字段取 before，这里这一读只是把 403 提到最前）。
+    // ★ select 里带上 cover/segments/branchTree：改壳改封面时要按**合并之后**的正文重算 assetUrls（见下面那条 ★★）
+    const doc = await BranchVideo.findById(id).select("_id author cover segments branchTree").lean();
+    if (!doc) notFound("Video not found");
+    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
+
     // 套用过的模板（模板作者奖励）先摘出来单独核：它要查 BranchTemplate 的存在性，不能跟着壳字段裸 $set
-    // （裸写的话一个不存在的 id 也会落库，之后清扫器替一个不存在的模板判一遍 template_gone —— 白占一行）
+    // （裸写的话一个不存在的 id 也会落库，之后清扫器替一个不存在的模板判一遍 template_gone —— 白占一行）。
+    // 回 `templateReward.at` = 现在：到期从挂上那一刻起算（model 里 at 的 ★）
     const tplFields = await resolveTemplateIds(body.templateIds);
     delete body.templateIds;
     const isRevise =
@@ -1614,12 +1623,6 @@ async function updateVideo(req, res, next) {
     //   但 `$set: {}` 会静默成功并回一条"改过了"的作品。整句拒（铁律八）。
     //   只带 templateIds 算改了东西（它是作品上的一格，与标签同类）。
     if (!Object.keys(body).length && !tplFields) badRequest("no fields to update");
-
-    // ★ select 里带上 cover/segments/branchTree：改封面时要按**合并之后**的正文
-    //   重算 assetUrls（见下面那条 ★★）
-    const doc = await BranchVideo.findById(id).select("_id author cover segments branchTree").lean();
-    if (!doc) notFound("Video not found");
-    if (String(doc.author) !== String(req.user._id)) forbidden("Forbidden");
 
     // validate 已经把未声明字段 strip 掉了，这里的 body 只可能是那五个键。
     // ★ cover 的 schema 已经把它限成 http(s) URL（不收 dataURL，见 schemas 里的说明），
