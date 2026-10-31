@@ -16,7 +16,7 @@ const { uploadToCloudinary } = require("../middleware/upload");
 const { clientIp } = require("../middleware/rateLimit");
 const { forbidden, notFound, invalidId, badRequest } = require("../utils/http");
 // 热度只有一份公式（想法榜也调它），见 utils/hotScore.js 的说明
-const { hotScore, roundHeat } = require("../utils/hotScore");
+const { hotScore, roundHeat, trendScore } = require("../utils/hotScore");
 const {
   assetKey: assetKeySchema,
   assetKind: assetKindSchema,
@@ -47,7 +47,16 @@ function isValidId(id) {
 
 // ── 互动计数与热度 ────────────────────────────────────────────────
 
-const EMPTY_STATS = Object.freeze({ views: 0, likes: 0, bookmarks: 0, heat: 0 });
+const EMPTY_STATS = Object.freeze({ views: 0, likes: 0, bookmarks: 0, heat: 0, trend: 0 });
+
+/**
+ * 市场条目的 stats 再加一格 trend（排「热门」用，按上架时间以 7 天半衰期衰减的 heat；utils/hotScore.trendScore 头上的 ★）。
+ * 单条的 /stats 端点不带它（那是详情页读数字用的，不排序）；老 App 不认这一格、照旧按 heat 排。
+ */
+function withTrend(stats, doc) {
+  const since = doc && (doc.publishedAt || doc.createdAt);
+  return { ...stats, trend: roundHeat(trendScore(stats.heat, since)) };
+}
 
 /**
  * 一条 BranchAssetStat → 响应里的 stats。
@@ -177,7 +186,7 @@ function toCardPayload(doc, stats = EMPTY_STATS) {
     ...(doc.sourceOwner ? { sourceOwner: String(doc.sourceOwner) } : {}),
     publishedAt: doc.publishedAt,
     description: doc.description || "",
-    stats,
+    stats: withTrend(stats, doc),
     createdAt: doc.createdAt,
   };
 }
@@ -195,7 +204,7 @@ function toDeckPayload(doc, stats = EMPTY_STATS) {
     description: doc.description || "",
     installs: Number(doc.installs || 0),
     sourceDeck: doc.sourceDeck ? String(doc.sourceDeck) : undefined,
-    stats,
+    stats: withTrend(stats, doc),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -215,7 +224,7 @@ function toSharedDeckPayload(doc, stats = EMPTY_STATS) {
     types: [...new Set(cards.map((c) => c.type))],
     installs: Number(doc.installs || 0),
     author: doc.owner && typeof doc.owner === "object" ? doc.owner : undefined,
-    stats,
+    stats: withTrend(stats, doc),
     publishedAt: doc.publishedAt,
   };
 }
@@ -945,7 +954,7 @@ function toSharedCardPayload(doc, stats = EMPTY_STATS) {
     views: shareableViews(doc.views),
     description: doc.description || "",
     author: doc.owner && typeof doc.owner === "object" ? doc.owner : undefined,
-    stats,
+    stats: withTrend(stats, doc),
     publishedAt: doc.publishedAt,
   };
 }
