@@ -344,6 +344,22 @@ describe('评审补的几条（2026-09-25）', () => {
     expect(sent).toContain('已按安全协议移除');
   });
 
+  it('★ 客服旧写法的历史里那句危机原话同样不会被回灌给模型（2026-10-30 补：原来只有陪聊接了）', async () => {
+    const { token } = await createUser();
+    await support(token, {
+      messages: [
+        { role: 'user', content: '我想自杀' },
+        { role: 'assistant', content: '（求助卡）' },
+        { role: 'user', content: '取回怎么用' },
+      ],
+      caps: ['safety'],
+    });
+    expect(mockAi.calls).toHaveLength(1);
+    const sent = JSON.stringify(mockAi.calls[0]);
+    expect(sent).not.toContain('我想自杀');
+    expect(sent).toContain('已按安全协议移除');
+  });
+
   it('★ 提纯出来的摘要命中敏感判据时整段丢弃，且不抹掉原来那段摘要', async () => {
     const { user } = await createUser();
     const thread = await chatMemory.openThread({ userId: user._id, scene: 'companion' });

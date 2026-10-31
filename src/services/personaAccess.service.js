@@ -19,6 +19,24 @@ const { serializeVoiceSettings } = require("../utils/voiceSettings");
  * 人设文本的唯一拼法（persona.controller.computeStyleDescriptor 是它的别名；插件 personaText / 数字人【人设】段 / 试聊都用它）。
  * 2026-09-05 起多拼 语气 / 称呼用户 / 边界（向导生成的字段，老人格没有就不出现），上限 600 → 900 字。
  */
+const STYLE_BUDGET = 900;
+/** 句子边界（从后往前找，截在这些标点之后） */
+const SENTENCE_END_RE = /[。！？；!?;]/g;
+/**
+ * 把一段话截到 limit 字以内、停在最后一个句子边界之后（找不到边界才退回逗号，再找不到才硬截）。
+ * 截过的末尾不加「…」：这段是人设指令，模型读到省略号会把它当成语气的一部分。
+ */
+function cutAtSentence(text, limit) {
+  if (text.length <= limit) return text;
+  const head = text.slice(0, limit);
+  let at = -1;
+  for (const m of head.matchAll(SENTENCE_END_RE)) at = m.index + 1;
+  if (at < 0) {
+    const comma = Math.max(head.lastIndexOf("，"), head.lastIndexOf(","));
+    at = comma > 0 ? comma + 1 : -1; // 停在逗号之后，与句末同一个口径
+  }
+  return at > 0 ? head.slice(0, at) : head;
+}
 function styleDescriptorOf(name, style) {
   const summary = String(style?.summary || "").trim();
   const catchphrases = Array.isArray(style?.catchphrases) ? style.catchphrases.filter(Boolean) : [];
@@ -26,14 +44,45 @@ function styleDescriptorOf(name, style) {
   const tone = String(style?.tone || "").trim();
   const addressUser = String(style?.addressUser || "").trim();
   const boundaries = Array.isArray(style?.boundaries) ? style.boundaries.filter(Boolean) : [];
-  const parts = [String(name || "").trim()];
-  if (summary) parts.push(`风格：${summary}`);
-  if (tone) parts.push(`语气：${tone}`);
-  if (catchphrases.length) parts.push(`口头禅：${catchphrases.join("、")}`);
-  if (stanceHint) parts.push(`倾向：${stanceHint}`);
-  if (addressUser) parts.push(`称呼用户：${addressUser}`);
-  if (boundaries.length) parts.push(`边界：${boundaries.join("；")}`);
-  return parts.join("｜").slice(0, 900);
+  // ★ 按预算整段取舍（2026-10-30，10-25 评审第 2 条）—— 原来是拼完 `.slice(0, 900)`：summary 一项就能到 2000 字，
+  //   硬截会把句子切成半句，更要紧的是排在最后的「边界」（作者给这个人格定的不能聊什么）整段被切没。
+  //   现在：放得下就逐字节与原来相同；放不下先**整段**丢优先级低的（倾向 → 口头禅 → 称呼用户 → 语气），
+  //   「边界」与名字永远保留；还放不下就把「风格」在句子边界处截短。预算是模型读得完、提示词放得下的那个数，不是存储上限。
+  const name0 = String(name || "").trim();
+  const slots = [
+    { key: "summary", text: summary ? `风格：${summary}` : "", drop: Infinity },
+    { key: "tone", text: tone ? `语气：${tone}` : "", drop: 4 },
+    { key: "catchphrases", text: catchphrases.length ? `口头禅：${catchphrases.join("、")}` : "", drop: 2 },
+    { key: "stanceHint", text: stanceHint ? `倾向：${stanceHint}` : "", drop: 1 },
+    { key: "addressUser", text: addressUser ? `称呼用户：${addressUser}` : "", drop: 3 },
+    { key: "boundaries", text: boundaries.length ? `边界：${boundaries.join("；")}` : "", drop: Infinity },
+  ].filter((x) => x.text);
+  const join = () => [name0, ...slots.map((x) => x.text)].join("｜");
+  if (join().length <= STYLE_BUDGET) return join();
+  // 先整段丢可丢的（drop 小的先丢）
+  const droppable = slots.filter((x) => Number.isFinite(x.drop)).sort((a, b) => a.drop - b.drop);
+  for (const d of droppable) {
+    if (join().length <= STYLE_BUDGET) break;
+    slots.splice(slots.indexOf(d), 1);
+  }
+  // 再把「风格」在句子边界处截短（边界那一段与名字不动）
+  const sum = slots.find((x) => x.key === "summary");
+  if (sum && join().length > STYLE_BUDGET) {
+    const others = join().length - sum.text.length;
+    const room = STYLE_BUDGET - others - "风格：".length;
+    if (room >= 20) sum.text = `风格：${cutAtSentence(summary, room)}`;
+    else slots.splice(slots.indexOf(sum), 1);
+  }
+  // 兜底：边界本身就写满了（12 条 × 120 字）—— 从后往前整条去掉
+  const bd = slots.find((x) => x.key === "boundaries");
+  if (bd) {
+    const list = [...boundaries];
+    while (list.length > 1 && join().length > STYLE_BUDGET) {
+      list.pop();
+      bd.text = `边界：${list.join("；")}`;
+    }
+  }
+  return join().slice(0, STYLE_BUDGET);
 }
 
 /**

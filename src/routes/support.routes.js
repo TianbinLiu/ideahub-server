@@ -326,7 +326,9 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
       return next(e);
     }
   } else {
-    messages = [...prefix, ...history.map((m) => ({ role: m.role, content: m.content }))];
+    // ★ 旧写法客户端自带的历史也要过一遍占位替换（2026-10-30，10-25 评审第 2 条）：陪聊那条 2026-09-25 就接了 chatSafety.sanitizeHistory，
+    //   客服这条一直是原样回灌 —— 用户说过的那句危机原话会在此后每一轮进模型。按会话那条路由 chatMemory.buildContextMessages 替换，这里补齐
+    messages = [...prefix, ...chatSafety.sanitizeHistory(history.map((m) => ({ role: m.role, content: m.content })))];
   }
 
   // ★★ 客服也要有闸（2026-09-25 评审）。原来只有官网陪聊接了协议，而**客服是 Google Play
