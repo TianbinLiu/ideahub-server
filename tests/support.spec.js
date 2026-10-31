@@ -956,3 +956,79 @@ describe("support.service 动作标记（2026-10-30）", () => {
     expect(withAll).toContain("【拿不准先问】");
   });
 });
+
+// ── 本人账单摘要（2026-10-30，docs/decisions-2026-10-30.md §三 7）：问到钱才读、只给模型不带 id 的摘要 ──
+describe("support.service 本人账单摘要（2026-10-30）", () => {
+  const svc = require("../src/services/support.service");
+  const now = new Date("2026-10-30T13:00:00Z"); // 北京时间 21:00
+  const hoursAgo = (h) => new Date(now.getTime() - h * 3600e3);
+
+  it.each([
+    ["为什么扣了我两次钱", true],
+    ["余额怎么少了", true],
+    ["这一发退了吗", true],
+    ["充值没到账", true],
+    ["Why was I charged twice?", true],
+    ["Is my refund done?", true],
+    ["How many tokens do I have", true],
+    ["取回怎么用", false],
+    ["怎么做模板", false],
+    ["How do I recover a video?", false],
+  ])("isBillingAsk(%j) = %s", (q, want) => {
+    expect(svc.isBillingAsk(q)).toBe(want);
+  });
+
+  const rows = [
+    { delta: -108900, reason: "ark_spend", memo: "task doubao-seedance-2-0-mini-260615 r2v tpl:68f1a2b3c4d5e6f7a8b9c0d1", balanceAfter: 1234567, createdAt: hoursAgo(1) },
+    { delta: 108900, reason: "ark_refund", memo: "task doubao-seedance-2-5-260628 未受理", balanceAfter: 1343467, createdAt: hoursAgo(30) },
+    { delta: -400, reason: "ark_spend", memo: "chat support", balanceAfter: 1234567, createdAt: hoursAgo(2) },
+    { delta: 0, reason: "admin_free", memo: "admin image doubao-seedream-4-0-20260415", costTokens: 13333, balanceAfter: 1234567, createdAt: hoursAgo(3) },
+    { delta: -50638, reason: "ark_spend", memo: "task doubao-seedance-2-0-mini-260615 r2v edit own:abc123/def456", balanceAfter: 1183929, createdAt: hoursAgo(5) },
+    { delta: 30000, reason: "template_reward", memo: "模板奖励 video:6a9 tpl:68f", balanceAfter: 1213929, createdAt: hoursAgo(6) },
+    { delta: 170000, reason: "grant", memo: "", balanceAfter: 170000, createdAt: new Date(now.getTime() - 40 * 86400e3) },
+  ];
+  const wallet = { plan: 1000000, addon: 234567, debt: 0, paidEver: true };
+
+  it("摘要里只有时间 · 事项 · 数额 · 余额：模板 id、素材 public_id、型号全名、作品 id 一个都不带", () => {
+    const d = svc.billingDigest({ rows, wallet, now });
+    expect(d).not.toMatch(/68f1a2b3|abc123|def456|doubao|seedance|video:6a9|tpl:/);
+    expect(d).toContain("套白模模板出片 -108,900，余 1,234,567");
+    expect(d).toContain("问 AI 客服 -400");
+    expect(d).toContain("片段重拍 -50,638");
+    expect(d).toContain("模板作者奖励 +30,000");
+    expect(d).toContain("管理员免单（原价 13,333）");
+    expect(d).toContain("没受理、当场退回 +108,900");
+  });
+
+  it("余额那一行：套餐 + 充值 = 合计，付没付过钱；欠款时说冻结", () => {
+    expect(svc.billingDigest({ rows: [], wallet, now })).toContain("余额：套餐 1,000,000 + 充值 / 赠送 234,567 = 1,234,567 token；付过钱（会员档可用）");
+    expect(svc.billingDigest({ rows: [], wallet: { plan: 0, addon: 0, debt: 5000, paidEver: false }, now })).toMatch(/欠款 5,000（账户冻结中/);
+    expect(svc.billingDigest({ rows: [], wallet: { plan: 2000, addon: 170000, debt: 0, paidEver: false }, now })).toContain("没付过钱（免费版）");
+  });
+
+  it("只留 30 天内的、最多 12 笔；北京时间当天写「今天 HH:MM」", () => {
+    const d = svc.billingDigest({ rows, wallet, now });
+    expect(d).not.toContain("新人额度"); // 40 天前的那一笔不进
+    expect(d).toContain("最近 6 笔");
+    expect(d).toContain("今天 20:00 套白模模板出片"); // 13:00Z − 1h = 12:00Z = 北京 20:00
+    expect(d).toContain("10-29 15:00 没受理、当场退回"); // 30 小时前 = 10-29 07:00Z = 北京 15:00
+    const many = Array.from({ length: 20 }, (_, i) => ({ delta: -1, reason: "ark_spend", memo: "chat support", balanceAfter: 1, createdAt: hoursAgo(i + 1) }));
+    expect(svc.billingDigest({ rows: many, wallet: null, now })).toContain("最近 12 笔");
+  });
+
+  it("没有钱包也没有记录 → 空串（提示词里不带这一段）；有钱包没记录 → 说没有变动", () => {
+    expect(svc.billingDigest({ rows: [], wallet: null, now })).toBe("");
+    expect(svc.billingDigest({ rows: [], wallet, now })).toContain("最近 30 天没有 token 变动记录");
+  });
+
+  it("buildSupportSystemPrompt：传了摘要才带那一段，没传一个字都不多", () => {
+    const base = svc.buildSupportSystemPrompt({ knowledge: "k" });
+    const withD = svc.buildSupportSystemPrompt({ knowledge: "k", billingDigest: "余额：套餐 1 + 充值 / 赠送 2 = 3 token" });
+    expect(base).not.toContain("本人账单摘要（服务器刚从");
+    expect(withD).toContain("===== 本人账单摘要（服务器刚从提问者自己的账户里读的");
+    expect(withD).toContain("余额：套餐 1 + 充值 / 赠送 2 = 3 token");
+    expect(withD).toContain("他问别人的账一律说只能看本人的");
+    // 摘要段排在高频问题之前（模型先读到「这是本人的账」再读标准答法）
+    expect(withD.indexOf("本人账单摘要")).toBeLessThan(withD.indexOf("高频问题标准答法"));
+  });
+});

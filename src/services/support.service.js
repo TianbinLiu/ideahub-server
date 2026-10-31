@@ -646,6 +646,147 @@ const CANONICAL_FAQ = [
   "服务器在中国香港（阿里云），数据库 MongoDB Atlas；隐私政策在官网 ideahubs.org/privacy 和 App 设置页。联系邮箱 support@ideahubs.org。",
 ];
 
+
+// ── 本人账单摘要（2026-10-30，docs/decisions-2026-10-30.md §三 7「客服查本人的账」）──────────────────────────────
+//
+// ★ 为什么是服务端读、只给模型一份摘要：PIPL 第 21 条的委托处理（店小蜜读订单状态作答就是这个形态）—— 模型方只在这一轮里
+//   看到提问者**本人**的流水，不看别人；而且只在他问到扣费 / 余额 / 退款时才读（不问不读：省一次库查询，也不把账摆进无关的对话）。
+// ★ 摘要里每一行只有「时间 · 事项 · 数额 · 余额」：memo 里的模板 id / 素材 public_id / 型号全名都不进去 —— 事项由 reason + memo 的
+//   开头翻成人话（labelOf），认不出的写「其他」。时间按北京时间（知识库里说日期也都是北京时间）。
+// ★ 不在这里判「该不该退」：那是 taskRefund / 清扫器的事。模型只照着流水说「这一笔退了 / 还没有退回记录」，拿不准照旧转人工。
+// ★ 官网隐私政策与 App 内那份都写了这一句（委托处理 + 显著提示），客服页开场白也说了。模型方（火山方舟）按协议不留存、不训练。
+const BILLING_ASK_RE =
+  /扣(了|费|款|钱|的|掉|走|多|少)|多扣|少了|退(款|钱|回|了|不退|没退)|余额|花(了|掉|费)|收费|计费|账单|流水|充值|到账|没到账|代币|额度|欠(费|款)|\brefund|\bcharg|\bbalance|\bbill|\bdeduct|\bcredit|\btokens?\b/i;
+function isBillingAsk(text) {
+  return BILLING_ASK_RE.test(String(text || ""));
+}
+
+const MODEL_LABELS = [
+  [/seedance-2-5/i, "电影级"],
+  [/seedance-2-0-mini/i, "高清 / 草稿"],
+  [/seedance-1-0-pro-fast/i, "极速"],
+  [/seedance-1-0-pro/i, "标准"],
+  [/hailuo|minimax/i, "真人档"],
+];
+function videoLabel(memo) {
+  for (const [re, l] of MODEL_LABELS) if (re.test(memo)) return l;
+  return "";
+}
+const fmtTok = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n)).toLocaleString("en-US") : "?");
+
+/** 一行流水的「事项」—— 只看 reason 与 memo 的开头，不把 memo 原文带出去 */
+function labelOf(reason, memo = "", costTokens) {
+  const m = String(memo || "");
+  switch (reason) {
+    case "ark_spend": {
+      if (/^admin /.test(m)) return labelOf("ark_spend", m.slice(6), costTokens);
+      if (/^chat support/.test(m)) return "问 AI 客服";
+      if (/^chat companion/.test(m)) return "陪聊";
+      if (/^tts\b/.test(m)) return /narration/.test(m) ? "配音" : "语音合成";
+      if (/^image\b/.test(m)) return /组图/.test(m) ? "出一组画面" : "出图";
+      if (/^chat\b/.test(m)) return "AI 对话（写剧情 / 看图）";
+      if (/^3d\b/.test(m)) return "3D 建模";
+      if (/^draftFinal\b/.test(m)) return "样片定稿（1080p）";
+      if (/^draft\b/.test(m)) return "样片（480p）";
+      if (/r2v tpl:/.test(m)) return "套白模模板出片";
+      if (/r2v edit/.test(m)) return "片段重拍";
+      if (/r2v extend/.test(m)) return "往后延长";
+      if (/r2v /.test(m)) return "带参考视频出片";
+      if (/^(task|video|material)\b/.test(m)) {
+        const l = videoLabel(m);
+        return l ? `出片（${l}）` : "出片";
+      }
+      return "AI 调用";
+    }
+    case "ark_refund":
+    case "minimax_refund":
+    case "provider_failed":
+    case "tutor_refund":
+      if (/未受理/.test(m)) return "没受理、当场退回";
+      if (/预扣多退/.test(m)) return "预扣多出的退回";
+      return "失败退回";
+    case "grant":
+      return "新人额度";
+    case "daily_grant":
+      return "每天赠送";
+    case "cycle_reset":
+      return "套餐额度刷新";
+    case "recharge":
+      return "充值";
+    case "plan_buy":
+      return "开通 / 续费套餐";
+    case "play_refund":
+      return "应用商店退款收回";
+    case "admin_free":
+      return `管理员免单（原价 ${fmtTok(costTokens)}）`;
+    case "remix_reward":
+      return "同款奖励";
+    case "template_reward":
+      return "模板作者奖励";
+    case "narration_free":
+      return "配音（免费额度）";
+    case "debt_incurred":
+      return "记欠款";
+    case "debt_repaid":
+      return "还欠款";
+    case "debt_forgiven":
+      return "欠款豁免";
+    default:
+      return "其他";
+  }
+}
+
+/** 北京时间：当天写「今天 HH:MM」，别的日子写「M-DD HH:MM」 */
+function bjTime(d, now) {
+  const t = new Date(d);
+  if (Number.isNaN(t.getTime())) return "";
+  const bj = new Date(t.getTime() + 8 * 3600e3);
+  const nb = new Date(new Date(now).getTime() + 8 * 3600e3);
+  const hhmm = bj.toISOString().slice(11, 16);
+  if (bj.toISOString().slice(0, 10) === nb.toISOString().slice(0, 10)) return `今天 ${hhmm}`;
+  return `${bj.getUTCMonth() + 1}-${String(bj.getUTCDate()).padStart(2, "0")} ${hhmm}`;
+}
+
+const DIGEST_ROWS_MAX = 12;
+const DIGEST_DAYS = 30;
+/**
+ * 把本人最近的流水 + 钱包压成给模型看的几行（纯函数）。
+ * @param {{rows?: Array<{delta:number, reason:string, memo?:string, balanceAfter?:number|null, costTokens?:number, createdAt:Date|string}>, wallet?: object|null, now?: Date}} o
+ *   rows 按新到旧（tokenWallet.listLedger 的顺序），只留 DIGEST_DAYS 天内的前 DIGEST_ROWS_MAX 笔；wallet 是 tokenWallet.getWallet 的形状
+ * @returns {string} 没东西可说时回空串（提示词里就不带这一段）
+ */
+function billingDigest({ rows = [], wallet = null, now = new Date() } = {}) {
+  const since = new Date(now).getTime() - DIGEST_DAYS * 86400e3;
+  const recent = (Array.isArray(rows) ? rows : [])
+    .filter((r) => r && r.createdAt && new Date(r.createdAt).getTime() >= since)
+    .slice(0, DIGEST_ROWS_MAX);
+  if (!wallet && recent.length === 0) return "";
+  const lines = [];
+  if (wallet) {
+    const plan = Number(wallet.plan) || 0;
+    const addon = Number(wallet.addon) || 0;
+    const debt = Number(wallet.debt) || 0;
+    lines.push(
+      `余额：套餐 ${fmtTok(plan)} + 充值 / 赠送 ${fmtTok(addon)} = ${fmtTok(plan + addon)} token` +
+        (debt > 0 ? `；欠款 ${fmtTok(debt)}（账户冻结中，充值后自动还）` : "") +
+        (wallet.paidEver ? "；付过钱（会员档可用）" : "；没付过钱（免费版）"),
+    );
+  }
+  if (recent.length) {
+    lines.push(`最近 ${recent.length} 笔（新到旧；北京时间；负数是扣、正数是入）：`);
+    for (const r of recent) {
+      const d = Number(r.delta) || 0;
+      lines.push(
+        `· ${bjTime(r.createdAt, now)} ${labelOf(r.reason, r.memo, r.costTokens)} ${d > 0 ? "+" : ""}${fmtTok(d)}` +
+          (r.balanceAfter != null ? `，余 ${fmtTok(r.balanceAfter)}` : ""),
+      );
+    }
+  } else {
+    lines.push(`最近 ${DIGEST_DAYS} 天没有 token 变动记录。`);
+  }
+  return lines.join("\n");
+}
+
 // ── 提示词 ───────────────────────────────────────────────────────────
 // ★ 分隔符与 companion.parseTags 同一个口径（2026-10-20）：「:」「：」「=」都认，两边与方括号里头可以有空格。原来只认半角冒号，
 //   而关思考之后模型更爱写 [action=explain] 这种等号写法（parseTags 已经认了）—— 写成 [handoff=billing] / [handoff：billing] 时，
@@ -658,7 +799,7 @@ function stripHandoffTags(text) {
   return String(text || "").replace(/\[\s*handoff[^\]]*\]\s*/gi, "");
 }
 
-function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false, appVersion = null, caps = [] } = {}) {
+function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge = "", lang = "zh", personaLine = "", enNames = false, appVersion = null, caps = [], billingDigest = "" } = {}) {
   const capGoto = Array.isArray(caps) && caps.includes("goto");
   const capAsk = Array.isArray(caps) && caps.includes("ask");
   const who = userName ? `正在咨询的用户叫「${userName}」。` : "";
@@ -692,7 +833,7 @@ function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge
       : null,
     langLine,
     enNamesLine,
-    "【依据】只根据下面「知识库」里的事实回答；知识库里没有的功能、价格、时限、政策一律说「这个我不确定，需要人工核实」，并按下面【转人工】第 5 条处理（回复开头写 [handoff:other]，告诉用户怎么提交），绝不编造。",
+    "【依据】只根据下面「知识库」里的事实（以及「本人账单摘要」里提问者自己的记录）回答；知识库里没有的功能、价格、时限、政策一律说「这个我不确定，需要人工核实」，并按下面【转人工】第 5 条处理（回复开头写 [handoff:other]，告诉用户怎么提交），绝不编造。",
     "【禁止承诺】知识库末尾的「客服禁止承诺的事项」是红线：涉及其中任何一条，只能如实说明现状，不能答应、不能暗示以后会有。",
     "【表达】口语、直接、先给结论再给一步步的操作；每次回复 2～5 句，每句不超过 40 字；不用 Markdown 标记、不用列表符号、不用表情符号。涉及钱和时限的数字要和知识库一字不差。",
     // 用户给客服装了人格市场的人格：只改语气与措辞，【依据】【禁止承诺】【转人工】一条不松（companionSetting.service.personaPromptLine）
@@ -720,6 +861,15 @@ function buildSupportSystemPrompt({ name = agentName(), userName = "", knowledge
     "转人工示例：[handoff:billing] [sad][face:sad][action:comfort] 退款要人工核对，我这边没法直接处理。 [neutral][face:normal][action:explain] 请点下面的「转人工」，写上任务号和下单时间。 [neutral][face:normal][action:explain] 再点「提交给人工客服」，提交了客服才看得到。",
     "标签只放在句首，不要在句中或句尾出现方括号。[handoff] 只能出现在整段回复的最开头，一段回复最多一次。",
     "",
+    // ★ 本人账单摘要（2026-10-30，只在这一问涉及扣费 / 余额 / 退款时路由才传；见 billingDigest 头上的 ★）
+    billingDigest
+      ? [
+          "===== 本人账单摘要（服务器刚从提问者自己的账户里读的，只因为他问到了扣费 / 余额 / 退款）=====",
+          "【用法】答他本人的账以这份为准：数字一字不差地念，说清是哪一笔；退没退看有没有对应的「退回」行，没有就说目前没有退回记录、再按知识库说退款规则与时限。摘要里没有的事别猜；他问别人的账一律说只能看本人的。不要主动背整张表，只答他问到的那几笔。",
+          billingDigest,
+          "",
+        ].join("\n")
+      : null,
     "===== 高频问题标准答法（优先照这个答） =====",
     ...CANONICAL_FAQ.map((line, i) => `${i + 1}. ${line}`),
     "",
@@ -864,6 +1014,8 @@ module.exports = {
   isEnglishAsk,
   replyInEnglish,
   buildSupportSystemPrompt,
+  isBillingAsk,
+  billingDigest,
   parseHandoff,
   HANDOFF_RE,
   stripHandoffTags,
