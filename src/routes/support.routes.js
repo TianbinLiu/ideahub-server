@@ -39,6 +39,7 @@ const { z } = require("zod");
 const { requireAuth, optionalAuth, requireRole } = require("../middleware/auth");
 const { aiRateLimit, userRateLimit } = require("../middleware/rateLimit");
 const billing = require("../services/billing.service");
+const wallet = require("../services/tokenWallet.service");
 const { priceOf } = require("../config/tokens");
 const { hasAiKey, aiChatStream } = require("../services/aiClient");
 const companion = require("../services/companion.service");
@@ -280,6 +281,16 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
 
   // 检索用最近两条用户消息：追问往往只有"那要多久"三个字，单看这一句什么都召回不到
   const knowledge = support.selectKnowledge(userTurns.slice(-2).join("\n"));
+  // ★ 问到扣费 / 余额 / 退款才读本人流水（support.billingDigest 头上的 ★：委托处理、只给模型一份不带 id 的摘要）；读失败这一轮照常答、不带摘要
+  let billingDigest = "";
+  if (support.isBillingAsk(userTurns.slice(-2).join("\n"))) {
+    try {
+      const [rows, w] = await Promise.all([wallet.listLedger(req.user._id, 40), wallet.getWallet(req.user._id)]);
+      billingDigest = support.billingDigest({ rows, wallet: w });
+    } catch (e) {
+      console.warn("[support] 读本人流水失败，这一轮不带账单摘要:", e && e.message);
+    }
+  }
   const system = support.buildSupportSystemPrompt({
     userName: req.user.displayName || req.user.username || "",
     knowledge,
@@ -293,6 +304,7 @@ publicRouter.post("/chat", requireAuth, aiRateLimit({ max: 20, scope: "support" 
     // 版本号静默进上下文、两种动作标记只对声明了的客户端说（support.buildSupportSystemPrompt 的 ★）
     appVersion: req.appVersion ?? null,
     caps: Array.isArray(parsed.data.caps) ? parsed.data.caps : [],
+    billingDigest,
   });
   // 人格卡带示例对话时插几组 few-shot（companion.service.personaExampleMessages），语气更像 TA；客服的事实与红线在 system 里不受影响
   // ★ few-shot 之后再补一句（2026-10-30，10-25 评审第 2 条）：示例对话排在系统提示之后，模型容易把示例的口径当成最新指令 ——
