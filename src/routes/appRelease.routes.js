@@ -46,6 +46,15 @@ const APPS = {
       "https://github.com/TianbinLiu/ideahub-app/releases/latest/download/latest.json",
     apkBase: (process.env.APP_APK_BASE || "").replace(/\/+$/, ""),
     cache: null, // { at, body }
+    // ★★ 2026-11-16（GitHub 账号被停用期间）：清单改读本机文件，与 whale 同一范式。
+    //   只有显式 APP_MANIFEST_LOCAL=1 才启用；不设时完全保持原样（仍走 GitHub 上游）。
+    //   为什么非要有这条：GitHub 被停用后上游直接 403，而进程一重启内存缓存就空了——
+    //   线上 /api/app/latest.json 从 11-10 起一直 503，而 App 的检查更新失败是**静默**的：
+    //   用户永远收不到更新提示，也没有任何症状可看。发版脚本改为把清单连同包一起 scp 上来。
+    manifestFile:
+      process.env.APP_MANIFEST_LOCAL === "1"
+        ? () => path.join(APK_DIR, process.env.APP_MANIFEST_FILE || "qimeng-latest.json")
+        : undefined,
   },
   shihui: {
     label: "诗绘",
