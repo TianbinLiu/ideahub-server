@@ -51,10 +51,16 @@ const APPS = {
     //   为什么非要有这条：GitHub 被停用后上游直接 403，而进程一重启内存缓存就空了——
     //   线上 /api/app/latest.json 从 11-10 起一直 503，而 App 的检查更新失败是**静默**的：
     //   用户永远收不到更新提示，也没有任何症状可看。发版脚本改为把清单连同包一起 scp 上来。
-    manifestFile:
-      process.env.APP_MANIFEST_LOCAL === "1"
+    // ★★ 2026-11-21 修：原来这里写成对象字面量里的三元，`APK_DIR` 与 `process.env` 都在
+    //   **模块加载那一刻**求值 —— 而 APK_DIR 是下面才 `const` 的（TDZ），开关真打开时
+    //   require 这一下就 ReferenceError，进程起不来。改成 getter：每次取时才读环境、
+    //   那时 APK_DIR 早就初始化好了（顺带也修了"dotenv 比这个模块晚加载 → 开关看起来没生效"：
+    //   2026-11-21 线上就是带着 APP_MANIFEST_LOCAL=1 却一直走 GitHub，一点症状都没有）。
+    get manifestFile() {
+      return process.env.APP_MANIFEST_LOCAL === "1"
         ? () => path.join(APK_DIR, process.env.APP_MANIFEST_FILE || "qimeng-latest.json")
-        : undefined,
+        : undefined;
+    },
   },
   shihui: {
     label: "诗绘",
