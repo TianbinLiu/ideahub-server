@@ -9,6 +9,10 @@
 //     才能删 —— 用它们的 TTL 的话，方舟在第 48 小时报 expired 的那一刻，登记先被 Mongo 删了，钱就退不回去了。
 //   所以「找回凭据」「取件单」「钱」各管各的：这张表只管钱，四条出片路（/api/ark 代理、白模化、MiniMax、Seed3D）共用。
 //
+// ★ 两种币（2026-11-23）：`currency: "ticket"` 的那一行扣的是**一张游戏券**（`charged: 1`），退款也退券
+//   （services/gameTicket.service.refund，不进 TokenLedger）；没有这一位 / 值为 "token" 的行一律按 token 退。
+//   判否定是刻意的 —— 这一位上线之前的每一行都是 token，老行不用回填。
+//
 // ══ 恰好退一次（两个 pm2 实例 + 清扫器 + 白模化取回 + 任何人的轮询，可能同时看见同一个失败）══
 //   state 是一台只往前走的状态机，每一步都是**条件原子更新**：
 //     open ──(上游明说失败，抢占)──▶ claimed ──(钱进了钱包)──▶ refunded
@@ -47,8 +51,16 @@ const genTaskChargeSchema = new mongoose.Schema(
      *  所以绝不能"谁问到失败就退给谁" */
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     model: { type: String, default: "", maxlength: 80 },
-    /** 实扣多少（管理员免单记 0）。与 took 两桶之和恒等 */
+    /** 实扣多少（管理员免单记 0）。与 took 两桶之和恒等。
+     *  ★ 券那一笔记的是**几张**（1），不是 token 报价 —— 见 currency */
     charged: { type: Number, required: true, min: 0 },
+    /**
+     * 这一笔扣的是**哪种币**（2026-11-23，「工坊游戏券」）：`"token"`（缺省，改版前每一行都是它）或 `"ticket"`。
+     * ★★ 为什么必须落库：退款那条路按它分家 —— 券的账按 token 退的话，上游失败一次，
+     *   玩家的券就变成他钱包里的 token，**零报错**（app 仓 g2-game-ui.md §7 第 6 条）。
+     *   判否定要小心：这一位上线之前的行都没有它，mongoose 读出来是 undefined ⇒ 一律当 `"token"`。
+     */
+    currency: { type: String, enum: ["token", "ticket"], default: "token" },
     /**
      * 这一笔是从哪一桶扣的（tokenWallet.debitSplit 的扣前快照算出来的，精确到个位）。
      * ★★ 退款按原桶退回：plan 的那部分回 plan、addon 的那部分回 addon。全进 addon 的话，

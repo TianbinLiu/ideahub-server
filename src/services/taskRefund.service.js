@@ -30,6 +30,8 @@ const GenTaskCharge = require("../models/GenTaskCharge");
 const TokenLedger = require("../models/TokenLedger");
 const BlockoutJob = require("../models/BlockoutJob");
 const wallet = require("./tokenWallet.service");
+// 「工坊游戏券」（2026-11-23）：券那一笔的退款走它，**不进** TokenLedger（券与 token 不可互换）
+const gameTicket = require("./gameTicket.service");
 const { createNotification } = require("./notification.service");
 const { callArk, T_POLL } = require("./arkGateway.service");
 const { BASES, minimaxRegion, minimaxKey, minimaxV2BaseOf } = require("../config/minimax");
@@ -146,14 +148,17 @@ function sameCharge(row, { user, api, region }) {
  * @param {{plan:number, addon:number}} o.took 从哪两桶扣的（chargedArkCall 的 took）
  * @param {string} [o.region] MiniMax 必带：任务建在哪个站（minimaxRegion()）
  * @param {"v2"} [o.api] MiniMax H3 必带 `"v2"`（结局怎么认、清扫器去哪问都按它分，见 GenTaskCharge.api）；真人档 / 方舟不传
+ * @param {"token"|"ticket"} [o.currency="token"] 这一发扣的是哪种币（见 GenTaskCharge.currency）。券那一路退款走 gameTicket
  * @returns {Promise<object|null>} 落下的那一行（lean）；没落下 null
  */
-async function recordCharge({ provider, taskId, kind, user, model = "", cost, free = false, took, memo = "", region, api, now = new Date() }) {
+async function recordCharge({ provider, taskId, kind, user, model = "", cost, free = false, took, memo = "", region, api, currency = "token", now = new Date() }) {
   const id = String(taskId ?? "");
   if (!TASK_ID_RE.test(id)) {
     console.error(`[task-refund] 受理了却拿不到能用的任务号（${provider} ${kind}），这一发失败时退不了钱`);
     return null;
   }
+  // ★ 券那一笔记的是「几张」（1），不是 token 报价；`took` 对券没有意义（没有两桶），固定 0/0
+  const ticket = currency === "ticket";
   const charged = free ? 0 : Math.max(0, Math.round(Number(cost) || 0));
   // 免单 / 一分没扣：没有钱要退，落成终态（不占清扫器的查询额度）。留一行是为了「那一发退了没有」查得到答案
   const nothingToRefund = !!free || charged <= 0;
@@ -165,7 +170,8 @@ async function recordCharge({ provider, taskId, kind, user, model = "", cost, fr
       user,
       model: String(model || "").slice(0, 80),
       charged,
-      took: normalizeTook(took, charged),
+      currency: ticket ? "ticket" : "token",
+      took: ticket ? { plan: 0, addon: 0 } : normalizeTook(took, charged),
       free: !!free,
       memo: String(memo || "").slice(0, 200),
       ...(region ? { region: String(region).slice(0, 8) } : {}),
@@ -206,28 +212,28 @@ async function recordCharge({ provider, taskId, kind, user, model = "", cost, fr
  * 给调用方（轮询端点 / 白模化取回 / task-charges 查询）的那一小块「钱怎么样了」。
  *   pending   我们还不知道结局（open）
  *   refunding 退款正在办（claimed：另一方刚抢到，或者搁浅了等清扫器续办）
- *   refunded  已经退回（tokens = 退了多少）
+ *   refunded  已经退回（tokens = 退了多少；券那一笔是 tickets = 1）
  *   settled   上游出成了，钱照收
  *   skipped   没有要退的（管理员免单 / 账号没了）
  *   lost      一直问不出结局，交给人工
- * @returns {{state:string, tokens:number}|null} null = 没有这笔账（上线之前的任务 / 不是经我们这里扣的）
+ * @returns {{state:string, tokens:number, tickets?:number, currency?:"ticket"}|null}
+ *   null = 没有这笔账（上线之前的任务 / 不是经我们这里扣的）
+ *   ★ token 那一笔的回包**形状逐字节不变**（只有 state / tokens 两个键）—— 老 App 已经在按它渲染，
+ *     多一个键就可能撞上某个 `toEqual`。券那一笔（这一版才有）另给 `tickets` 与 `currency`：
+ *     它的 `tokens` 恒为 0（**真的没退 token**），不这么写的话「退 1 token」会被 App 原样念出来。
  */
 function refundView(row) {
   if (!row) return null;
-  switch (row.state) {
-    case "refunded":
-      return { state: "refunded", tokens: Number(row.refundedTokens) || Number(row.charged) || 0 };
-    case "claimed":
-      return { state: "refunding", tokens: Number(row.charged) || 0 };
-    case "open":
-      return { state: "pending", tokens: Number(row.charged) || 0 };
-    case "settled":
-      return { state: "settled", tokens: Number(row.charged) || 0 };
-    case "lost":
-      return { state: "lost", tokens: Number(row.charged) || 0 };
-    default:
-      return { state: "skipped", tokens: 0 };
-  }
+  const units = Number(row.charged) || 0;
+  let state = "skipped";
+  if (row.state === "refunded") state = "refunded";
+  else if (row.state === "claimed") state = "refunding";
+  else if (row.state === "open") state = "pending";
+  else if (row.state === "settled") state = "settled";
+  else if (row.state === "lost") state = "lost";
+  if (isTicketCharge(row)) return { state, tokens: 0, tickets: units, currency: "ticket" };
+  const tokens = state === "refunded" ? Number(row.refundedTokens) || units : state === "skipped" ? 0 : units;
+  return { state, tokens };
 }
 
 /** 白模化那一发退了钱：把它的取件单一起钉成 failed（带上退款那句话）。条件原子更新，谁先到谁写，幂等 */
@@ -256,10 +262,14 @@ async function followUp(row, { viewerIsOwner = false, detail = "" } = {}) {
     //   而「一笔说不出来历的余额变动比一条通知糟」。出片那几种的本人轮询由 App 当场说「已退回」，不重复发。
     if (!viewerIsOwner || mine.kind === "3d") {
       // 正文由 App 按界面语言说（金额是数，不拼成句子 —— 与 BRANCH_REMIX_REWARD 同一条理由）；不带 actorId：平台口径
+      // ★ 券那一笔另给 tickets / currency，`tokens` 写 0：真的没退 token，写成 1 就成了「退回 1 token」
+      const ticket = isTicketCharge(mine);
       await createNotification({
         userId: mine.user,
         type: NOTIFY_TYPE,
-        payload: { tokens: Number(mine.refundedTokens) || Number(mine.charged) || 0, kind: mine.kind, taskId: mine.taskId, provider: mine.provider },
+        payload: ticket
+          ? { tokens: 0, tickets: Number(mine.refundedTokens) || Number(mine.charged) || 0, currency: "ticket", kind: mine.kind, taskId: mine.taskId, provider: mine.provider }
+          : { tokens: Number(mine.refundedTokens) || Number(mine.charged) || 0, kind: mine.kind, taskId: mine.taskId, provider: mine.provider },
       });
     }
   } catch (e) {
@@ -269,11 +279,44 @@ async function followUp(row, { viewerIsOwner = false, detail = "" } = {}) {
 }
 
 /**
+ * 这一行扣的是哪种币（判否定：没有这一位 = 这一位上线之前的老行 = token）。
+ * ★ 只看这一处：退款走哪条路（token 两桶 / 一张券）、日志怎么写、给客户端那块「钱怎么样了」都问它。
+ */
+function isTicketCharge(row) {
+  return row?.currency === "ticket";
+}
+
+/**
  * 把一行 claimed 办成 refunded。`resume` = 这一行不是这一拍刚抢到的（搁浅续办），要先问账本钱进没进过。
  * @returns {Promise<object>} 办完之后的那一行（lean）
  */
 async function payRefund(row, { resume = false, now = new Date(), viewerIsOwner = false, detail = "" } = {}) {
   const memo = memoOf(row.provider, row.taskId);
+  // ★★ 两种币分家（2026-11-23）：券那一笔按 token 退的话，玩家的券会变成他钱包里的 token（零报错）。
+  //   券走 gameTicket.refund，幂等键就是 memoOf 那个 `provider:taskId`（与 TokenLedger 的 memo 同一个口径）——
+  //   所以续办 / 重复轮询都只退一次，不需要像下面那样先查账本（券的「账本」就是 GameTicketGrant 的唯一索引）。
+  if (isTicketCharge(row)) {
+    const r = await gameTicket.refund({ userId: row.user, refId: `${row.provider}:${row.taskId}`, memo, now });
+    if (!r.applied && !r.duplicate) {
+      // 账号没了（或退的那一刻余额行建不出来）：与 token 那条路同一个收尾，不留一行永远办不完的 claimed
+      const gone = await GenTaskCharge.findOneAndUpdate(
+        { _id: row._id, state: "claimed" },
+        { $set: { state: "skipped", note: "user_gone", settledAt: now, purgeAt: purgeAtOf(now), notified: true } },
+        { returnDocument: "after" },
+      ).lean();
+      console.warn(`[task-refund] ${row.provider} task=${row.taskId} 失败了，但游戏券退不回去（账号不在了）`);
+      return gone || { ...row, state: "skipped", note: "user_gone" };
+    }
+    if (r.duplicate) console.warn(`[task-refund] ${row.provider} task=${row.taskId} 的退券上一轮已经进账，只补标记`);
+    const doneTicket = await GenTaskCharge.findOneAndUpdate(
+      { _id: row._id, state: "claimed" },
+      { $set: { state: "refunded", refundedTokens: row.charged, settledAt: now, purgeAt: purgeAtOf(now), notified: false } },
+      { returnDocument: "after" },
+    ).lean();
+    const finTicket = doneTicket || (await GenTaskCharge.findById(row._id).lean()) || { ...row, state: "refunded", refundedTokens: row.charged };
+    if (finTicket.state === "refunded") await followUp(finTicket, { viewerIsOwner, detail });
+    return (await GenTaskCharge.findById(row._id).lean()) || finTicket;
+  }
   const already = resume ? await TokenLedger.exists({ user: row.user, reason: LEDGER_REASON, memo }) : null;
   if (!already) {
     const w = await wallet.refundSplit(row.user, row.took, LEDGER_REASON, memo, now);

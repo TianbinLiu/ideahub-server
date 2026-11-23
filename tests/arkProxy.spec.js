@@ -1247,6 +1247,13 @@ describe("健康端点", () => {
       minimaxV2: false,
       // minimaxV2FreeTextOnly：没付过钱的人在 H3 上只能纯文字出片（tokens.MINIMAX_V2_FREE_TEXT_ONLY，2026-10-26 终审）—— 代码常量，不随 key 变
       minimaxV2FreeTextOnly: true,
+      // 工坊游戏券（2026-11-23，tests/gameTicket.spec.js）：App 见不到 gameTickets:true 就不摆「用券出片」；
+      // 另两位是每月几张 / 每发出一张（App 只显示服务端下发的数，不在本机算）
+      gameTickets: true,
+      gameTicketMonthly: 6,
+      gameTicketPerGeneration: 1,
+      // gameTicketUnlocksMedia：带券的那一发越过 minimaxV2FreeTextOnly（H3 上带图，工坊对局要挂卡出片）
+      gameTicketUnlocksMedia: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

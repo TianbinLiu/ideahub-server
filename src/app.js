@@ -249,6 +249,10 @@ app.use("/api/runway", require("./routes/runway.routes"));
 // AI token 钱包。★ 必须在服务端：它以前长在 app 的 IndexedDB 里，等于把收银台交给顾客，
 // 而每次方舟调用都是真金白银。扣费发生在 /api/ark 转发之前（见 ark.routes 的 billedForward）
 app.use("/api/me/wallet", require("./routes/wallet.routes"));
+// 工坊游戏券（2026-11-23）：GET /api/game/tickets（余额/本月已用/上限/下次重置）+
+// POST /api/game/tickets/grant（**仅管理员**；分享 / 邀请的事件源还没落，见那个路由的文件头）。
+// ★ 出片扣券**不在这里**：那三条出片路由上带 `X-Game-Ticket` 标记即可（钱的那段序列仍在 billing 一份里）。
+app.use("/api/game", require("./routes/gameTicket.routes"));
 // 充值订单与支付回调。★ 发币的唯一入口是这里的回调结算，钱包路由已经不发币了。
 // 回调端点无鉴权（渠道服务器不带 token），安全全压在渠道 adapter 的验签上，
 // 所以未注册的渠道一律拒绝——见 services/payment/channels.js 的文件头。

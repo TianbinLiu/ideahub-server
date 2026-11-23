@@ -318,6 +318,13 @@ async function chargedArkCall({
    *   让每个调用点各算一个 zone 传进来，就是 N 份实现。归门禁管的调用不带它直接抛 —— 漏传要响。
    */
   req = null,
+  /**
+   * 这一发从哪种币里出（2026-11-23，「工坊游戏券」）：`"ticket"` = 扣一张券、不碰 token 钱包。
+   * ★ 由路由决定（middleware/gameTicket 解析 `X-Game-Ticket` / `payWithTicket` 后挂在 req 上），
+   *   这里**不自己读 req**：那样三条出片路由各读一次，规则就有了三份实现（铁律六）。
+   * ★ 不传 = 改版前的行为，逐字节相同。
+   */
+  currency = "token",
 }) {
   const model = String(body?.model ?? "");
   if (!modelAllowed(model)) {
@@ -352,6 +359,9 @@ async function chargedArkCall({
   //   真人档的 768P 由 minimax 路由在调这里之前钉好。管理员的豁免在 billing.preAuthorize 里（denyReason 对免单不生效）。
   // ★ media（只给 H3）：带不带图在**这里**从 body 现算 —— H3 路由的 forward 转发的就是这同一个 body 对象。
   //   不让路由传：漏传是零症状的（免费用户带图照样过去，tokens.MINIMAX_V2_FREE_TEXT_ONLY 的 ★）
+  // ★ ticket（只给带券的那一发）：**只**放开「H3 上带图」那一条（config/tokens.freeTextOnlyDenial 的四条理由），
+  //   档位门禁照旧 —— 券不是会员（app 仓 g2-game-ui.md §7 第 5 条 ③）。不传 currency 的请求逐字节不变。
+  const paidByTicket = currency === "ticket";
   const denied = videoPlanDenial({
     paid: isPaidUser(before),
     kind,
@@ -361,6 +371,7 @@ async function chargedArkCall({
     draft: body?.draft !== undefined && body?.draft !== false,
     draftFinal,
     ...(kind === "minimax_v2" ? { media: minimaxV2HasMedia(body) } : {}),
+    ticket: paidByTicket,
   });
 
   // 出片地区门禁（海外不给 Seedance；MiniMax 出片（真人档 / H3）海外只准国际站）。执行只在 regionGate 一处，地区从 req 现算。
@@ -387,6 +398,8 @@ async function chargedArkCall({
     cost,
     memo,
     refundTag,
+    // 券那一发扣的是一张券、不是 token；没受理时也退券（billing.refundUnaccepted 的 currency 那一支）
+    currency,
     denyReason: denied?.message || "",
     // 结构化给 App 的两样（英文界面不显示服务端的中文句子，靠它们自己说）：allowed = 免费版能用哪几档；freeTextOnly = 档位开着、拒的是带图
     denyExtra:
@@ -403,20 +416,26 @@ async function chargedArkCall({
   });
 
   if (!r.ok) {
-    // 拒绝的三种形态（冻结 / 套餐 / 余额）在 billing 里已经拼好整句，这里只补回
+    // 拒绝的几种形态（冻结 / 套餐 / 余额 / 券）在 billing 里已经拼好整句，这里只补回
     // 调用方按 reason 分支时要的那个标签（既有测试按它断言）。
-    const reason = r.body.code === "WALLET_FROZEN" ? "debt" : r.body.code === "PLAN_REQUIRED" ? "plan" : "funds";
+    const code = r.body.code;
+    const reason =
+      code === "WALLET_FROZEN" ? "debt" : code === "PLAN_REQUIRED" ? "plan" : code === "NO_GAME_TICKET" || code === "GAME_TICKETS_OFF" ? "ticket" : "funds";
     if (reason === "plan") r.body.model = model;
     return { ok: false, reason, status: r.status, body: r.body, wallet: r.wallet };
   }
 
   const { status, text } = upstream;
-  const { accepted, wallet: w, free, took } = r;
-  if (!accepted && !free) console.warn(`[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
+  const { accepted, wallet: w, free, took, currency: cur, charged } = r;
+  // 券那一发退的是券不是 token，日志别写成「已退回 56,000 token」（那就是在日志里说谎）
+  if (!accepted && !free) {
+    console.warn(cur === "ticket" ? `[ark] ${path} 上游 ${status}，已退回 1 张游戏券` : `[ark] ${path} 上游 ${status}，已退回 ${cost} token`);
+  }
 
   // took / memo：受理了的异步任务由调用方记进 GenTaskCharge（受理后失败按原桶退回，services/taskRefund）
   // upstreamModel：真发给方舟的型号（出图接了班时与 body.model 不同；其余 kind 恒等于 body.model）
-  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo, upstreamModel };
+  // currency / charged：这一发扣的是哪种币、实扣多少（券 = 1）。记账必须照抄这两样（见 billing.chargedCall 的 ★）
+  return { ok: true, status, text, accepted, wallet: w, cost, free, took, memo, upstreamModel, currency: cur, charged };
 }
 
 module.exports = {

@@ -56,6 +56,13 @@ cp .env.example .env
 ⚠️ `.env` 已被 gitignore，**永远不要提交**，也不要把值贴进聊天或文档。
 生产密钥一律在服务器上用 `openssl rand -base64 48` 生成。
 
+**工坊对局 · 游戏券（可选，缺省开）**：只有 `GAME_TICKETS` 一个开关（写 `off` 关掉，不用发版）。
+数额与规则是**代码常量**（`src/config/gameTicket.js`：每月 6 张、每发出一张、任务加券每天最多 5 张），
+不在环境变量里 —— 那是价目表，改数要过评审。带券出片走请求头 `X-Game-Ticket: 1`（或请求体
+`payWithTicket: true`），扣一张券、不扣 token，并越过「免费版在 H3 上只能纯文字」那一条；
+端点、错误码、能力位（`/api/ark/health` 的 `gameTickets`）见 `docs/api-contract.md`「工坊游戏券」。
+⚠ 还没做的：分享 / 邀请的事件源（发券端点今天**只给管理员**）与全站熔断。
+
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 
 ## 4. 跑起来
