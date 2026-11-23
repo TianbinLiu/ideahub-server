@@ -785,6 +785,10 @@ function isPaidUser(wallet) {
  * ★ 放开 = 改成 false，要第 9 条的小验做完、主人点头（代码常量、不做环境变量：放开要过代码评审，不能在服务器上悄悄拨）。
  *   /api/ark/health 的 minimaxV2FreeTextOnly 原样下发它：App 照它对没付过钱的人只发纯文字（不补画帧、不带参考图），
  *   不然那些人每一发都在扣费之前吃一个 403。
+ * ★ 2026-11-23 起有**一个例外**：带游戏券（`currency: "ticket"`）的那一发放行带图 —— 工坊对局要挂卡出片。
+ *   放开在 freeTextOnlyDenial 的 `ticket` 入参（四条安全理由写在那里），**不是**把这个常量改成 false：
+ *   常量放开 = 所有免费账号都能免费带图（无限）→ 那不是「带券能带图」，是「带券这件事不存在了」。
+ *   /api/ark/health 的 minimaxV2FreeTextOnly 照旧报 true（它说的是"没有券的时候"），另加 gameTicket 能力位。
  */
 const MINIMAX_V2_FREE_TEXT_ONLY = true;
 
@@ -803,9 +807,27 @@ function minimaxV2HasMedia(body) {
 /**
  * 「免费版在 H3 上只能纯文字」那一句（MINIMAX_V2_FREE_TEXT_ONLY）。null = 不归它管 / 放行。
  * media 只认真值 true：不传（undefined）是在问「这一档对他开不开」（videoRegion.minimaxOpenTo），不是问某一发请求。
+ *
+ * @param {boolean} [ticket=false] 这一发是不是**用游戏券**结算的（`currency: "ticket"`，arkGateway.chargedArkCall 传）。
+ *   ★★ 带券就放行（2026-11-23，「工坊对局」要挂卡出片）：**这张券本身就是这一发带图的许可**。
+ *   为什么这样安全（四条，缺一条都不该放开）：
+ *     ① 券是**限量且要花掉的**：每人每月 6 张、一张一发、不可购买 / 转让 / 与 token 互换
+ *        （services/gameTicket.service 的 T1）。原来这条门禁怕的是「任何登录用户都能拿图白嫖 H3-Lite」——
+ *        现在那一发要先花掉一张平台发的券，一个人一个月最多 6 发，**不是无限量**；
+ *     ② 券的发放走唯一索引幂等 + 日上限（GameTicketGrant），刷不出来；
+ *     ③ 只放开**这一条**：档位门禁照旧（券 ≠ 付费用户，H3 / H3-Highspeed 对没付过钱的人仍然 403），
+ *        也没有放开真人档（v1）与参考视频那几条 —— 工坊默认档 L1 = `draft-mm`（H3-Lite · 480P），
+ *        一张券换的就是这一格；
+ *     ④ 上游失败会退券（billing.refundUnaccepted / taskRefund 的 currency:"ticket" 那一支），
+ *        内容审核没过的那一发不会白吃掉玩家的券。
+ *   ⚠ 今天还没验过的是「H3 收不收真人照片」（契约「等主人拍板」第 9 条）—— 那一条**不因为这个开关而改变**：
+ *     带券能发图，但能不能出得好、出不出来仍然是上游的事；要彻底挡住 realPerson 卡，是 App 入池处的事
+ *     （app 仓 g2-game-ui.md §2 的 A 方案），不是这里。
  */
-function freeTextOnlyDenial(kind, media) {
+function freeTextOnlyDenial(kind, media, ticket = false) {
   if (kind !== "minimax_v2" || !MINIMAX_V2_FREE_TEXT_ONLY || media !== true) return null;
+  // 带券的一发放行（★ 见上）。★ 只认严格真值：传 undefined / 字符串都不算
+  if (ticket === true) return null;
   return {
     message:
       "免费版在 MiniMax 上只能用文字出片（不带首帧、尾帧和参考图）；带图出片需要付费套餐——开通任意付费套餐，或充值过任意一次，即可使用。",
@@ -844,6 +866,8 @@ function isVideoGeneration(kind, model) {
  * @param {object|null} [o.draftFinal] 样片第二步（resolveDraftFinal 的结论）
  * @param {boolean} [o.media] 只给 MiniMax H3（minimax_v2）：这一发带不带图（minimaxV2HasMedia；chargedArkCall 从请求体现算）。
  *   带图 + 没付过钱 → 拒（MINIMAX_V2_FREE_TEXT_ONLY）。**不传 = 只问「这一档对他开不开」**（不看图；videoRegion.minimaxOpenTo 就这么问）
+ * @param {boolean} [o.ticket] 这一发是不是**用游戏券**结算（`currency: "ticket"`）。带券时唯一的差别是
+ *   放行「H3 上带图」那一条（freeTextOnlyDenial 的 ★★），档位门禁、真人档、参考视频一概不放。
  * @returns {{message:string, allowed:string[]|null, freeTextOnly?:true}|null} null = 放行；否则 message 是能直接显示的整句、
  *   allowed 是此刻免费版能用的档名（freeVideoLabels，去重；结构化给客户端：英文界面不显示服务端的中文句子，靠它自己说）；
  *   freeTextOnly 为真 = 档位本身对他开着、拒的是「带图」（这时 allowed 为 null：说「只能用草稿」对一个正在用草稿的人是错话）
@@ -859,7 +883,7 @@ function isVideoGeneration(kind, model) {
  *   客户端要么显示成天书、要么自己再拼一遍文案（第二处实现）。句子里**不许有 ASCII 双引号**：
  *   老 App 用 `"message"\s*:\s*"([^"]+)"` 抠这句话，带引号会被拦腰截断。
  */
-function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, media, now = Date.now() }) {
+function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = false, draftFinal = null, media, ticket = false, now = Date.now() }) {
   const m = String(model ?? "");
   if (!isVideoGeneration(kind, m)) return null;
   if (paid) return null;
@@ -870,13 +894,13 @@ function videoPlanDenial({ paid, kind, model, resolution, r2v = null, draft = fa
     if (kind === "task" && m === SEEDANCE_2_5) {
       return { message: "「电影级」只对付费用户开放：单段消耗远超免费版的额度。开通任意付费套餐，或充值过任意一次，即可使用。", allowed: null };
     }
-    // 档位放开了，带图照样要付过钱（MINIMAX_V2_FREE_TEXT_ONLY 的 ★：不跟着这个开关走）
-    return freeTextOnlyDenial(kind, media);
+    // 档位放开了，带图照样要付过钱（MINIMAX_V2_FREE_TEXT_ONLY 的 ★：不跟着这个开关走）——除非这一发带券
+    return freeTextOnlyDenial(kind, media, ticket);
   }
   const open = freeVideoTiers(now);
   const plain = !r2v && !draft && !draftFinal;
   // 档位对他开着时才看「带没带图」：档位都不开的（H3-Highspeed / H3），先说「这一档要付费」—— 那才是根本原因
-  if (plain && open.some((t) => t.kind === kind && t.model === m && t.resolution === resolution)) return freeTextOnlyDenial(kind, media);
+  if (plain && open.some((t) => t.kind === kind && t.model === m && t.resolution === resolution)) return freeTextOnlyDenial(kind, media, ticket);
   const allowed = freeVideoLabels(now);
   // ★ 旧版 App（2.61 及更早）原样显示这句话，而它们的档位表里**没有「草稿」**（只有「极速」可用；11-24 之后连它都停了）——
   //   只说「只能用草稿」，那些包里的人找不到这一档。所以点到草稿时补半句「看不到就更新 App」：新版 App 看得到，这半句对它不算错话。

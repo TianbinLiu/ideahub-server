@@ -2982,6 +2982,10 @@ H3 三档没有白模模板、往后延长、样片两步、片段重拍、声�
   清扫器问 `/v2/query/video_generation/{id}`，`settleTask` 只结同一版接口建的账；同一个开关 `MINIMAX_FAIL_REFUND` 管它，App 对 H3 说「会自动退回」之前同样看 `minimaxFailRefund`。
   站内通知里 H3 的 `kind` 是 `video`（说「一段视频没出成」），`minimax` 那一格只给真人档。
 - ⚠ **钱不能"退"进别人的余额镜像**：`refund` 字段与余额头只给账的主人；别人轮询我的任务只看得见方舟的原话。
+- **券那一笔退的是券**（2026-11-23）：账上 `currency: "ticket"`、`charged: 1`（张），退款走 `services/gameTicket.service.refund`、
+  **不进 TokenLedger**（券与 token 不可互换）；幂等键 `provider:taskId`。轮询 / `task-charges` 回包对券那一笔是
+  `{ state, tokens: 0, tickets: 1, currency: "ticket" }` —— token 那一笔的形状逐字节不变（只有 `state` / `tokens` 两个键）。
+  为什么必须分家：按 token 退的话，上游失败一次，玩家的券就变成他钱包里的 token，**零报错**（见「工坊游戏券」）。
 
 ### 组图（`POST /api/ark/image-groups`，2026-10-05）
 
@@ -3401,6 +3405,99 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 **显示余额**与**按下按钮之前提前拦一道**，被绕过不会造成任何损失（服务端不认它）。
 25 处调用点因此保持同步签名不变；权威值随 `/api/ark` 的响应头覆盖回来，最多短暂偏差且自愈。
 离线模式（没配 `VITE_API_BASE`）下它仍然是唯一账本——那种包本来就不出网。
+
+## 工坊游戏券（GameTicket，2026-11-23）
+
+设计正本在 app 仓：`docs/g2-game-ui.md` §7「改造清单（9 条）」与 `docs/g4-ui-revamp-spec.md` §0
+（免费套餐每月 6 张券、任务加券、**券只用于游戏内出片、不扣 token 钱包**）。
+
+### 两张表
+
+| 集合 | 键 | 说明 |
+|---|---|---|
+| `gametickets` | `(userId, cycle)` 唯一 | 一个账号 × 一个 UTC 月（`"YYYY-MM"`）一行。`balance` 是**唯一作数的余额**（扣券是一次带 `$gte` 条件的 `$inc`）；`granted` 是当月免费套餐那一份、`earned` 是任务 / 管理员加的；`spent` / `refunded` 是**两个单调计数器**（退款不回退 `spent`：退款可能落到下个月，`$inc used:-1` 会让新月变成负数） |
+| `gameticketgrants` | `(userId, source, refId)` 唯一 | 发放 / 退回流水。`source`: `monthly` / `share` / `invite` / `admin` / `refund`，`kind`: `grant` / `refund`。**唯一键就是幂等的实现**：抢不到 = 这一笔已经发过（重放不再发）。没有 TTL（删了就能重领） |
+
+★ 券与 token **不可互换**（没有汇率、买不到、转不了），所以券的进出**不记 TokenLedger**；
+「券花在哪儿了」看 `GenTaskCharge` 里 `currency: "ticket"` 的那几行（一发一行、带任务号）。
+★ 月度券**没有定时任务**：跨月第一次触达（读余额 / 花券）时靠唯一键抢发 —— 与钱包的 `cycle` 同一个套路。
+
+### 端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/game/tickets` | 登录 | `{ ok, cycle, limit, granted, earned, spent, refunded, used, left, perGeneration, nextResetAt, enabled }`。读一次就完成当月懒发。`used = spent − refunded`（净用了多少）；`left` 是余额；`nextResetAt` 是下个月 1 日 00:00:00 UTC |
+| POST | `/api/game/tickets/grant` | **管理员** | `{ userId?, source, count?, refId?, memo? }` → 201 `{ granted:true, count, tickets }`；同一个 `refId` 再来 → **200** `{ granted:false, duplicate:true }`（不是错误，别重试）。`share` / `invite` 必须带 `refId`（事件 id）否则 400 `REF_ID_REQUIRED`；`count` 1~10；任务加券每天最多 5 张（超过 → 400 `DAY_CAP`） |
+
+★ 发券端点**只给管理员**：今天「分享 App / 邀请新用户」还没有服务端落点（邀请只有群邀请、分享只有客户端壳），
+开放给任何登录用户 = 自己给自己发券 = 平台无限印真金白银的出片额度。真正的任务事件源落地后**仍然**只保留管理员门
+（那是补发 / 测试 / 客服兜底），由事件源直接调 `services/gameTicket.service.grant`。
+
+### 带券出片（三条出片路由同一套）
+
+请求**明确**带标记才走券（不带 = 走 token 钱包，与改版前逐字节相同）：
+
+- 请求头 `X-Game-Ticket: 1`（**推荐**，App 用这个）；
+- 或请求体 `payWithTicket: true`（服务端会先把它从请求体里删掉再转发，不会发给方舟 / MiniMax）。
+
+| 路由 | kind | 备注 |
+|---|---|---|
+| `POST /api/ark/contents/generations/tasks` | `task` | Seedance 出片 / 样片两步 |
+| `POST /api/minimax/video` | `minimax_video` | 真人档（本来就只给付过钱的人） |
+| `POST /api/minimax/v2/video` | `minimax_v2` | H3（**免费账号带券可以带图**，见下） |
+
+带券的那一发：**扣一张券、token 钱包一分不动**（不冻结、不扣两桶、不写 `ark_spend` 流水）。
+出图 / 对话 / Seed3D 带标记 → **400 `TICKET_NOT_APPLICABLE`**（券只用于出片；不静默改走 token 扣钱）。
+
+**顺序（三条路由一致，写在 `billing.preAuthorize` 的注释里）**：冻结（退款欠额，W4「冻结一切消费」）→
+套餐门禁（`denyReason`，券**不是**会员）→ 扣券 → 转发 → 没受理退券。
+**管理员免单优先于券**：管理员带券的请求不扣券（`free:true`、`charged:0`，照旧落一笔 `admin_free`）。
+日上限（`tokens.dailyCapDenial`）**不套在券上** —— 那套数是 token 的额度，券的上限就是券本身（每月 6 张）。
+
+**失败退券**（两种，都只退一次）：
+
+- 上游**没受理**：当场退（`billing.refundUnaccepted` 的 `currency:"ticket"` 分支），不落任务账；
+- **受理之后**才失败（方舟 `failed` / `cancelled` / `expired`、MiniMax `Fail` / `failed` / `cancelled`）：
+  `GenTaskCharge.currency: "ticket"` + `charged: 1`，清扫器 / 轮询结账时走 `gameTicket.refund`，
+  幂等键 `provider:taskId`。**不是**按 token 退 —— 按 token 退的话玩家的券会变成他钱包里的钱，零报错。
+  轮询回包的 `refund` 对券那一笔是 `{ state, tokens: 0, tickets: 1, currency: "ticket" }`（token 那一笔形状不变）。
+
+### 免费账号带图：只对带券的请求放开
+
+`tokens.MINIMAX_V2_FREE_TEXT_ONLY`（免费版在 H3 上只能纯文字）有一个例外：**带券的那一发可以带图**。
+开放点是 `videoPlanDenial({ ticket: true })` / `freeTextOnlyDenial(kind, media, ticket)`，只影响这一条判定 ——
+**档位门禁照旧**：券不是会员，H3 / H3-Highspeed 对没付过钱的人仍然 403 `PLAN_REQUIRED`（且**不扣券**）；
+真人档、参考视频那几条也不受影响。
+
+为什么这样安全（四条，缺一条都不该放开）：
+
+1. 券**限量且要花掉**：每人每月 6 张、一张一发、买不到转不了，一个人一个月最多 6 发带图的 H3-Lite（不是无限量）；
+2. 券的发放是唯一索引 + 日上限，刷不出来；
+3. 只放开**这一条**：工坊默认档 L1 = `draft-mm`（H3-Lite · 480P），一张券换的就是这一格；
+4. 上游失败 / 内容审核没过会退券，不会白吃掉玩家的券。
+
+⚠ 仍然没验过的是「H3 收不收真人照片」（「等主人拍板」第 9 条）—— 带券能发图不等于那条结论变了；
+彻底挡住 realPerson 卡是 App 入池处的事。
+
+### 能力位（`GET /api/ark/health`）
+
+| 位 | 说明 |
+|---|---|
+| `gameTickets` | 有 `/api/game/tickets`、出片路由认券标记。**读不到这一位 = 老服务端，App 不摆「用券出片」** |
+| `gameTicketMonthly` | 每月几张（6） |
+| `gameTicketPerGeneration` | 每发出一张（1） |
+| `gameTicketUnlocksMedia` | 带券的那一发越过 `minimaxV2FreeTextOnly` —— App 在「有券」时可以给没付过钱的玩家发带图的 H3-Lite。**没券的请求照样 403 `freeTextOnly`** |
+
+### 错误码
+
+| HTTP | `code` | 什么时候 |
+|---|---|---|
+| 403 | `NO_GAME_TICKET` | 券不够（带 `need: 1`、`left`、`nextResetAt`）。**不是 402** —— 402 的语义是「充值就能继续」，而券买不到 |
+| 403 | `GAME_TICKETS_OFF` | 这台服务器 `GAME_TICKETS=off`。**不会**静默改走 token |
+| 400 | `TICKET_NOT_APPLICABLE` | 带了券标记、但这一发不是出片（出图 / 对话 / Seed3D） |
+| 403 | `PLAN_REQUIRED` | 带券点了会员档 / 真人档（券 ≠ 会员）。带券时**不扣券** |
+
+回归测试：`server/tests/gameTicket.spec.js`（34 条）。
 
 ## 客户端接入约定
 

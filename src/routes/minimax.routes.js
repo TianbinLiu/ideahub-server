@@ -50,8 +50,16 @@ const wallet = require("../services/tokenWallet.service");
 const taskRefund = require("../services/taskRefund.service");
 // 视频任务的服务端登记（App 重启之后取回用；H3 从 2026-10-26 起也记，见 models/ArkVideoTask 的 ★★）
 const arkVideoTask = require("../services/arkVideoTask.service");
+// 工坊游戏券（2026-11-23）：券标记收进 req、body 里的同名键删掉；币种判据只有 gameTicket.currencyOf 一处
+const gameTicket = require("../services/gameTicket.service");
+const { payWithTicket } = require("../middleware/gameTicket");
 
 const router = express.Router();
+
+// ★ 与 /api/ark 同一条：挂在整条 /api/minimax 上，两件小事 —— 收标记、删 body 里的同名键
+//   （H3 的请求体是 zod 严格白名单，多一个键就是整句 400；真人档是挑字段，但删掉更干净）。
+//   只有两条**出片**路由会把币种传下去；轮询 / 取件 / 查询不看它。
+router.use(payWithTicket);
 
 /** 上游超时。创建体可能带 base64 首帧（压到 720p 仍有 2-3MB，照 ark 的实测经验
  *  给宽），轮询与 ark 的 T_POLL 同一个量级。 */
@@ -136,6 +144,8 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
   body.resolution = MINIMAX_REAL_RESOLUTION;
 
   try {
+    // ★ 币种（2026-11-23）：带券 = 扣一张券、不扣 token。真人档永远算"出片"，所以 currencyOf 不会回 null
+    const currency = gameTicket.currencyOf(req, "minimax_video", model);
     // 整段「钱」的序列（门禁→原子扣→转发→没受理退→管理员免单记账）在
     // arkGateway.chargedArkCall **唯一一份**——这里只换了"往哪儿转发"与"受理判据"。
     const out = await chargedArkCall({
@@ -146,6 +156,7 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
       path: "(minimax)/video_generation",
       body,
       timeoutMs: T_CREATE,
+      currency: currency === "ticket" ? "ticket" : "token",
       forward: async () => {
         // ★ 这里**不许抛**：forward 在扣费之后执行，抛出去就绕过了"未受理退款"那一步
         //   （chargedArkCall 只对返回的 status 判退）。超时/断连一律折成 504 返回，
@@ -199,7 +210,9 @@ router.post("/video", requireAuth, genLimit, async (req, res, next) => {
         kind: "minimax",
         user: req.user._id,
         model,
-        cost: out.cost,
+        // ★ 实扣多少 + 哪种币（券 = 1 张）。照抄 out.cost 会让券那一笔记成 token 报价（失败时按 token 退）
+        cost: out.charged,
+        currency: out.currency,
         free: out.free,
         took: out.took,
         memo: out.memo,
@@ -489,6 +502,10 @@ router.post("/v2/video", requireAuth, genLimit, async (req, res, next) => {
     v2Creating += 1;
     v2CreatingBy.set(uid, (v2CreatingBy.get(uid) || 0) + 1);
     try {
+      // ★ 币种（2026-11-23）：带券的那一发扣一张券、不碰 token 钱包。**带券时 H3 上允许带图**
+      //   （tokens.freeTextOnlyDenial 的 `ticket` 入参，四条安全理由写在那里）—— 工坊对局要挂卡出片。
+      //   档位门禁照旧：券不是会员，H3 / H3-Highspeed 对没付过钱的人仍然 403。
+      const currency = gameTicket.currencyOf(req, "minimax_v2", body.model);
       const out = await chargedArkCall({
         user: req.user,
         // 在册 = 价目表里有它（schemas 已经拦过；chargedArkCall 自己还要问一遍，别让它成为唯一的一道）
@@ -497,6 +514,7 @@ router.post("/v2/video", requireAuth, genLimit, async (req, res, next) => {
         path: "(minimax)/v2/video_generation",
         body,
         timeoutMs: T_CREATE,
+        currency: currency === "ticket" ? "ticket" : "token",
         forward: async () => {
           // ★ 这里**不许抛**（与真人档同一条）：forward 在扣费之后执行，超时 / 断连折成 504 让「没受理就退」照常走
           try {
@@ -544,7 +562,9 @@ router.post("/v2/video", requireAuth, genLimit, async (req, res, next) => {
         kind: "video",
         user: req.user._id,
         model: body.model,
-        cost: out.cost,
+        // ★ 实扣多少 + 哪种币（券 = 1 张），照抄 chargedArkCall 的结论（见真人档那一处）
+        cost: out.charged,
+        currency: out.currency,
         free: out.free,
         took: out.took,
         memo: out.memo,
@@ -553,8 +573,8 @@ router.post("/v2/video", requireAuth, genLimit, async (req, res, next) => {
       // ★★ 再登记一条给 App 重启之后取回用（models/ArkVideoTask 的 ★★；GET /api/minimax/video-tasks 列它）。
       //   与上面记账是两件事：账只管钱、登记管「找得回来」。只吼不抛（任务已受理、钱已扣）
       //   costTokens 是这一发**实扣**的数：管理员免单记 0（与方舟那张登记表同一条，ark.routes 的 billedForward）——
-      //   记 out.cost 的话，取回列表对一发没扣过钱的任务说「花了 N」（2026-10-26 文档审核）
-      await arkVideoTask.recordMinimaxV2Task({ userId: req.user._id, body, taskId, costTokens: out.free ? 0 : out.cost });
+      //   记 out.cost 的话，取回列表对一发没扣过钱的任务说「花了 N」（2026-10-26 文档审核）；券那一发同理记 0
+      await arkVideoTask.recordMinimaxV2Task({ userId: req.user._id, body, taskId, costTokens: out.free || out.currency === "ticket" ? 0 : out.cost });
       setWalletHeaders(res, out.wallet);
       return res.status(200).json({ ok: true, task_id: taskId });
     } finally {

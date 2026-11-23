@@ -81,11 +81,21 @@ const {
 // ★★ 「扣钱 → 转发 → 没受理就退」这条序列的唯一实现在 services/arkGateway ——
 //   白模化端点（routes/branchTemplate）自己也要发方舟请求，两处各写一遍就是两套记账。
 const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_POLL } = require("../services/arkGateway.service");
+// 工坊游戏券（2026-11-23）：`payWithTicket` 只把「这一发用券」的标记收进 req 并删掉 body 里的同名键；
+// 真正决定币种的是 gameTicket.currencyOf（唯一判据），钱的那一段序列仍在 billing 里。
+const gameTicket = require("../services/gameTicket.service");
+const { payWithTicket } = require("../middleware/gameTicket");
 const wallet = require("../services/tokenWallet.service");
 // MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
 const { isMinimaxV2VideoUrl, minimaxV2Enabled } = require("../config/minimax");
 
 const router = express.Router();
+
+// ★ 券标记挂在整条 /api/ark 上（而不是只挂出片那一条）：这个中间件做两件事 ——
+//   ① 把「要付券」这件事收进 req（`req.payWithTicket`）；② **删掉请求体里的同名键**，
+//   免得它跟着转发的一体发给方舟（`withServerTaskFields` 只剥几个已知字段，不是白名单）。
+//   只对出片那一发生效（下面的 billedForward 会拦，出图 / 对话 / Seed3D 带标记直接 400，不静默改走 token）。
+router.use(payWithTicket);
 
 /**
  * 允许调用的模型白名单。**与 app 仓 src/ai/arkClient.ts 的 MODELS、
@@ -165,6 +175,16 @@ router.get("/health", (_req, res) => {
   //   · minimaxV2FreeTextOnly：没付过钱的人在 H3 上只能纯文字出片（带首帧 / 尾帧 / 参考图要付过钱；tokens.MINIMAX_V2_FREE_TEXT_ONLY，
   //     2026-10-26 终审：H3 收不收真人照片还没验过）。App 照它对没付过钱的人只发纯文字 —— 不照的话那些人每一发都在扣费之前吃 403 PLAN_REQUIRED
   //     （回包带 freeTextOnly: true）。读不到这一位 = 老服务端，那上面本来就没有 H3（minimaxV2 也读不到）。
+  // 2026-11-23 的能力位（工坊游戏券，app 仓 g2-game-ui.md §7 第 7 条）：
+  //   · gameTickets：这台服务器有 GET /api/game/tickets，出片路由认 `X-Game-Ticket: 1` / `payWithTicket: true`
+  //     （扣一张券、不扣 token）。读不到这一位 = 老服务端，App **不摆「用券出片」**（与 serverCaps 那一套同形：
+  //     拿不准就不放行，别先放行再吃一个没有这个端点的 404）。
+  //   · gameTicketMonthly / gameTicketPerGeneration：每月几张、每发出一张。App 只显示服务端下发的数，
+  //     不在本机算（价目表两仓各写一份就散，templateReward 那条纪律）。
+  //   · gameTicketUnlocksMedia：带券的那一发**越过** minimaxV2FreeTextOnly（H3 上带图）——
+  //     工坊对局要挂卡出片，所以 App 在「有券」时可以给没付过钱的玩家发带图的 H3-Lite。
+  //     ★ 它说的是「带券时那一条限制不适用」，不是「免费版可以带图」：没券的请求照样 403 freeTextOnly。
+  //  ★ 这三位放在 gameTickets 关着（GAME_TICKETS=off）时照常回：读是安全的，`gameTickets:false` 就是「别用」。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -186,6 +206,11 @@ router.get("/health", (_req, res) => {
     templateReward: true,
     minimaxV2: minimaxV2Enabled(),
     minimaxV2FreeTextOnly: MINIMAX_V2_FREE_TEXT_ONLY,
+    // 工坊游戏券（2026-11-23）：能力位见上面那一段注释
+    gameTickets: gameTicket.enabled(),
+    gameTicketMonthly: gameTicket.MONTHLY_TICKETS,
+    gameTicketPerGeneration: gameTicket.TICKETS_PER_GENERATION,
+    gameTicketUnlocksMedia: gameTicket.enabled(),
   });
 });
 
@@ -218,6 +243,17 @@ router.get("/health", (_req, res) => {
 function billedForward(kind, path, timeoutMs) {
   return async (req, res, next) => {
     try {
+      // ★ 币种只在这一处算（gameTicket.currencyOf 是唯一判据）：带券标记 + 这一发是出片 → 扣券；
+      //   带券标记却不是出片（出图 / 对话 / Seed3D）→ **拒**，不静默改走 token 扣钱
+      //   （用户点的是「用一张券」，我们不能不说一声就花掉他的钱）。
+      const currency = gameTicket.currencyOf(req, kind, req.body?.model);
+      if (currency === null) {
+        return res.status(400).json({
+          ok: false,
+          code: "TICKET_NOT_APPLICABLE",
+          message: "游戏券只能用于出片（视频），这一发是出图 / 对话 / 建模——当前请求未被受理，也没有扣费。",
+        });
+      }
       // ★★ 整段"钱"的判断（在册 → 套餐门禁 → 原子扣费 → 转发 → 没受理就退 → 管理员免单
       //   照实记账）都在 services/arkGateway.chargedArkCall 里 —— **只有那一份实现**。
       //   白模化端点（POST /api/branch/templates/blockoutize）服务端自己发方舟请求时
@@ -240,6 +276,8 @@ function billedForward(kind, path, timeoutMs) {
         // 出片地区门禁从它现算地区（arkGateway.regionGate）：Seedance 出片在海外被拦时回 403 REGION_UNAVAILABLE、不扣钱。
         // 只有创建类走这里；轮询 / 取件 / 查询都不经过 billedForward，在途任务照常取得回来
         req,
+        // 这一发扣 token 还是扣一张券（"token" / "ticket"）
+        currency,
       });
 
       if (!out.ok) {
@@ -267,7 +305,8 @@ function billedForward(kind, path, timeoutMs) {
           responseText: out.text,
           r2v: req.r2v ?? null,
           draftFinal: req.draftFinal ?? null,
-          costTokens: out.free ? 0 : out.cost,
+          // 实扣的 token 数：管理员免单 0、**券那一发也是 0**（券不是 token，记成报价就成了「花了 56,000」）
+          costTokens: out.free || out.currency === "ticket" ? 0 : out.cost,
         });
         // ★★ 记账（services/taskRefund）：这一发扣了多少、从哪两桶扣的、是不是免单 —— 方舟之后明说失败 / 取消 / 过期时
         //   按它原样退回。每一发受理了的任务都记（Seedance 普通出片、r2v、样片两步、Seed3D）；记账只吼不抛
@@ -286,7 +325,10 @@ function billedForward(kind, path, timeoutMs) {
           kind: req.draftFinal ? "draftFinal" : req.body?.draft === true ? "draft" : Object.hasOwn(VIDEO_MULT, model) ? "video" : "3d",
           user: req.user._id,
           model,
-          cost: out.cost,
+          // ★ 实扣多少 + 扣的是哪种币（券 = 1 张）：照抄 chargedArkCall 的结论，**不要**写成 out.cost ——
+          //   券那一发照抄报价的话，失败时按 token 退（玩家的券变成了钱包里的 token，零报错）
+          cost: out.charged,
+          currency: out.currency,
           free: out.free,
           took: out.took,
           memo: out.memo,

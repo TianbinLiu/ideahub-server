@@ -38,6 +38,9 @@ const Report = require("../models/Report");
 const TokenLedger = require("../models/TokenLedger");
 const TokenOrder = require("../models/TokenOrder");
 const GenTaskCharge = require("../models/GenTaskCharge");
+// 工坊游戏券（2026-11-23）：删号级联 ⑨.6 的两张表
+const GameTicket = require("../models/GameTicket");
+const GameTicketGrant = require("../models/GameTicketGrant");
 const ArkVideoTask = require("../models/ArkVideoTask");
 const BlockoutJob = require("../models/BlockoutJob");
 const ArkImageGroup = require("../models/ArkImageGroup");
@@ -335,6 +338,8 @@ async function unbanUser(req, res, next) {
  *      它们一两天就会自己过期，但等过期期间是这个人的提示词与产物地址 —— 删号就该当场没。
  *      ⚠ 在画的那一组被删掉之后，它的后台结算会找不到这一行、什么都不做（钱包也没了，没有可退的人）。
  *      还有剪辑页免费配音的计数器 NarrationFreeUsage（2026-10-08）→ deleteMany：只是当天用了几个字，3 天自己过期，删号就当场没。
+ *   ⑨.6 GameTicket / GameTicketGrant（工坊游戏券，2026-11-23）→ deleteMany：账号级资产，余额与发放流水都没有主人了。
+ *      与 ⑦.9 两张奖励表的区别：那些行是别人的上限计数依据，这两张每行只为本人作数。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
  *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
@@ -531,6 +536,12 @@ async function purgeUserCascade(userId) {
   removed.blockoutJobs = (await BlockoutJob.deleteMany({ ownerId: uid })).deletedCount;
   removed.arkImageGroups = (await ArkImageGroup.deleteMany({ userId: uid })).deletedCount;
   removed.narrationFreeUsage = (await NarrationFreeUsage.deleteMany({ userId: uid })).deletedCount;
+  // ⑨.6 工坊游戏券（2026-11-23）：余额行与发放 / 退回流水。★ 两张都删 —— 券是账号级资产，
+  //   留着只是因为删号后还有一行永远花不到的余额与一堆没有主人的流水（读不出来也退不回去）。
+  //   ⚠ 与 ⑦.9 那两张奖励表的区别：那些行是**别人上限计数**的依据（所以只删"他是原作者"的），
+  //   GameTicketGrant 的每一行都只为自己作数，可以整张清掉。
+  removed.gameTickets = (await GameTicket.deleteMany({ userId: uid })).deletedCount;
+  removed.gameTicketGrants = (await GameTicketGrant.deleteMany({ userId: uid })).deletedCount;
 
   // ⑩ 关注、通知、搜索记录
   removed.follows = (await Follow.deleteMany({ $or: [{ follower: uid }, { following: uid }] })).deletedCount;
