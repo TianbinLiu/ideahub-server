@@ -77,8 +77,17 @@ cp .env.example .env
 扣血 20/15/10/5 按人数缩放、4/8 人局剩 2 人结束 / 2 人局剩 1 人结束），不在环境变量里；回合数据存在
 房间文档的 `rounds[]` 里，过期懒清理删房间时一起没。只有一个总开关 `GAME_ROUNDS=off`（急停回合端点，
 不影响房间端点），能力位是 `/api/ark/health` 的 `gameRounds`。端点、错误码与结算公式见
-`docs/api-contract.md`「工坊对局：回合引擎」。
-⚠ 还没做的：事件三选一、断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、推送。
+`docs/api-contract.md`「工坊对局：回合引擎」。打完一局（`next` 遇 `GAME_OVER`）时房间会落成 `over`
+并写 `winners` / `finishedAt`，任何人读房间快照的 `state` / `winners` 都能判结束与平局。
+
+**工坊对局 · 回合间事件（可选，缺省开，2026-11-23）**：第 2/4/6 回合结算之后的三选一**由服务端出题**
+（同一房间同一回合所有人看到同一个事件；之前只在本机跑，跨端会对不上）。事件表 / 触发回合 /
+确定性抽选 / 效果拆分是**代码常量**（`src/config/gameEvent.js`，与 App `rules.GAME_EVENTS` 同口径）：
+`effects.server` 只有 `hp`（由服务端落库，App 不要再应用一次），金币 / 模型档位 / 道具上限 /
+免费刷新在 `effects.client` 里原样交给 App 本地落。只有一个总开关 `GAME_EVENTS_API=off`（急停
+`/rounds/events*`，不影响回合端点），能力位是 `/api/ark/health` 的 `gameEvents`。端点、响应形状、
+错误码见 `docs/api-contract.md`「工坊对局：回合引擎」→「回合间事件」。
+⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、推送。
 
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 

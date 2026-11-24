@@ -62,9 +62,10 @@ const ROOM_TTL_MS = readMinutes("GAME_ROOM_TTL_MINUTES", 30, 5, 240);
 
 /**
  * `playing` 的房间多久过期（分钟）。
- * ★ 比等待房长得多：这一局可能真的在打。但**回合引擎还没接**，
- *   所以 `playing` 之后没有任何东西会把它推到 `closed` —— 给一个兜底寿命，
- *   免得每一局都留下一行永远不死的房间（以及「这个人永远在房间里、再也排不了队」）。
+ * ★ 比等待房长得多：这一局可能真的在打（8 回合 × 每回合几分钟，中途还有人掉线等着）。
+ * ★ 打完一局会变 `over`（`POST /rounds/next` 遇到 GAME_OVER 时落库），`over` **用等待房那一档**
+ *   （30 分钟，见 ttlMsFor）：结算屏 / 复盘看完就够了，再长就是给每一局留一行永远不死的房间。
+ *   所以 2 小时这一档只兜「还在打、但已经没人轮询」的房。
  */
 const PLAYING_ROOM_TTL_MS = readMinutes("GAME_ROOM_PLAYING_TTL_MINUTES", 120, 30, 1440);
 
@@ -154,7 +155,11 @@ function capacityOf(room) {
   return Number(room?.seats) || MIN_CUSTOM_SEATS;
 }
 
-/** 按状态给寿命（毫秒） */
+/**
+ * 按状态给寿命（毫秒）。
+ * ★ 只有 `playing` 拿 2 小时；`waiting` / `over` / `closed` 都是 30 分钟那档
+ *   （sweepExpired 里按状态各删一条，两处同一口径）。
+ */
 function ttlMsFor(status) {
   return status === "playing" ? PLAYING_ROOM_TTL_MS : ROOM_TTL_MS;
 }

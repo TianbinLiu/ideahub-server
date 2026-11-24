@@ -116,7 +116,12 @@ function isExpired(room, now = Date.now()) {
   return now - base > config.ttlMsFor(room.status);
 }
 
-/** 「这个人在哪间**还活着**的房里」——建房 / 排队之前先问它（一人一间，见 models/GameRoom 的索引注释） */
+/**
+ * 「这个人在哪间**还活着**的房里」——建房 / 排队之前先问它（一人一间，见 models/GameRoom 的索引注释）。
+ * ★ 只算 `waiting` / `playing`：**`over` 不算「还在一间房里」**。一局打完，那间房只剩结算屏的价值，
+ *   再拿它把几个人挡在「不能再开一局」外面就是拿旧局当锁（他们想接着玩的心愿正是下一局的开始）。
+ *   旧房仍按 over 的寿命（30 分钟）自己过期，与这条判断互不影响。
+ */
 function findActiveRoomOf(userId, now = Date.now()) {
   return GameRoom.findOne({
     "members.userId": userId,
@@ -151,6 +156,10 @@ async function sweepExpired({ now = Date.now(), force = false } = {}) {
     const done = await Promise.all([
       GameRoom.deleteMany({ members: { $size: 0 } }),
       GameRoom.deleteMany({ status: "waiting", lastSeenAt: { $lt: waitingCut } }),
+      // ★ `over` 用等待房那档寿命（30 分钟）：打完的一局留着给复盘 / 结算屏够久了，
+      //   再长就是给每一局留一行永远不死的房间（以及「这个人永远在房间里」）。
+      //   config.ttlMsFor 对 over 回的也是这一档，两处同一口径（见那边的 ★）。
+      GameRoom.deleteMany({ status: "over", lastSeenAt: { $lt: waitingCut } }),
       GameRoom.deleteMany({ status: "closed", lastSeenAt: { $lt: waitingCut } }),
       GameRoom.deleteMany({ status: "playing", lastSeenAt: { $lt: playingCut } }),
     ]);
@@ -195,12 +204,27 @@ async function touch(room, now) {
 /** 开局卡在哪儿（快照里的 `startBlockedBy`，与 startRoom 的判定同一套说法） */
 function startBlockedByOf(room, now = Date.now()) {
   if (room.status === "playing") return "already-started";
+  // ★ 打完一局（status: "over"）也是「不能开局」：不报出来的话快照会给出 canStart:true，
+  //   而 startRoom 会拿 ROOM_ALREADY_STARTED 拒 —— 按钮亮着却点不动。
+  if (room.status === "over") return "over";
   if (room.status === "closed") return "closed";
   if (isExpired(room, now)) return "expired";
   const required = config.requiredPlayersOf(room);
   if (room.members.length < required) return "not-enough-players";
   if (room.members.some((m) => !m.ready)) return "not-all-ready";
   return null;
+}
+
+/**
+ * 对外的三态（`state`）：`waiting` / `playing` / `over`。
+ * ★ 为什么不直接把 `status` 给 App：`status` 里还有一个历史遗留的 `closed`（今天没有东西写它，
+ *   但老数据里可能有）。App 只认三态，映射只在**这一处**做 —— 客户端各写一遍就会有两种说法。
+ */
+function stateOf(room) {
+  const status = room?.status;
+  if (status === "waiting") return "waiting";
+  if (status === "over" || status === "closed") return "over";
+  return "playing";
 }
 
 /**
@@ -218,12 +242,19 @@ async function snapshotOf(room, { viewerId = null, now = Date.now() } = {}) {
   const hostId = hostIdOf(room);
   const blocked = startBlockedByOf(room, now);
   const base = new Date(room.lastSeenAt || room.updatedAt || now).getTime();
+  const over = room.status === "over";
   return {
     code: room.code,
     roomId: String(room._id),
     mode: room.mode,
     seats: config.capacityOf(room),
+    /**
+     * `status`：落库的状态（含历史遗留的 `closed`）。
+     * `state`：App 认的三态（`waiting` / `playing` / `over`），由 stateOf 一处映射。
+     * ★ 两个都给：老 App 已经在读 `status`，新 App 只认 `state`；删掉 `status` 会打断老包。
+     */
     status: room.status,
+    state: stateOf(room),
     origin: room.origin,
     hostId: hostId ? String(hostId) : null,
     requiredPlayers: config.requiredPlayersOf(room),
@@ -250,6 +281,14 @@ async function snapshotOf(room, { viewerId = null, now = Date.now() } = {}) {
     createdAt: isoOf(room.createdAt),
     updatedAt: isoOf(room.updatedAt),
     startedAt: isoOf(room.startedAt),
+    /**
+     * 结束状态对外可见（2026-11-23）：
+     * · 没结束 → `winners: null`、`finishedAt: null`（**稳定的形状**，App 不用先判字段在不在）；
+     * · 结束（`status: "over"`）→ `winners` 是 userId 数组，**空数组 = 平局 / 同归于尽**（不是「还没算」）。
+     * ★ 只有房主能调 `next`，写完 over 别人读到的就是这一份 —— 这就是「结束不再只活在回包里」。
+     */
+    winners: over ? (room.winners || []).map((id) => String(id)) : null,
+    finishedAt: over ? isoOf(room.finishedAt) : null,
     lastSeenAt: isoOf(room.lastSeenAt),
     expiresAt: isoOf(new Date(base + config.ttlMsFor(room.status))),
   };
