@@ -158,6 +158,10 @@ async function snapshotOf(room, round, { viewerId = null } = {}) {
     entries: entries.map((entry) => {
       const key = String(entry.userId);
       return {
+        // ★ 举报 `game-entry` 的 targetId（App 拿它递 POST /api/branch/reports）。
+        //   老房间的存量投稿没有这一格 → 如实回 null（重交一次就有），不要现编一个：
+        //   编出来的 id 在库里不存在，举报会 404 TARGET_NOT_FOUND，比"这格是空的"更难查。
+        entryId: entry.entryId ? String(entry.entryId) : null,
         userId: key,
         name: names.get(key) || null,
         prompt: entry.prompt,
@@ -313,6 +317,8 @@ async function startRound({ userId, code, now = Date.now() }) {
  * POST /api/game/rooms/:code/rounds/entries
  *
  * 一人一条，**重复提交覆盖**（`submittedAt` 刷新）。只在 `phase: "creating"`。
+ * ★ 每条投稿有一个**稳定的** `entryId`（首次交片生成、覆盖不换）：举报 `game-entry` 认它，
+ *   见下面 submitEntry 里的 ★★ 与 models/GameRoom.js 的 roundEntrySchema。
  * 错误：409 `NOT_IN_ROOM` / 409 `PLAYER_ELIMINATED` / 404 `ROUND_NOT_FOUND` / 409 `WRONG_PHASE` /
  *      400 `BAD_PROMPT` / `PROMPT_TOO_LONG` / `BAD_CARD_NAMES` / `BAD_ENTRY_FIELD`。
  *
@@ -339,8 +345,48 @@ async function submitEntry({ userId, code, body, now = Date.now() }) {
   const parsed = entryInputOf(body);
   if (!parsed.ok) return parsed;
   const n = round.round;
-  const doc = { userId: oidOf(userId), ...parsed.value, submittedAt: atOf(now) };
+  /**
+   * ★★ `entryId`：**首次交片生成、覆盖提交保持不变**（2026-11-24，举报 `game-entry` 的靶子，
+   *   见 models/GameRoom.js 的 roundEntrySchema）。App 的举报键认的是这个 id，换一次
+   *   就等于"同一条投稿被报两次、管理端打开两条"，而且零报错。
+   *   这里**不读请求体**里的 entryId（entryInputOf 只挑白名单字段）：id 由服务端说了算。
+   */
+  const existing = entryOf(round, userId);
+  const entryId = existing && existing.entryId ? existing.entryId : new mongoose.Types.ObjectId();
   const at = atOf(now);
+  const doc = { entryId, userId: oidOf(userId), ...parsed.value, submittedAt: at };
+
+  /**
+   * 老房间的存量投稿（上线前交的片）没有 entryId：**先补上**，再走下面的覆盖写。
+   * ★ 这次更新只写 entryId 一格，且条件要求"那一格还不存在" —— 并发两个请求同时补时，
+   *   后到的那一个在同一个文档上重判，不会再写一遍（也不会把先到的 id 换掉）。
+   */
+  if (existing && !existing.entryId) {
+    await GameRoom.updateOne(
+      {
+        _id: room._id,
+        rounds: { $elemMatch: { round: n, "entries.userId": userId, "entries.entryId": { $exists: false } } },
+      },
+      { $set: { "rounds.$[r].entries.$[e].entryId": entryId } },
+      { arrayFilters: [{ "r.round": n }, { "e.userId": oidOf(userId) }] },
+    );
+  }
+
+  /**
+   * 覆盖那一格写成**逐字段 $set**（并且**永远不写 entryId**），不是整条 `entries.$[e] = doc`。
+   * ★ 整条替换会把 entryId 一起写成本次生成的那个 —— 而下面"替换扑空 → 追加扑空"的
+   *   竞态分支里，本次的 existing 可能是空的（另一发刚把这条插进去），于是同一用户并发交两次
+   *   会把已经发出去的 id 换掉。id 只在"新增"那一格里带（`doc.entryId`），覆盖这条路一个字都不碰它。
+   */
+  const replaceSet = {
+    "rounds.$[r].entries.$[e].prompt": doc.prompt,
+    "rounds.$[r].entries.$[e].cardNames": doc.cardNames,
+    "rounds.$[r].entries.$[e].videoUrl": doc.videoUrl,
+    "rounds.$[r].entries.$[e].posterUrl": doc.posterUrl,
+    "rounds.$[r].entries.$[e].placeholder": doc.placeholder,
+    "rounds.$[r].entries.$[e].modelTier": doc.modelTier,
+    "rounds.$[r].entries.$[e].submittedAt": doc.submittedAt,
+  };
 
   let updated = null;
   for (let attempt = 0; attempt < 2 && !updated; attempt += 1) {
@@ -350,7 +396,7 @@ async function submitEntry({ userId, code, body, now = Date.now() }) {
         "members.userId": userId,
         rounds: { $elemMatch: { round: n, phase: "creating", "entries.userId": userId } },
       },
-      { $set: { "rounds.$[r].entries.$[e]": doc, lastSeenAt: at } },
+      { $set: { ...replaceSet, lastSeenAt: at } },
       { arrayFilters: [{ "r.round": n }, { "e.userId": oidOf(userId) }], returnDocument: "after" },
     );
     if (updated) break;

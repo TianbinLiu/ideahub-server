@@ -359,6 +359,8 @@ router.post("/rooms/:code/rounds/start", requireAuth, actLimit, async (req, res,
  *
  * 请求体：`{ prompt, cardNames: string[], videoUrl?, posterUrl?, placeholder?, modelTier? }`
  * 回包：当前回合快照（与 GET current 同形）
+ * ★ 重复提交是**覆盖**（`submittedAt` 刷新），但 `entryId` **保持不变**（2026-11-24：
+ *   举报 `game-entry` 认它；客户端不许自带这个字段，服务端说了算）。
  * 错误码：400 `BAD_PROMPT` / 400 `PROMPT_TOO_LONG` / 400 `BAD_CARD_NAMES` / 400 `BAD_ENTRY_FIELD` /
  *        404 `ROUND_NOT_FOUND` / 409 `NOT_IN_ROOM` / 409 `PLAYER_ELIMINATED` / 409 `WRONG_PHASE`
  */
@@ -377,8 +379,10 @@ router.post("/rooms/:code/rounds/entries", requireAuth, actLimit, async (req, re
 /**
  * GET /api/game/rooms/:code/rounds/current —— 当前回合快照（展映 / 投票屏轮询它；成员读续命）
  *
- * 回包：`{ ok, round, phase, entries:[{ userId, name, prompt, cardNames, videoUrl, posterUrl,
+ * 回包：`{ ok, round, phase, entries:[{ entryId, userId, name, prompt, cardNames, videoUrl, posterUrl,
  *   placeholder, likes, likedByMe, votes, votedByMe }], allSubmitted, likesPending, votesPending }`
+ * ★ `entryId`（2026-11-24）是这条投稿的**稳定 id**（首次交片生成、覆盖提交不变），也是举报
+ *   `game-entry` 的 targetId；老房间的存量投稿没有它 → 回 `null`（重交一次就有）。
  * ★ `likes` / `votes` 是**计数**，`likedByMe` / `votedByMe` 是「我」视角；**谁投给谁不暴露**。
  * ★ `likesPending` / `votesPending` 是还差几个人的**数字**（不是名单）。
  * 错误码：404 `ROOM_NOT_FOUND` / 404 `ROUND_NOT_FOUND` / 409 `NOT_IN_ROOM`

@@ -178,7 +178,9 @@ describe("举报 · 提交", () => {
       .send({ targetType: "video", targetId: videoId, reason: "spam" })
       .expect(401);
 
-    await report(viewer.token, { targetType: "user", targetId: videoId, reason: "spam" }).expect(400);
+    // ★ 用 "scenario"（真模型名、但不是举报靶子）当反例：2026-11-24 起 "user" 是合法类型了，
+    //   拿它当反例只会测到"靶子不存在 404"，测不到枚举边界
+    await report(viewer.token, { targetType: "scenario", targetId: videoId, reason: "spam" }).expect(400);
     await report(viewer.token, { targetType: "video", targetId: videoId, reason: "我不喜欢" }).expect(400);
     await report(viewer.token, { targetType: "video", targetId: "not-an-id", reason: "spam" }).expect(400);
     await report(viewer.token, { targetType: "video", targetId: videoId }).expect(400); // 缺 reason
@@ -319,8 +321,9 @@ describe("举报 · 管理端队列", () => {
       .get("/api/admin/branch/reports?status=pendign")
       .set("Authorization", `Bearer ${admin.token}`)
       .expect(400);
+    // ★ 同上：2026-11-24 起 targetType=user 是合法的（对局里的玩家），反例换成真不认识的类型
     await request(app)
-      .get("/api/admin/branch/reports?targetType=user")
+      .get("/api/admin/branch/reports?targetType=scenario")
       .set("Authorization", `Bearer ${admin.token}`)
       .expect(400);
     // all 是合法的（要看全部历史）

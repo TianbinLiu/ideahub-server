@@ -47,6 +47,14 @@ it("评论 / 弹幕没有可撤销的下架 → 400，原话不变", async () =>
   await expect(takedownTarget({ targetType: "danmaku", targetId: id, operatorId: op })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/弹幕没有可撤销的下架/) });
 });
 
+it("user / game-entry（2026-11-24，对局 UGC 举报）：处置本轮没做，两种动作都如实 400 —— 不许假装办成了", async () => {
+  expect(TAKEDOWN_TARGETS).toEqual(expect.arrayContaining(["user", "game-entry"]));
+  for (const targetType of ["user", "game-entry"]) {
+    await expect(takedownTarget({ targetType, targetId: id, operatorId: op })).rejects.toMatchObject({ status: 400 });
+    await expect(takedownTarget({ targetType, targetId: id, operatorId: op, hard: true })).rejects.toMatchObject({ status: 400 });
+  }
+});
+
 it("video 下架 / 删除仍转调作品线的那两个函数", async () => {
   applyTakedown.mockResolvedValueOnce({ _id: id });
   expect(await takedownTarget({ targetType: "video", targetId: id, operatorId: op, reason: "x" })).toMatchObject({ applied: "takedown" });

@@ -27,6 +27,10 @@ const createBody = z.object({
   targetType: z.enum(Report.TARGET_TYPES),
   // 只判形状（24 位十六进制 = ObjectId），合法性在 controller 里再判一次 400 ——
   // 不判的话 Mongo 的 CastError 会被兜成 500，而这是调用方拼错了参数
+  // ★ 2026-11-24 起 targetType 多了 "user" / "game-entry"（工坊对局里的玩家与回合投稿）：
+  //   它们的 targetId 同样是 24-hex ObjectId（user → users._id；game-entry → 回合投稿的 entryId），
+  //   **但靶子必须存在**（不存在 404 TARGET_NOT_FOUND）—— 与其余四种"刻意不校验存在"分岔，
+  //   理由在 controllers/report.controller.createReport 的 ★★。entryId 不接受客户端自造，由服务端给。
   targetId: z.string().trim().regex(/^[a-f0-9]{24}$/i, "targetId must be a 24-hex ObjectId"),
   reason: z.enum(Report.REASONS),
   // 500 是契约值，客户端输入框上限必须与它相等：客户端松了会收到一串 400，

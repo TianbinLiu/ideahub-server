@@ -1271,6 +1271,9 @@ describe("健康端点", () => {
       // 回合间事件（2026-11-23，tests/gameEvent.spec.js）：App 见不到 gameEvents:true 就退回本机事件
       // （跨端会对不上）；与 gameRounds 分开报（GAME_EVENTS_API=off 时只有这一位 false）
       gameEvents: true,
+      // 对局 UGC 可举报（2026-11-24，tests/gameReport.spec.js）：举报端点认 targetType = "user" /
+      // "game-entry"（工坊对局里的玩家本人与回合投稿）。App 见不到这一位就不摆那两格举报键
+      gameReports: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

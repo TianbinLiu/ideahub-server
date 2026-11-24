@@ -62,9 +62,32 @@ const memberSchema = new mongoose.Schema(
   { _id: false },
 );
 
-/** 一条交片（一期作品）。★ `_id:false`：对外只认 userId（一人一条），内部不需要第二个 id */
+/**
+ * 一条交片（一期作品）。
+ * ★ `_id:false` 仍成立 —— mongoose 的自动子文档 id 每次替换都会换一个新的，拿它当举报靶子
+ *   （`targetId`）会让"覆盖提交之后管理员点开报的是另一条"，所以不靠它。
+ *   改用显式的 `entryId`（2026-11-24，见下面那个字段）：**首次交片生成，覆盖提交不变**。
+ */
 const roundEntrySchema = new mongoose.Schema(
   {
+    /**
+     * 这条投稿的**稳定 id**（2026-11-24，举报 `game-entry` 的靶子）。
+     * ★ 为什么要它：`POST /rounds/entries` 的重复提交是**整条覆盖**，而没有子文档 `_id`
+     *   时一条投稿根本没有任何对外 id —— App 想给它一格举报键也递不出 targetId。
+     * ★ 为什么是 ObjectId 而不是 (房号, 回合, userId) 的 hash：后者也能算出来，但举报接口
+     *   只认 24-hex ObjectId（Report.targetId 是 ObjectId），hash 还得再映射一次；
+     *   ObjectId 落库即用，且"一人一条"本来就唯一。
+     * ★ **覆盖提交时保持不变**：值不是在 schema 的 default 里"每次生成一份"，
+     *   而是服务层判定（services/gameRound.service.submitEntry：已有投稿沿用旧 id，
+     *   首次才生成、写进那一次更新里）。
+     * ★★ **刻意不给 `default`**：Mongoose 的 default 在**非 lean 读取**时也会把缺的路径补上
+     *   （实测：连读两次，同一个缺字段的子文档会拿到两个不同的新 ObjectId）。老房间的存量
+     *   投稿于是会在快照里每次显示一个**库里不存在**的 id —— 举报必然 404，而没有任何报错。
+     *   ⇒ id 只在"写库那一拍"由服务层生成；读到的 undefined 就如实回 null。
+     * ⚠ 老房间（上线前就已交的片）没有这一格：快照里如实回 `entryId: null`，
+     *   重交一次就有。房间最多活 2 小时，这个空窗不需要写迁移。
+     */
+    entryId: { type: mongoose.Schema.Types.ObjectId },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     prompt: { type: String, required: true },
     /** 卡名（App 侧的卡在客户端是完整 GameCard；服务端只保留展映 / 复盘要看的那几个字） */
@@ -246,6 +269,16 @@ gameRoomSchema.index({ status: 1, lastSeenAt: 1 });
  * 数组字段上的索引给 `{ "members.userId": uid }` 这种查询用。
  */
 gameRoomSchema.index({ "members.userId": 1 });
+
+/**
+ * 「这条投稿现在还在哪间房」：举报 `game-entry` 时按 `entryId` 找靶子
+ * （受理时的存在性校验 + 管理端现查，见 services/gameReport.service）。
+ * ★ 路径穿过 rounds[] → entries[] 两层数组（单键，不是复合索引 —— 同一路径里两层数组
+ *   在单键下 Mongo 会逐叶子建键，实测可用；与 nciiTakedown.MEDIA_SOURCES 那条路径同一种写法）。
+ * ★ 不加的话每次举报 game-entry 都要扫一遍 gamerooms：房间里只有几十 KB，但集合里同时
+ *   活着的房有几百间，而举报是外部可触发的请求。
+ */
+gameRoomSchema.index({ "rounds.entries.entryId": 1 });
 
 /**
  * 按房号查一间房（join / leave / ready / start / kick / 快照都走它）。

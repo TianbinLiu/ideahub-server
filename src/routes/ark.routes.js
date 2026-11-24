@@ -218,6 +218,12 @@ router.get("/health", (_req, res) => {
   //     （第 2/4/6 回合结算后的三选一**由服务端出题**，2026-11-23）。`GAME_EVENTS_API=off` 急停时 false；
   //     **回合引擎本身还开着**（gameRounds 仍为 true），两件事分开报。
   //     读不到这一位 = 老服务端（事件只在本机跑，跨端会对不上），App 见到 false 就退回本机事件。
+  // 2026-11-24 的能力位（工坊对局里的 UGC 可举报，api-contract「举报 · 对局里的两类对象」）：
+  //   · gameReports：这台服务器认 targetType = "user" / "game-entry" 的举报（POST /api/branch/reports）——
+  //     对局里的玩家本人与回合投稿。★ 读不到这一位 = 老服务端，App **不摆那两格举报键**
+  //     （与 gameTickets / gameRooms 同一条口径：拿不准就藏起来，别先摆出来再吃一个 400）。
+  //     ★ 与 GAME_ROOMS 开关**无关**：房间关着时存量举报照样要被处理，这两位说的是举报端点认哪些类型。
+  //     其余细节（entryId 从哪来、冗余上下文、404 TARGET_NOT_FOUND）见 docs/api-contract.md。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -256,6 +262,8 @@ router.get("/health", (_req, res) => {
     gameRounds: gameRoom.enabled() && gameRound.enabled(),
     // 回合间事件（2026-11-23）：三选一由服务端出题；关掉时退回本机事件（跨端会对不上，所以独立一位）
     gameEvents: gameRoom.enabled() && gameRound.enabled() && gameEvent.enabled(),
+    // 对局 UGC 可举报（2026-11-24）：举报端点认 targetType = "user" / "game-entry"（能力位见上面那一段）
+    gameReports: true,
   });
 });
 
