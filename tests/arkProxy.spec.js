@@ -1259,6 +1259,9 @@ describe("健康端点", () => {
       gameRooms: true,
       gameRoomModes: ["match4", "match8", "custom"],
       gameRoomMaxSeats: 8,
+      // SSE 推送（2026-11-23，tests/gameRoomStream.spec.js）：App 见不到 gameRoomStream:true 就只轮询。
+      // ★ 它为 true 也不代表「跨实例实时」：pm2 cluster 下推送只覆盖同一进程，轮询退路要留着
+      gameRoomStream: true,
       // 工坊对局的回合引擎（2026-11-23，tests/gameRound.spec.js）：App 见不到 gameRounds:true 就不摆
       // 「开始回合 / 展映 / 投票」这些按钮；与 gameRooms 分开报（GAME_ROUNDS=off 时只有这一位 false）
       gameRounds: true,

@@ -253,10 +253,11 @@ app.use("/api/me/wallet", require("./routes/wallet.routes"));
 // POST /api/game/tickets/grant（**仅管理员**；分享 / 邀请的事件源还没落，见那个路由的文件头）。
 // ★ 出片扣券**不在这里**：那三条出片路由上带 `X-Game-Ticket` 标记即可（钱的那段序列仍在 billing 一份里）。
 app.use("/api/game", require("./routes/gameTicket.routes"));
-// 工坊对局 · 房间与匹配（2026-11-23，G5 联机的第一块，**HTTP 轮询版**）：
-// /api/game/rooms（建房 / 进房 / 退房 / 准备 / 开局 / 踢人 / 快照）+ /api/game/queue（进队 / 状态 / 离队）。
+// 工坊对局 · 房间与匹配（2026-11-23，G5 联机的第一块）：
+// /api/game/rooms（建房 / 进房 / 退房 / 准备 / 开局 / 踢人 / 快照 / **SSE 推送**）+ /api/game/queue（进队 / 状态 / 离队）。
 // ★ 与上面那个路由共用 /api/game 前缀，路径不重叠；两块的判定都在各自 service 里，互不引用。
-// ★ WebSocket 推送还没做：客户端每 2~5 秒轮询一次，端点的形状到时候不用改。
+// ★ 推送（GET /api/game/rooms/:code/stream，2026-11-23）是**单实例**的（进程内 EventEmitter）：
+//   pm2 cluster 下另一个实例上的写不会推过来，轮询端点必须留着当退路。见 services/gameRoomBus 文件头。
 app.use("/api/game", require("./routes/gameRoom.routes"));
 // 充值订单与支付回调。★ 发币的唯一入口是这里的回调结算，钱包路由已经不发币了。
 // 回调端点无鉴权（渠道服务器不带 token），安全全压在渠道 adapter 的验签上，

@@ -63,14 +63,25 @@ cp .env.example .env
 端点、错误码、能力位（`/api/ark/health` 的 `gameTickets`）见 `docs/api-contract.md`「工坊游戏券」。
 ⚠ 还没做的：分享 / 邀请的事件源（发券端点今天**只给管理员**）与全站熔断。
 
-**工坊对局 · 房间与匹配（可选，缺省开）**：建房 / 进房 / 准备 / 开局 / 踢人 + 4 人 / 8 人匹配队列
-（HTTP 轮询版，WebSocket 还没做）。玩法规则是**代码常量**（`src/config/gameRoom.js`：4 人匹配 = 4 座、
-8 人匹配 = 8 座、自定义房 2~8 座且 2 人即可开局、房号 6 位），不在环境变量里；
+**工坊对局 · 房间与匹配（可选，缺省开）**：建房 / 进房 / 准备 / 开局 / 踢人 + 4 人 / 8 人匹配队列。
+玩法规则是**代码常量**（`src/config/gameRoom.js`：4 人匹配 = 4 座、8 人匹配 = 8 座、
+自定义房 2~8 座且 2 人即可开局、房号 6 位），不在环境变量里；
 环境变量只有寿命这一类旋钮，全都有缺省值：`GAME_ROOM_TTL_MINUTES`（等待房 30）、
 `GAME_ROOM_PLAYING_TTL_MINUTES`（playing 120）、`GAME_QUEUE_HEARTBEAT_SEC`（排队心跳 90）、
 `GAME_QUEUE_MATCH_TTL_MINUTES`（撮合行 10）。总开关 `GAME_ROOMS=off`。
 端点、状态机、错误码、能力位（`/api/ark/health` 的 `gameRooms`）见 `docs/api-contract.md`
-「工坊对局：房间与匹配」。⚠ 还没做的：推送、跨服、房间里的人的断线重连。
+「工坊对局：房间与匹配」。⚠ 还没做的：跨实例广播（推送今天只覆盖单实例）、跨服、
+房间里的人的断线重连。
+
+**工坊对局 · SSE 推送（可选，缺省开，2026-11-23）**：`GET /api/game/rooms/:code/stream` 一条长连接
+收「房间 / 回合 / 事件 / 结束」的变化：建连即 `snapshot`，之后有变化推 `update`，每 20 秒
+`ping` 心跳，错误走 `error`、30 分钟寿命到期走 `end`（都是推完就关）。鉴权支持
+`Authorization: Bearer` 与 `?token=` 兜底；每用户同时最多 2 条（超出 429 `TOO_MANY_STREAMS`）。
+★★ **它是单实例推送**：广播是进程内 EventEmitter（`src/services/gameRoomBus.js`），pm2 cluster 的
+两个实例各有一份 —— App 的轮询退路必须留着；`/api/ark/health` 的 `gameRoomStream` 只表示「有这条流」。
+只有两个寿命旋钮：`GAME_STREAM_HEARTBEAT_SEC`（心跳 20）、`GAME_STREAM_MAX_SEC`（单连接寿命 1800）。
+帧格式、事件与错误码见 `docs/api-contract.md`「工坊对局：推送（SSE）」。⚠ 还没做的：跨实例广播
+（Redis pub/sub）、gzip、断线重连的续帧 / Last-Event-ID。
 
 **工坊对局 · 回合引擎（可选，缺省开）**：开局之后每一回合「开回合 → 各自交片 → 全员展映 → 点赞 →
 投票 → 服务端算两个榜与扣血 → 下一回合」。规则是**代码常量**（`src/config/gameRound.js`：初始 100 血、
@@ -87,7 +98,7 @@ cp .env.example .env
 免费刷新在 `effects.client` 里原样交给 App 本地落。只有一个总开关 `GAME_EVENTS_API=off`（急停
 `/rounds/events*`，不影响回合端点），能力位是 `/api/ark/health` 的 `gameEvents`。端点、响应形状、
 错误码见 `docs/api-contract.md`「工坊对局：回合引擎」→「回合间事件」。
-⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、推送。
+⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、跨实例推送。
 
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 
