@@ -3499,6 +3499,213 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 
 回归测试：`server/tests/gameTicket.spec.js`（34 条）。
 
+## 工坊对局：房间与匹配（GameRoom，2026-11-23）
+
+设计正本在 app 仓：`docs/workshop-game-design.md` §三「服务端房间协议」与 §四 G5「联机」、
+`docs/g2-game-ui.md` 的大厅需求（**4 人匹配 / 8 人匹配 / 自定义房间邀请**）。
+
+**这是 HTTP 轮询版**：客户端每 2~5 秒轮询一次房间快照 / 队列状态，服务端不主动推任何东西。
+WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送只是把轮询的结果主动塞过来）。
+`status: "playing"` 之后服务端**不再推进任何东西** —— 回合引擎（出片 / 展映 / 点赞 / 投票 / 扣血）
+是 G5 后面的事，今天不在这块里。
+
+### 两张表
+
+| 集合 | 键 | 说明 |
+|---|---|---|
+| `gamerooms` | `code` **唯一** / `status + lastSeenAt` / `members.userId` | 一间房：`code`（6 位房号）、`mode`（`match4` / `match8` / `custom`）、`seats`、`hostId`、`status`（`waiting` / `playing` / `closed`）、`members[{ userId, ready, joinedAt }]`（**数组顺序就是座位顺序**，`seat` 是派生量、不落库）、`origin`（`create` / `match`）、`startedAt`、`lastSeenAt` |
+| `gamequeues` | `userId` **唯一** / `mode + status + enqueuedAt` / `status + lastSeenAt` | 一行 = 一个人（**同时只能在一个池子里**）。`status`（`waiting` / `matched`）、`enqueuedAt`（排队顺序，**续队不动它**）、`lastSeenAt`（心跳）、`matchedAt` / `roomId` / `code`（撮合成功之后才有） |
+
+★ **不存敏感信息**：两张表里只有 ObjectId。用户名 / 头像在读快照时按 `members.userId` 现拼（一次 `$in`），
+所以改昵称后队友屏幕上立刻是新名字，删号之后也不留副本。
+★ 两张表都**不设 Mongo TTL**：过期走懒清理（见下）。TTL 只认一个绝对时间点 —— 删不掉「0 个人的房」
+这种结构化条件，也没法给 `waiting` 与 `playing` 两种寿命，而且 `code` 唯一索引的行被 TTL 删掉之后，
+房号可能被下一间房重新分配（客户端手里那个码会静默指到另一间房）。
+
+### 端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/api/game/rooms` | 登录 | 建房 `{ mode, seats? }` → **201** `{ ok, room }` |
+| POST | `/api/game/rooms/join` | 登录 | 进房 `{ code }` → `{ ok, room }` |
+| GET | `/api/game/rooms/:code` | 登录 | 快照 → `{ ok, room }`（任何登录用户都能看：邀请链接要先能预览） |
+| POST | `/api/game/rooms/:code/leave` | 登录 | 退房 → `{ ok, left, closed, code, roomId, hostId, hostTransferred, room }` |
+| POST | `/api/game/rooms/:code/ready` | 登录 | 准备 `{ ready: true\|false }` → `{ ok, room }` |
+| POST | `/api/game/rooms/:code/start` | **仅房主** | 开局 → `{ ok, room }`（`room.status` = `playing`） |
+| POST | `/api/game/rooms/:code/kick` | **仅房主** | 踢人 `{ userId }` → `{ ok, kicked, room }` |
+| POST | `/api/game/queue` | 登录 | 进队 / 续队 `{ mode: "match4"\|"match8" }` → 见下 |
+| GET | `/api/game/queue` | 登录 | 我的排队状态 + 两个池子 |
+| DELETE | `/api/game/queue` | 登录 | 离队 → `{ ok, left }`（幂等：本来没排也回 200，`left:false`） |
+
+**建房的座位规则**（不静默忽略任何参数）：
+
+| mode | `seats` | 开局要几个人（`requiredPlayers`） |
+|---|---|---|
+| `match4` | **固定 4**（带了别的数 → 400 `SEATS_LOCKED`） | 4 |
+| `match8` | **固定 8**（同上） | 8 |
+| `custom` | **必填** 2~8 的整数（缺 / 越界 → 400 `BAD_SEATS`） | **2**（不看选了几座：8 座的房 2 个人也能先玩） |
+
+**房间快照（唯一的对外形状）**：
+
+```json
+{ "ok": true, "room": {
+  "code": "K7M2QX", "roomId": "…", "mode": "custom", "seats": 8, "status": "waiting",
+  "origin": "create", "hostId": "…", "requiredPlayers": 2, "memberCount": 3,
+  "members": [{ "userId": "…", "username": "…", "avatarUrl": null, "seat": 0,
+                "ready": true, "isHost": true, "joinedAt": "2026-11-23T…" }],
+  "canStart": false, "startBlockedBy": "not-all-ready",
+  "createdAt": "…", "updatedAt": "…", "startedAt": null, "lastSeenAt": "…", "expiresAt": "…"
+} }
+```
+
+- `canStart` 是**看的人视角**（只有房主能开局）；`startBlockedBy` 是客观原因，
+  取值 `null` / `not-enough-players` / `not-all-ready` / `already-started` / `closed` / `expired`
+  —— App 拿前者决定按钮亮不亮，拿后者说一句为什么。
+- `updatedAt` = **最后一次状态变化**（进房 / 准备 / 开局 / 踢人）；`lastSeenAt` = 最后一次「有人在看」。
+  ★ 成员轮询只刷 `lastSeenAt`（`timestamps: false`），**不改 `updatedAt`** —— 否则界面上那格
+  「更新时间」永远是「刚才」，两个语义混成一个字段。**过期判 `lastSeenAt`**（见下）。
+- `expiresAt` = `lastSeenAt` + 按状态给的寿命，给客户端倒计时用（**仅供参考**，不保证那一刻准点删）。
+
+**队列回包**：
+
+```json
+// waiting
+{ "ok": true, "status": "waiting", "mode": "match4", "queued": 3, "need": 4,
+  "etaSec": 30, "position": 1, "enqueuedAt": "…",
+  "pools": { "match4": { "queued": 3, "need": 4, "etaSec": 30 },
+             "match8": { "queued": 1, "need": 8, "etaSec": 210 } } }
+
+// matched —— **房间码就是从这一格给出去的**
+{ "ok": true, "status": "matched", "mode": "match4", "queued": null, "need": 4, "etaSec": 0,
+  "code": "K7M2QX", "roomId": "…", "matchedAt": "…", "room": { …快照… }, "pools": { … } }
+
+// idle（没在排队）
+{ "ok": true, "status": "idle", "mode": null, "queued": null, "need": null,
+  "etaSec": null, "position": null, "pools": { … } }
+```
+
+- `etaSec` = `(need − queued) × 30`（还差几个人 × 每人 30 秒）—— **只是大厅上那句「约 N 秒」**，
+  不是承诺：真实等待取决于此刻有没有人在排。
+- `pools` **永远给**（大厅上「4 人匹配 2/4」「8 人匹配 1/8」那两行读它，一次 aggregate）。
+- `position` 是 1 起的排队位置（按 `enqueuedAt`，粗算）。
+
+### 房间状态机与权限
+
+```
+waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing
+   │                                                │
+   │ 最后一个人 leave                                │ 今天没有东西推它（回合引擎未接）
+   ▼                                                ▼
+（硬删）                                    （lastSeenAt 超过 playing 寿命 → 硬删）
+```
+
+| 动作 | 允许的状态 | 谁 | 被拒时的码 |
+|---|---|---|---|
+| `join` | `waiting` | 任何登录用户（一人只能在一间房） | 404 `ROOM_NOT_FOUND` / 409 `ROOM_ALREADY_STARTED` / 409 `ROOM_FULL` / 409 `ALREADY_IN_ROOM` |
+| `ready` | `waiting` | 房里的成员 | 409 `NOT_IN_ROOM` / 409 `ROOM_ALREADY_STARTED` |
+| `start` | `waiting` | **仅房主** | 403 `NOT_HOST` / 409 `NOT_ENOUGH_PLAYERS`（`need`/`have`）/ 409 `NOT_ALL_READY`（`waitingOn`）/ 409 `ROOM_ALREADY_STARTED` |
+| `kick` | `waiting` | **仅房主**，不能踢自己 | 403 `NOT_HOST` / 400 `CANNOT_KICK_SELF` / 404 `MEMBER_NOT_FOUND` / 409 `ROOM_ALREADY_STARTED` |
+| `leave` | **任何状态** | 房里的成员 | 409 `NOT_IN_ROOM` |
+
+- **全员 ready 才算达标**：`start` 的原子更新把「还在等 + 人数够 + 没有 `ready:false` 的成员」写进同一个条件 ——
+  否则两个人同时点开局、或者点开局的同时有人取消准备，会出现「少一个人也开了」。
+- **房主退房 → 房主自动转移**给最早进房的人（`hostIdOf` 一处判据；房主不在成员里时也走这条兜底，
+  所以删号级联把房主拔掉之后这间房仍然有人能开局）。
+- **最后一个人退房 → 房间当场删掉**（不留给懒清理：那几个人可能马上要再建一间，
+  而「一人一间」的检查会把他们挡在已经没人的旧房外面）。
+- **`leave` 在任何状态都允许**：玩到一半想走是真实需求；`playing` 之后没有任何东西会把它推走，
+  最后一个走的人删掉房间，其他人才能重新建房 / 排队。
+- **`ready` 的缺省值**：`create` 出来的房，房主建成即 ready；**撮合出来的房全员 ready**
+  （点「匹配」本身就是「我要玩」，再要一次准备只会让整桌卡在「有人没点」——没有超时踢人机制）。
+- **座位**是 `members` 的下标（加入顺序），有人离开之后自然重排。App 只按座位号排队显示，不持有座位语义。
+
+### 匹配撮合（轻量：在进队那一次请求里就地撮合）
+
+没有后台撮合进程、没有 Redis 队列：谁「进队 / 续队」谁就顺手看一眼同模式排队的人够不够，够了就地建房。
+
+1. 客户端每 2~5 秒 `POST /api/game/queue`（`{mode}`）= **续队 + 撮合的那一拍**；
+2. 续队只刷心跳（`lastSeenAt`），**不动 `enqueuedAt`** —— 否则「谁续得勤谁排队靠后」；
+3. 取同模式、还在等、**心跳没超时**（90 秒）的前 N 个人（N = 该模式的座位数，4 / 8），
+   按 `enqueuedAt` 从早到晚；不够 N 个就回 `waiting`；
+4. 够 N 个 → 逐个**带条件原子更新**（`status: "waiting"` 才改成 `matched`）把人占住。
+   抢不到的那几个是别人先占了，直接跳过；**凑不满就把自己刚占的人放回队里**（位置不变），这一拍不撮合，
+   下一次轮询再来；
+5. 占满 N 个 → 建房（`origin: "match"`，房主 = **最早排队**的那位，全员 ready），房号写进这 N 行
+   （`matched` + `code` + `roomId`）；
+6. **匹配成功不删队列行**：撮合是在**别人的请求里**发生的，本人此刻可能正处在两次轮询之间 ——
+   删掉那一行他就把房号彻底错过了。`GET /api/game/queue` 会一直回 `matched` + 房号，
+   直到他 `DELETE /api/game/queue`（我看过了 / 我不去了）或那一行过了 10 分钟撮合寿命被懒清理。
+7. 那一行指向的房间**没了**（过期 / 被删）→ 状态回到 `idle`、那一行清掉，重新排队能排上。
+
+★ 两个请求可能同时判断「够了」——所以「每个候选人一次带条件的原子更新」是必需的，先查后写会让
+同一个人被塞进两间房，而且两张回包都理直气壮（症状零：客户端以为自己在两局里）。
+★ 并发抖动（两个人各抢到 2 个、然后都放回去）是**接受**的：客户端每 2~5 秒一拍，下一拍就撮合上了；
+绝不为此在请求里 sleep 重试（那会把两个人的请求一起拖住）。
+★ `GET /api/game/queue` 的 `pools` 与撮合用的是**同一个心跳窗口**，所以「4 人匹配 2/4」不会数上已经走了的人。
+
+### 过期清理（懒清理，没有定时任务）
+
+- **判据**：`lastSeenAt`（不是 `updatedAt`）+ 按状态给的寿命。`waiting` 房 **30 分钟**、
+  `playing` 房 **120 分钟**（回合引擎还没接，这一局可能真的在打，给个兜底寿命免得永远不死）。
+  **0 个人的房立刻算过期**（兜底：退房那一路会当场删，进程崩在中间也不会留下鬼房）。
+- **谁给它续命**：`join` / `ready` / `start` / `kick` / `leave` 这些动作，以及**成员**轮询快照。
+  路人读快照**不续命**（点开邀请看一眼不该让一间没人管的房活着）。
+- **什么时候清理**：每一个读 / 写房间与队列的端点顺带清理一遍（`services/gameRoom.service.sweepExpired`），
+  进程内**节流 30 秒**；被读到的那个过期房**不靠**这轮扫描（`loadRoom` 单独判它自己 → 404）。
+- **为什么不写定时任务**：这份代码跑在 pm2 cluster 的两个实例上（铁律八：常驻任务先问要跑几份），
+  而这里要删的东西只在有人访问时才值得删 —— 没人看的过期房留着不花钱。
+- **服务端内部时间**：`GAME_ROOM_TTL_MINUTES`（30）/ `GAME_ROOM_PLAYING_TTL_MINUTES`（120）/
+  `GAME_QUEUE_HEARTBEAT_SEC`（90）/ `GAME_QUEUE_MATCH_TTL_MINUTES`（10），都有缺省值、都在
+  `src/config/gameRoom.js` 里夹了上下界（改这些只影响寿命，不影响玩法）。
+
+### 错误码
+
+| HTTP | `code` | 什么时候 |
+|---|---|---|
+| 400 | `BAD_MODE` | mode 不在名单里（房间：`match4`/`match8`/`custom`；队列：`match4`/`match8`） |
+| 400 | `BAD_SEATS` | custom 的 `seats` 不是 2~8 的整数 |
+| 400 | `SEATS_LOCKED` | match4 / match8 带了与模式不符的 `seats`（**不静默忽略**） |
+| 400 | `BAD_READY` | `ready` 不是布尔 |
+| 400 | `BAD_USER` | 踢人时 `userId` 不是合法账号 id |
+| 404 | `ROOM_NOT_FOUND` | 房号不对 / 已过期（**同一个码**：不告诉猜码的人「这个码存在但过期了」） |
+| 404 | `MEMBER_NOT_FOUND` | 要踢的人不在这间房里 |
+| 403 | `NOT_HOST` | 不是房主却想开局 / 踢人（带 `hostId`） |
+| 409 | `ROOM_FULL` | 满员（带 `seats` / `memberCount`） |
+| 409 | `ROOM_ALREADY_STARTED` | 已经开局（进房 / 准备 / 开局 / 踢人） |
+| 409 | `ALREADY_IN_ROOM` | 已经在这间/别的房里（带 `roomCode` / `roomId`；重复进房时还带快照） |
+| 409 | `NOT_IN_ROOM` | 不在房里却想准备 / 退房 |
+| 409 | `NOT_ENOUGH_PLAYERS` | 人数没到开局线（带 `need` / `have`） |
+| 409 | `NOT_ALL_READY` | 有人没准备（带 `waitingOn` = 还没准备的人） |
+| 409 | `CANNOT_KICK_SELF` | 房主想踢自己（该走 `leave`） |
+| 409 | `QUEUE_MODE_CONFLICT` | 已经在另一个池子里（带 `queuedMode`）；先 `DELETE /api/game/queue` |
+| 503 | `GAME_ROOMS_OFF` | 这台服务器 `GAME_ROOMS=off` |
+
+★ **错误的 `code` 与房间码不会撞车**：房间码在错误回包里叫 `roomCode`（成功回包里叫 `code`）——
+两个都叫 `code` 的话，`fail()` 展开时房间码会把错误码盖掉，客户端拿到的是一串房号。
+
+### 能力位（`GET /api/ark/health`）
+
+| 位 | 说明 |
+|---|---|
+| `gameRooms` | 有 `/api/game/rooms*` 与 `/api/game/queue`。**读不到这一位 = 老服务端，App 不摆大厅入口** |
+| `gameRoomModes` | 这台服务器认哪几种模式（今天 `["match4","match8","custom"]`；`GAME_ROOMS=off` 时是 `[]`） |
+| `gameRoomMaxSeats` | 自定义房间最多几座（8）。App 只照服务端下发的摆，不在本机写死 |
+
+### 还没做（别当成已做）
+
+- **WebSocket / SSE 推送**：现在是轮询。真做的时候这一批端点的形状不变，只是多一条连接；
+- **回合推进**：`status: "playing"` 之后没有任何东西会推它 —— 出片 / 展映 / 点赞 / 投票 / 扣血 / 淘汰
+  要等回合引擎（它同样需要推送 + 断线重连）；
+- **跨服**：没有分片、没有共享队列。撮合是「本进程 + 本库」的，多实例靠 Mongo 的唯一索引与条件更新
+  （两个 pm2 实例同时撮合是安全的，见上「撮合」第 4 步）；
+- **断线重连**：成员没有心跳 / 掉线标记，房间里的人不会因为关掉 App 而消失 —— 只有队列有心跳。
+  所以「僵尸成员」今天只能靠房主 `kick`、队友等他等到房间过期；
+- **房号枚举**：6 位 × 32 字符 ≈ 10.7 亿种，进房限流 30 次/分钟；没有「房号只对邀请者可见」的
+  加密票据（自定义房间靠房号本身保密，知道码的人就能进）；
+- **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）。
+
+回归测试：`server/tests/gameRoom.spec.js`（45 条）。
+
 ## 客户端接入约定
 
 - `app/src/api/client.ts` 统一封装：`API_BASE`（`VITE_API_BASE`，缺省时走本地 IndexedDB 离线模式）、

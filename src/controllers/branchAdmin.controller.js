@@ -41,6 +41,9 @@ const GenTaskCharge = require("../models/GenTaskCharge");
 // 工坊游戏券（2026-11-23）：删号级联 ⑨.6 的两张表
 const GameTicket = require("../models/GameTicket");
 const GameTicketGrant = require("../models/GameTicketGrant");
+// 工坊对局的房间与匹配队列（2026-11-23）：删号级联 ⑨.7
+const GameRoom = require("../models/GameRoom");
+const GameQueue = require("../models/GameQueue");
 const ArkVideoTask = require("../models/ArkVideoTask");
 const BlockoutJob = require("../models/BlockoutJob");
 const ArkImageGroup = require("../models/ArkImageGroup");
@@ -340,6 +343,9 @@ async function unbanUser(req, res, next) {
  *      还有剪辑页免费配音的计数器 NarrationFreeUsage（2026-10-08）→ deleteMany：只是当天用了几个字，3 天自己过期，删号就当场没。
  *   ⑨.6 GameTicket / GameTicketGrant（工坊游戏券，2026-11-23）→ deleteMany：账号级资产，余额与发放流水都没有主人了。
  *      与 ⑦.9 两张奖励表的区别：那些行是别人的上限计数依据，这两张每行只为本人作数。
+ *   ⑨.7 GameRoom / GameQueue（工坊对局的房间与排队，2026-11-23）→ 排队行整行删；房间只把他从
+ *      members 里拔掉，再删「他原本是房主、拔完就空了」的那几间（房里还有别人的座，不能整间删）。
+ *      他若只是客人，房主的 hostId 会悬空 —— 读路径的 hostIdOf 会把房主落到最早进房的人，自愈。
  *   ⑩ Follow（关注与被关注）、Notification（他收的 + 他触发的）、SearchHistory
  *      （他的搜索记录，用户私有数据）→ deleteMany
  *   ⑩.5 数字人对话（ChatThread / ChatMessage / ChatUsageLog / ChatMemory）→ chatMemory.purgeUserChatData
@@ -542,6 +548,14 @@ async function purgeUserCascade(userId) {
   //   GameTicketGrant 的每一行都只为自己作数，可以整张清掉。
   removed.gameTickets = (await GameTicket.deleteMany({ userId: uid })).deletedCount;
   removed.gameTicketGrants = (await GameTicketGrant.deleteMany({ userId: uid })).deletedCount;
+  // ⑨.7 工坊对局的房间与匹配队列（2026-11-23）：排队那一行整行删（它只为自己作数）。
+  //   房间不能整间删 —— 里面还有别人的座。所以只把这个人从 members 里拔掉，然后删掉
+  //   「他原本是房主、拔完就空了」的那几间。⚠ 他若只是客人、房里还有别人，`hostId` 会悬空 ——
+  //   这是**故意**留给读路径的：`gameRoom.service.hostIdOf` 在房主不在成员里时自动把房主
+  //   落到最早进房的人（一组判据，不是两条），下一次 start / kick / 快照就会自愈。
+  removed.gameQueues = (await GameQueue.deleteMany({ userId: uid })).deletedCount;
+  removed.gameRoomMemberships = (await GameRoom.updateMany({ "members.userId": uid }, { $pull: { members: { userId: uid } } })).modifiedCount;
+  removed.gameRooms = (await GameRoom.deleteMany({ members: { $size: 0 }, hostId: uid })).deletedCount;
 
   // ⑩ 关注、通知、搜索记录
   removed.follows = (await Follow.deleteMany({ $or: [{ follower: uid }, { following: uid }] })).deletedCount;
