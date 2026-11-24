@@ -106,6 +106,15 @@ pub/sub，pm2 cluster 的另一个实例上的写也能推过来；没有 Redis 
 错误码见 `docs/api-contract.md`「工坊对局：回合引擎」→「回合间事件」。
 ⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）。
 
+**工坊对局 · 历史回合 / 战绩（可选，缺省开，2026-11-24）**：`GET /api/game/rooms/:code/rounds/history`
+把一局的**全部**回合（交片 / 两个计数 / 结算榜）与按人累加的战绩（`summary`）一次读全 —— App 的
+「战绩 + 每回合影片回放」不用再拼房间快照。只读、没有新存储（数据仍在房间文档的 `rounds[]` 里，
+房间过期被懒清理 = 历史一起没）。口径：`wins` = 综合名次第一的次数、`likesTotal` / `votesTotal` =
+全回合累加、`bestRound` = 名次最好的一回合（详见契约）。只有 `GAME_HISTORY=off` 一个急停
+（历史端点 503 `GAME_HISTORY_OFF`，其余回合端点照常；`GAME_ROUNDS=off` 时先回 `GAME_ROUNDS_OFF`），
+能力位是 `/api/ark/health` 的 `gameHistory`。⚠ 还没做的：历史持久化到独立集合（跨房间战绩 /
+公开回放）、观战。
+
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 
 ## 4. 跑起来

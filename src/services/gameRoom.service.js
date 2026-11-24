@@ -803,6 +803,9 @@ module.exports = {
   isExpired,
   normalizeCode,
   startBlockedByOf,
+  // 对外形状（快照与历史回合同一处）：`state` 三态映射、时间统一成 ISO 串（null 稳定，见各自函数头）
+  stateOf,
+  isoOf,
   // 回合引擎要共用同一份「按房号取活房 / 成员读续命」：expire 那条判据只有这里一处，
   // 回合引擎自己再写一遍 loadRoom 就会变成「房间过期了但回合端点还认」的第二个真相。
   loadRoom,

@@ -1274,6 +1274,9 @@ describe("健康端点", () => {
       // 对局 UGC 可举报（2026-11-24，tests/gameReport.spec.js）：举报端点认 targetType = "user" /
       // "game-entry"（工坊对局里的玩家本人与回合投稿）。App 见不到这一位就不摆那两格举报键
       gameReports: true,
+      // 历史回合 / 战绩（2026-11-24，tests/gameHistory.spec.js）：有 GET /api/game/rooms/:code/rounds/history
+      // （App 的「战绩 + 每回合影片回放」）。GAME_HISTORY=off 或 GAME_ROUNDS=off 时 false
+      gameHistory: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

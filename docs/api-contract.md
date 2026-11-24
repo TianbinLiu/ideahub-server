@@ -3799,6 +3799,7 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | `gameRounds` | 有 `/api/game/rooms/:code/rounds*`（回合引擎）。`GAME_ROUNDS=off` 时 false，房间端点不受影响。**读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮** |
 | `gameEvents` | 有 `GET / POST /api/game/rooms/:code/rounds/events[/choice]`（回合间事件由服务端出题，2026-11-23）。`GAME_EVENTS_API=off` 时 false，回合引擎不受影响。**读不到这一位 = 老服务端，App 退回本机事件**（跨端会对不上） |
 | `gameReports` | 举报端点认 `targetType: "user"` / `"game-entry"`（工坊对局里的玩家本人与回合投稿，2026-11-24；见「举报 · 对局里的两类对象」）。**读不到这一位 = 老服务端，App 不摆那两格举报键**（那两格递上去会 400）。静态为 true，与 `GAME_ROOMS` 开关无关 |
+| `gameHistory` | 有 `GET /api/game/rooms/:code/rounds/history`（历史回合 + 战绩，2026-11-24；见「历史回合与战绩」）。`GAME_HISTORY=off` 或 `GAME_ROUNDS=off` 时 false（历史闸在回合闸之后）。**读不到这一位 = 老服务端，App 不摆「战绩 / 回放」** |
 
 ### 还没做（别当成已做）
 
@@ -3809,7 +3810,9 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
   仍然适用 —— 将来一秒几千条时才需要考虑分片 / 按房订阅，现在一桌一次写最多推 8 个连接，远没到；
 - **断线续帧 / `Last-Event-ID`**：重连只拿最新 `snapshot`，不补断线期间漏掉的帧（客户端拿到的是一份
   完整快照，够用；真要做补帧得在服务端存一小时的帧缓冲，不值）；
-- **回合引擎的历史回合读取**：回合数据都留在 `rounds[]`，但没有读第 N 回合的端点（复盘 / 分享还没做）；
+- **历史回合的持久化**：读历史回合的端点已有（`GET /api/game/rooms/:code/rounds/history`，见
+  「历史回合与战绩」），但数据仍内嵌在房间文档里 —— 房间过期被懒清理后历史一起没；跨房间的
+  持久战绩、公开回放、观战需要另存一份到独立集合（还没做）；
 - **跨服**：没有分片、没有共享队列。撮合是「本进程 + 本库」的，多实例靠 Mongo 的唯一索引与条件更新
   （两个 pm2 实例同时撮合是安全的，见上「撮合」第 4 步）；
 - **断线重连**：成员没有心跳 / 掉线标记，房间里的人不会因为关掉 App 而消失 —— 只有队列有心跳。
@@ -3861,6 +3864,7 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | POST | `/api/game/rooms/:code/rounds/start` | **仅房主** | 开第 1 回合（房间 `playing` 且还没有回合）→ 回合快照 |
 | POST | `/api/game/rooms/:code/rounds/entries` | 房间成员 | 交片（一人一条、重复覆盖；只在 `creating`）→ 回合快照 |
 | GET | `/api/game/rooms/:code/rounds/current` | 房间成员 | 当前回合快照（展映 / 投票屏轮询；成员读续命） |
+| GET | `/api/game/rooms/:code/rounds/history` | 房间成员 | 历史回合 + 战绩（**全部**回合、按 round 升序；只读，见「历史回合与战绩」） |
 | POST | `/api/game/rooms/:code/rounds/phase` | **仅房主** | `{ phase: "screening" \| "voting" }` 推进阶段 |
 | POST | `/api/game/rooms/:code/rounds/like` | 房间成员 | `{ targetUserId }` 点赞（只在 `screening`）→ 回合快照 |
 | POST | `/api/game/rooms/:code/rounds/vote` | 房间成员 | `{ targetUserId: string \| null }` 投票 / 弃权（只在 `voting`）→ 回合快照 |
@@ -4030,6 +4034,73 @@ App 只负责**应用交给它的效果**。
   `/api/ark/health` 的 `gameEvents` 报 false（App 退回本机事件）。**回合端点照旧**（与 `GAME_ROUNDS` 分开）。
 - `/api/ark/health` 的 `gameEvents`：缺省 true；读不到 = 老服务端（没有事件端点）。
 
+### 历史回合与战绩（GET .../rounds/history，2026-11-24）
+
+App 的「战绩 + 每回合影片回放」用它一次读全：房间文档 `rounds[]` 里本来就有每个回合的交片 /
+点赞 / 投票 / 结算，但之前没有读历史的端点 —— 一局打完后客户端只能看到最后一回合。
+实现：`src/services/gameRound.service.js` 的 `getHistory`（**唯一实现**，统计口径也只在它的文件头与
+这一节）、`src/config/gameHistory.js`（急停开关）、`src/routes/gameRoom.routes.js`（一条路由 + 闸）。
+
+**GET `/api/game/rooms/:code/rounds/history`**（**房间成员**；轮询档限流 240/分钟）
+
+```json
+{ "ok": true,
+  "room": { "code": "AB3K7Q", "state": "over", "winners": ["…"], "finishedAt": "2026-11-24T08:00:00.000Z" },
+  "rounds": [
+    { "round": 1, "settled": true,
+      "entries": [{ "entryId": "…", "userId": "…", "name": "…", "prompt": "…",
+                    "cardNames": ["…"], "videoUrl": "…", "posterUrl": "…",
+                    "placeholder": false, "modelTier": "draft", "likes": 2, "votes": 1 }],
+      "settlement": { "ranking": [{ "userId": "…", "name": "…", "likes": 2, "votes": 1,
+                                    "likeRank": 1, "voteRank": 1, "composite": 2,
+                                    "damage": 5, "hp": 95, "eliminated": false }],
+                      "winners": ["…"] } },
+    { "round": 2, "settled": false, "entries": [ … ] }
+  ],
+  "summary": {
+    "roundsPlayed": 1,
+    "perPlayer": [{ "userId": "…", "name": "…", "hp": 95,
+                    "wins": 1, "likesTotal": 2, "votesTotal": 1, "bestRound": 1 }]
+  } }
+```
+
+**形状与规则**：
+
+- `rounds[]`：**全部**回合（含正在打的那一回合，`settled: false`），**按 `round` 升序**；不翻页
+  （一局最多 8 回合，整份回包只有几十 KB）。
+- `settled`：`settlement` 落没落库（settle 在同一次原子更新里写 phase 与 settlement，两者等价）。
+  `settlement` 只在已结算的回合出现（形状里它是**可选的**，不是 `null`）。
+- `entries[]`：与回合快照的 entries 同一条「只存 id、名字现拼」纪律，**按座位排**（中途退房的人
+  排最后）；比快照多一个 `modelTier`（回放 / 复盘要显示当时用的档位），**不含** `likedByMe` /
+  `votedByMe`（历史是公共事实，不是「我」的视角）。`likes` / `votes` 仍是**计数**，谁投给谁不暴露。
+  `entryId` 老投稿没有时如实回 `null`（与快照同一口径）。
+- `room`：`code` / `state`（三态，与房间快照同一个 `stateOf` 映射）/ `winners` / `finishedAt`。
+  没结束时 `winners` / `finishedAt` 是 `null`；结束时空数组 = 平局（与房间快照同一条）。
+- **权限**：只有房间成员能读；不是成员 → **403 `NOT_IN_ROOM`**（读接口用 403；回合写接口那条
+  409 `NOT_IN_ROOM` 说的是「状态冲突」）。成员读一次也给房间续命（`lastSeenAt`，与
+  `rounds/current` 同一条）。
+- **过期**：房间被懒清理删掉 → 404 `ROOM_NOT_FOUND`（回合数据内嵌在房间文档里，没有第二份）。
+
+**summary 的统计口径**（与 App 战绩屏逐条同口径；改这里要同步 App，别让客户端再算一遍）：
+
+| 字段 | 口径 |
+|---|---|
+| `roundsPlayed` | **已结算**回合数（正在打的那一回合不算；总量看 `rounds.length`） |
+| `perPlayer` | **当前还在房里的人**，顺序与房间快照 `members[]`（座位）一致；`hp` 是当前血量（老房间缺这一位按 100，与快照同一兜底） |
+| `wins` | 该玩家在已结算回合里**综合名次第一**的次数（结算榜 `ranking[0]`；settle 已按 composite → voteRank → votes → likes → userId 排成不并列的一列） |
+| `likesTotal` / `votesTotal` | **全部回合**（含正在打的）里以该玩家为对象的计数之和；弃权（`targetUserId: null`）不计给任何人 |
+| `bestRound` | 该玩家综合名次最好的一回合（结算榜位置最靠前；并列取较早的回合）；**一次结算都没进过榜的人没有这一格**（不是 `null`） |
+
+★ 中途退房的人：历史回合的 `entries` / `settlement` 里照样有他（那是落库的事实），但 `perPlayer`
+只列当前成员 —— 成员退房时房间文档里不会留他的 hp 快照。跨房间的持久战绩需要独立集合（见「还没做」）。
+
+**开关与能力位**：
+
+- `GAME_HISTORY=off` 急停：只有这个端点 503 `GAME_HISTORY_OFF`，其余回合端点照常；
+  `/api/ark/health` 的 `gameHistory` 报 false（App 不摆「战绩 / 回放」）。
+- `GAME_ROUNDS=off` 时先回 503 `GAME_ROUNDS_OFF`（历史闸注册在回合闸**之后**），`gameHistory` 也报 false。
+- 读不到 `gameHistory` = 老服务端（没有这个端点）。
+
 ### 错误码（回合端点）
 
 | HTTP | `code` | 什么时候 |
@@ -4041,6 +4112,7 @@ App 只负责**应用交给它的效果**。
 | 400 | `BAD_PHASE` | 阶段参数不是 `screening` / `voting` |
 | 400 | `BAD_OPTION` | 事件选择：`optionId` 不是这个事件的选项（带可选 `options`） |
 | 403 | `NOT_HOST` | 非房主调 start / phase / next；**或**未全员投票时非房主调 settle（带 `votesPending`） |
+| 403 | `NOT_IN_ROOM` | **历史回合端点**：不是这间房的成员（读接口用 403；回合写接口那条「不是成员」在下面 409 那一行 —— 那是状态冲突） |
 | 404 | `ROOM_NOT_FOUND` | 房号不对 / 已过期（与房间端点同一个码） |
 | 404 | `TARGET_NOT_IN_ROOM` | 点赞 / 投票的对象不在这回合（非成员或已淘汰） |
 | 404 | `ROUND_NOT_FOUND` | 这间房还没开始任何回合 |
@@ -4055,6 +4127,7 @@ App 只负责**应用交给它的效果**。
 | 409 | `NO_ENTRIES` | 结算时这一回合没有任何可结算的作品（正常流程不会出现） |
 | 503 | `GAME_ROUNDS_OFF` | 这台服务器 `GAME_ROUNDS=off`（房间端点不受影响，仍是 `GAME_ROOMS` 管） |
 | 503 | `GAME_EVENTS_OFF` | 这台服务器 `GAME_EVENTS_API=off`（回合端点不受影响） |
+| 503 | `GAME_HISTORY_OFF` | 这台服务器 `GAME_HISTORY=off`（只关历史回合端点，其余回合端点不受影响） |
 
 ### 开关与能力位
 
@@ -4063,8 +4136,12 @@ App 只负责**应用交给它的效果**。
   **房间端点照旧**（建房 / 进房 / 开局），与 `GAME_ROOMS=off` 是两件事。
 - `GAME_EVENTS_API=off` 急停：`/api/game/rooms/:code/rounds/events*` 一律 503 `GAME_EVENTS_OFF`，
   `/api/ark/health` 的 `gameEvents` 报 false；**回合端点照旧**（与 `GAME_ROUNDS` 分开，事件出问题不关上整局）。
-- `/api/ark/health` 的 `gameRounds` / `gameEvents`（今天缺省都是 true）。读不到 `gameRounds` = 老服务端，
-  App 在 `playing` 后不摆回合按钮；读不到 `gameEvents` = 老服务端，App 退回本机事件（跨端会对不上）。
+- `GAME_HISTORY=off` 急停：`/api/game/rooms/:code/rounds/history` 回 503 `GAME_HISTORY_OFF`，
+  `/api/ark/health` 的 `gameHistory` 报 false；**其余回合端点照旧**（历史读取出问题不关上整局）。
+  `GAME_ROUNDS=off` 时这条端点先回 `GAME_ROUNDS_OFF`（历史闸在回合闸之后）。
+- `/api/ark/health` 的 `gameRounds` / `gameEvents` / `gameHistory`（今天缺省都是 true）。读不到
+  `gameRounds` = 老服务端，App 在 `playing` 后不摆回合按钮；读不到 `gameEvents` = 老服务端，
+  App 退回本机事件（跨端会对不上）；读不到 `gameHistory` = 老服务端，App 不摆「战绩 / 回放」。
 - 房间快照的 `members[]` 带 `hp`（开局 100；0 = 淘汰）；快照另有 `state` / `winners` / `finishedAt`
   （见「工坊对局：房间与匹配」的快照一节）。老房间没有 `hp` 时按 100 读，不写迁移。
 
@@ -4076,13 +4153,18 @@ App 只负责**应用交给它的效果**。
   （所以第 2/4/6 回合之外不会再有事件 —— 事件回合是固定的三个）；
 - **推送**：回合 / 房间变化已经走 SSE（见「工坊对局：推送（SSE）」），有 Redis 时跨实例、
   没有时退回单实例；**没有断线续帧**，客户端轮询仍是断线退路；
-- **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）；
+- **历史持久化 / 观战回放**：读历史回合的端点已有（见「历史回合与战绩」），但回合数据仍内嵌在
+  房间文档里 —— 房间过期（over 房 30 分钟）被懒清理后历史一起没；跨房间的持久战绩、公开回放、
+  观战都需要把历史另存一份到独立集合（本轮不做）；
 - **事件选择的审计读取**：`eventPicks` 落在 `rounds[]` 里，但没有「谁选了什么」的对外端点
   （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）；
 - **对局 UGC 举报的后台处置**：`user` / `game-entry` 两类举报本轮只做受理（见「举报 · 对局里的
   两类对象」）—— 没有「删一条投稿」的入口（会打乱全员交片 / 投票的判定），封人仍走账号治理线。
 
-回归测试：`server/tests/gameRound.spec.js`（30 条，含投稿 `entryId` 覆盖不变）+ `server/tests/gameEvent.spec.js`（10 条）。
+回归测试：`server/tests/gameRound.spec.js`（30 条，含投稿 `entryId` 覆盖不变）+ `server/tests/gameEvent.spec.js`（10 条）+
+`server/tests/gameHistory.spec.js`（9 条：形状与升序 / settled 标记 / 两回合 summary 口径 / over 的
+winners 与 finishedAt / 非成员 403 与未登录 401 / 不存在与过期 404 / 成员读续命 / 能力位 /
+`GAME_HISTORY` 与 `GAME_ROUNDS`、`GAME_ROOMS` 三个闸的先后）。
 
 ## 工坊对局：推送（SSE，2026-11-23）
 

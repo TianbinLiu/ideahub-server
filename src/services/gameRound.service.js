@@ -101,6 +101,39 @@ function aliveMembersOf(room) {
   return (room?.members || []).filter((member) => hpOf(member) > 0);
 }
 
+/** 座位表：userId → 成员数组下标（座位 = 加入顺序，见 models/GameRoom 文件头）。快照与历史回合同一份 */
+function seatIndexOf(room) {
+  return new Map((room?.members || []).map((member, index) => [String(member.userId), index]));
+}
+
+/**
+ * 一回合的投稿按**座位**排（房间快照与历史回合**同一串**）。
+ * ★ 不在座上的（中途退房的人）排最后、同座按 userId 定序 —— 顺序必须是确定的，
+ *   否则同一个回合在两屏之间会悄悄换顺序。
+ */
+function orderedEntriesOf(round, seatIndex) {
+  return (round?.entries || []).slice().sort((a, b) => {
+    const sa = seatIndex.has(String(a.userId)) ? seatIndex.get(String(a.userId)) : Number.MAX_SAFE_INTEGER;
+    const sb = seatIndex.has(String(b.userId)) ? seatIndex.get(String(b.userId)) : Number.MAX_SAFE_INTEGER;
+    return sa - sb || String(a.userId).localeCompare(String(b.userId));
+  });
+}
+
+/**
+ * 一回合的两个计数（`targetUserId → 收到几个`）。
+ * ★ 弃权行（`targetUserId: null`）**不计给任何人** —— 投票留弃权行是为了凑齐「全员表态」，
+ *   不是一张给某人的票。快照 / 结算 / 历史回合三处共用这一份（铁律六）。
+ */
+function countsOf(items) {
+  const counts = new Map();
+  for (const item of items || []) {
+    if (item.targetUserId === null || item.targetUserId === undefined) continue;
+    const key = String(item.targetUserId);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
+}
+
 /**
  * 这局结束了没有 + 胜者是谁（**唯一判据**，settle 与 next 都问它）。
  * ★ 4/8 人局剩 ≤2 人结束、2 人局剩 1 人结束 —— 理由见 config/gameRound.winnerTargetOf。
@@ -132,26 +165,13 @@ async function namesOf(ids) {
  */
 async function snapshotOf(room, round, { viewerId = null } = {}) {
   const alive = aliveMembersOf(room);
-  const seatOf = new Map((room.members || []).map((member, index) => [String(member.userId), index]));
-  const entries = (round?.entries || []).slice().sort((a, b) => {
-    const sa = seatOf.has(String(a.userId)) ? seatOf.get(String(a.userId)) : Number.MAX_SAFE_INTEGER;
-    const sb = seatOf.has(String(b.userId)) ? seatOf.get(String(b.userId)) : Number.MAX_SAFE_INTEGER;
-    return sa - sb || String(a.userId).localeCompare(String(b.userId));
-  });
+  const seatIndex = seatIndexOf(room);
+  const entries = orderedEntriesOf(round, seatIndex);
   const names = await namesOf(entries.map((entry) => entry.userId));
   const likes = round?.likes || [];
   const votes = round?.votes || [];
-  const likeCounts = new Map();
-  for (const like of likes) {
-    const key = String(like.targetUserId);
-    likeCounts.set(key, (likeCounts.get(key) || 0) + 1);
-  }
-  const voteCounts = new Map();
-  for (const vote of votes) {
-    if (vote.targetUserId === null || vote.targetUserId === undefined) continue; // 弃权不计给任何人
-    const key = String(vote.targetUserId);
-    voteCounts.set(key, (voteCounts.get(key) || 0) + 1);
-  }
+  const likeCounts = countsOf(likes);
+  const voteCounts = countsOf(votes);
   return {
     round: round?.round ?? null,
     phase: round?.phase ?? null,
@@ -181,15 +201,18 @@ async function snapshotOf(room, round, { viewerId = null } = {}) {
   };
 }
 
-/** 结算回包：把落库的 userId 现拼成 name（与房间快照同一条「只存 id」纪律） */
-async function settlementOf(settlement) {
+/**
+ * 结算回包：把落库的 userId 现拼成 name（与房间快照同一条「只存 id」纪律）。
+ * `names` 可选：历史回合一次读多份榜单时由调用方先查好（否则每个回合都要再查一次 User）。
+ */
+async function settlementOf(settlement, names = null) {
   if (!settlement) return null;
   const ranking = settlement.ranking || [];
-  const names = await namesOf(ranking.map((row) => row.userId));
+  const nameMap = names || (await namesOf(ranking.map((row) => row.userId)));
   return {
     ranking: ranking.map((row) => ({
       userId: String(row.userId),
-      name: names.get(String(row.userId)) || null,
+      name: nameMap.get(String(row.userId)) || null,
       likes: row.likes,
       votes: row.votes,
       likeRank: row.likeRank,
@@ -439,6 +462,143 @@ async function getCurrent({ userId, code, now = Date.now() }) {
   const round = currentRoundOf(room);
   if (!round) return fail("ROUND_NOT_FOUND", 404, "this room has no active round");
   return { ok: true, ...(await snapshotOf(room, round, { viewerId: userId })) };
+}
+
+/**
+ * GET /api/game/rooms/:code/rounds/history —— 一局的历史回合 + 战绩（2026-11-24）
+ *
+ * 回包：`{ ok, room: { code, state, winners, finishedAt },
+ *   rounds: [{ round, settled, entries: [{ entryId, userId, name, prompt, cardNames, videoUrl,
+ *   posterUrl, placeholder, modelTier, likes, votes }], settlement? }],
+ *   summary: { roundsPlayed, perPlayer: [{ userId, name, hp, wins, likesTotal, votesTotal, bestRound? }] } }`
+ *
+ * ★ 与 `rounds/current` 的分工：那边只回答「现在这一回合」（展映 / 投票屏轮询），这边回答
+ *   「这一局从头到尾发生了什么」—— 战绩屏与每回合影片回放一次读全，不给客户端留拼装的口子。
+ * ★ 返回**全部**回合（不是只返回已结算的）：正在打的那一回合也要能看（`settled: false`、没有
+ *   `settlement`）。`settled` 的判据是 `settlement` 落没落库（settle 在同一次原子更新里写
+ *   phase 与 settlement，两者等价）。**按 round 升序**（库里本来就是追加顺序，这里仍显式排序：
+ *   对外形状不该依赖存储顺序）。
+ * ★ 不翻页：一局最多 8 回合（App 单机口径），整份回包只有几十 KB。
+ * ★ 权限：**只有房间成员能读**（403 `NOT_IN_ROOM`）。读接口用 403，回合写接口那条 409
+ *   `NOT_IN_ROOM` 说的是「状态冲突」（先解决「你在这个房里吗」才能继续），两件事不要混。
+ *   成员读一次也给房间续一次命（与 `rounds/current` 同一条：开着战绩屏的人也是在看着这间房）。
+ * ★ 房间已过期被懒清理 → 404 `ROOM_NOT_FOUND`（回合数据内嵌在房间文档里，房间没了历史就没了）。
+ *   ⚠ 把历史另存一份到独立集合（跨房间的持久战绩 / 回放）**本轮不做**，契约里写在「还没做」。
+ *
+ * 战绩口径（summary，与 App 战绩屏逐条同口径；改这里必须同步 docs/api-contract.md）：
+ * · `roundsPlayed` = **已结算**回合数（正在打的那一回合不算；总量看 `rounds.length`）；
+ * · `perPlayer` = **当前还在房里的人**，顺序与房间快照 `members[]`（座位）一致；`hp` 是成员
+ *   当前血量（老房间缺这一位按 START_HP，与快照同一兜底）；
+ * · `wins` = 该玩家在**已结算回合**里综合名次第一的次数（结算榜 `ranking[0]`：settle 已经按
+ *   composite → voteRank → votes → likes → userId 排成不并列的一列）；
+ * · `likesTotal` / `votesTotal` = **全部回合**（含正在打的）里以该玩家为对象的计数之和；
+ *   弃权（`targetUserId: null`）不计给任何人；
+ * · `bestRound` = 该玩家综合名次最好的一回合（结算榜位置最靠前；并列取较早的回合）。
+ *   **一次结算都没进过榜的人没有这一格**（不是 null：「没打过」与「没记录」是两件事）。
+ * ★ 中途退房的人：历史回合的 entries / settlement 里照样有他（那是落库的事实），但 `perPlayer`
+ *   只列当前成员 —— 成员退房时房间文档里不会留他的 hp 快照，硬拼一行只能编一个数。
+ */
+async function getHistory({ userId, code, now = Date.now() }) {
+  const room = await gameRoom.loadRoom(code, now);
+  if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  if (!memberOf(room, userId)) {
+    return fail("NOT_IN_ROOM", 403, "only players in this room can read its round history", { roomCode: room.code });
+  }
+  await gameRoom.touch(room, now);
+
+  const seatIndex = seatIndexOf(room);
+  const rounds = (room.rounds || []).slice().sort((a, b) => (Number(a.round) || 0) - (Number(b.round) || 0));
+
+  // 名字一次查全（投稿的人 + 结算榜上的人 + 现在的成员）：一局最多 8 × 8 条，别逐回合查 User 表
+  const ids = (room.members || []).map((member) => String(member.userId));
+  for (const round of rounds) {
+    for (const entry of round.entries || []) ids.push(String(entry.userId));
+    for (const row of round.settlement?.ranking || []) ids.push(String(row.userId));
+  }
+  const names = await namesOf(ids);
+
+  const likesTotal = new Map();
+  const votesTotal = new Map();
+  const wins = new Map();
+  /** userId → { index, round }：结算榜里最好的名次位置与那一回合的号码（并列取较早的回合） */
+  const bestRank = new Map();
+  let roundsPlayed = 0;
+  const roundPayloads = [];
+
+  for (const round of rounds) {
+    const likeCounts = countsOf(round.likes);
+    const voteCounts = countsOf(round.votes);
+    for (const [key, count] of likeCounts) likesTotal.set(key, (likesTotal.get(key) || 0) + count);
+    for (const [key, count] of voteCounts) votesTotal.set(key, (votesTotal.get(key) || 0) + count);
+
+    const settled = Boolean(round.settlement);
+    let settlement = null;
+    if (settled) {
+      roundsPlayed += 1;
+      settlement = await settlementOf(round.settlement, names);
+      (round.settlement.ranking || []).forEach((row, index) => {
+        const key = String(row.userId);
+        if (index === 0) wins.set(key, (wins.get(key) || 0) + 1);
+        const best = bestRank.get(key);
+        if (!best || index < best.index || (index === best.index && round.round < best.round)) {
+          bestRank.set(key, { index, round: round.round });
+        }
+      });
+    }
+
+    roundPayloads.push({
+      round: round.round,
+      settled,
+      entries: orderedEntriesOf(round, seatIndex).map((entry) => {
+        const key = String(entry.userId);
+        return {
+          // 老房间的存量投稿没有 entryId → 如实 null（与回合快照同一口径；重交一次就有）
+          entryId: entry.entryId ? String(entry.entryId) : null,
+          userId: key,
+          name: names.get(key) || null,
+          prompt: entry.prompt,
+          cardNames: (entry.cardNames || []).slice(),
+          videoUrl: entry.videoUrl ?? null,
+          posterUrl: entry.posterUrl ?? null,
+          placeholder: Boolean(entry.placeholder),
+          modelTier: entry.modelTier ?? null,
+          likes: likeCounts.get(key) || 0,
+          votes: voteCounts.get(key) || 0,
+        };
+      }),
+      // `settlement` 只在已结算的回合出现（形状里它是可选的，App 判 `settled` 即可）
+      ...(settlement ? { settlement } : {}),
+    });
+  }
+
+  const over = room.status === "over";
+  return {
+    ok: true,
+    room: {
+      code: room.code,
+      state: gameRoom.stateOf(room),
+      // 与房间快照同一套：没结束 winners / finishedAt 是 null；结束时空数组 = 平局
+      winners: over ? (room.winners || []).map((id) => String(id)) : null,
+      finishedAt: over ? gameRoom.isoOf(room.finishedAt) : null,
+    },
+    rounds: roundPayloads,
+    summary: {
+      roundsPlayed,
+      perPlayer: (room.members || []).map((member) => {
+        const key = String(member.userId);
+        const best = bestRank.get(key);
+        return {
+          userId: key,
+          name: names.get(key) || null,
+          hp: hpOf(member),
+          wins: wins.get(key) || 0,
+          likesTotal: likesTotal.get(key) || 0,
+          votesTotal: votesTotal.get(key) || 0,
+          ...(best ? { bestRound: best.round } : {}),
+        };
+      }),
+    },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -696,17 +856,8 @@ async function settle({ userId, code, now = Date.now() }) {
   const entries = (round.entries || []).filter((entry) => aliveIds.has(String(entry.userId)));
   if (!entries.length) return fail("NO_ENTRIES", 409, "there are no entries to settle");
   const playerCount = entries.length;
-  const likeCounts = new Map();
-  for (const like of round.likes || []) {
-    const key = String(like.targetUserId);
-    likeCounts.set(key, (likeCounts.get(key) || 0) + 1);
-  }
-  const voteCounts = new Map();
-  for (const vote of round.votes || []) {
-    if (vote.targetUserId === null || vote.targetUserId === undefined) continue;
-    const key = String(vote.targetUserId);
-    voteCounts.set(key, (voteCounts.get(key) || 0) + 1);
-  }
+  const likeCounts = countsOf(round.likes);
+  const voteCounts = countsOf(round.votes);
   const rows = entries.map((entry) => {
     const key = String(entry.userId);
     return { userId: key, likes: likeCounts.get(key) || 0, votes: voteCounts.get(key) || 0 };
@@ -1078,6 +1229,8 @@ module.exports = {
   startRound,
   submitEntry,
   getCurrent,
+  // 历史回合 + 战绩（只读；全量、按 round 升序，见 getHistory 文件头）
+  getHistory,
   setPhase,
   likeEntry,
   voteEntry,

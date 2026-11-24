@@ -34,6 +34,7 @@
  * | POST   | /api/game/rooms/:code/rounds/start   | **仅房主** | 开第 1 回合（`playing` 且还没有回合） |
  * | POST   | /api/game/rooms/:code/rounds/entries | 房间成员 | 交片（一人一条、重复覆盖；只在 creating） |
  * | GET    | /api/game/rooms/:code/rounds/current | 房间成员 | 当前回合快照（展映 / 投票屏轮询） |
+ * | GET    | /api/game/rooms/:code/rounds/history | 房间成员 | 历史回合 + 战绩（全部回合、按 round 升序；只读） |
  * | POST   | /api/game/rooms/:code/rounds/phase   | **仅房主** | `{phase:"screening"\|"voting"}` 推进阶段 |
  * | POST   | /api/game/rooms/:code/rounds/like    | 房间成员 | `{targetUserId}` 点赞（只在 screening） |
  * | POST   | /api/game/rooms/:code/rounds/vote    | 房间成员 | `{targetUserId\|null}` 投票 / 弃权（只在 voting） |
@@ -66,6 +67,7 @@ const gameRoomStream = require("../services/gameRoomStream.service");
 const config = require("../config/gameRoom");
 const roundConfig = require("../config/gameRound");
 const eventConfig = require("../config/gameEvent");
+const historyConfig = require("../config/gameHistory");
 
 const router = express.Router();
 
@@ -122,6 +124,23 @@ function requireGameRoundsOn(req, res, next) {
   });
 }
 router.use("/rooms/:code/rounds", requireGameRoundsOn);
+
+/**
+ * 历史回合 / 战绩读取的总开关（`GAME_HISTORY=off` 急停，2026-11-24）。
+ * ★ 注册在回合闸**之后**：`GAME_ROUNDS=off` 时这一条根本轮不到，先回 `GAME_ROUNDS_OFF`
+ *   （回合引擎整个关掉时，历史端点也不该单独活着 —— App 那时也不该再进「对局」的屏）。
+ *   `GAME_ROUNDS` 开着、只有这里 off 时回 503 `GAME_HISTORY_OFF`。
+ * ★ 只挂 `/rooms/:code/rounds/history`：其余回合端点照常（历史读取出问题不该把整局关掉）。
+ */
+function requireGameHistoryOn(req, res, next) {
+  if (historyConfig.enabled()) return next();
+  return res.status(503).json({
+    ok: false,
+    code: "GAME_HISTORY_OFF",
+    message: "round history is turned off on this server",
+  });
+}
+router.use("/rooms/:code/rounds/history", requireGameHistoryOn);
 
 /**
  * 回合间事件的总开关（`GAME_EVENTS_API=off` 急停，2026-11-23）。
@@ -390,6 +409,28 @@ router.post("/rooms/:code/rounds/entries", requireAuth, actLimit, async (req, re
 router.get("/rooms/:code/rounds/current", requireAuth, pollLimit, async (req, res, next) => {
   try {
     reply(res, await gameRound.getCurrent({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/game/rooms/:code/rounds/history —— 一局的历史回合 + 战绩（**房间成员**；2026-11-24）
+ *
+ * 回包：`{ ok, room: { code, state, winners, finishedAt },
+ *   rounds: [{ round, settled, entries:[{ entryId, userId, name, prompt, cardNames, videoUrl,
+ *   posterUrl, placeholder, modelTier, likes, votes }], settlement? }],
+ *   summary: { roundsPlayed, perPlayer:[{ userId, name, hp, wins, likesTotal, votesTotal, bestRound? }] } }`
+ * ★ 全部回合（含正在打的，`settled:false`）、按 round 升序、不翻页；`settlement` 只在已结算的回合出现。
+ * ★ 战绩口径（wins / likesTotal / votesTotal / bestRound）写在 service.getHistory 文件头与
+ *   docs/api-contract.md「历史回合与战绩」—— 两处同一份，别在客户端再算一遍。
+ * ★ 房间过期被懒清理 → 404（历史没另存一份，见契约的「还没做」）。
+ * 错误码：401（未登录）/ 403 `NOT_IN_ROOM`（不是这间房的成员）/ 404 `ROOM_NOT_FOUND` /
+ *        503 `GAME_ROUNDS_OFF`（回合闸在前）/ 503 `GAME_HISTORY_OFF`
+ */
+router.get("/rooms/:code/rounds/history", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.getHistory({ userId: req.user._id, code: req.params.code }));
   } catch (err) {
     next(err);
   }
