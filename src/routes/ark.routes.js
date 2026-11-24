@@ -88,6 +88,7 @@ const gameTicket = require("../services/gameTicket.service");
 const gameRoom = require("../config/gameRoom");
 // 工坊对局回合引擎（只读总开关，能力位用；见 /health 的注释）
 const gameRound = require("../config/gameRound");
+const gameEvent = require("../config/gameEvent");
 const { payWithTicket } = require("../middleware/gameTicket");
 const wallet = require("../services/tokenWallet.service");
 // MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
@@ -200,6 +201,10 @@ router.get("/health", (_req, res) => {
   //   · gameRounds：这台服务器有 /api/game/rooms/:code/rounds*（开回合 / 交片 / 展映 / 点赞 / 投票 / 结算 / 下一回合）。
   //     `GAME_ROUNDS=off` 急停时 false；**房间本身还开着**（gameRooms 仍为 true），两件事分开报。
   //     读不到这一位 = 老服务端，App 在 `playing` 之后不摆「开始回合」这些按钮。
+  //   · gameEvents：这台服务器有 GET/POST /api/game/rooms/:code/rounds/events[/choice]
+  //     （第 2/4/6 回合结算后的三选一**由服务端出题**，2026-11-23）。`GAME_EVENTS_API=off` 急停时 false；
+  //     **回合引擎本身还开着**（gameRounds 仍为 true），两件事分开报。
+  //     读不到这一位 = 老服务端（事件只在本机跑，跨端会对不上），App 见到 false 就退回本机事件。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -232,6 +237,8 @@ router.get("/health", (_req, res) => {
     gameRoomMaxSeats: gameRoom.MAX_SEATS,
     // 工坊对局的回合引擎（2026-11-23）：能力位见上面那一段注释
     gameRounds: gameRoom.enabled() && gameRound.enabled(),
+    // 回合间事件（2026-11-23）：三选一由服务端出题；关掉时退回本机事件（跨端会对不上，所以独立一位）
+    gameEvents: gameRoom.enabled() && gameRound.enabled() && gameEvent.enabled(),
   });
 });
 

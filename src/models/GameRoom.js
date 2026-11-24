@@ -100,6 +100,25 @@ const roundVoteSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/**
+ * 回合间事件的一次选择（第 2/4/6 回合结算之后的三选一，2026-11-23）。
+ * ★ **不存事件 id**：出哪个事件是 `(roomCode, round)` 的纯函数（config/gameEvent.eventFor），
+ *   存一份 id 就是第二处真相（表一改、旧回合里那份 id 就指不到任何事件）。
+ * ★ 一人一行、**第一选作数**（App 规则同一条：投过 / 选过再点不改）。服务端只存 `userId`：
+ *   名字在读快照时现拼（与房间成员同一条纪律），选项本身在 config/gameEvent 里。
+ * ★ 这里只落「谁选了什么」；**唯一由服务端执行的效果是 hp**（见 config/gameEvent 文件头），
+ *   写在这条选择落的同一次原子更新里，所以重复 / 并发选择不会把血加两次。
+ */
+const roundEventPickSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    /** 选项 id；`"skip"` = App 的跳过出口（三选一全落不了账时仍然能表态，见 config/gameEvent） */
+    optionId: { type: String, required: true },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 /** 结算榜上的一行。★ 存**结果**不存输入：结算是这一回合的终态，下一回合 read 它只用于复盘 */
 const settlementRowSchema = new mongoose.Schema(
   {
@@ -145,6 +164,12 @@ const roundSchema = new mongoose.Schema(
     /** 这一回合的票（含弃权行） */
     votes: { type: [roundVoteSchema], default: [] },
     settlement: { type: roundSettlementSchema, default: null },
+    /**
+     * 这一回合结算之后的**事件选择**（只有第 2/4/6 回合会有行）。
+     * ★ 事件本身不落库：哪个事件是 `(房号, 回合)` 的纯函数（config/gameEvent.eventFor）；
+     *   这里只记「谁选了什么」，用来算 `myChoice` / `allChosen`（跨端一致的那两个数）。
+     */
+    eventPicks: { type: [roundEventPickSchema], default: [] },
   },
   { _id: false },
 );
@@ -163,10 +188,13 @@ const gameRoomSchema = new mongoose.Schema(
     /** 房主。★ 只在「退房 / 踢人」时看它；判据是 service.hostIdOf（房主不在房里时自动落到最早进房的人） */
     hostId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     /**
-     * `waiting` → `playing`（房主开局）→ `closed`（今天没有东西会写 closed，
-     * 但状态机留着：回合引擎接上之后「打完一局」就是它；过期清理是硬删）
+     * 房间状态机：`waiting` → `playing`（房主开局）→ `over`（打完一局：`POST /rounds/next` 在
+     * `GAME_OVER` 那一刻落库，见 services/gameRound.service.nextRound）。
+     * ★ `closed` 是早先留的值（今天没有任何东西写它）；留着是为了老数据不触发 enum 校验，
+     *   快照对外只报 `state: waiting|playing|over`（closed 归到 over 那一档）。
+     * ★ 过期清理是硬删，与状态无关。
      */
-    status: { type: String, required: true, enum: ["waiting", "playing", "closed"], default: "waiting" },
+    status: { type: String, required: true, enum: ["waiting", "playing", "over", "closed"], default: "waiting" },
     /** 房间成员，**数组顺序就是座位顺序**（文件头 ★）。最多 8 个（8 人匹配） */
     members: { type: [memberSchema], default: [] },
     /**
@@ -182,6 +210,15 @@ const gameRoomSchema = new mongoose.Schema(
     origin: { type: String, enum: ["create", "match"], default: "create" },
     /** 开局时间（`status: "playing"` 那一刻） */
     startedAt: { type: Date, default: null },
+    /**
+     * 胜者（`status: "over"` 时才有意义；**空数组 = 平局 / 同归于尽**，不是「还没算」）。
+     * ★ 为什么落在房间上而不是只回给 `next` 的调用方：只有房主能调 next，其他人拿不到那份回包；
+     *   结束状态必须能从**任何人都读得到的快照**里看见（`GET /api/game/rooms/:code`）。
+     * ★ 顺序与 settle / gameOverOf 一致：hp 降序、同血按 userId（三处同一串，别在客户端再排一次）。
+     */
+    winners: { type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }], default: [] },
+    /** 结束时间（`status` 变 `over` 那一刻）；没结束时 null */
+    finishedAt: { type: Date, default: null },
     /** 最后一次「有人在看」的时间；过期判它（文件头 ★★） */
     lastSeenAt: { type: Date, default: Date.now },
   },

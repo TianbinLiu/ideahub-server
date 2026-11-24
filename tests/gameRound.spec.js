@@ -538,6 +538,71 @@ describe("下一回合：当前状态清空、历史回合不丢、仅房主、�
 });
 
 // ─────────────────────────────────────────────────────────────────────
+describe("结束状态对外可见：next 在 GAME_OVER 时把房间落成 over（winners / finishedAt）", () => {
+  test("★ 只剩胜者名额时 next → 409 GAME_OVER，并把房间写成 over：任何人读快照都能判结束", async () => {
+    const room = await submittedRound(4);
+    await phase(room.host, room.code, "screening").expect(200);
+    await phase(room.host, room.code, "voting").expect(200);
+    await setHp(room.code, room.users[2].id, 5);
+    await setHp(room.code, room.users[3].id, 5);
+    await settle(room.host, room.code).expect(200);
+
+    const over = await next(room.host, room.code);
+    expect(over.status).toBe(409);
+    expect(over.body).toMatchObject({ code: "GAME_OVER" });
+
+    // ★ 不是房主、也没调过 next 的人，读快照也能看到结束状态
+    const snap = await snapshot(room.users[1], room.code).expect(200);
+    expect(snap.body.room).toMatchObject({ status: "over", state: "over", startBlockedBy: "over" });
+    expect(snap.body.room.winners.slice().sort()).toEqual([room.users[0].id, room.users[1].id].sort());
+    expect(typeof snap.body.room.finishedAt).toBe("string");
+    // 每个人的 hp 照旧在快照里（淘汰的是 0，不是缺字段）
+    expect(snap.body.room.members).toHaveLength(4);
+    for (const member of snap.body.room.members) expect(typeof member.hp).toBe("number");
+    expect(snap.body.room.members.filter((member) => member.hp === 0)).toHaveLength(2);
+
+    // 幂等：再调 next 还是 GAME_OVER，finishedAt 不被改写
+    const again = await next(room.host, room.code);
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({ code: "GAME_OVER" });
+    const snapAgain = await snapshot(room.users[1], room.code).expect(200);
+    expect(snapAgain.body.room.finishedAt).toBe(snap.body.room.finishedAt);
+    expect(snapAgain.body.room.winners.slice().sort()).toEqual(snap.body.room.winners.slice().sort());
+  });
+
+  test("★ 平局（全员同归于尽）：over + winners 是空数组（不是 null / 不是缺字段）", async () => {
+    const room = await submittedRound(4);
+    await phase(room.host, room.code, "screening").expect(200);
+    await phase(room.host, room.code, "voting").expect(200);
+    for (const user of room.users) await setHp(room.code, user.id, 5);
+    await settle(room.host, room.code).expect(200);
+    // 全员 0 血：settle 的回包不带 winners（空数组不展开），但 next 的 GAME_OVER 必须判成「结束了」
+    const over = await next(room.host, room.code);
+    expect(over.status).toBe(409);
+    expect(over.body).toMatchObject({ code: "GAME_OVER" });
+    expect(over.body.winners).toEqual([]);
+
+    const snap = await snapshot(room.users[2], room.code).expect(200);
+    expect(snap.body.room).toMatchObject({ status: "over", state: "over", winners: [] });
+    expect(Array.isArray(snap.body.room.winners)).toBe(true);
+    expect(snap.body.room.winners).toHaveLength(0);
+    expect(typeof snap.body.room.finishedAt).toBe("string");
+  });
+
+  test("没结束时快照：state playing / waiting，winners 与 finishedAt 为 null", async () => {
+    const room = await playingRoom(2);
+    const playingSnap = await snapshot(room.host, room.code).expect(200);
+    expect(playingSnap.body.room).toMatchObject({ state: "playing", winners: null, finishedAt: null });
+
+    const users = [];
+    for (let i = 0; i < 2; i += 1) users.push(await registerUser(`wait-state-${i}`));
+    const waitingRoom = await create(users[0], { mode: "custom", seats: 2 }).expect(201);
+    const waitingSnap = await snapshot(users[0], waitingRoom.body.room.code).expect(200);
+    expect(waitingSnap.body.room).toMatchObject({ state: "waiting", winners: null, finishedAt: null });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
 describe("房间快照带上 hp / 能力位 / 总开关", () => {
   test("GET /api/game/rooms/:code 的每个成员带 hp（开局 100）", async () => {
     const room = await playingRoom(2);

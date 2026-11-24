@@ -18,7 +18,8 @@
  * | `likeEntry`    | 点赞（只在 `screening`；一人一条一次；不能给自己；**幂等**） |
  * | `voteEntry`    | 投票（只在 `voting`；不能给自己；`null` = 弃权；一人一次，**幂等**） |
  * | `settle`       | 两个榜 + 综合名次 + 扣血 + 淘汰 + 胜者（房主，或全员已投票时任何成员） |
- * | `nextRound`    | 回合 +1、回到 `creating`（**仅房主**；保留历史；只剩胜者名额时 `GAME_OVER`） |
+ * | `getRoundEvent` / `chooseRoundEvent` | 第 2/4/6 回合结算后的三选一（服务端出题、跨端一致；只有 hp 由服务端落） |
+ * | `nextRound`    | 回合 +1、回到 `creating`（**仅房主**；保留历史；只剩胜者名额时把房间落成 `over` + `GAME_OVER`） |
  *
  * ══ ★★ 数据放在房间文档的 `rounds[]`（models/GameRoom 文件头有完整取舍） ════════════════
  *   一桌最多 8 人、一回合最多 8 条作品，文档远小于 16MB；而点赞 / 投票的「一人一次」要**原子判定**，
@@ -51,6 +52,8 @@ const User = require("../models/User");
 const gameRoom = require("./gameRoom.service");
 const roomConfig = require("../config/gameRoom");
 const config = require("../config/gameRound");
+// 回合间事件（第 2/4/6 回合结算后的三选一）：事件表 / 确定性抽选 / GAME_EVENTS_API 开关都在这里
+const eventConfig = require("../config/gameEvent");
 
 const { sameId } = gameRoom;
 
@@ -768,7 +771,11 @@ async function nextRound({ userId, code, now = Date.now() }) {
     return fail("ROUND_NOT_SETTLED", 409, "settle the current round before starting the next one", { phase: round.phase });
   }
   const over = gameOverOf(room);
-  if (over.over) return fail("GAME_OVER", 409, "the game is over", { winners: over.winners });
+  if (over.over) {
+    // ★ 结束不只是「这次 next 的回包」：把 over / winners / finishedAt 落库，别人读快照也看得见。
+    await markRoomOver(room, over.winners, now);
+    return fail("GAME_OVER", 409, "the game is over", { winners: over.winners });
+  }
   const at = atOf(now);
   const nextNo = round.round + 1;
   const updated = await GameRoom.findOneAndUpdate(
@@ -802,10 +809,223 @@ async function nextRound({ userId, code, now = Date.now() }) {
     const fresh = await GameRoom.findById(room._id);
     if (!fresh) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
     const freshOver = gameOverOf(fresh);
-    if (freshOver.over) return fail("GAME_OVER", 409, "the game is over", { winners: freshOver.winners });
+    if (freshOver.over) {
+      await markRoomOver(fresh, freshOver.winners, now);
+      return fail("GAME_OVER", 409, "the game is over", { winners: freshOver.winners });
+    }
     return fail("ROUND_NOT_SETTLED", 409, "the round changed concurrently, please refresh");
   }
   return snapshotByRoom(updated, userId);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 回合间事件（第 2/4/6 回合结算之后、下一回合创建之前）
+// ─────────────────────────────────────────────────────────────────────
+
+/** 我在这一回合事件里的选择（没有回 null）。★ 一人一行、**第一选作数**（与 App 同一条） */
+function eventPickOf(round, userId) {
+  return (round?.eventPicks || []).find((pick) => sameId(pick.userId, userId)) || null;
+}
+
+/**
+ * 事件视角的两个数：`myChoice` 与 `allChosen`（**唯一实现**，GET 与 POST 共用）。
+ * ★ `allChosen` 只看**存活**的人：被淘汰的人在结算那一刻就已经不在这一局里了（App 也不再弹事件），
+ *   把他算进来会让「全员选完」永远凑不齐 —— 整桌卡在事件屏，而服务端没有任何超时机制。
+ */
+function eventChoiceStateOf(room, round, viewerId) {
+  const picks = round?.eventPicks || [];
+  const chosen = new Set(picks.map((pick) => String(pick.userId)));
+  const alive = aliveMembersOf(room);
+  const mine = eventPickOf(round, viewerId);
+  return {
+    myChoice: mine ? mine.optionId : null,
+    allChosen: alive.length > 0 && alive.every((member) => chosen.has(String(member.userId))),
+  };
+}
+
+/**
+ * 事件的对外形状。
+ * ★ `effects` 拆成两半（契约在 config/gameEvent 文件头）：`server` 是服务端**会**执行的键（今天只有
+ *   `hp`，选完就已经落库了，App 不要再应用一次）；`client` 与 App `rules.EventEffect` 同形，原样应用。
+ * ★ 选项顺序照事件表（App 的 `optionsForPlayer` 会按玩家档位 / 连胜再筛一遍；服务端不知道金币与档位，
+ *   只下发全量三/四个选项 + 花费，扣钱与可选项判定仍在 App 本地）。
+ */
+function eventPayloadOf(room, round, event, viewerId) {
+  return {
+    round: round.round,
+    eventId: event.id,
+    title: event.title,
+    options: event.options.map((option) => ({
+      id: option.id,
+      cost: option.cost,
+      label: option.label,
+      effects: {
+        server: { ...option.effects.server },
+        client: option.effects.client.map((effect) => ({ ...effect })),
+      },
+    })),
+    ...eventChoiceStateOf(room, round, viewerId),
+  };
+}
+
+/**
+ * GET / POST 共用的前置闸（**唯一实现**）：房间在 → 我是成员且还活着 → 这一回合已结算 →
+ * 这局还没结束 → 这一回合确实是事件回合。
+ * ★ 顺序是刻意的：先回答「你能不能玩」（404 / 409 NOT_IN_ROOM / PLAYER_ELIMINATED），再回答
+ *   「现在能不能读」（ROUND_NOT_SETTLED），最后才是「这一回合有没有事件」（NO_EVENT）。
+ */
+async function eventContextOf({ code, userId, now }) {
+  const room = await gameRoom.loadRoom(code, now);
+  if (!room) return { error: fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)") };
+  const member = memberOf(room, userId);
+  if (!member) return { error: fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code }) };
+  if (hpOf(member) <= 0) return { error: fail("PLAYER_ELIMINATED", 409, "eliminated players do not get events") };
+  const round = currentRoundOf(room);
+  if (!round) return { error: fail("ROUND_NOT_FOUND", 404, "this room has no active round") };
+  // ★ 「settled 之后、下一回合 creating 之前」= 当前回合（数组最后一条）就是 settled。
+  //   已经 next 过的房间最后一条是 creating，天然不满足；不用再比回合号。
+  if (round.phase !== "settled") {
+    return {
+      error: fail("ROUND_NOT_SETTLED", 409, "events are only available after the round is settled", {
+        phase: round.phase,
+        round: round.round,
+      }),
+    };
+  }
+  const over = gameOverOf(room);
+  // 结束的一局没有事件：这一回合的血已经定下胜者，再让人回血 / 升档会把结算结果改掉。
+  if (over.over) return { error: fail("GAME_OVER", 409, "the game is over", { winners: over.winners }) };
+  const event = eventConfig.eventFor(room.code, round.round);
+  if (!event) {
+    return {
+      error: fail("NO_EVENT", 404, "this round has no event", {
+        round: round.round,
+        eventRounds: eventConfig.EVENT_AFTER_ROUNDS.slice(),
+      }),
+    };
+  }
+  return { room, member, round, event };
+}
+
+/**
+ * GET /api/game/rooms/:code/rounds/events —— 当前待选事件
+ *
+ * 回包：`{ ok, round, eventId, title, options:[{ id, cost, label, effects:{ server, client } }],
+ *   myChoice, allChosen }`
+ * 错误：404 `ROOM_NOT_FOUND` / 409 `NOT_IN_ROOM` / 409 `PLAYER_ELIMINATED` / 404 `ROUND_NOT_FOUND` /
+ *      409 `ROUND_NOT_SETTLED`（还没结算，或已经 next 到下一回合）/ 409 `GAME_OVER` / 404 `NO_EVENT`
+ *      （这一回合不是事件回合，带 `eventRounds`）/ 503 `GAME_EVENTS_OFF`（路由闸）。
+ * ★ 只在**成员**读时续命（只刷 `lastSeenAt`）；事件 / 选择状态一概不写（轮询路径不产生新状态）。
+ */
+async function getRoundEvent({ userId, code, now = Date.now() }) {
+  const ctx = await eventContextOf({ code, userId, now });
+  if (ctx.error) return ctx.error;
+  await gameRoom.touch(ctx.room, now);
+  return { ok: true, ...eventPayloadOf(ctx.room, ctx.round, ctx.event, userId) };
+}
+
+/**
+ * POST /api/game/rooms/:code/rounds/events/choice —— `{ optionId }`
+ *
+ * 回包：`{ ok, myChoice, allChosen }`（`optionId: "skip"` = App 的跳过出口，也记一个表态）
+ * 错误：同 GET 的前置闸，加上 400 `BAD_OPTION`（不是这个事件的选项）。
+ *
+ * ★★ **幂等 + hp 只落一次**：同一次原子更新里做三件事 ——
+ *      ① 条件里带 `eventPicks.userId: {$ne: me}`（这个人这一回合还没选过）；
+ *      ② `$push` 我的选择；
+ *      ③ 如果这个选项有 hp 效果，`$set` 我的**绝对血量**（钳在 0~START_HP）。
+ *    所以「双击 / 重试 / 两个设备同时点」只有一发能匹配上：选择只写一条、血只加一次。
+ *    没匹配上的那一发重读一次，发现「我已经选过」就把第一次的结果原样回出去（**第一选作数**）。
+ * ★ hp 写绝对值（不是 `$inc`）：与 settle 同一条取舍 —— 谁写都是同一个结果，重复写也不会叠加。
+ * ★ 条件里还有 `"rounds.round": {$ne: 下一回合号}`：**下一回合已经建出来**时不能再往上一回合的事件里
+ *   写选择（那已经是「翻篇」了；GET 那边由「当前回合必须 settled」挡住）。
+ */
+async function chooseRoundEvent({ userId, code, optionId, now = Date.now() }) {
+  const ctx = await eventContextOf({ code, userId, now });
+  if (ctx.error) return ctx.error;
+  const { room, member, round, event } = ctx;
+
+  const wanted = String(optionId ?? "").trim();
+  if (!wanted) {
+    return fail("BAD_OPTION", 400, "optionId is required", { options: event.options.map((option) => option.id) });
+  }
+  const option = eventConfig.optionOf(event, wanted);
+  if (!option && wanted !== eventConfig.SKIP_PICK) {
+    return fail("BAD_OPTION", 400, "optionId is not one of this event's options", {
+      options: [...event.options.map((item) => item.id), eventConfig.SKIP_PICK],
+    });
+  }
+
+  // 选过了 → 第一选作数，原样回第一次那一份（重复点击 / 并发第二发都走这里，不再写库）
+  if (eventPickOf(round, userId)) {
+    return { ok: true, ...eventChoiceStateOf(room, round, userId) };
+  }
+
+  const heal = Number(option?.effects?.server?.hp) || 0;
+  const hpAfter = Math.min(config.START_HP, Math.max(0, hpOf(member) + heal));
+  const at = atOf(now);
+  const update = {
+    $push: {
+      "rounds.$[r].eventPicks": {
+        userId: oidOf(userId),
+        optionId: option ? option.id : eventConfig.SKIP_PICK,
+        at,
+      },
+    },
+    $set: { lastSeenAt: at },
+  };
+  const arrayFilters = [{ "r.round": round.round }];
+  if (heal) {
+    update.$set["members.$[m].hp"] = hpAfter;
+    arrayFilters.push({ "m.userId": oidOf(userId) });
+  }
+  const updated = await GameRoom.findOneAndUpdate(
+    {
+      _id: room._id,
+      "members.userId": userId,
+      rounds: { $elemMatch: { round: round.round, phase: "settled", "eventPicks.userId": { $ne: userId } } },
+      "rounds.round": { $ne: round.round + 1 },
+    },
+    update,
+    { arrayFilters, returnDocument: "after" },
+  );
+  if (updated) {
+    const updatedRound = currentRoundOf(updated);
+    return { ok: true, ...eventChoiceStateOf(updated, updatedRound, userId) };
+  }
+
+  // 没匹配上：可能是并发下的第二发（我已经选过），也可能阶段刚被推进 / 这局刚结束。重读按真实原因回话。
+  const fresh = await GameRoom.findById(room._id);
+  if (!fresh) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  const freshRound = currentRoundOf(fresh);
+  if (!freshRound) return fail("ROUND_NOT_FOUND", 404, "this room has no active round");
+  if (freshRound.phase !== "settled") {
+    return fail("ROUND_NOT_SETTLED", 409, "events are only available after the round is settled", {
+      phase: freshRound.phase,
+      round: freshRound.round,
+    });
+  }
+  const freshOver = gameOverOf(fresh);
+  if (freshOver.over) return fail("GAME_OVER", 409, "the game is over", { winners: freshOver.winners });
+  if (eventPickOf(freshRound, userId)) {
+    return { ok: true, ...eventChoiceStateOf(fresh, freshRound, userId) };
+  }
+  return fail("EVENT_CHOICE_CONFLICT", 409, "could not record the choice, please retry");
+}
+
+/**
+ * 把「这局真的结束了」落库：`status: "over"` + `winners` + `finishedAt`。
+ * ★ 为什么必须落库：只有**房主**能调 next，之前 winners 只活在那一次回包里，别的玩家读快照永远
+ *   看不到「结束 / 平局」—— 这正是「结束状态要对外可见」要补的那一刀。
+ * ★ 条件带 `status: "playing"`：两发 next 撞在一起只有一发落库；另一发读到 already over。
+ *   winners 空数组照写（平局 / 同归于尽也是结束，`[]` 与「没结束」靠 status / state 区分）。
+ */
+async function markRoomOver(room, winners, now) {
+  const at = atOf(now);
+  await GameRoom.updateOne(
+    { _id: room._id, status: "playing" },
+    { $set: { status: "over", winners, finishedAt: at, lastSeenAt: at } },
+  );
 }
 
 module.exports = {
@@ -817,6 +1037,9 @@ module.exports = {
   voteEntry,
   settle,
   nextRound,
+  // 回合间事件（第 2/4/6 回合结算之后）
+  getRoundEvent,
+  chooseRoundEvent,
   // 判据 / 形状（测试与路由不用自己再写一遍）
   currentRoundOf,
   gameOverOf,

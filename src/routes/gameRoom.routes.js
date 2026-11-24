@@ -34,7 +34,14 @@
  * | POST   | /api/game/rooms/:code/rounds/like    | 房间成员 | `{targetUserId}` 点赞（只在 screening） |
  * | POST   | /api/game/rooms/:code/rounds/vote    | 房间成员 | `{targetUserId\|null}` 投票 / 弃权（只在 voting） |
  * | POST   | /api/game/rooms/:code/rounds/settle  | 房主 / 全员已投 | 两个榜 + 扣血 + 淘汰 + 胜者 |
- * | POST   | /api/game/rooms/:code/rounds/next    | **仅房主** | 回合 +1（保留历史；只剩胜者名额 → GAME_OVER） |
+ * | POST   | /api/game/rooms/:code/rounds/next    | **仅房主** | 回合 +1（保留历史；只剩胜者名额 → 落库 over + `GAME_OVER`） |
+ *
+ * 回合间事件（2026-11-23，第 2/4/6 回合结算之后的三选一，契约见 `docs/api-contract.md`）：
+ *
+ * | 方法 | 路径 | 鉴权 | 说明 |
+ * |---|---|---|---|
+ * | GET    | /api/game/rooms/:code/rounds/events        | 房间成员 | 当前待选事件（服务端出题，同房间同回合同一个） |
+ * | POST   | /api/game/rooms/:code/rounds/events/choice | 房间成员 | `{optionId}` 记录我的选择（幂等，第一选作数） |
  *
  * ★ 所有判定都在 `services/gameRoom.service.js` 与 `services/gameRound.service.js`（唯一实现）；这个文件只做
  *   ① 关掉时的 503 闸 ② 限流 ③ 把 service 的 `{ok:false, status, code, message}` 照原样回给客户端。
@@ -51,6 +58,7 @@ const gameRoom = require("../services/gameRoom.service");
 const gameRound = require("../services/gameRound.service");
 const config = require("../config/gameRoom");
 const roundConfig = require("../config/gameRound");
+const eventConfig = require("../config/gameEvent");
 
 const router = express.Router();
 
@@ -85,6 +93,22 @@ function requireGameRoundsOn(req, res, next) {
   });
 }
 router.use("/rooms/:code/rounds", requireGameRoundsOn);
+
+/**
+ * 回合间事件的总开关（`GAME_EVENTS_API=off` 急停，2026-11-23）。
+ * ★ 与 `GAME_ROUNDS` 分开：回合引擎还开着时也能单独关掉「读事件 / 选事件」
+ *   （事件出问题不该顺手把整局关掉）。注册在回合闸之后：`GAME_ROUNDS=off` 时先回 `GAME_ROUNDS_OFF`。
+ * ★ 只挂 `/rooms/:code/rounds/events`：回合的其它端点（开回合 / 交片 / 结算 / next）照常。
+ */
+function requireGameEventsOn(req, res, next) {
+  if (eventConfig.enabled()) return next();
+  return res.status(503).json({
+    ok: false,
+    code: "GAME_EVENTS_OFF",
+    message: "round events are turned off on this server",
+  });
+}
+router.use("/rooms/:code/rounds/events", requireGameEventsOn);
 
 const createLimit = userRateLimit({ max: 20, scope: "game-room-create" });
 const joinLimit = userRateLimit({ max: 30, scope: "game-room-join" });
@@ -145,11 +169,14 @@ router.post("/rooms/join", requireAuth, joinLimit, async (req, res, next) => {
 /**
  * GET /api/game/rooms/:code —— 房间快照（大厅 / 对局里都用它轮询）
  *
- * 回包：`{ ok:true, room: { code, roomId, mode, seats, status, origin, hostId, requiredPlayers,
- *   memberCount, members:[{userId, username, avatarUrl, seat, ready, isHost, joinedAt}],
- *   canStart, startBlockedBy, createdAt, updatedAt, startedAt, lastSeenAt, expiresAt } }`
+ * 回包：`{ ok:true, room: { code, roomId, mode, seats, status, state, origin, hostId, requiredPlayers,
+ *   memberCount, members:[{userId, username, avatarUrl, seat, ready, hp, isHost, joinedAt}],
+ *   canStart, startBlockedBy, winners, finishedAt, createdAt, updatedAt, startedAt, lastSeenAt, expiresAt } }`
  * ★ 座位是**派生量**（数组下标），迟到 / 退房之后自然重排，不落库。
  * ★ `updatedAt` = 最后一次**状态变化**；成员轮询只刷 `lastSeenAt`（它才是过期判据）。
+ * ★ `state` 是 App 认的三态（`waiting` / `playing` / `over`；`status` 保留给老包，另有历史遗留的 `closed`）。
+ *   `state: "over"` 时 `winners` 是 userId 数组（**空数组 = 平局**）、`finishedAt` 是结束时间；
+ *   没结束时这两项是 `null`（稳定的形状，App 不用先判字段在不在）。每个人身上的 `hp` 照旧给。
  */
 router.get("/rooms/:code", requireAuth, pollLimit, async (req, res, next) => {
   try {
@@ -371,9 +398,53 @@ router.post("/rooms/:code/rounds/settle", requireAuth, actLimit, async (req, res
 });
 
 /**
+ * GET /api/game/rooms/:code/rounds/events —— 当前待选事件（**第 2/4/6 回合结算之后、下一回合之前**）
+ *
+ * 回包：`{ ok, round, eventId, title, options:[{ id, cost, label,
+ *   effects: { server: { hp? }, client: [...] } }], myChoice, allChosen }`
+ * ★ 事件由 `(roomCode, round)` **确定性抽选**（config/gameEvent.eventFor）：同一房间同一回合，
+ *   四个人看到的是同一个事件（之前各跑各的，选项/事件会对不上）。
+ * ★ `effects.server` 是服务端**已经 / 将会**执行的那部分（今天只有 `hp`），App 不要再应用一次；
+ *   `effects.client` 与 App `rules.EventEffect` 同形，原样在本地应用（金币 / 档位 / 道具上限 / 免费刷新）。
+ * ★ 只在回合是当前最后一条且 `settled` 时可读；`next` 之后（下一回合 `creating`）回 `ROUND_NOT_SETTLED`。
+ * 错误码：404 `ROOM_NOT_FOUND` / 409 `NOT_IN_ROOM` / 409 `PLAYER_ELIMINATED` / 404 `ROUND_NOT_FOUND` /
+ *        409 `ROUND_NOT_SETTLED` / 409 `GAME_OVER` / 404 `NO_EVENT`（不是事件回合，带 `eventRounds`）/
+ *        503 `GAME_EVENTS_OFF`。
+ */
+router.get("/rooms/:code/rounds/events", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.getRoundEvent({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/events/choice —— 记下我的选择 `{ optionId }`
+ *
+ * 回包：`{ ok, myChoice, allChosen }`
+ * ★ **幂等、第一选作数**：重复点 / 两个设备同时点，只有第一发落库（同一次原子更新里写选择 + 落 hp）。
+ * ★ `optionId: "skip"` = App 三选一全落不了账时的跳过出口（App `EVENT_SKIP_PICK`），也记一个表态。
+ * 错误码：400 `BAD_OPTION` / 其余同 GET 的前置闸 / 503 `GAME_EVENTS_OFF`。
+ */
+router.post("/rooms/:code/rounds/events/choice", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    reply(
+      res,
+      await gameRound.chooseRoundEvent({ userId: req.user._id, code: req.params.code, optionId: body.optionId }),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/game/rooms/:code/rounds/next —— 下一回合（**仅房主**；上一回合必须已 settled）
  *
  * 回包：新回合快照（round +1、phase `creating`、entries/likes/votes 都是空的；**历史回合原样留着**）
+ * ★ `GAME_OVER` 时顺手把房间落成 `over`（写 `winners` / `finishedAt`）：结束状态不再只活在这一发回包里，
+ *   任何人 `GET /api/game/rooms/:code` 都读得到（平局 = `winners: []`）。
  * 错误码：403 `NOT_HOST` / 404 `ROUND_NOT_FOUND` / 409 `ROUND_NOT_SETTLED` /
  *        409 `GAME_OVER`（带 `winners`，胜者可能是空数组 = 同归于尽）
  */
