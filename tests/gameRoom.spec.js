@@ -1,4 +1,4 @@
-﻿// tests/gameRoom.spec.js
+// tests/gameRoom.spec.js
 // 「工坊对局」的房间与匹配（2026-11-23，G5 联机的第一块，HTTP 轮询版）。
 // 设计正本在 app 仓 docs/workshop-game-design.md §三「服务端房间协议」与 docs/g2-game-ui.md 的大厅需求
 // （4 人匹配 / 8 人匹配 / 自定义房间邀请）。
@@ -196,7 +196,13 @@ describe("建房：座位数由模式锁死，房号 6 位", () => {
     const doc = await GameRoom.findOne({ code: room.code }).lean();
     expect(JSON.stringify(doc)).not.toMatch(/@test\.local/);
     expect(JSON.stringify(doc)).not.toMatch(new RegExp(u.username));
-    expect(doc.members[0]).toEqual({ userId: doc.members[0].userId, ready: true, joinedAt: expect.any(Date) });
+    // 回合引擎（2026-11-23）起成员多了 hp（开局 100）；除它之外仍然只有 id / ready / joinedAt
+    expect(doc.members[0]).toEqual({
+      userId: doc.members[0].userId,
+      ready: true,
+      hp: 100,
+      joinedAt: expect.any(Date),
+    });
   });
 });
 

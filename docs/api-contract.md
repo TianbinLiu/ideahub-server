@@ -3504,16 +3504,16 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 设计正本在 app 仓：`docs/workshop-game-design.md` §三「服务端房间协议」与 §四 G5「联机」、
 `docs/g2-game-ui.md` 的大厅需求（**4 人匹配 / 8 人匹配 / 自定义房间邀请**）。
 
-**这是 HTTP 轮询版**：客户端每 2~5 秒轮询一次房间快照 / 队列状态，服务端不主动推任何东西。
-WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送只是把轮询的结果主动塞过来）。
-`status: "playing"` 之后服务端**不再推进任何东西** —— 回合引擎（出片 / 展映 / 点赞 / 投票 / 扣血）
-是 G5 后面的事，今天不在这块里。
+**这是 HTTP 轮询版**：客户端每 2~5 秒轮询一次房间快照 / 队列状态（`playing` 之后轮询回合快照），
+服务端不主动推任何东西。WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送只是把轮询的结果
+主动塞过来）。`status: "playing"` 之后由**回合引擎**推进（见下一节「工坊对局：回合引擎」）；
+阶段推进仍然靠房主点 / 全员交齐 / 全员投完，服务端不自己往前推。
 
 ### 两张表
 
 | 集合 | 键 | 说明 |
 |---|---|---|
-| `gamerooms` | `code` **唯一** / `status + lastSeenAt` / `members.userId` | 一间房：`code`（6 位房号）、`mode`（`match4` / `match8` / `custom`）、`seats`、`hostId`、`status`（`waiting` / `playing` / `closed`）、`members[{ userId, ready, joinedAt }]`（**数组顺序就是座位顺序**，`seat` 是派生量、不落库）、`origin`（`create` / `match`）、`startedAt`、`lastSeenAt` |
+| `gamerooms` | `code` **唯一** / `status + lastSeenAt` / `members.userId` | 一间房：`code`（6 位房号）、`mode`（`match4` / `match8` / `custom`）、`seats`、`hostId`、`status`（`waiting` / `playing` / `closed`）、`members[{ userId, ready, hp, joinedAt }]`（**数组顺序就是座位顺序**，`seat` 是派生量、不落库；`hp` 开局 100、0 = 淘汰）、`rounds[]`（回合历史，见下一节）、`origin`（`create` / `match`）、`startedAt`、`lastSeenAt` |
 | `gamequeues` | `userId` **唯一** / `mode + status + enqueuedAt` / `status + lastSeenAt` | 一行 = 一个人（**同时只能在一个池子里**）。`status`（`waiting` / `matched`）、`enqueuedAt`（排队顺序，**续队不动它**）、`lastSeenAt`（心跳）、`matchedAt` / `roomId` / `code`（撮合成功之后才有） |
 
 ★ **不存敏感信息**：两张表里只有 ObjectId。用户名 / 头像在读快照时按 `members.userId` 现拼（一次 `$in`），
@@ -3552,7 +3552,7 @@ WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送
   "code": "K7M2QX", "roomId": "…", "mode": "custom", "seats": 8, "status": "waiting",
   "origin": "create", "hostId": "…", "requiredPlayers": 2, "memberCount": 3,
   "members": [{ "userId": "…", "username": "…", "avatarUrl": null, "seat": 0,
-                "ready": true, "isHost": true, "joinedAt": "2026-11-23T…" }],
+                "ready": true, "hp": 100, "isHost": true, "joinedAt": "2026-11-23T…" }],
   "canStart": false, "startBlockedBy": "not-all-ready",
   "createdAt": "…", "updatedAt": "…", "startedAt": null, "lastSeenAt": "…", "expiresAt": "…"
 } }
@@ -3592,11 +3592,11 @@ WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送
 ### 房间状态机与权限
 
 ```
-waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing
-   │                                                │
-   │ 最后一个人 leave                                │ 今天没有东西推它（回合引擎未接）
-   ▼                                                ▼
-（硬删）                                    （lastSeenAt 超过 playing 寿命 → 硬删）
+waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ──(回合引擎：settle / next / GAME_OVER)──┐
+   │                                                │                                              │
+   │ 最后一个人 leave                                │ 没人再轮询 / 全员走了                          │
+   ▼                                                ▼                                              ▼
+（硬删）                                    （lastSeenAt 超过 playing 寿命 → 硬删）        （打完仍留到过期）
 ```
 
 | 动作 | 允许的状态 | 谁 | 被拒时的码 |
@@ -3646,7 +3646,8 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing
 ### 过期清理（懒清理，没有定时任务）
 
 - **判据**：`lastSeenAt`（不是 `updatedAt`）+ 按状态给的寿命。`waiting` 房 **30 分钟**、
-  `playing` 房 **120 分钟**（回合引擎还没接，这一局可能真的在打，给个兜底寿命免得永远不死）。
+  `playing` 房 **120 分钟**（一局可能真的在打；回合引擎接上之后这仍是兜底寿命 ——
+  打完 / 全员走了 / 没人再轮询，就靠它过期，那几个人才能再建房、再排队）。
   **0 个人的房立刻算过期**（兜底：退房那一路会当场删，进程崩在中间也不会留下鬼房）。
 - **谁给它续命**：`join` / `ready` / `start` / `kick` / `leave` 这些动作，以及**成员**轮询快照。
   路人读快照**不续命**（点开邀请看一眼不该让一间没人管的房活着）。
@@ -3690,12 +3691,12 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing
 | `gameRooms` | 有 `/api/game/rooms*` 与 `/api/game/queue`。**读不到这一位 = 老服务端，App 不摆大厅入口** |
 | `gameRoomModes` | 这台服务器认哪几种模式（今天 `["match4","match8","custom"]`；`GAME_ROOMS=off` 时是 `[]`） |
 | `gameRoomMaxSeats` | 自定义房间最多几座（8）。App 只照服务端下发的摆，不在本机写死 |
+| `gameRounds` | 有 `/api/game/rooms/:code/rounds*`（回合引擎）。`GAME_ROUNDS=off` 时 false，房间端点不受影响。**读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮** |
 
 ### 还没做（别当成已做）
 
 - **WebSocket / SSE 推送**：现在是轮询。真做的时候这一批端点的形状不变，只是多一条连接；
-- **回合推进**：`status: "playing"` 之后没有任何东西会推它 —— 出片 / 展映 / 点赞 / 投票 / 扣血 / 淘汰
-  要等回合引擎（它同样需要推送 + 断线重连）；
+- **回合引擎的历史回合读取**：回合数据都留在 `rounds[]`，但没有读第 N 回合的端点（复盘 / 分享还没做）；
 - **跨服**：没有分片、没有共享队列。撮合是「本进程 + 本库」的，多实例靠 Mongo 的唯一索引与条件更新
   （两个 pm2 实例同时撮合是安全的，见上「撮合」第 4 步）；
 - **断线重连**：成员没有心跳 / 掉线标记，房间里的人不会因为关掉 App 而消失 —— 只有队列有心跳。
@@ -3705,6 +3706,161 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing
 - **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）。
 
 回归测试：`server/tests/gameRoom.spec.js`（45 条）。
+
+## 工坊对局：回合引擎（GameRound，2026-11-23）
+
+设计正本在 app 仓：`docs/workshop-game-design.md` §2.0（五个阶段）/ §2.5（两个榜 / 扣血 / 淘汰 / 胜者）、
+`docs/game-rules-engine.md` §5-8、`src/studio/game/rules.ts`。服务端实现：
+`src/services/gameRound.service.js`（判定唯一实现）、`src/routes/gameRoom.routes.js`（`/rounds*` 八条）、
+`src/config/gameRound.js`（常量与开关）。
+
+一回合：`creating`（各自交片）→ `screening`（全员展映 + 点赞）→ `voting`（投票 / 弃权）→
+`settled`（服务端算两个榜 + 扣血 + 淘汰）→ `next`（回合 +1，回到 `creating`）。
+
+### 数据放在房间文档的 `rounds[]` 里（不另开集合）
+
+| 字段 | 说明 |
+|---|---|
+| `rounds[].round` | 回合号，1 起。**当前回合 = 数组最后一条**，不另存指针 |
+| `rounds[].phase` | `creating` / `screening` / `voting` / `settled` |
+| `rounds[].entries[]` | `{ userId, prompt, cardNames[], videoUrl, posterUrl, placeholder, modelTier, submittedAt }`，一人一条（重复交覆盖） |
+| `rounds[].likes[]` | `{ userId, targetUserId, at }`，一人一条一次 |
+| `rounds[].votes[]` | `{ userId, targetUserId, at }`，`targetUserId: null` = 弃权（弃权也留一行，否则「全员表态」凑不齐） |
+| `rounds[].settlement` | `{ ranking[], winners[], settledAt }`；`ranking` 每行带两个榜、综合名次、扣血与最终 hp |
+
+★ 为什么内嵌：一桌 ≤8 人、一回合 ≤8 条作品，8 回合的文档也只有几十 KB（Mongo 上限 16MB）；
+而点赞 / 投票的「一人一次」要**同一份文档上的原子条件更新**才判得干净。删房间（过期懒清理 /
+最后一人退房）删的就是整份文档 —— **回合数据跟着一起没**，没有第二张表要级联。
+★ 点赞 / 投票状态放在**回合**上而不是每条作品上：判据是「这个人这一回合点过没有」，
+`{ rounds: { $elemMatch: { round, phase, "likes.userId": { $ne: uid } } } }` 能把三个条件塞进同一次原子更新。
+★ 不存用户名 / 头像：`name` 在读快照 / 结算回包时按 userId 现拼（与房间快照同一条纪律）。
+
+### 端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/api/game/rooms/:code/rounds/start` | **仅房主** | 开第 1 回合（房间 `playing` 且还没有回合）→ 回合快照 |
+| POST | `/api/game/rooms/:code/rounds/entries` | 房间成员 | 交片（一人一条、重复覆盖；只在 `creating`）→ 回合快照 |
+| GET | `/api/game/rooms/:code/rounds/current` | 房间成员 | 当前回合快照（展映 / 投票屏轮询；成员读续命） |
+| POST | `/api/game/rooms/:code/rounds/phase` | **仅房主** | `{ phase: "screening" \| "voting" }` 推进阶段 |
+| POST | `/api/game/rooms/:code/rounds/like` | 房间成员 | `{ targetUserId }` 点赞（只在 `screening`）→ 回合快照 |
+| POST | `/api/game/rooms/:code/rounds/vote` | 房间成员 | `{ targetUserId: string \| null }` 投票 / 弃权（只在 `voting`）→ 回合快照 |
+| POST | `/api/game/rooms/:code/rounds/settle` | 房主 / 全员已投后任何成员 | 两个榜 + 扣血 + 淘汰 → `{ round, phase:"settled", settlement }` |
+| POST | `/api/game/rooms/:code/rounds/next` | **仅房主** | 回合 +1、`creating`；保留历史回合；到胜者名额 → 409 `GAME_OVER` |
+
+**交片请求体**：`{ prompt: string, cardNames?: string[], videoUrl?: string, posterUrl?: string,
+placeholder?: boolean, modelTier?: string }`
+- `prompt` 必填、按**码点数** ≤ 80（与 App `PROMPT_BASE_MAX` 对齐；空 / 超长 400）；
+- `cardNames` 最多 20 个、每个 1~64 字（空数组 = 空镜，照样能交）；
+- `videoUrl` / `posterUrl` ≤ 2048 字（只挡整段 base64，不校验主机）；
+- `placeholder` 只认布尔；`modelTier` ≤ 32 字（`draft` / `hd` / `cinema`，不在这里枚举 —— 档位表在 App）。
+
+**回合快照（`GET .../rounds/current` 与交片 / 点赞 / 投票 / 阶段推进的回包，同一个形状）**：
+
+```json
+{ "ok": true, "round": 1, "phase": "screening",
+  "entries": [{ "userId": "…", "name": "…", "prompt": "…", "cardNames": ["…"],
+                "videoUrl": "…", "posterUrl": "…", "placeholder": false,
+                "likes": 2, "likedByMe": true, "votes": 1, "votedByMe": false }],
+  "allSubmitted": true, "likesPending": 1, "votesPending": 4 }
+```
+
+- `likes` / `votes` 是**计数**；`likedByMe` / `votedByMe` 是「我」视角。**谁投给谁不暴露**
+  （回包里没有 `likedBy` / `votedBy` 名单）。
+- `likesPending` / `votesPending` 是还差几个人的**数字**（不是名单），与 App `roundViewOf.pending` 同口径。
+- `deadlineAt` 今天**不发**：没有超时自动推进（见下「还没做」）。
+
+**阶段规则**：
+- `creating → screening`：房主点，且**全员已交片**；否则 409 `NOT_ALL_SUBMITTED`（带 `waitingOn` / `count` / `need`）。
+- `screening → voting`：房主点，不要求全员已点赞（可以在展映途中提前进投票）；
+- 同一阶段重复调用**幂等**回快照；
+- 点赞只在 `screening`、投票只在 `voting`；重复 / 并发点赞投票都是**幂等**（回快照，计数不涨）；
+- **不能给自己点赞 / 投票**（400 `CANNOT_LIKE_SELF` / `CANNOT_VOTE_SELF`；与 App 单机版「可以自赞」不同，
+  这是联机版拍板的口径）；投过 / 弃过都算表态，第一票作数（不静默改票）。
+
+### 结算：两个榜、综合名次、扣血（与 App 逐字一致）
+
+1. **两个榜**用竞赛排名（并列同名次：2,2,1 → 1,1,3）：`likeRank` 按点赞数、`voteRank` 按票数。
+2. `composite = likeRank + voteRank`；综合名次**不并列**，排序键依次是
+   `composite` → `voteRank` → `votes` → `likes` → `userId`（与 App `tallyRound` 完全同序）。
+3. 扣血（`config/gameRound.damageForRank`，App `rules.damageForRank` 同式）：
+
+   ```
+   base = rankFromLast < 3 ? [20, 15, 10][rankFromLast] : 5   // 0 = 最后一名
+   damage = max(5, floor(base × 人数 / 4 / 5) × 5)
+   ```
+
+   人数 = 这一期参与结算的人数。**证据（两仓同一组数）**：
+
+   | 人数 | 从好到差（第一名 → 最后一名）的扣血 |
+   |---|---|
+   | 4 | 5 / 10 / 15 / 20 |
+   | 8 | 10 / 10 / 10 / 10 / 10 / 20 / 30 / 40 |
+   | 3 | 5 / 10 / 15 |
+   | 2 | 5 / 10 |
+
+   `hp = max(0, hp - damage)`，`hp === 0` 即淘汰（不另存 eliminated 布尔）。
+4. **胜者**：`winnerTarget = min(2, 开局人数 − 1)`（4/8 人局剩 ≤2 人、**2 人局剩 1 人**）。
+   ★ 2 人局不能照字面「剩 ≤2 人」判 —— 那样开局那一刻就已经结束（App `winnerTargetOf` 同一切口）。
+5. `settle` 幂等：已 `settled` 再调回**同一份落库结果**，不会重复扣血；
+   房主可以不等全员投票就结算（他替整桌按），非房主只在全员表态后能触发（「最后一个人投完，谁点都算数」）。
+
+**结算回包**：
+
+```json
+{ "ok": true, "round": 1, "phase": "settled",
+  "settlement": {
+    "ranking": [{ "userId": "…", "name": "…", "likes": 2, "votes": 1,
+                  "likeRank": 1, "voteRank": 1, "composite": 2,
+                  "damage": 5, "hp": 95, "eliminated": false }],
+    "winners": ["…"]   // 只在剩到胜者名额时出现；空数组 = 同归于尽（平局）
+  } }
+```
+
+`ranking` 从好到差排好；`winners` 是 **userId 数组**（与 App `winnersOf` 的形状一致），
+按 hp 降序、同血按 userId 定序（settle 与下一次 `next` 的 `GAME_OVER.winners` 是同一串）。
+
+### 错误码（回合端点）
+
+| HTTP | `code` | 什么时候 |
+|---|---|---|
+| 400 | `BAD_PROMPT` / `PROMPT_TOO_LONG` | prompt 不是字符串 / 空 / 超 80 字 |
+| 400 | `BAD_CARD_NAMES` / `BAD_ENTRY_FIELD` | 卡名不是字符串数组 / 越界；videoUrl / posterUrl / placeholder / modelTier 类型或长度不对 |
+| 400 | `BAD_TARGET` | 点赞 / 投票的 `targetUserId` 不是合法 id；投票缺这个字段（弃权要显式发 `null`） |
+| 400 | `CANNOT_LIKE_SELF` / `CANNOT_VOTE_SELF` | 给自己点赞 / 投票 |
+| 400 | `BAD_PHASE` | 阶段参数不是 `screening` / `voting` |
+| 403 | `NOT_HOST` | 非房主调 start / phase / next；**或**未全员投票时非房主调 settle（带 `votesPending`） |
+| 404 | `ROOM_NOT_FOUND` | 房号不对 / 已过期（与房间端点同一个码） |
+| 404 | `TARGET_NOT_IN_ROOM` | 点赞 / 投票的对象不在这回合（非成员或已淘汰） |
+| 404 | `ROUND_NOT_FOUND` | 这间房还没开始任何回合 |
+| 409 | `ROOM_NOT_PLAYING` | 房间还在 `waiting`，不能开回合 |
+| 409 | `ROUND_ALREADY_STARTED` | 已经有回合了（`start` 是「开第 1 回合」，之后走 `next`） |
+| 409 | `NOT_ALL_SUBMITTED` | 还有人没交片，不能进 `screening` |
+| 409 | `WRONG_PHASE` | 当前阶段不允许这个动作（带 `phase` / `expected`） |
+| 409 | `NOT_IN_ROOM` / `PLAYER_ELIMINATED` | 不是房间成员 / 已淘汰的人还想交片、点赞、投票 |
+| 409 | `ROUND_NOT_SETTLED` | 上一回合没结算就 `next` |
+| 409 | `GAME_OVER` | 已剩到胜者名额（`next` 时；带 `winners`，可能为空数组 = 平局） |
+| 409 | `NO_ENTRIES` | 结算时这一回合没有任何可结算的作品（正常流程不会出现） |
+| 503 | `GAME_ROUNDS_OFF` | 这台服务器 `GAME_ROUNDS=off`（房间端点不受影响，仍是 `GAME_ROOMS` 管） |
+
+### 开关与能力位
+
+- `GAME_ROUNDS=off` 急停：`/api/game/rooms/:code/rounds*` 一律 503 `GAME_ROUNDS_OFF`，
+  `/api/ark/health` 的 `gameRounds` 报 false（App 不摆「开始回合 / 展映 / 投票 / 结算」）；
+  **房间端点照旧**（建房 / 进房 / 开局），与 `GAME_ROOMS=off` 是两件事。
+- `/api/ark/health` 新增 `gameRounds`（今天缺省 true）。读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮。
+- 房间快照的 `members[]` 新增 `hp`（开局 100；0 = 淘汰）。老房间没有这一位时按 100 读，不写迁移。
+
+### 还没做（别当成已做）
+
+- **事件三选一**（第 2/4/6 回合后的灵感爆发等，App 单机版已有）：服务端没有事件表与选择端点；
+- **超时自动推进**：没有 `deadlineAt` / 倒计时 / 托管；有人关屏，整桌就停在这一阶段（只能等他或房间过期）；
+- **断线重连 / 托管投票**：成员没有心跳，掉线的人不会自动跳过（与房间那块的已知缺口同一个）；
+- **总回合上限**：App 单机版打满 8 回合结束；服务端今天只按「剩到胜者名额」结束，没有 8 回合硬闸；
+- **推送**：仍然轮询（2~5 秒一次），WebSocket 接上时这些端点形状不变；
+- **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）。
+
+回归测试：`server/tests/gameRound.spec.js`（25 条）。
 
 ## 客户端接入约定
 
