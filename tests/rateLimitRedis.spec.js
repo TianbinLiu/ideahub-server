@@ -35,6 +35,11 @@ const PROBE_HOOK_TIMEOUT_MS = 10_000;
 let available = false;
 let probeClient = null;
 
+// ★ 本套用例会把 process.env.REDIS_URL 指向测试 Redis；Jest 的 --runInBand 下 process.env
+//   是跨测试文件共享的。跑完必须还原：否则后面的用例会意外连上 Redis、留下不会关闭的
+//   socket（Jest 打完退不出去），或者把「没有 Redis」的 gameRoomStreamShared 断言变红。
+const SAVED_REDIS_URL = process.env.REDIS_URL;
+
 beforeAll(async () => {
   let client = null;
   let budgetTimer;
@@ -74,6 +79,8 @@ beforeAll(async () => {
 }, PROBE_HOOK_TIMEOUT_MS);
 
 afterAll(() => {
+  if (SAVED_REDIS_URL === undefined) delete process.env.REDIS_URL;
+  else process.env.REDIS_URL = SAVED_REDIS_URL;
   if (probeClient) {
     try { probeClient.destroy(); } catch {}
   }

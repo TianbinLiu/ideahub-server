@@ -652,8 +652,11 @@ describe("能力位与总开关", () => {
       gameRooms: true,
       gameRoomModes: ["match4", "match8", "custom"],
       gameRoomMaxSeats: 8,
-      // SSE 推送（2026-11-23，tests/gameRoomStream.spec.js）：有 /rooms/:code/stream ≠ 跨实例实时
+      // SSE 推送（2026-11-23，tests/gameRoomStream.spec.js）：有 /rooms/:code/stream
       gameRoomStream: true,
+      // 跨实例（2026-11-24）：没有 REDIS_URL 时是 false（本套不配）；集成测试在 tests/gameRoomBusRedis.spec.js。
+      // 用 any(Boolean) 不把开发机导出的 REDIS_URL 变成假红
+      gameRoomStreamShared: expect.any(Boolean),
     });
   });
 
@@ -666,7 +669,13 @@ describe("能力位与总开关", () => {
     expect((await request(app).get("/api/game/queue").set(u.auth)).status).toBe(503);
     expect((await request(app).get("/api/game/rooms/AAAAAA").set(u.auth)).status).toBe(503);
     const h = await request(app).get("/api/ark/health").expect(200);
-    expect(h.body).toMatchObject({ gameRooms: false, gameRoomModes: [], gameRoomStream: false });
+    expect(h.body).toMatchObject({
+      gameRooms: false,
+      gameRoomModes: [],
+      gameRoomStream: false,
+      // 总开关关着时跨实例一位也必须是 false（没有流可推）
+      gameRoomStreamShared: false,
+    });
     // ★ 关对局不该顺手关掉出片扣券：同前缀的另一个路由照常
     const tickets = await request(app).get("/api/game/tickets").set(u.auth).expect(200);
     expect(tickets.body.ok).toBe(true);

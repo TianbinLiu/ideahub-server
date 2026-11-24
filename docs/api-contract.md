@@ -3506,8 +3506,9 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 
 **轮询 + SSE 推送**（2026-11-23）：所有读写端点照旧；另外有一条长连接
 `GET /api/game/rooms/:code/stream`（见「工坊对局：推送（SSE）」），建连即下发快照，之后房间 / 回合
-有变化就推。★ 推送是**单实例**的（进程内事件总线，pm2 cluster 的两个实例各推各的），客户端
-每 2~5 秒的轮询**必须保留**当作跨实例与断线的退路。`status: "playing"` 之后由**回合引擎**推进
+有变化就推。★ 推送**有 Redis 时跨实例**（2026-11-24：pub/sub，pm2 cluster 的 A 实例上的写能推到
+连在 B 上的客户端）；没有 `REDIS_URL` / Redis 连不上 / 订阅断线重连中则退回进程内广播，那段时间
+客户端每 2~5 秒的轮询是唯一退路（能力位 `gameRoomStreamShared` 见下）。`status: "playing"` 之后由**回合引擎**推进
 （见下一节「工坊对局：回合引擎」）；阶段推进仍然靠房主点 / 全员交齐 / 全员投完，服务端不自己往前推。
 
 ### 两张表
@@ -3706,15 +3707,18 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | `gameRooms` | 有 `/api/game/rooms*` 与 `/api/game/queue`。**读不到这一位 = 老服务端，App 不摆大厅入口** |
 | `gameRoomModes` | 这台服务器认哪几种模式（今天 `["match4","match8","custom"]`；`GAME_ROOMS=off` 时是 `[]`） |
 | `gameRoomMaxSeats` | 自定义房间最多几座（8）。App 只照服务端下发的摆，不在本机写死 |
-| `gameRoomStream` | 有 `GET /api/game/rooms/:code/stream`（SSE 推送，2026-11-23）。`GAME_ROOMS=off` 时 false。**读不到这一位 = 老服务端，App 只能轮询**；★ 它为 true 也**不代表跨实例实时**（见「推送」的 ★★），轮询退路不能删 |
+| `gameRoomStream` | 有 `GET /api/game/rooms/:code/stream`（SSE 推送，2026-11-23）。`GAME_ROOMS=off` 时 false。**读不到这一位 = 老服务端，App 只能轮询**。★ 它只说「有这条流」，**不代表跨实例实时**（后者看下一行） |
+| `gameRoomStreamShared` | 推送**这一刻能不能跨实例**（2026-11-24）。有 `REDIS_URL` 且 pub/sub 连接正常时 true；没有 / 连不上 / 订阅断线重连中为 false（只有本实例能收到）。**读不到这一位或为 false = App 不能删轮询**；`GAME_ROOMS=off` 时也是 false。这一位会随 Redis 恢复自己变回 true（不缓存） |
 | `gameRounds` | 有 `/api/game/rooms/:code/rounds*`（回合引擎）。`GAME_ROUNDS=off` 时 false，房间端点不受影响。**读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮** |
 | `gameEvents` | 有 `GET / POST /api/game/rooms/:code/rounds/events[/choice]`（回合间事件由服务端出题，2026-11-23）。`GAME_EVENTS_API=off` 时 false，回合引擎不受影响。**读不到这一位 = 老服务端，App 退回本机事件**（跨端会对不上） |
 
 ### 还没做（别当成已做）
 
-- **跨实例推送**：SSE 已经上了，但广播只在**本进程**（`services/gameRoomBus` 是 EventEmitter）——
-  pm2 cluster 的另一个实例上的写不会推过来，靠客户端轮询兜底。要做跨实例得引 Redis pub/sub
-  （接口不用改，换 bus 的实现即可）；
+- **跨机房 / 跨 Redis**：pub/sub 只覆盖连**同一个 Redis** 的实例。多机房要把 Redis 做主从 / 哨兵
+  或换消息总线；同一 Redis 集群内不需要改代码；
+- **消息体积 / 堆积**：消息只有 `{instanceId, room}` 几十字节（实例 id + 房号），**不带快照数据**；pub/sub 不落盘、
+  不重放，订阅者掉了就掉了（有轮询兜底）。Redis 的 `client-output-buffer-limit` 对 pub/sub 客户端
+  仍然适用 —— 将来一秒几千条时才需要考虑分片 / 按房订阅，现在一桌一次写最多推 8 个连接，远没到；
 - **断线续帧 / `Last-Event-ID`**：重连只拿最新 `snapshot`，不补断线期间漏掉的帧（客户端拿到的是一份
   完整快照，够用；真要做补帧得在服务端存一小时的帧缓冲，不值）；
 - **回合引擎的历史回合读取**：回合数据都留在 `rounds[]`，但没有读第 N 回合的端点（复盘 / 分享还没做）；
@@ -3727,7 +3731,7 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 - **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）。
 
 回归测试：`server/tests/gameRoom.spec.js`（45 条）。SSE 推送见「工坊对局：推送（SSE）」与
-`server/tests/gameRoomStream.spec.js`（16 条）。
+`server/tests/gameRoomStream.spec.js`（16 条）、跨实例见 `server/tests/gameRoomBusRedis.spec.js`（5 条）。
 
 ## 工坊对局：回合引擎（GameRound，2026-11-23）
 
@@ -3976,8 +3980,8 @@ App 只负责**应用交给它的效果**。
 - **断线重连 / 托管投票**：成员没有心跳，掉线的人不会自动跳过（与房间那块的已知缺口同一个）；
 - **总回合上限**：App 单机版打满 8 回合结束；服务端今天只按「剩到胜者名额」结束，没有 8 回合硬闸
   （所以第 2/4/6 回合之外不会再有事件 —— 事件回合是固定的三个）；
-- **推送**：回合 / 房间变化已经走 SSE（见「工坊对局：推送（SSE）」），但它是**单实例**的、也没有
-  断线续帧；客户端轮询仍是退路；
+- **推送**：回合 / 房间变化已经走 SSE（见「工坊对局：推送（SSE）」），有 Redis 时跨实例、
+  没有时退回单实例；**没有断线续帧**，客户端轮询仍是断线退路；
 - **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）；
 - **事件选择的审计读取**：`eventPicks` 落在 `rounds[]` 里，但没有「谁选了什么」的对外端点
   （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）。
@@ -3986,10 +3990,10 @@ App 只负责**应用交给它的效果**。
 
 ## 工坊对局：推送（SSE，2026-11-23）
 
-把 App 的 2 秒轮询换成服务端推送：一条长连接就能收到「房间 / 回合 / 事件 / 结束」的变化，
-轮询作为**跨实例与断线时的退路**保留。服务端实现：`src/services/gameRoomStream.service.js`
-（帧 / 快照 / 心跳 / 寿命 / 连接上限 / 清理）、`src/services/gameRoomBus.js`（进程内广播）、
-`src/routes/gameRoom.routes.js`（一条路由 + `bumpRoom` 收口）。
+把 App 的 2 秒轮询换成服务端推送：一条长连接就能收到「房间 / 回合 / 事件 / 结束」的变化。
+服务端实现：`src/services/gameRoomStream.service.js`（帧 / 快照 / 心跳 / 寿命 / 连接上限 / 清理）、
+`src/services/gameRoomBus.js`（变化总线：有 Redis 时 pub/sub 跨实例，没有时退回进程内）、
+`src/routes/gameRoom.routes.js`（一条路由 + `bumpRoom` 收口）。断线 / Redis 故障期间轮询仍是退路。
 
 ### 端点与鉴权
 
@@ -4071,18 +4075,26 @@ data: {"reason":"lifetime"}
 **收到 `error` 或 `end` 之后连接不可再用**（服务端已关闭），客户端按自己的退避策略重连；
 重连**不保证**补上断线期间的帧，但第一帧 `snapshot` 就是最新状态，够用。
 
-### ★★ 单实例限制（务必写清，别按「全服实时」用）
+### ★★ 跨实例与降级（2026-11-24 起）
 
-- 广播走**进程内** `EventEmitter`（`services/gameRoomBus.js`）：**只覆盖同一个 Node 进程里的连接**。
-  线上是 pm2 cluster（2 实例）+ nginx，nginx 不粘会话 —— A 上的写只会推给连在 A 上的订阅者，
-  连在 B 上的客户端收不到，**必须靠它自己的轮询兜底**。
-- `/api/ark/health` 的 `gameRoomStream: true` 只表示「这台服务器有这条流」，**不表示跨实例实时**。
-- 为什么不做跨实例：要跨进程就得引 Redis pub/sub（本次不新增依赖）。以后要做只换 bus 的实现
-  （`publish` / `subscribe` 签名不变），路由与帧格式都不用动。
-- 单实例内也有上限：每条连接都是一个 listener，同一间房超过 64 个订阅者会被拒（`TOO_MANY_STREAMS`），
-  正常一桌 8 人 × 2 条 = 16，够用。
-- 「每用户 2 条」与「每间房 64 个订阅者」的计数也都是**进程内**的：cluster 下同一个账号在不同实例上
-  各可开 2 条（总 4 条）。客户端本来就该只保留一条连接，这里是防泄漏 / 防刷的软闸，不是计费闸。
+- 广播走 `services/gameRoomBus.js`：
+  - 频道 `game-room:<CODE>`（与本地事件名同一个字符串；房号统一大写）；
+  - 每个实例启动时 `PSUBSCRIBE game-room:*` **一次**。★ 为什么用通配而不是按房订阅：Redis 没有
+    通配频道，单频道模式就得在订阅者 `0→1` / 归零时 SUBSCRIBE / UNSUBSCRIBE，还要维护一份
+    「本实例在看哪些房」的映射，并处理退订竞态、重连后重放这份映射；通配只多收几字节的
+    「别人房间」消息，换来无状态、新房号自动覆盖、重连由客户端库自动重放 —— 这里选简单的正确做法。
+  - `publish` **先在本进程 emit**（与改造前同一延迟），再 `PUBLISH` 到 Redis；消息体是
+    `{ instanceId, room: <CODE> }`，收到 `instanceId === 自己` 的回环直接丢掉 —— 所以**每个实例恰好分发一次**。
+    `publish` 的返回值仍是「本进程里被通知到的订阅者数」（0 不代表全服没人听）。
+  - 订阅者归零时**不退订**频道（保持简单）；收到一条「本实例没人订阅」的房号直接丢，不缓存、不补发。
+- 降级（任何一步失败都只 warn **一次**，不刷屏）：
+  - 没有 `REDIS_URL` / 连不上 / PSUBSCRIBE 失败 / 断线重连中 → `publish` 只做本地 emit，行为与
+    改造前完全一样；`/api/ark/health` 的 `gameRoomStreamShared=false`，App **必须保留轮询**；
+  - 重连交给 node-redis（上限 5 秒一次、不放弃），它会把已注册的 PSUBSCRIBE 自动重放；
+    Redis 恢复后 `gameRoomStreamShared` 自己变回 true。断线期间漏掉的帧不补（重连只拿最新快照）。
+- 上限仍是**进程内**计数：每条连接一个 listener，同一间房超过 64 个订阅者会被拒
+  （`TOO_MANY_STREAMS`），正常一桌 8 人 × 2 条 = 16；「每用户 2 条」与「每间房 64 个」也是按实例
+  计数（cluster 下同一账号在不同实例各可开 2 条）。这些是防泄漏 / 防刷的软闸，不是计费闸。
 
 ### 服务端收口：`bumpRoom()` 与 `replyWrite()`
 
@@ -4093,8 +4105,8 @@ data: {"reason":"lifetime"}
   虽然回 409，但它把房间落成了 `over`（`winners` / `finishedAt`），必须推。
 - 连接断开 / 超时 / 房间被删 / 服务端 error：`res` 的 `close` 事件统一清理（退订 + 清心跳与寿命
   定时器 + 释放每用户名额），这些都是幂等的，重复调用无副作用。
-- 连接期间每 60 秒给房间续一次命（`lastSeenAt`）：有了推送之后客户端不再轮询，不续命的话
-  `playing` 房超过 120 分钟会被懒清理删掉。
+- 连接期间每 60 秒给房间续一次命（`lastSeenAt`）：有了推送之后客户端可能不再高频轮询，
+  不续命的话 `playing` 房超过 120 分钟会被懒清理删掉。
 
 ### 测试
 
@@ -4103,6 +4115,13 @@ data: {"reason":"lifetime"}
 客户端断开 / 房间被删 / 建连失败三种清理、bus 上限与退订、帧格式纯函数。
 选型：**supertest + 真实流读取**（`app.listen(0)` + 原生 `fetch` 的 `ReadableStream`），
 不是直接调 handler —— 响应头、429 状态码、客户端断开后的清理只有走真实 HTTP 才测得到。
+
+`server/tests/gameRoomBusRedis.spec.js`（6 条）：两个独立 bus（各自一条 Redis 订阅连接）
+A publish → B 订阅者收到、A 自己的只收到一次（回环去重）；发布方本进程没人订阅也照发 Redis；
+退订 / 归零后不再收到；没人订阅时消息直接丢；无 Redis 时退回进程内 + `/api/ark/health` 的
+`gameRoomStreamShared=false`；REDIS_URL 写错 / 指向不可用端口只 warn 一次、进程不崩。
+**需要 Redis**（`REDIS_TEST_URL`，缺省 `redis://127.0.0.1:6379`），连不上时跳过并打印原因
+（CI 的 jest 带 Redis service，会真跑）。
 
 ## 客户端接入约定
 

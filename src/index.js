@@ -265,6 +265,10 @@ function setupGracefulShutdown(server) {
         await Promise.all([
           require("mongoose").disconnect(),
           require("./config/redis").quit(),
+          // 工坊对局推送的 Redis 订阅 / 发布连接（services/gameRoomBus）：退订 + 断开。
+          // ★ 单独一份连接、单独一次 quit —— 它与上面那个限流客户端不是同一个 client，
+          //   漏掉这里的话 SIGTERM 之后进程会多挂一条到 Redis 的 socket（pm2 到时强杀）。
+          require("./services/gameRoomBus").close(),
         ]);
         console.log(`已断开数据库与 Redis 连接，退出（${why}）`);
       } catch (e) {
