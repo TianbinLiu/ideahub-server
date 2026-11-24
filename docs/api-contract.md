@@ -3734,6 +3734,8 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 ★ 点赞 / 投票状态放在**回合**上而不是每条作品上：判据是「这个人这一回合点过没有」，
 `{ rounds: { $elemMatch: { round, phase, "likes.userId": { $ne: uid } } } }` 能把三个条件塞进同一次原子更新。
 ★ 不存用户名 / 头像：`name` 在读快照 / 结算回包时按 userId 现拼（与房间快照同一条纪律）。
+★ 交片里的 `videoUrl` / `posterUrl` 是用户产物，已登记进 NCII 副本检索
+（`nciiTakedown.MEDIA_SOURCES` 的 `GameRoom.rounds.entries.*`，路径穿过两层数组）。
 
 ### 端点
 
