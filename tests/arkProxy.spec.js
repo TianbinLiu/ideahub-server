@@ -1254,6 +1254,11 @@ describe("健康端点", () => {
       gameTicketPerGeneration: 1,
       // gameTicketUnlocksMedia：带券的那一发越过 minimaxV2FreeTextOnly（H3 上带图，工坊对局要挂卡出片）
       gameTicketUnlocksMedia: true,
+      // 工坊对局的房间与匹配（2026-11-23，tests/gameRoom.spec.js）：App 见不到 gameRooms:true 就不摆大厅入口；
+      // 另两位是这台服务器认哪几种模式 / 自定义房间最多几座（App 只照服务端下发的摆，不在本机写死）
+      gameRooms: true,
+      gameRoomModes: ["match4", "match8", "custom"],
+      gameRoomMaxSeats: 8,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

@@ -84,6 +84,8 @@ const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_PO
 // 工坊游戏券（2026-11-23）：`payWithTicket` 只把「这一发用券」的标记收进 req 并删掉 body 里的同名键；
 // 真正决定币种的是 gameTicket.currencyOf（唯一判据），钱的那一段序列仍在 billing 里。
 const gameTicket = require("../services/gameTicket.service");
+// 工坊对局房间与匹配（只读它的常量与总开关，能力位用；见 /health 的注释）
+const gameRoom = require("../config/gameRoom");
 const { payWithTicket } = require("../middleware/gameTicket");
 const wallet = require("../services/tokenWallet.service");
 // MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
@@ -185,6 +187,13 @@ router.get("/health", (_req, res) => {
   //     工坊对局要挂卡出片，所以 App 在「有券」时可以给没付过钱的玩家发带图的 H3-Lite。
   //     ★ 它说的是「带券时那一条限制不适用」，不是「免费版可以带图」：没券的请求照样 403 freeTextOnly。
   //  ★ 这三位放在 gameTickets 关着（GAME_TICKETS=off）时照常回：读是安全的，`gameTickets:false` 就是「别用」。
+  // 2026-11-23 的能力位（工坊对局的房间与匹配，api-contract「工坊对局房间与匹配」）：
+  //   · gameRooms：这台服务器有 /api/game/rooms* 与 /api/game/queue（建房 / 进房 / 准备 / 开局 / 匹配）。
+  //     读不到这一位 = 老服务端，App **不摆大厅入口**（与 gameTickets 同一条口径：拿不准就藏起来，
+  //     别先摆出来再吃一个 404）。
+  //   · gameRoomModes：这台服务器认哪几种模式（match4 / match8 / custom）。App 照它摆几个键，
+  //     不在本机写死 —— 哪天只开 4 人匹配，服务端收窄这一个数组就够了。
+  //   · gameRoomMaxSeats：自定义房间最多几座（今天 8）。同上，不在 App 里抄一份。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -211,6 +220,10 @@ router.get("/health", (_req, res) => {
     gameTicketMonthly: gameTicket.MONTHLY_TICKETS,
     gameTicketPerGeneration: gameTicket.TICKETS_PER_GENERATION,
     gameTicketUnlocksMedia: gameTicket.enabled(),
+    // 工坊对局的房间与匹配（2026-11-23）：能力位见上面那一段注释
+    gameRooms: gameRoom.enabled(),
+    gameRoomModes: gameRoom.enabled() ? gameRoom.MODES.slice() : [],
+    gameRoomMaxSeats: gameRoom.MAX_SEATS,
   });
 });
 
