@@ -91,6 +91,8 @@ const gameRoomBus = require("../services/gameRoomBus");
 // 工坊对局回合引擎（只读总开关，能力位用；见 /health 的注释）
 const gameRound = require("../config/gameRound");
 const gameEvent = require("../config/gameEvent");
+// 历史回合 / 战绩读取（只读总开关，能力位用；见 /health 的注释）
+const gameHistory = require("../config/gameHistory");
 const { payWithTicket } = require("../middleware/gameTicket");
 const wallet = require("../services/tokenWallet.service");
 // MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
@@ -224,6 +226,12 @@ router.get("/health", (_req, res) => {
   //     （与 gameTickets / gameRooms 同一条口径：拿不准就藏起来，别先摆出来再吃一个 400）。
   //     ★ 与 GAME_ROOMS 开关**无关**：房间关着时存量举报照样要被处理，这两位说的是举报端点认哪些类型。
   //     其余细节（entryId 从哪来、冗余上下文、404 TARGET_NOT_FOUND）见 docs/api-contract.md。
+  // 2026-11-24 的能力位（工坊对局的历史回合 / 战绩，api-contract「工坊对局：回合引擎」→「历史回合与战绩」）：
+  //   · gameHistory：这台服务器有 GET /api/game/rooms/:code/rounds/history —— 一局的**全部**回合
+  //     （交片 / 两个计数 / 结算榜）外加一份按人累加的战绩一次读全（App 的「战绩 + 每回合影片回放」）。
+  //     `GAME_HISTORY=off` 急停时 false；★ 回合引擎关着（`GAME_ROUNDS=off`）时也是 false ——
+  //     历史端点在那条闸之后注册（见 routes/gameRoom.routes.js），只关历史时 `gameRounds` 仍为 true。
+  //     读不到这一位 = 老服务端，App 不摆「战绩 / 回放」。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -264,6 +272,8 @@ router.get("/health", (_req, res) => {
     gameEvents: gameRoom.enabled() && gameRound.enabled() && gameEvent.enabled(),
     // 对局 UGC 可举报（2026-11-24）：举报端点认 targetType = "user" / "game-entry"（能力位见上面那一段）
     gameReports: true,
+    // 历史回合 / 战绩（2026-11-24）：有 GET /api/game/rooms/:code/rounds/history（能力位见上面那一段）
+    gameHistory: gameRoom.enabled() && gameRound.enabled() && gameHistory.enabled(),
   });
 });
 
