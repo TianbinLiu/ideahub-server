@@ -370,12 +370,6 @@ function createRoomBus(options = {}) {
     }
   }
 
-  /**
-   * 退出时清理：退订 + 断开两条连接（幂等）。
-   * ★ 先 pUnsubscribe 再 quit：让 Redis 立刻知道这个实例不再收了；quit 失败（连接已经断了 /
-   *   对端不答）就 destroy，别让优雅退出卡在关闭一条已经没救的 socket 上。
-   * ★ close 之后 isShared() 恒为 false，publish 仍可本地分发（幂等收尾时不再指望 Redis）。
-   */
   /** 带超时的 await：退出一刻 Redis 可能正在重连，不能让 shutdown 卡在一条没救的 socket 上 */
   function withTimeout(promise, timeoutMs) {
     let timer;
@@ -388,6 +382,12 @@ function createRoomBus(options = {}) {
     ]).finally(() => clearTimeout(timer));
   }
 
+  /**
+   * 退出时清理：退订 + 断开两条连接（幂等）。
+   * ★ 先 pUnsubscribe 再 quit：让 Redis 立刻知道这个实例不再收了；quit 失败（连接已经断了 /
+   *   对端不答）就 destroy，别让优雅退出卡在关闭一条已经没救的 socket 上。
+   * ★ close 之后 isShared() 恒为 false，publish 仍可本地分发（幂等收尾时不再指望 Redis）。
+   */
   async function close() {
     if (closed) return;
     closed = true;
