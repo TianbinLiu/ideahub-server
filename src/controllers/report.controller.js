@@ -9,9 +9,16 @@ const BranchVideo = require("../models/BranchVideo");
 const BranchComment = require("../models/BranchComment");
 const BranchDanmaku = require("../models/BranchDanmaku");
 const Persona = require("../models/Persona");
+// 对局里的两类靶子（user / game-entry，2026-11-24）：存在性 + 受理时落的冗余上下文只有这一份判据
+const {
+  GAME_REPORT_TARGET_TYPES,
+  resolveGameReportTarget,
+  targetPayloadsOfUsers,
+  targetPayloadsOfGameEntries,
+} = require("../services/gameReport.service");
 const AppError = require("../utils/AppError");
 const CODES = require("../utils/errorCodes");
-const { invalidId, notFound } = require("../utils/http");
+const { invalidId, notFound, failWith } = require("../utils/http");
 
 const USER_FIELDS = "_id username displayName avatarUrl";
 
@@ -81,6 +88,24 @@ function toUserPayload(user) {
 }
 
 /**
+ * 受理时抄下的上下文（只有 `user` / `game-entry` 两类，见 models/Report.js 的 targetContextSchema）。
+ * ★ 形状固定：两类都回全部六个键（不适用的给空串 / null），管理端不用先判"这类有没有这一格"。
+ *   ★ 但**整格**在其它四种类型上是 `null` —— `null`（没有这份上下文）与"有上下文、字段全空"
+ *   是两件事，代码里别用 `|| {}` 把它们抹平。
+ */
+function toTargetContextPayload(ctx) {
+  if (!ctx) return null;
+  return {
+    offenderUserId: ctx.offenderUserId ? String(ctx.offenderUserId) : null,
+    roomCode: ctx.roomCode || "",
+    round: typeof ctx.round === "number" ? ctx.round : null,
+    entryId: ctx.entryId ? String(ctx.entryId) : null,
+    prompt: ctx.prompt || "",
+    videoUrl: ctx.videoUrl || "",
+  };
+}
+
+/**
  * 一条举报。
  * ★ `status` 兜一层 `|| "pending"`：这一列是 required + default，理论上不会缺，
  *   但对外的形状不该依赖"理论上"——客户端按 `!== "pending"` 判已处理，
@@ -92,6 +117,9 @@ function toReportPayload(doc, ctx = {}) {
     _id: doc._id,
     targetType: doc.targetType,
     targetId: doc.targetId,
+    // 受理时抄下的现场（user / game-entry 才有；其它类型 null）。★ 与下面管理端现查的
+    // `target` 是两件事：那份是"现在还在不在"，这份是"报的时候是什么"（房间过期就只剩它）。
+    targetContext: toTargetContextPayload(doc.targetContext),
     reason: doc.reason,
     detail: doc.detail || "",
     status: doc.status || "pending",
@@ -113,7 +141,7 @@ function toReportPayload(doc, ctx = {}) {
 /**
  * POST /api/branch/reports
  *
- * ★★ 这里**刻意不校验被举报对象存在 / 当前用户看不看得见**。
+ * ★★ 这里**刻意不校验被举报对象存在 / 当前用户看不看得见**（video / comment / danmaku / persona 四类）。
  *   任何"存在就 201、不存在就 404"的写法，都会把这条端点变成一个探测私密作品的旁路
  *   —— 拿一串 id 挨个试，凭状态码就能把库里有哪些作品、哪条评论属于哪条作品数出来
  *   （与 assertVisible 挡的是同一类旁路，那边为此把 403 全改成了 404）。
@@ -124,6 +152,17 @@ function toReportPayload(doc, ctx = {}) {
  *     ③ 管理端**现查**对象，查不到就如实标 `target.exists = false`，一眼能筛掉。
  *   顺带还避免了在这里抄第三份可见性规则（铁律六）——那份规则收在
  *   branchVideo.controller 的 visibilityFilter/visibleTo 里，这里够不着，也不该够得着。
+ *
+ * ★★ 2026-11-24 加的两类（`user` / `game-entry`）**反过来必须校验存在**（404 TARGET_NOT_FOUND）。
+ *   不是把上面那条规矩推翻，而是它们本来就不适用：
+ *   · 靶子是一枚裸 ObjectId，身后没有"可见性规则"这一层可抄（玩家在房间快照里本来就看得见；
+ *     投稿的 entryId 就在同一份快照里）；
+ *   · `game-entry` 受理时要**落一份冗余上下文**（roomCode / round / offenderUserId / prompt / videoUrl，
+ *     见 models/Report.js 的 targetContextSchema）—— 查不到就没有现场可落，那还不如当场说 404，
+ *     别让队列里多一条什么也答不出的死条目；
+ *   · `user` 的存在性在公开资料页（GET /api/users/:id）本来就能问到，这里不多给一个字节。
+ *   校验放在**去重预检之后**：重复举报的老口径是 409（带首次那条 reportId），
+ *   不该因为靶子在这期间被删/过期就突然变成 404（那会让客户端把"已受理过"显示成"没报上"）。
  */
 async function createReport(req, res, next) {
   try {
@@ -145,6 +184,19 @@ async function createReport(req, res, next) {
       });
     }
 
+    // 对局里的两类：靶子必须存在（见函数头 ★★），并抄下服务端此刻看到的现场
+    let targetContext = null;
+    if (GAME_REPORT_TARGET_TYPES.includes(targetType)) {
+      const resolved = await resolveGameReportTarget(targetType, targetId);
+      if (!resolved) {
+        throw failWith(404, "TARGET_NOT_FOUND", `Report target not found: ${targetType}`, {
+          targetType,
+          targetId: String(targetId),
+        });
+      }
+      targetContext = resolved.context;
+    }
+
     let doc;
     try {
       doc = await Report.create({
@@ -153,6 +205,7 @@ async function createReport(req, res, next) {
         targetId,
         reason,
         detail: detail || "",
+        targetContext,
       });
     } catch (err) {
       // 两次点击几乎同时到达：上面的预检双双扑空，唯一索引在这里兜底
@@ -179,7 +232,8 @@ async function createReport(req, res, next) {
 /**
  * 把这一页举报指向的对象**现查**出来。
  *
- * ★ 按类型分三批查，不是逐条查：一页 20 条就是 20 次往返。
+ * ★ 按类型**分批**查，不是逐条查：一页 20 条就是 20 次往返。
+ *   （2026-11-24 起六类：四种内容 + `user` / `game-entry` 两种人 / 投稿。）
  * ★ 查不到一律给 `{ exists: false }`，**不是**把这一项省掉 —— 省掉的话管理端分不出
  *   "对象已经没了"和"我们忘了查"（铁律八）。作者自己删掉、或已经被下架过，都会走这条。
  * ★★ 弹幕这一项会带出 `author`。这是**整个系统里唯一**一处透出弹幕作者的地方，
@@ -187,9 +241,11 @@ async function createReport(req, res, next) {
  *   这条例外成立的前提是**这个端点整条挂在 requireRole("admin") 后面** ——
  *   哪天把列表端点放开给普通用户（比如做"我的举报"），必须先把这个字段摘掉，
  *   否则举报一次就能查出某条弹幕是谁发的，整面弹幕墙都被去匿名化了。
+ * ★ `user` / `game-entry` 不受上面那条弹幕例外约束：被举报的玩家与投稿人在对局快照里
+ *   本来就对同房的人可见（快照里带着 userId / name），这里只是把名字现拼出来。
  */
 async function resolveTargets(rows) {
-  const idsByType = { video: [], comment: [], danmaku: [], persona: [] };
+  const idsByType = { video: [], comment: [], danmaku: [], persona: [], user: [], "game-entry": [] };
   for (const r of rows) {
     if (idsByType[r.targetType]) idsByType[r.targetType].push(r.targetId);
   }
@@ -197,7 +253,7 @@ async function resolveTargets(rows) {
   const out = new Map(); // `${type}:${id}` → payload
   const put = (type, id, payload) => out.set(`${type}:${String(id)}`, payload);
 
-  const [videos, comments, danmaku, personas] = await Promise.all([
+  const [videos, comments, danmaku, personas, users, gameEntries] = await Promise.all([
     idsByType.video.length
       ? BranchVideo.find({ _id: { $in: idsByType.video } })
           // ★ `revision` / `revisedAt`：让复核的人知道「这条作品被回炉重做过 N 次」。
@@ -226,6 +282,10 @@ async function resolveTargets(rows) {
           .populate("author", USER_FIELDS)
           .lean()
       : [],
+    // 对局里的两类（2026-11-24）：查询与形状都在 services/gameReport.service 一处
+    // （受理时落上下文用的是同一份判据）。查不到就是空 Map → 下面 put 不进去 → exists:false。
+    targetPayloadsOfUsers(idsByType.user),
+    targetPayloadsOfGameEntries(idsByType["game-entry"]),
   ]);
 
   for (const v of videos) {
@@ -287,6 +347,12 @@ async function resolveTargets(rows) {
       createdAt: p.createdAt,
     });
   }
+
+  // 对局里的两类（2026-11-24）：目标形状由 services/gameReport.service 给（与受理时同一份判据）。
+  // ★ 这两类都**没有** `author` 那一格：user 的靶子就是人本身（userId / username 直接给），
+  //   game-entry 给的是 `userId` + `username`（投稿人）。查不到就不 put → 上层落 `{exists:false}`。
+  for (const [id, payload] of users) put("user", id, payload);
+  for (const [id, payload] of gameEntries) put("game-entry", id, payload);
 
   return out;
 }

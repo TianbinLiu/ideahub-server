@@ -85,6 +85,11 @@ const NOT_USER_MEDIA = {
   // 移除请求**自己**的字段：`urls` 是请求人给我们的链接、`removed[].url` 是处置留痕。
   // 它们不是我们托管的影像 —— 把它们收进检索，结果会是「请求指向请求自己」。
   TakedownRequest: ["urls", "url"],
+  // 举报受理时从服务端库里抄下的现场（2026-11-24，`targetContext.videoUrl`，只有 user / game-entry
+  // 两类有）：它指向的是**别人的**媒体 —— 那条视频的落点 `GameRoom.rounds.entries.videoUrl` 已经登记，
+  // 这一格只是引用副本（房间过期整份删掉之后还给管理员留个现场），没有独立可访问的资产。
+  // 列进 MEDIA_SOURCES 的话，检索结果里会多出一堆指向同一条视频的举报行，反而不好处置。
+  Report: ["videoUrl"],
 };
 
 /**

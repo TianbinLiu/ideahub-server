@@ -1,9 +1,9 @@
 // src/models/Report.js
-// 用户举报：视频 / 评论 / 弹幕三种对象共用一张表。
+// 用户举报：视频 / 评论 / 弹幕 / 人格 / 玩家 / 对局投稿六种对象共用一张表。
 //
-// ★ 为什么三种对象共一张表而不是三张：举报的**处理流程**只有一条（待处理 → 下架 / 驳回），
-//   管理员要的是"一个按时间排的待处理队列"。拆成三张表，那个队列就得三查一合再排序，
-//   分页游标也没法统一 —— 而三者在这条流程里的差别只有"删的时候删哪张表"。
+// ★ 为什么这些对象共一张表而不是各一张：举报的**处理流程**只有一条（待处理 → 下架 / 驳回），
+//   管理员要的是"一个按时间排的待处理队列"。拆成几张表，那个队列就得几查一合再排序，
+//   分页游标也没法统一 —— 而它们在这条流程里的差别只有"删的时候删哪张表"。
 //
 // ★ `targetId` 上**故意不写 ref**：mongoose 的 ref 只能指向一个 model，而这一列
 //   同时装着 BranchVideo / BranchComment / BranchDanmaku 的 _id。写死任意一个都会让
@@ -14,6 +14,12 @@
 //   ① 快照只能来自举报者的请求体 —— 那是外部输入，伪造一段脏话栽赃谁都做得到；
 //   ② 管理员处理时要看的是**现在**的内容（作者可能已经自己删了/改了标题）。
 //   所以正文由管理端**现查**，查不到就如实标 `target.exists = false`（铁律八）。
+// ★ 唯一例外是下面的 `targetContext`（2026-11-24，只给 `user` / `game-entry` 两类）：
+//   它**仍然不接受请求体里的任何一份** —— 是服务端在受理那一刻从自己的库里抄的。
+//   为什么这两类非得留一份：对局的房间文档会随过期懒清理整份删掉（见 GameRoom 文件头），
+//   投稿的提示词 / 成片地址到管理员打开队列时可能已经**无从现查**，而"报的是哪条投稿、
+//   谁交的、交了什么"正是复核唯一能看的东西。存的是"我们当时看到的那一条"，
+//   与"用户递来的快照"是两回事；管理端仍然优先显示现查到的 target。
 const mongoose = require("mongoose");
 
 /**
@@ -21,7 +27,15 @@ const mongoose = require("mongoose");
  * 新增取值必须同步 docs/api-contract.md「举报」与 App 的提交入口。
  */
 // 2026-09-28 加 "persona"（治理 P5：人格线此前没有任何下架端点）；处理器在 services/takedown.service.js 的 registry 里，两处一致由 tests/takedownRegistry.spec.js 钉住
-const TARGET_TYPES = ["video", "comment", "danmaku", "persona"];
+// ★ 2026-11-24 加 "user" 与 "game-entry"（工坊对局里的两类用户内容）：
+//   · "user"        —— 玩家本人（昵称 / 头像 / 局内行为），targetId 是 users._id；
+//   · "game-entry"  —— 一回合的一条投稿（提示词 + 生成的影片 + 卡名），targetId 是
+//     GameRoom.rounds[].entries[].entryId（那个 id 就是为举报补的，见 models/GameRoom.js）。
+//   这两类**必须校验靶子存在**（404 TARGET_NOT_FOUND），与下面 video/comment/danmaku/persona
+//   「刻意不校验」不是同一条规矩 —— 理由写在 controllers/report.controller.js 的 createReport 头上。
+//   ⚠ 它们的「处置」本轮没做（管理端只有 dismissal）：注册表里两格都是 noTakedown/noDelete，
+//   管理员点下架会收到一句人话的 400，而不是假装办成了。
+const TARGET_TYPES = ["video", "comment", "danmaku", "persona", "user", "game-entry"];
 
 /**
  * 理由分类。★ 存的是**英文 key**，中文文案在客户端。
@@ -91,12 +105,51 @@ const ACTIONS = Object.keys(ACTION_STATUS);
  */
 const STATUSES = ["pending", ...Object.values(ACTION_STATUS)];
 
+/**
+ * 受理 `user` / `game-entry` 举报时，服务端**从自己的库里**抄下来的上下文（见文件头 ★ 唯一例外）。
+ * 其它四种类型这一格一直是 `null`（它们的正文由管理端现查，查不到就 exists:false）。
+ *
+ * ★ 字段名是跨仓契约的一部分（docs/api-contract.md「举报 · 对局里的两类对象」）：
+ *   · `user`        —— 只有 `offenderUserId`；
+ *   · `game-entry`  —— 六个全有：`roomCode` / `round` / `entryId` / `offenderUserId` /
+ *     `prompt`（截断，见 services/gameReport.service 的 PROMPT_SNAPSHOT_MAX）/ `videoUrl`。
+ *   ★ 冗余存 `entryId`（与 targetId 相同）不是笔误：管理员一眼要看出"报的是哪条投稿"，
+ *     而 targetId 是混着六种 id 的一列（没有 ref，见文件头 ★）。
+ * ★ 为什么不给 `roomCode` / `round` 上 ref 或外键：房间会被整份删掉，这一格**故意**是孤儿数据 ——
+ *   它存在的理由就是"靶子没了之后还答得出当时报的是什么"。
+ */
+const targetContextSchema = new mongoose.Schema(
+  {
+    /** 被举报的人（两类都有；`user` 类就是靶子本身，`game-entry` 类是投稿人） */
+    offenderUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    /** 对局房号（`game-entry` 才有；房间删了也留着） */
+    roomCode: { type: String, default: "" },
+    /** 回合号（`game-entry` 才有） */
+    round: { type: Number, default: null },
+    /** 回合投稿的稳定 id（`game-entry` 才有；与 targetId 相等） */
+    entryId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /** 投稿提示词（`game-entry` 才有；**截断**存，完整正文由管理端现查） */
+    prompt: { type: String, default: "" },
+    /** 成片地址（`game-entry` 才有；占位片是 null，这里归一成空串） */
+    videoUrl: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+
 const reportSchema = new mongoose.Schema(
   {
     reporter: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
 
     targetType: { type: String, enum: TARGET_TYPES, required: true },
     targetId: { type: mongoose.Schema.Types.ObjectId, required: true },
+
+    /**
+     * 受理时抄下的上下文（`user` / `game-entry` 才有，见上面的 targetContextSchema 与文件头 ★）。
+     * ★ 缺省就是 `null`（不是空对象）：老数据 / 其它四种类型从来没有这一格，
+     *   `null` 与"有上下文但字段全空"必须是两种不同的形状，管理端据此决定要不要画那一块。
+     */
+    targetContext: { type: targetContextSchema, default: null },
 
     reason: { type: String, enum: REASONS, required: true },
 

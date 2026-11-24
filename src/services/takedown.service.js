@@ -22,6 +22,10 @@
 //
 // ★ 人格（persona）只有 takedown 没有 delete：人格是作者的资产（别人可能已下载 / 已购），下架 = shared:false + takenDown:true 就足够把它从市场与他人视野里摘掉；
 //   要删由作者自己 DELETE /api/personas/:id。作者看得见 takenDownReason、看不见 takenDownBy（docs/02 6.6）。
+// ★ 2026-11-24 加的两类（对局里的 user / game-entry）**两格都空**，只有一句人话的 400：
+//   它们本轮只做「受理 + 人工核实」，处置正文不在这一轮（深做后台不在本轮）。详见各自注册项的 ★。
+//   ⚠ 注册项本身不能省：tests/takedownRegistry.spec.js 钉住「Report.TARGET_TYPES 里每一种都有处理器」，
+//   少了的表现是管理员点下架得到一句"Unsupported target type"（认不出的类型），而不是"这类没有那种处置"。
 const mongoose = require("mongoose");
 const BranchVideo = require("../models/BranchVideo");
 const BranchComment = require("../models/BranchComment");
@@ -80,11 +84,36 @@ const HANDLERS = {
       return done("takedown", "persona", targetId);
     },
   },
+  /**
+   * 玩家本人（2026-11-24，工坊对局的举报 `user`）。
+   * ★ 两格都空**不是漏写**：账号处置与内容处置是两条线（见 User.banned 头上那段 ★★）。
+   *   「把这条举报标成 taken_down」在这一类上没有可对应的东西 —— 封人走
+   *   POST /api/admin/branch/users/:id/ban（那条路不碰举报队列），删号是用户自己的权利。
+   *   管理员对这类举报要做的只有驳回；想封人就去封人。这里如实 400，绝不假装办成了。
+   */
+  user: {
+    noTakedown:
+      "「用户」没有下架这种处置：封人走 POST /api/admin/branch/users/:id/ban（与内容处置分开，见 User.banned）；这条举报请用 action=dismiss 收尾。",
+    noDelete: "举报不提供删号：删号由用户本人发起，或走 POST /api/admin/branch/users/:id/ban 封禁。",
+  },
+  /**
+   * 对局回合投稿（2026-11-24，`game-entry`）。
+   * ★ 本轮只做「受理 + 人工核实」：投稿内嵌在房间文档的 rounds[].entries[] 里（过期整份删），
+   *   没有独立的隐藏位；而在本轮删一条投稿会打乱「全员已交片 / 已点赞 / 已投票」这些判定
+   *   （allSubmitted / likesPending / 结算榜单都按参与人算），所以不下发 takedown / delete 两格。
+   *   管理员用 action=dismiss 收尾；要动内容就整房处理（过期懒清理，见 GameRoom 文件头）。
+   */
+  "game-entry": {
+    noTakedown:
+      "回合投稿本轮没有可撤销的下架：它跟着房间文档走（没有独立隐藏位），删一条会打乱「全员已交片」等回合判定；请用 action=dismiss 收尾。",
+    noDelete:
+      "回合投稿本轮不提供硬删除：删一条会打乱「全员已交片」等回合判定（房间过期会整份清理）；请用 action=dismiss 收尾。",
+  },
 };
 
 /**
  * 处置一个被举报的对象。
- * @param {"video"|"comment"|"danmaku"|"persona"} targetType
+ * @param {"video"|"comment"|"danmaku"|"persona"|"user"|"game-entry"} targetType
  * @param {string} targetId
  * @param {string} operatorId 处理这条举报的管理员
  * @param {string} reason     给作者看的原因（作品与人格的下架用得上：会原样显示给作者）

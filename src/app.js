@@ -157,7 +157,7 @@ app.use("/api/auth", oauthRoutes);
 app.use("/api/me", meRoutes);
 app.use("/api/company", companyRoutes);
 app.use("/api/notifications", notificationsRoutes);
-// 举报（视频 / 评论 / 弹幕）。两个入口、一份实现（见 routes/report.routes.js）：
+// 举报（视频 / 评论 / 弹幕 / 人格 / 玩家 / 对局投稿）。两个入口、一份实现（见 routes/report.routes.js）：
 // 用户提交挂在 /api/branch 下，管理端的列队与处理挂在既有的 /api/admin 门后面。
 // ★ 管理端这条**必须排在 `app.use("/api/admin", adminRoutes)` 之前**：admin.routes.js
 //   开头就是 `router.use(requireAuth, requireRole)`，排在它后面的话每个请求会白白

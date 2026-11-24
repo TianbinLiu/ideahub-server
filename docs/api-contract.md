@@ -780,9 +780,17 @@ B 站式弹幕：一句话 + 它该在**视频第几秒**飘过去。与评论�
 
 > **2026-09-28（老师人格 M2，治理 P5）**：`targetType` 加 `persona`（人格线此前没有任何下架端点）；理由加 `instructorClaim`（教授认领 / 要求下架，**人工核实**再处置；App 的 `REPORT_REASONS` 还没有它 —— 服务端先上，老版本只是少一项可选）。处置走 `services/takedown.service.js` 的 **registry**（按 targetType 注册，不再往 if-chain 加分支）；`instructorClaim` 另有**人工核实队列**（`GET/POST /api/tutor/admin/claims…`，见「老师人格」一节末尾），与这条通用队列同一张表、同一份处置正文（`services/reportResolve.service.js`，2026-09-29 从 `resolveReport` 抽出）：`persona` 只有 `takedown`（写 `Persona.takenDown:true, shared:false, takenDownAt / takenDownReason / takenDownBy`；作者看得见原因、看不见处置人；下架后作者不能再 `PUT { shared:true }`，`/api/tutor/market` 与详情对非作者 404，也不能再发布），`delete` 一律 400（人格是作者的资产，要删由作者自己 `DELETE /api/personas/:id`）。管理端列表的 `target` 多一种形状 `{ exists, personaId, name, kind, shared, takenDown, takenDownReason, author, createdAt }`。
 
-能举报**三种对象**：作品（`video`）、评论（`comment`）、弹幕（`danmaku`）。
-三者共用一张 `Report` 表与同一条处理流程（待处理 → 下架 / 删除 / 驳回）——
-管理端要的是"一个按时间排的待处理队列"，拆三张表那个队列就得三查一合再排序。
+能举报**六种对象**：作品（`video`）、评论（`comment`）、弹幕（`danmaku`）、人格（`persona`）、
+玩家（`user`，工坊对局里的玩家本人）、回合投稿（`game-entry`，工坊对局一回合的一条投稿）。
+六者共用一张 `Report` 表与同一条处理流程（待处理 → 下架 / 删除 / 驳回）——
+管理端要的是"一个按时间排的待处理队列"，拆成六张表那个队列就得六查一合再排序。
+
+★ `user` / `game-entry` 是 2026-11-24 加的（工坊对局里的两类 UGC；App 那格举报键靠它们点亮），
+  与其余四种有三处不同：**靶子必须存在**（404 `TARGET_NOT_FOUND`）、受理时**多存一份上下文**
+  （`targetContext`）、**后台本轮没有处置动作**（管理员只能 `dismiss`）。见下面
+  「对局里的两类对象（`user` / `game-entry`）」。
+
+`persona` 见下面「老师人格」一节里的治理说明（2026-09-28 加）；`user` / `game-entry` 见下一节。
 
 ### 端点
 
@@ -827,6 +835,7 @@ B 站式弹幕：一句话 + 它该在**视频第几秒**飘过去。与评论�
 ```
 {
   _id, targetType, targetId,
+  targetContext: {…} | null,           // 只有 user / game-entry 有，其余 null（见「对局里的两类对象」）
   reason, detail,                      // detail 可空串
   status,                              // 见下「状态机」
   reporter: { _id, username, displayName, avatarUrl },
@@ -958,7 +967,7 @@ pending ─────────┼─ action=delete   ─▶ deleted      �
 长窗才是硬顶。唯一索引只保证"同一个人对同一个对象一次"，**挡不住**"一个人举报一千个不同对象"
 —— 那正是这两个桶存在的理由。
 
-### ★★ 提交端点**不校验对象存在 / 可见**
+### ★★ 提交端点**不校验对象存在 / 可见**（`user` / `game-entry` 两类除外）
 
 举报一个根本不存在的 id 也会 **201**。这是刻意的：任何"存在就 201、不存在就 404"的写法，
 都会把这条端点变成一个**探测私密作品的旁路**——拿一串 id 挨个试，凭状态码就能把库里
@@ -969,19 +978,24 @@ pending ─────────┼─ action=delete   ─▶ deleted      �
 垃圾举报由三样兜住：① 唯一索引；② 上面两个限流桶；③ 管理端**现查**对象，
 查不到就如实标 `target.exists = false`，一眼能筛掉。
 
+★ **例外**（2026-11-24）：`user` / `game-entry` **要**校验靶子存在，不存在回 **404
+`TARGET_NOT_FOUND`**。理由与上面不冲突 —— 见下节。
+
 ★ 同理，请求体里**不收 `videoId`**（发了会被 zod strip 掉）。那是外部输入，伪造一个
 别的作品 id 就能让管理员点去看错误的现场；评论/弹幕属于哪条作品由服务端按 `targetId`
 **现查**，那份才是权威的（结果在 `target.videoId` 里回给管理端）。
-
 ### `target` 是**现查**的，不是快照
 
-管理端列表里每条举报会把被举报对象**当场查出来**（按 `targetType` 分三批查，不是逐条）：
+管理端列表里每条举报会把被举报对象**当场查出来**（按 `targetType` 分批查，不是逐条）：
 
 | targetType | `target` 字段 |
 |---|---|
 | `video` | `{ exists, videoId, title, cover, visibility, takedown, author, createdAt }` |
 | `comment` | `{ exists, videoId, text, author, createdAt }` |
 | `danmaku` | `{ exists, videoId, text, at, author, createdAt }` |
+| `persona` | `{ exists, personaId, name, kind, shared, takenDown, takenDownReason, author, createdAt }` |
+| `user` | `{ exists, userId, username, displayName, avatarUrl, banned, deactivated, createdAt }` |
+| `game-entry` | `{ exists, entryId, roomCode, round, userId, username, prompt, cardNames, videoUrl, posterUrl, placeholder, submittedAt }` |
 
 - 查不到一律给 `{ exists: false }`。★ 用**必给的布尔** `exists`，不用"缺省即正常"的
   `missing?`：后者一旦服务端漏给这一项，客户端读到 `undefined` → falsy → 显示成
@@ -992,16 +1006,84 @@ pending ─────────┼─ action=delete   ─▶ deleted      �
   由 server `branchVideo.controller` 的 `isTakenDown` 一处说了算，在举报这边再写一遍
   就是第三份判断（铁律六）。⚠ 队列里出现"已下架但还有待处理举报"是正常的 ——
   管理员也可以走 `POST /api/admin/branch/videos/:id/takedown` 直接下架，那条路不碰举报队列。
-- **不存快照**。快照只能来自举报者的请求体（外部输入，伪造一段脏话栽赃谁都做得到），
-  而管理员要看的本来就是**现在**的内容。
-- `Report.targetId` 上**没有 `ref`**：一列同时装三张表的 `_id`，写死任意一个都会让
-  populate 在另外两种类型上**静默返回 null**（不报错，对象凭空消失）。解引用按类型分派。
+- **不存快照**。唯一例外是 `user` / `game-entry` 的 `targetContext` —— 那是**服务端**从自己
+  库里抄的，不是举报人递的（见下节）。用户提交的快照不能收：那是外部输入，伪造一段脏话
+  栽赃谁都做得到；而管理员要看的本来就是**现在**的内容。
+- `Report.targetId` 上**没有 `ref`**：一列同时装六种靶子的 `_id`，写死任意一个都会让
+  populate 在另外几种类型上**静默返回 null**（不报错，对象凭空消失）。解引用按类型分派。
 
 ★★ **弹幕这一项会带出 `author`** —— 弹幕的作者是**存了的**（`BranchDanmaku.author`），
 只是对普通用户从不透出（见上「弹幕」：对外只有一个 `mine` 布尔）。
 这里是全系统**唯一**一处把它露出来的地方，成立的前提是**整个列表端点挂在
 `requireRole(ADMIN_ROLE)` 后面**。哪天把它放开给普通用户（比如做「我的举报」），
 **必须先把这个字段摘掉**，否则举报一次就能查出某条弹幕是谁发的，整面弹幕墙都被去匿名化了。
+
+★ `user` / `game-entry` 这两类**不受上面那条弹幕例外约束**：被举报的玩家与投稿人在对局快照里
+本来就对同房的人可见（快照带着 `userId` / `name`），这里只是把名字现拼出来。
+
+### 对局里的两类对象（`user` / `game-entry`，2026-11-24）
+
+工坊对局里会产生两类用户内容，而此前它们都没有可递的 id：
+
+| targetType | targetId 是什么 | 靶子从哪来 |
+|---|---|---|
+| `user` | `users._id` | 房间快照 `members[].userId`（公开资料页也看得到） |
+| `game-entry` | 回合投稿的 `entryId`（24-hex ObjectId） | `GET /api/game/rooms/:code/rounds/current` 的 `entries[].entryId` |
+
+**`entryId` 是 2026-11-24 新加的**：`POST /api/game/rooms/:code/rounds/entries` 首次交片时生成，
+**覆盖提交保持不变**（内容替换、`submittedAt` 刷新，id 不变）。客户端**不许**自带这个字段
+（服务端说了算），也**不要**拿 `(回合, userId)` 自己拼。老房间（上线前交的片）快照里这一格是
+`null`，重交一次才有 —— 房间最多活 2 小时，不留迁移。
+
+**请求**：与其它类型同一条端点、同一个请求体 `{ targetType, targetId, reason, detail? }`。
+
+**校验（与其余四种相反）**：靶子必须存在 —— `user` 查 `users`，`game-entry` 在某个
+`gamerooms.rounds[].entries[]` 里找得到；否则：
+
+```
+404 { ok:false, code:"TARGET_NOT_FOUND", message:"Report target not found: <type>",
+      details:{ targetType, targetId } }
+```
+
+★ 为什么这两类反过来必须校验：靶子是一枚裸 ObjectId，身后没有可见性规则可抄；而 `game-entry`
+受理时要落一份上下文，查不到就没得落 —— 与其在队列里多一条什么也答不出的死条目，不如当场 404。
+★ 顺序：**去重预检在存在性校验之前**。同一个人重复举报同一个靶子照旧 **409 `DUPLICATE`**
+（带首次的 `reportId`），哪怕这个靶子在这期间已经被删 / 过期 —— 反过来会让客户端把
+"已受理过"显示成"没报上"。
+
+**响应里多一格 `targetContext`**（`user` / `game-entry` 才有；其余四种是 `null`；
+两类都回全部六个键，不适用的给空串 / `null`）：
+
+```json
+"targetContext": {
+  "offenderUserId": "…",   // 被举报的人（两类都有；game-entry 是投稿人）
+  "roomCode": "ABC123",    // 对局房号（user 类为空串）
+  "round": 1,              // 回合号（user 类为 null）
+  "entryId": "…",          // 回合投稿的 entryId（与 targetId 相同；user 类为 null）
+  "prompt": "…",           // 投稿提示词（截断到 200 码点；正常投稿 ≤80 字不会被切）
+  "videoUrl": "…"          // 成片地址（占位片为空串）
+}
+```
+
+★ 这是**服务端在受理那一刻从自己的库里抄的**，不接受请求体里的任何一份（同名键会被 zod
+strip 掉）：能递的话，伪造一段脏话栽赃谁都做得到（见上「`target` 是现查的」那段的 ★）。
+★ 为什么要存：房间过期懒清理会把**整份文档一起删**（`models/GameRoom.js` 文件头），到管理员
+打开队列时投稿的提示词 / 成片地址可能已经无从现查；`targetContext` 就是那份现场。
+管理端仍然优先显示现查到的 `target`。
+
+**后台处置本轮不深做**：这两类 `action=takedown` / `action=delete` 都回 **400** 一句人话
+（`services/takedown.service.js` 注册表里两格是空的：`user` 的封人走
+`POST /api/admin/branch/users/:id/ban`，与内容处置分开；`game-entry` 没有独立隐藏位，
+删一条会打乱「全员已交片 / 已投票」的判定）。现阶段的收尾动作只有 `action=dismiss`。
+★ 这是**故意不降级**：假装下架成功会让举报记录写着 `taken_down` 而内容还在（与评论 / 弹幕
+那条同一条理由）。
+
+**能力位**：`GET /api/ark/health` 的 `gameReports: true`。App 见不到这一位（老服务端）就
+**不摆那两格举报键** —— 别先摆出来再吃一个 400。
+
+回归测试：`server/tests/gameReport.spec.js`（10 条：两类受理与上下文 / 404 / 409 / 截断 /
+管理端两页与房间清理后的上下文 / 处置 400 / 能力位）+ `tests/gameRound.spec.js` 的
+"`entryId` 覆盖提交不变"那一条。
 
 ### 「下架 / 删除」调另一条线的服务，举报侧**不写一行清理逻辑**
 
@@ -1028,6 +1110,9 @@ exports.takedownTarget = async ({ targetType, targetId, operatorId, reason, hard
 办成"删除"，会让举报记录上写着 `taken_down`（可撤销、内容还在）而内容其实已经没了 ——
 事后申诉时谁也说不清发生过什么，且一个错都不报。
 
+⚠ `user` / `game-entry` 更彻底：**两格都没有**（见上「对局里的两类对象」），
+`takedown` / `delete` 一律 400，管理员的收尾动作只有 `dismiss`。
+
 ★★ **任何一种失败（服务抛错、400、以及服务整个不存在时的 501）都不写状态**：
 举报原地留在 `pending`，管理员可以重来。把状态标成 `taken_down` 而内容还挂在首页上，
 是这一整块里最坏的一种失败 —— 管理员以为处理完了、举报者以为被受理了，
@@ -1040,7 +1125,9 @@ exports.takedownTarget = async ({ targetType, targetId, operatorId, reason, hard
 501  { ok:false, code:"TAKEDOWN_UNAVAILABLE", details:{ reportId, status:"pending", action, applied:false } }
 ```
 
-回归测试 `server/tests/report.spec.js`（R1–R12，13 条）。★ R11 / R11b 一律**看内容**
+回归测试 `server/tests/report.spec.js`（R1–R12，13 条）与 `server/tests/gameReport.spec.js`
+（10 条，`user` / `game-entry` 两类：受理与上下文 / 404 / 409 / 截断 / 管理端 / 处置 400 /
+能力位）。★ R11 / R11b 一律**看内容**
 （作品是不是真的 404 了、评论是不是真的从列表里没了），不看状态字段 ——
 "状态对、内容没动"正是这块最需要防的失败。
 
@@ -3711,6 +3798,7 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | `gameRoomStreamShared` | 推送**这一刻能不能跨实例**（2026-11-24）。有 `REDIS_URL` 且 pub/sub 连接正常时 true；没有 / 连不上 / 订阅断线重连中为 false（只有本实例能收到）。**读不到这一位或为 false = App 不能删轮询**；`GAME_ROOMS=off` 时也是 false。这一位会随 Redis 恢复自己变回 true（不缓存） |
 | `gameRounds` | 有 `/api/game/rooms/:code/rounds*`（回合引擎）。`GAME_ROUNDS=off` 时 false，房间端点不受影响。**读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮** |
 | `gameEvents` | 有 `GET / POST /api/game/rooms/:code/rounds/events[/choice]`（回合间事件由服务端出题，2026-11-23）。`GAME_EVENTS_API=off` 时 false，回合引擎不受影响。**读不到这一位 = 老服务端，App 退回本机事件**（跨端会对不上） |
+| `gameReports` | 举报端点认 `targetType: "user"` / `"game-entry"`（工坊对局里的玩家本人与回合投稿，2026-11-24；见「举报 · 对局里的两类对象」）。**读不到这一位 = 老服务端，App 不摆那两格举报键**（那两格递上去会 400）。静态为 true，与 `GAME_ROOMS` 开关无关 |
 
 ### 还没做（别当成已做）
 
@@ -3728,7 +3816,9 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
   所以「僵尸成员」今天只能靠房主 `kick`、队友等他等到房间过期；
 - **房号枚举**：6 位 × 32 字符 ≈ 10.7 亿种，进房限流 30 次/分钟；没有「房号只对邀请者可见」的
   加密票据（自定义房间靠房号本身保密，知道码的人就能进）；
-- **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）。
+- **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）；
+- **对局 UGC 举报的后台处置**（2026-11-24 只做了"受理 + 人工核实"）：`user` 的封禁仍走
+  `POST /api/admin/branch/users/:id/ban`，`game-entry` 没有删除 / 下架入口（删一条会打乱回合判定）。
 
 回归测试：`server/tests/gameRoom.spec.js`（45 条）。SSE 推送见「工坊对局：推送（SSE）」与
 `server/tests/gameRoomStream.spec.js`（16 条）、跨实例见 `server/tests/gameRoomBusRedis.spec.js`（5 条）。
@@ -3749,7 +3839,7 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 |---|---|
 | `rounds[].round` | 回合号，1 起。**当前回合 = 数组最后一条**，不另存指针 |
 | `rounds[].phase` | `creating` / `screening` / `voting` / `settled` |
-| `rounds[].entries[]` | `{ userId, prompt, cardNames[], videoUrl, posterUrl, placeholder, modelTier, submittedAt }`，一人一条（重复交覆盖） |
+| `rounds[].entries[]` | `{ entryId, userId, prompt, cardNames[], videoUrl, posterUrl, placeholder, modelTier, submittedAt }`，一人一条（重复交覆盖）。★ `entryId`（2026-11-24）是这条投稿的**稳定 id**：首次交片生成、覆盖提交**不变**，也是举报 `game-entry` 的 targetId；老房间的存量投稿没有它（快照回 `null`） |
 | `rounds[].likes[]` | `{ userId, targetUserId, at }`，一人一条一次 |
 | `rounds[].votes[]` | `{ userId, targetUserId, at }`，`targetUserId: null` = 弃权（弃权也留一行，否则「全员表态」凑不齐） |
 | `rounds[].settlement` | `{ ranking[], winners[], settledAt }`；`ranking` 每行带两个榜、综合名次、扣血与最终 hp |
@@ -3785,17 +3875,21 @@ placeholder?: boolean, modelTier?: string }`
 - `cardNames` 最多 20 个、每个 1~64 字（空数组 = 空镜，照样能交）；
 - `videoUrl` / `posterUrl` ≤ 2048 字（只挡整段 base64，不校验主机）；
 - `placeholder` 只认布尔；`modelTier` ≤ 32 字（`draft` / `hd` / `cinema`，不在这里枚举 —— 档位表在 App）。
+- ★ **`entryId` 不是请求字段**（发了会被忽略）：它由服务端在首次交片时生成，
+  重复提交**保持不变**（2026-11-24；举报 `game-entry` 的 targetId 认它，见「举报 · 对局里的两类对象」）。
 
 **回合快照（`GET .../rounds/current` 与交片 / 点赞 / 投票 / 阶段推进的回包，同一个形状）**：
 
 ```json
 { "ok": true, "round": 1, "phase": "screening",
-  "entries": [{ "userId": "…", "name": "…", "prompt": "…", "cardNames": ["…"],
+  "entries": [{ "entryId": "…", "userId": "…", "name": "…", "prompt": "…", "cardNames": ["…"],
                 "videoUrl": "…", "posterUrl": "…", "placeholder": false,
                 "likes": 2, "likedByMe": true, "votes": 1, "votedByMe": false }],
   "allSubmitted": true, "likesPending": 1, "votesPending": 4 }
 ```
 
+- `entryId` 是这条投稿的**稳定 id**（首次交片生成、覆盖提交不变；App 拿它递 `game-entry` 举报）。
+  老房间的存量投稿没有它 → 快照回 `null`（重交一次就有；房间最多活 2 小时，不留迁移）。
 - `likes` / `votes` 是**计数**；`likedByMe` / `votedByMe` 是「我」视角。**谁投给谁不暴露**
   （回包里没有 `likedBy` / `votedBy` 名单）。
 - `likesPending` / `votesPending` 是还差几个人的**数字**（不是名单），与 App `roundViewOf.pending` 同口径。
@@ -3984,9 +4078,11 @@ App 只负责**应用交给它的效果**。
   没有时退回单实例；**没有断线续帧**，客户端轮询仍是断线退路；
 - **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）；
 - **事件选择的审计读取**：`eventPicks` 落在 `rounds[]` 里，但没有「谁选了什么」的对外端点
-  （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）。
+  （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）；
+- **对局 UGC 举报的后台处置**：`user` / `game-entry` 两类举报本轮只做受理（见「举报 · 对局里的
+  两类对象」）—— 没有「删一条投稿」的入口（会打乱全员交片 / 投票的判定），封人仍走账号治理线。
 
-回归测试：`server/tests/gameRound.spec.js`（29 条）+ `server/tests/gameEvent.spec.js`（10 条）。
+回归测试：`server/tests/gameRound.spec.js`（30 条，含投稿 `entryId` 覆盖不变）+ `server/tests/gameEvent.spec.js`（10 条）。
 
 ## 工坊对局：推送（SSE，2026-11-23）
 

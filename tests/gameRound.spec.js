@@ -223,6 +223,63 @@ describe("交片：一人一条、重复提交覆盖、字段校验", () => {
     expect(doc.rounds[0].entries[0].prompt).toBe("第二次（覆盖）");
   });
 
+  test("★ 每条投稿有稳定的 entryId：首次生成、覆盖提交不变；快照里带它（举报 game-entry 的靶子）", async () => {
+    const { code, users, host } = await playingRoom(4);
+    await roundsStart(host, code).expect(200);
+
+    const first = await submit(users[0], code, { prompt: "第一次", cardNames: [] }).expect(200);
+    const entryId = first.body.entries[0].entryId;
+    expect(entryId).toMatch(/^[a-f0-9]{24}$/);
+
+    // ★ 覆盖提交换掉 entryId 的话，App 那格举报键指向的是一条再也找不到的投稿，而两边都不报错
+    const second = await submit(users[0], code, {
+      prompt: "第二次（覆盖）",
+      cardNames: ["A"],
+      videoUrl: "https://example.test/v2.mp4",
+    }).expect(200);
+    expect(second.body.entries).toHaveLength(1);
+    expect(second.body.entries[0].entryId).toBe(entryId);
+
+    // 同一回合另一条投稿是另一个 id；快照（GET current）与库里的那一份都一致
+    const other = await submit(users[1], code, { prompt: "另一个人", cardNames: [] }).expect(200);
+    const otherId = other.body.entries.find((entry) => entry.userId === users[1].id).entryId;
+    expect(otherId).toMatch(/^[a-f0-9]{24}$/);
+    expect(otherId).not.toBe(entryId);
+
+    const snap = await current(users[0], code).expect(200);
+    const ids = snap.body.entries.map((entry) => entry.entryId);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids).toContain(entryId);
+
+    const doc = await GameRoom.findOne({ code }).lean();
+    const stored = doc.rounds[0].entries.find((entry) => String(entry.userId) === users[0].id);
+    expect(String(stored.entryId)).toBe(entryId);
+  });
+
+  test("★ 老房间的存量投稿没有 entryId：重交一次补上，之后再覆盖不变", async () => {
+    const { code, users, host } = await playingRoom(2);
+    await roundsStart(host, code).expect(200);
+    const first = await submit(users[0], code, { prompt: "上线前交的片", cardNames: [] }).expect(200);
+    const oldId = first.body.entries[0].entryId;
+    // 模拟老数据：上线前的房间文档里没有这一格（服务端读到的 undefined 就该如实回 null，不现编一个）
+    await GameRoom.updateOne(
+      { code },
+      { $unset: { "rounds.$[r].entries.$[e].entryId": "" } },
+      { arrayFilters: [{ "r.round": 1 }, { "e.userId": new mongoose.Types.ObjectId(users[0].id) }] },
+    );
+    const legacy = await current(users[0], code).expect(200);
+    expect(legacy.body.entries[0].entryId).toBeNull();
+
+    const backfilled = await submit(users[0], code, { prompt: "重交一次补 id", cardNames: [] }).expect(200);
+    const newId = backfilled.body.entries[0].entryId;
+    expect(newId).toMatch(/^[a-f0-9]{24}$/);
+    expect(newId).not.toBe(oldId);
+    // 补上之后再覆盖，还是那一个
+    const again = await submit(users[0], code, { prompt: "再覆盖", cardNames: [] }).expect(200);
+    expect(again.body.entries[0].entryId).toBe(newId);
+  });
+
   test("非成员不能交片；淘汰的人不能交片", async () => {
     const { code, users, host } = await playingRoom(4);
     await roundsStart(host, code).expect(200);
