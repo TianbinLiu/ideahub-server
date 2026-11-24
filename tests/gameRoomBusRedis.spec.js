@@ -18,6 +18,7 @@
 // ★ 文件开头先清掉 REDIS_URL：默认单例（生产代码 require 的那一个）必须落在「没有 Redis」的
 //   分支上，否则开发机 / CI 里导出的 REDIS_URL 会让 ③ 的能力位断言变成偶发红。跨实例用例
 //   自己显式传 redisUrl 建独立实例。
+const SAVED_ENV = { REDIS_URL: process.env.REDIS_URL, GAME_ROOMS: process.env.GAME_ROOMS };
 delete process.env.REDIS_URL;
 // 能力位那一断言要房间总开关是「开」的（GAME_ROOMS=off 时 gameRoomStream 本来就是 false）。
 delete process.env.GAME_ROOMS;
@@ -100,6 +101,11 @@ beforeAll(async () => {
 }, PROBE_HOOK_TIMEOUT_MS);
 
 afterAll(() => {
+  // 还原（Jest --runInBand 下 process.env 跨测试文件共享；别把「没有 Redis」这个状态带给别人）
+  for (const [key, value] of Object.entries(SAVED_ENV)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   try {
     probeClient?.destroy();
   } catch {
