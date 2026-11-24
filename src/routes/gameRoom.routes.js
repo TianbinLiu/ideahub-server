@@ -9,9 +9,9 @@
  * `docs/g2-game-ui.md` 的大厅需求（4 人匹配 / 8 人匹配 / 自定义房间邀请）。
  * ★ **轮询 + SSE 推送**（2026-11-23）：房间 / 回合的变化走 `GET /api/game/rooms/:code/stream`
  *   （实现在 `services/gameRoomStream.service.js`），一条长连接就能收到 snapshot / update /
- *   ping / error / end。轮询端点**全部保留**，它们是跨实例与断线的退路 —— pm2 cluster 下推送
- *   只覆盖同一进程（见 gameRoomBus 文件头的 ★★）。推送只是把轮询的结果主动塞过去，
- *   这些端点的形状**不用改**。
+ *   ping / error / end。轮询端点**全部保留**：推送有 Redis 时跨实例（2026-11-24），没有 Redis /
+ *   断线时退回进程内，那段时间只能靠轮询（见 gameRoomBus 文件头的 ★★ 与 /api/ark/health 的
+ *   `gameRoomStreamShared`）。推送只是把轮询的结果主动塞过去，这些端点的形状**不用改**。
  *
  * | 方法 | 路径 | 鉴权 | 说明 |
  * |---|---|---|---|

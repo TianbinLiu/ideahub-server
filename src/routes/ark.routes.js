@@ -86,6 +86,8 @@ const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_PO
 const gameTicket = require("../services/gameTicket.service");
 // 工坊对局房间与匹配（只读它的常量与总开关，能力位用；见 /health 的注释）
 const gameRoom = require("../config/gameRoom");
+// 工坊对局的推送总线：gameRoomStreamShared 要问它「Redis pub/sub 此刻通不通」（见 /health 里那一段）
+const gameRoomBus = require("../services/gameRoomBus");
 // 工坊对局回合引擎（只读总开关，能力位用；见 /health 的注释）
 const gameRound = require("../config/gameRound");
 const gameEvent = require("../config/gameEvent");
@@ -200,9 +202,14 @@ router.get("/health", (_req, res) => {
   // 2026-11-23 的能力位（工坊对局的 SSE 推送，api-contract「工坊对局：推送（SSE）」）：
   //   · gameRoomStream：这台服务器有 GET /api/game/rooms/:code/stream（建连即 snapshot，之后
   //     update / ping / error / end）。读不到这一位 = 老服务端，App 只能轮询。
-  //     ★★ 它说的是「有这条流」，**不是「跨实例实时」**：pm2 cluster 下推送只覆盖同一进程，
-  //     另一个实例上的写收不到 —— App 的轮询退路必须留着，别拿到 true 就把轮询删掉。
   //     判据与 gameRooms 同一个总开关（GAME_ROOMS=off 时 false）。
+  //   · gameRoomStreamShared（2026-11-24）：推送**这一刻能不能跨实例**。广播总线有 Redis pub/sub
+  //     且连接正常时为 true；没有 REDIS_URL / Redis 连不上 / 订阅断线重连中为 false
+  //     （此时只有本实例能收到自己房间的变化）。★ 它和 gameRoomStream 是两件事：有这条流 ≠ 跨实例；
+  //     老服务端读不到这一位 = 按 false 处理（App 不能删轮询）。判据在 services/gameRoomBus.isShared，
+  //     路由这里只做转发（不缓存 —— 重连成功之后下一次请求就该变回 true）。
+  //     ★★ 即便它是 true，断线期间漏掉的帧也不会补（没有 Last-Event-ID）；轮询仍建议低频保底，
+  //     但 App 可以在它为 true 时把轮询降频，而不是完全删掉。
   // 2026-11-23 的能力位（工坊对局的回合引擎，api-contract「工坊对局：回合引擎」）：
   //   · gameRounds：这台服务器有 /api/game/rooms/:code/rounds*（开回合 / 交片 / 展映 / 点赞 / 投票 / 结算 / 下一回合）。
   //     `GAME_ROUNDS=off` 急停时 false；**房间本身还开着**（gameRooms 仍为 true），两件事分开报。
@@ -241,8 +248,10 @@ router.get("/health", (_req, res) => {
     gameRooms: gameRoom.enabled(),
     gameRoomModes: gameRoom.enabled() ? gameRoom.MODES.slice() : [],
     gameRoomMaxSeats: gameRoom.MAX_SEATS,
-    // SSE 推送（2026-11-23）：有 /api/game/rooms/:code/stream；单实例语义见上面的 ★★
+    // SSE 推送（2026-11-23）：有 /api/game/rooms/:code/stream
     gameRoomStream: gameRoom.enabled(),
+    // 跨实例推送（2026-11-24）：Redis pub/sub 此刻通不通；false = 只有本实例能收到（见上面的 ★★）
+    gameRoomStreamShared: gameRoom.enabled() && gameRoomBus.isShared(),
     // 工坊对局的回合引擎（2026-11-23）：能力位见上面那一段注释
     gameRounds: gameRoom.enabled() && gameRound.enabled(),
     // 回合间事件（2026-11-23）：三选一由服务端出题；关掉时退回本机事件（跨端会对不上，所以独立一位）

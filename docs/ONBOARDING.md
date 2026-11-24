@@ -13,7 +13,7 @@
 |---|---|
 | Node.js | 20 LTS 或更高 |
 | MongoDB | 本地实例，或问团队要开发库连接串 |
-| Redis | 可选。不装会降级到进程内限流计数，本地开发够用 |
+| Redis | 可选。不装会降级到进程内限流计数、工坊对局推送也退回单实例；本地开发够用 |
 | Claude Code | `npm i -g @anthropic-ai/claude-code`，或用桌面版 |
 
 Claude Code 会自动读取仓库里的 `CLAUDE.md` 与 `AGENTS.md`，
@@ -36,6 +36,11 @@ cp .env.example .env
 - `MONGO_URI` —— 本地 `mongodb://127.0.0.1:27017/ideahub`，或问团队要开发库
 - `JWT_SECRET` —— 本地随便填够长即可；**生产值绝不要放本地**
 - `OTP_PEPPER` —— 同上
+
+`REDIS_URL`（可选）：例如 `redis://127.0.0.1:6379`。配了它，限流计数走 Redis（跨 pm2 实例共享），
+工坊对局的 SSE 推送也经 Redis pub/sub **跨实例**；不配则两样都退回进程内（限流变松、推送只覆盖
+本实例），服务照常起来。生产（pm2 cluster 2 实例）**必须配**，否则跨实例推送能力位
+`/api/ark/health` 的 `gameRoomStreamShared` 恒为 false。
 
 其余（OAuth、邮件、AI、Cloudinary、短信）不填时对应功能不可用，但服务能起来。
 
@@ -70,18 +75,19 @@ cp .env.example .env
 `GAME_ROOM_PLAYING_TTL_MINUTES`（playing 120）、`GAME_QUEUE_HEARTBEAT_SEC`（排队心跳 90）、
 `GAME_QUEUE_MATCH_TTL_MINUTES`（撮合行 10）。总开关 `GAME_ROOMS=off`。
 端点、状态机、错误码、能力位（`/api/ark/health` 的 `gameRooms`）见 `docs/api-contract.md`
-「工坊对局：房间与匹配」。⚠ 还没做的：跨实例广播（推送今天只覆盖单实例）、跨服、
-房间里的人的断线重连。
+「工坊对局：房间与匹配」。⚠ 还没做的：跨服、房间里的人的断线重连。
 
 **工坊对局 · SSE 推送（可选，缺省开，2026-11-23）**：`GET /api/game/rooms/:code/stream` 一条长连接
 收「房间 / 回合 / 事件 / 结束」的变化：建连即 `snapshot`，之后有变化推 `update`，每 20 秒
 `ping` 心跳，错误走 `error`、30 分钟寿命到期走 `end`（都是推完就关）。鉴权支持
 `Authorization: Bearer` 与 `?token=` 兜底；每用户同时最多 2 条（超出 429 `TOO_MANY_STREAMS`）。
-★★ **它是单实例推送**：广播是进程内 EventEmitter（`src/services/gameRoomBus.js`），pm2 cluster 的
-两个实例各有一份 —— App 的轮询退路必须留着；`/api/ark/health` 的 `gameRoomStream` 只表示「有这条流」。
+★★ **有 Redis 时跨实例**：广播总线（`src/services/gameRoomBus.js`）配了 `REDIS_URL` 就走 Redis
+pub/sub，pm2 cluster 的另一个实例上的写也能推过来；没有 Redis / 连不上 / 订阅重连中则自动退回
+进程内广播（只有本实例能收到）。`/api/ark/health` 的 `gameRoomStream` 只表示「有这条流」，
+`gameRoomStreamShared` 才表示「这一刻跨实例通不通」（false = App 别把轮询退路删掉）。
 只有两个寿命旋钮：`GAME_STREAM_HEARTBEAT_SEC`（心跳 20）、`GAME_STREAM_MAX_SEC`（单连接寿命 1800）。
-帧格式、事件与错误码见 `docs/api-contract.md`「工坊对局：推送（SSE）」。⚠ 还没做的：跨实例广播
-（Redis pub/sub）、gzip、断线重连的续帧 / Last-Event-ID。
+帧格式、事件与错误码见 `docs/api-contract.md`「工坊对局：推送（SSE）」。⚠ 还没做的：gzip、
+断线重连的续帧 / Last-Event-ID、多机房（Redis 只覆盖同一个实例集群）。
 
 **工坊对局 · 回合引擎（可选，缺省开）**：开局之后每一回合「开回合 → 各自交片 → 全员展映 → 点赞 →
 投票 → 服务端算两个榜与扣血 → 下一回合」。规则是**代码常量**（`src/config/gameRound.js`：初始 100 血、
@@ -98,7 +104,7 @@ cp .env.example .env
 免费刷新在 `effects.client` 里原样交给 App 本地落。只有一个总开关 `GAME_EVENTS_API=off`（急停
 `/rounds/events*`，不影响回合端点），能力位是 `/api/ark/health` 的 `gameEvents`。端点、响应形状、
 错误码见 `docs/api-contract.md`「工坊对局：回合引擎」→「回合间事件」。
-⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、跨实例推送。
+⚠ 还没做的：断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）。
 
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 
