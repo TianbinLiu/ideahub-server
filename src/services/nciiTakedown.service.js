@@ -52,6 +52,9 @@ const MEDIA_SOURCES = [
   { model: "BountyComment", label: "赏金评论", fields: ["imageUrl"] },
   { model: "Bounty", label: "赏金任务", fields: ["coverImageUrl"] },
   { model: "BountySubmission", label: "赏金投稿", fields: ["screenshotUrl"] },
+  // 工坊对局的回合作品（2026-11-23 回合引擎）：视频与封面都是用户产物，别人转走 / 重贴也要搜得到。
+  // 路径穿过 rounds[] → entries[] 两层数组（Mongo 点号路径天然展开，见文件头 ★）。
+  { model: "GameRoom", label: "工坊对局回合作品", fields: ["rounds.entries.videoUrl", "rounds.entries.posterUrl"] },
   { model: "LeaderboardPost", label: "榜单投稿", fields: ["imageUrls"] },
   { model: "Meme", label: "梗图素材", fields: ["imageUrl"] },
   { model: "Persona", label: "人格卡封面", fields: ["coverImageUrl"] },

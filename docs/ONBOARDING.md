@@ -70,7 +70,15 @@ cp .env.example .env
 `GAME_ROOM_PLAYING_TTL_MINUTES`（playing 120）、`GAME_QUEUE_HEARTBEAT_SEC`（排队心跳 90）、
 `GAME_QUEUE_MATCH_TTL_MINUTES`（撮合行 10）。总开关 `GAME_ROOMS=off`。
 端点、状态机、错误码、能力位（`/api/ark/health` 的 `gameRooms`）见 `docs/api-contract.md`
-「工坊对局：房间与匹配」。⚠ 还没做的：推送、回合引擎（`playing` 之后不推进）、跨服、房间里的人的断线重连。
+「工坊对局：房间与匹配」。⚠ 还没做的：推送、跨服、房间里的人的断线重连。
+
+**工坊对局 · 回合引擎（可选，缺省开）**：开局之后每一回合「开回合 → 各自交片 → 全员展映 → 点赞 →
+投票 → 服务端算两个榜与扣血 → 下一回合」。规则是**代码常量**（`src/config/gameRound.js`：初始 100 血、
+扣血 20/15/10/5 按人数缩放、4/8 人局剩 2 人结束 / 2 人局剩 1 人结束），不在环境变量里；回合数据存在
+房间文档的 `rounds[]` 里，过期懒清理删房间时一起没。只有一个总开关 `GAME_ROUNDS=off`（急停回合端点，
+不影响房间端点），能力位是 `/api/ark/health` 的 `gameRounds`。端点、错误码与结算公式见
+`docs/api-contract.md`「工坊对局：回合引擎」。
+⚠ 还没做的：事件三选一、断线重连 / 超时自动推进、总回合上限（今天打到只剩胜者名额为止）、推送。
 
 **老师人格（tutor，可选，`TUTOR_ENABLED=true` 才挂）**：变量名见 `.env.example` 末尾那一组（`TUTOR_AI_MODEL_TEACH` / `TUTOR_AI_MODEL_CHEAP` / `TUTOR_MATERIAL_MAX_BYTES` / `TUTOR_TEXT_JSON_LIMIT` / `TUTOR_ALLOW_DEMO` / `TUTOR_WORKER_POLL_MS`）。开了要有 `AI_API_KEY` 与 Cloudinary 三项，`npm run check:config` 会拦「开了却没配齐」。契约在 `docs/api-contract.md`「老师人格（tutor）」，核心纯函数在 `src/tutor/core/`（从 tutor 仓同步的生成物，别手改）。
 

@@ -86,6 +86,8 @@ const { callArk, chargedArkCall, arkConfigured, setWalletHeaders, T_CREATE, T_PO
 const gameTicket = require("../services/gameTicket.service");
 // 工坊对局房间与匹配（只读它的常量与总开关，能力位用；见 /health 的注释）
 const gameRoom = require("../config/gameRoom");
+// 工坊对局回合引擎（只读总开关，能力位用；见 /health 的注释）
+const gameRound = require("../config/gameRound");
 const { payWithTicket } = require("../middleware/gameTicket");
 const wallet = require("../services/tokenWallet.service");
 // MiniMax H3（V2）：成片地址（产物代理认它）与「这台服务器开没开 V2」（健康端点的能力位）—— 判据都只在 config/minimax
@@ -194,6 +196,10 @@ router.get("/health", (_req, res) => {
   //   · gameRoomModes：这台服务器认哪几种模式（match4 / match8 / custom）。App 照它摆几个键，
   //     不在本机写死 —— 哪天只开 4 人匹配，服务端收窄这一个数组就够了。
   //   · gameRoomMaxSeats：自定义房间最多几座（今天 8）。同上，不在 App 里抄一份。
+  // 2026-11-23 的能力位（工坊对局的回合引擎，api-contract「工坊对局：回合引擎」）：
+  //   · gameRounds：这台服务器有 /api/game/rooms/:code/rounds*（开回合 / 交片 / 展映 / 点赞 / 投票 / 结算 / 下一回合）。
+  //     `GAME_ROUNDS=off` 急停时 false；**房间本身还开着**（gameRooms 仍为 true），两件事分开报。
+  //     读不到这一位 = 老服务端，App 在 `playing` 之后不摆「开始回合」这些按钮。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -224,6 +230,8 @@ router.get("/health", (_req, res) => {
     gameRooms: gameRoom.enabled(),
     gameRoomModes: gameRoom.enabled() ? gameRoom.MODES.slice() : [],
     gameRoomMaxSeats: gameRoom.MAX_SEATS,
+    // 工坊对局的回合引擎（2026-11-23）：能力位见上面那一段注释
+    gameRounds: gameRoom.enabled() && gameRound.enabled(),
   });
 });
 

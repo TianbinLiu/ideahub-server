@@ -24,6 +24,7 @@ let Report;
 let User;
 let BranchVideo;
 let BranchDeck;
+let GameRoom;
 let ncii;
 let signToken;
 
@@ -39,6 +40,7 @@ beforeAll(async () => {
   User = require('../src/models/User');
   BranchVideo = require('../src/models/BranchVideo');
   BranchDeck = require('../src/models/BranchDeck');
+  GameRoom = require('../src/models/GameRoom');
   ncii = require('../src/services/nciiTakedown.service');
   ({ signToken } = require('../src/utils/jwt'));
 });
@@ -160,6 +162,31 @@ describe('已知相同副本检索（§3(b)(1)(B)）', () => {
     const { refs, urls } = await ncii.findReferences([`https://ideahubs.org/video/${v._id}`]);
     expect(urls).toContain(frame);
     expect(refs.map((r) => r.id)).toContain(String(copy._id));
+  });
+
+  it('工坊对局回合作品里的视频 / 封面地址也能被检索到（rounds[] → entries[] 两层数组）', async () => {
+    const { user } = await makeUser();
+    const video = 'https://res.cloudinary.com/demo/video/upload/v1/round-copy.mp4';
+    const poster = 'https://res.cloudinary.com/demo/image/upload/v1/round-copy.jpg';
+    const room = await GameRoom.create({
+      code: 'NCII01',
+      mode: 'custom',
+      seats: 2,
+      hostId: user._id,
+      status: 'playing',
+      members: [{ userId: user._id, ready: true, hp: 100 }],
+      rounds: [
+        {
+          round: 1,
+          phase: 'settled',
+          entries: [{ userId: user._id, prompt: '回合作品', cardNames: [], videoUrl: video, posterUrl: poster }],
+        },
+      ],
+    });
+    const foundVideo = await ncii.findReferences([video]);
+    expect(foundVideo.refs.some((r) => r.model === 'GameRoom' && r.id === String(room._id))).toBe(true);
+    const foundPoster = await ncii.findReferences([poster]);
+    expect(foundPoster.refs.some((r) => r.model === 'GameRoom' && r.id === String(room._id))).toBe(true);
   });
 
   it('改过尺寸的 Cloudinary 地址算同一张图（只按整串比会漏）', async () => {

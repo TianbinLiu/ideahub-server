@@ -23,7 +23,20 @@
  * | GET    | /api/game/queue                | 登录 | 排队状态（人数 / 还差几个 / 预计等待 / 两个池子） |
  * | DELETE | /api/game/queue                | 登录 | 离队 |
  *
- * ★ 所有判定都在 `services/gameRoom.service.js`（唯一实现）；这个文件只做
+ * 回合引擎（2026-11-23，`services/gameRound.service.js`；设计正本 app 仓 `docs/g3-round-loop.md`）：
+ *
+ * | 方法 | 路径 | 鉴权 | 说明 |
+ * |---|---|---|---|
+ * | POST   | /api/game/rooms/:code/rounds/start   | **仅房主** | 开第 1 回合（`playing` 且还没有回合） |
+ * | POST   | /api/game/rooms/:code/rounds/entries | 房间成员 | 交片（一人一条、重复覆盖；只在 creating） |
+ * | GET    | /api/game/rooms/:code/rounds/current | 房间成员 | 当前回合快照（展映 / 投票屏轮询） |
+ * | POST   | /api/game/rooms/:code/rounds/phase   | **仅房主** | `{phase:"screening"\|"voting"}` 推进阶段 |
+ * | POST   | /api/game/rooms/:code/rounds/like    | 房间成员 | `{targetUserId}` 点赞（只在 screening） |
+ * | POST   | /api/game/rooms/:code/rounds/vote    | 房间成员 | `{targetUserId\|null}` 投票 / 弃权（只在 voting） |
+ * | POST   | /api/game/rooms/:code/rounds/settle  | 房主 / 全员已投 | 两个榜 + 扣血 + 淘汰 + 胜者 |
+ * | POST   | /api/game/rooms/:code/rounds/next    | **仅房主** | 回合 +1（保留历史；只剩胜者名额 → GAME_OVER） |
+ *
+ * ★ 所有判定都在 `services/gameRoom.service.js` 与 `services/gameRound.service.js`（唯一实现）；这个文件只做
  *   ① 关掉时的 503 闸 ② 限流 ③ 把 service 的 `{ok:false, status, code, message}` 照原样回给客户端。
  *   路由里**不写任何**「几个人能开局 / 谁算房主」的判断 —— 那种句子抄第二遍就会跟服务端说出两种话。
  *
@@ -35,7 +48,9 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
 const gameRoom = require("../services/gameRoom.service");
+const gameRound = require("../services/gameRound.service");
 const config = require("../config/gameRoom");
+const roundConfig = require("../config/gameRound");
 
 const router = express.Router();
 
@@ -54,6 +69,22 @@ function requireGameRoomsOn(req, res, next) {
   });
 }
 router.use(["/rooms", "/queue"], requireGameRoomsOn);
+
+/**
+ * 回合引擎的总开关（`GAME_ROUNDS=off` 急停）。
+ * ★ 与 `GAME_ROOMS` 分开：对局房间本身还开着时，也能把「开回合 / 交片 / 结算」单独关掉
+ *   （回合引擎出问题不该顺手把大厅也关掉）。`GAME_ROOMS=off` 时上面的闸会先回 `GAME_ROOMS_OFF`。
+ * ★ 只挂在 `/rooms/:code/rounds` 前缀上：不是整棵 `/rooms`，建房 / 进房 / 快照照常。
+ */
+function requireGameRoundsOn(req, res, next) {
+  if (roundConfig.enabled()) return next();
+  return res.status(503).json({
+    ok: false,
+    code: "GAME_ROUNDS_OFF",
+    message: "the round engine is turned off on this server",
+  });
+}
+router.use("/rooms/:code/rounds", requireGameRoundsOn);
 
 const createLimit = userRateLimit({ max: 20, scope: "game-room-create" });
 const joinLimit = userRateLimit({ max: 30, scope: "game-room-join" });
@@ -220,6 +251,135 @@ router.get("/queue", requireAuth, pollLimit, async (req, res, next) => {
 router.delete("/queue", requireAuth, joinLimit, async (req, res, next) => {
   try {
     reply(res, await gameRoom.dequeue({ userId: req.user._id }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 回合引擎（2026-11-23）：每一回合交片 → 展映 → 点赞 → 投票 → 结算 → 下一回合
+// ★ 判定全在 services/gameRound.service.js；这里只做开关 / 限流 / 把结果原样回出去。
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/game/rooms/:code/rounds/start —— 开第 1 回合（**仅房主**；房间必须已 `playing`）
+ * 回包：`{ ok, round, phase, entries, allSubmitted, likesPending, votesPending }`（回合快照）
+ * 错误码：403 `NOT_HOST` / 409 `ROOM_NOT_PLAYING` / 409 `ROUND_ALREADY_STARTED`
+ */
+router.post("/rooms/:code/rounds/start", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.startRound({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/entries —— 我这一回合的交片（**一人一条，重复提交覆盖**）
+ *
+ * 请求体：`{ prompt, cardNames: string[], videoUrl?, posterUrl?, placeholder?, modelTier? }`
+ * 回包：当前回合快照（与 GET current 同形）
+ * 错误码：400 `BAD_PROMPT` / 400 `PROMPT_TOO_LONG` / 400 `BAD_CARD_NAMES` / 400 `BAD_ENTRY_FIELD` /
+ *        404 `ROUND_NOT_FOUND` / 409 `NOT_IN_ROOM` / 409 `PLAYER_ELIMINATED` / 409 `WRONG_PHASE`
+ */
+router.post("/rooms/:code/rounds/entries", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.submitEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/game/rooms/:code/rounds/current —— 当前回合快照（展映 / 投票屏轮询它；成员读续命）
+ *
+ * 回包：`{ ok, round, phase, entries:[{ userId, name, prompt, cardNames, videoUrl, posterUrl,
+ *   placeholder, likes, likedByMe, votes, votedByMe }], allSubmitted, likesPending, votesPending }`
+ * ★ `likes` / `votes` 是**计数**，`likedByMe` / `votedByMe` 是「我」视角；**谁投给谁不暴露**。
+ * ★ `likesPending` / `votesPending` 是还差几个人的**数字**（不是名单）。
+ * 错误码：404 `ROOM_NOT_FOUND` / 404 `ROUND_NOT_FOUND` / 409 `NOT_IN_ROOM`
+ */
+router.get("/rooms/:code/rounds/current", requireAuth, pollLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.getCurrent({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/phase —— 房主推进阶段 `{ phase: "screening" | "voting" }`
+ *
+ * · creating → screening：全员已交片，否则 409 `NOT_ALL_SUBMITTED`（带 `waitingOn`）；
+ * · screening → voting：房主可提前进（不要求全员已点赞）；
+ * · 同一阶段重复调用幂等回快照。
+ * 错误码：400 `BAD_PHASE` / 403 `NOT_HOST` / 404 `ROUND_NOT_FOUND` / 409 `NOT_ALL_SUBMITTED` / 409 `WRONG_PHASE`
+ */
+router.post("/rooms/:code/rounds/phase", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    reply(res, await gameRound.setPhase({ userId: req.user._id, code: req.params.code, phase: body.phase }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/like —— 点赞 `{ targetUserId }`（只在 screening）
+ * 回包：当前回合快照；**一人一条一次、不能给自己、不能取消、重复是幂等的**（计数不涨）
+ * 错误码：400 `BAD_TARGET` / 400 `CANNOT_LIKE_SELF` / 404 `TARGET_NOT_IN_ROOM` / 404 `ROUND_NOT_FOUND` /
+ *        409 `NOT_IN_ROOM` / 409 `WRONG_PHASE` / 409 `PLAYER_ELIMINATED`
+ */
+router.post("/rooms/:code/rounds/like", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    reply(res, await gameRound.likeEntry({ userId: req.user._id, code: req.params.code, targetId: body.targetUserId }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/vote —— 投票 `{ targetUserId: string | null }`（null = 弃权；只在 voting）
+ * 回包：当前回合快照；**一人一次、不能给自己、投过 / 弃过再投是幂等的**（第一票作数）
+ * 错误码：400 `BAD_TARGET` / 400 `CANNOT_VOTE_SELF` / 404 `TARGET_NOT_IN_ROOM` / 404 `ROUND_NOT_FOUND` /
+ *        409 `WRONG_PHASE` / 409 `PLAYER_ELIMINATED`
+ */
+router.post("/rooms/:code/rounds/vote", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.voteEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/settle —— 两个榜 + 综合名次 + 扣血 + 淘汰（**房主**，或全员已投票后任何成员）
+ *
+ * 回包：`{ ok, round, phase:"settled", settlement:{ ranking:[{ userId, name, likes, votes, likeRank,
+ *   voteRank, composite, damage, hp, eliminated }], winners? } }`
+ * ★ `winners` 只在「剩到胜者名额」时出现（4/8 人局剩 2 人、2 人局剩 1 人）：`winners` = userId 数组。
+ * ★ 幂等：已结算的回合再调回**同一份**落库结果，不会重复扣血。
+ * 错误码：403 `NOT_HOST`（未全员投票且不是房主）/ 404 `ROUND_NOT_FOUND` / 409 `WRONG_PHASE` / 409 `NO_ENTRIES`
+ */
+router.post("/rooms/:code/rounds/settle", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.settle({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/rounds/next —— 下一回合（**仅房主**；上一回合必须已 settled）
+ *
+ * 回包：新回合快照（round +1、phase `creating`、entries/likes/votes 都是空的；**历史回合原样留着**）
+ * 错误码：403 `NOT_HOST` / 404 `ROUND_NOT_FOUND` / 409 `ROUND_NOT_SETTLED` /
+ *        409 `GAME_OVER`（带 `winners`，胜者可能是空数组 = 同归于尽）
+ */
+router.post("/rooms/:code/rounds/next", requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRound.nextRound({ userId: req.user._id, code: req.params.code }));
   } catch (err) {
     next(err);
   }

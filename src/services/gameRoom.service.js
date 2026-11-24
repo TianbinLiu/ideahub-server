@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file gameRoom.service.js - 工坊对局的**房间状态机 + 撮合 + 懒清理**（唯一实现）
  * @category Service
  *
@@ -52,6 +52,7 @@ const GameRoom = require("../models/GameRoom");
 const GameQueue = require("../models/GameQueue");
 const User = require("../models/User");
 const config = require("../config/gameRoom");
+const { START_HP } = require("../config/gameRound");
 
 const QUEUE_PURGE_INTERVAL_MS = 10 * 1000;
 
@@ -235,6 +236,11 @@ async function snapshotOf(room, { viewerId = null, now = Date.now() } = {}) {
         avatarUrl: user?.avatarUrl || null,
         seat: index,
         ready: Boolean(m.ready),
+        /**
+         * 血量（回合引擎，2026-11-23）。★ 老房间 / 这一版之前建的行没有 hp 字段，
+         * 读的时候按 START_HP 兜底 —— 不为此写一次迁移（回合第一次结算会把它落库）。
+         */
+        hp: Number.isFinite(m.hp) ? m.hp : START_HP,
         isHost: sameId(m.userId, hostId),
         joinedAt: isoOf(m.joinedAt),
       };
@@ -753,9 +759,14 @@ module.exports = {
   // 快照 / 清理（路由与测试用）
   snapshotOf,
   sweepExpired,
-  // 判据（测试与未来回合引擎用；**别再实现一遍**）
+  // 判据（测试与回合引擎用；**别再实现一遍**）
   hostIdOf,
   isExpired,
   normalizeCode,
   startBlockedByOf,
+  // 回合引擎要共用同一份「按房号取活房 / 成员读续命」：expire 那条判据只有这里一处，
+  // 回合引擎自己再写一遍 loadRoom 就会变成「房间过期了但回合端点还认」的第二个真相。
+  loadRoom,
+  touch,
+  sameId,
 };
