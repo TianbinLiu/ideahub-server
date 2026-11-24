@@ -505,6 +505,20 @@ describe("下一回合：当前状态清空、历史回合不丢、仅房主、�
     expect((await next(fresh.host, fresh.code)).body).toMatchObject({ code: "ROUND_NOT_FOUND" });
   });
 
+  test("★ 并发 next 只加一回合（下一回合号码写进原子条件，不会 push 出两条）", async () => {
+    const room = await submittedRound(2);
+    await phase(room.host, room.code, "screening").expect(200);
+    await phase(room.host, room.code, "voting").expect(200);
+    await vote(room.users[0], room.code, room.users[1].id).expect(200);
+    await vote(room.users[1], room.code, room.users[0].id).expect(200);
+    await settle(room.host, room.code).expect(200);
+    const [a, b] = await Promise.all([next(room.host, room.code), next(room.host, room.code)]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    const doc = await GameRoom.findOne({ code: room.code }).lean();
+    expect(doc.rounds).toHaveLength(2);
+    expect(doc.rounds[1].round).toBe(2);
+  });
+
   test("下一回合的点赞 / 投票不会读到上一回合的状态；新回合可以正常交片", async () => {
     const room = await submittedRound(2);
     await phase(room.host, room.code, "screening").expect(200);

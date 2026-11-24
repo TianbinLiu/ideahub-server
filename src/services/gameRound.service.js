@@ -776,6 +776,10 @@ async function nextRound({ userId, code, now = Date.now() }) {
       _id: room._id,
       status: "playing",
       rounds: { $elemMatch: { round: round.round, phase: "settled" } },
+      // ★ 下一回合的号码必须还不存在：只看「第 n 回合已结算」的话，两个房主请求会同时匹配上，
+      //   各 push 一条第 n+1 回合（一个是空的、一个带着内容，后面全乱）。`rounds.round: {$ne}` 是
+      //   数组字段的「没有任何一条是这个号码」，与上面的 $elemMatch 一起构成这次 push 的并发闸。
+      "rounds.round": { $ne: nextNo },
     },
     {
       $push: {

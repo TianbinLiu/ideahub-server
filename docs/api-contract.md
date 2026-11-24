@@ -3860,7 +3860,7 @@ placeholder?: boolean, modelTier?: string }`
 - **推送**：仍然轮询（2~5 秒一次），WebSocket 接上时这些端点形状不变；
 - **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）。
 
-回归测试：`server/tests/gameRound.spec.js`（25 条）。
+回归测试：`server/tests/gameRound.spec.js`（26 条）。
 
 ## 客户端接入约定
 
