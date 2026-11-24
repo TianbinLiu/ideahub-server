@@ -184,6 +184,26 @@ describe("降级：没有 Redis 时退回进程内（能力位 false）", () => 
     }
   });
 
+  test("REDIS_URL 不是合法 URL：构造不抛、isShared=false、本地照旧投递（配置写错不该把进程带崩）", async () => {
+    const warnings = [];
+    const bus = createRoomBus({
+      redisUrl: "not-a-url", // node-redis 的 createClient 对这个值是同步抛 TypeError 的
+      instanceId: "bad-url",
+      logger: quietLogger(warnings),
+    });
+    try {
+      const seen = [];
+      bus.subscribe("BADURL1", () => seen.push("changed"));
+      expect(bus.isShared()).toBe(false);
+      expect(bus.publish("BADURL1")).toBe(1);
+      expect(seen).toEqual(["changed"]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("创建失败");
+    } finally {
+      await bus.close();
+    }
+  });
+
   test("REDIS_URL 指向不可用端口：构造不抛、isShared=false、本地照旧投递、warn 只一次", async () => {
     const warnings = [];
     const bus = createRoomBus({

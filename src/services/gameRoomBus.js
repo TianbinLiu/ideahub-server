@@ -216,8 +216,22 @@ function createRoomBus(options = {}) {
       return;
     }
 
-    subscriber = createClient({ url: redisUrl, socket: socketOptions() });
-    publisher = createClient({ url: redisUrl, socket: socketOptions() });
+    try {
+      subscriber = createClient({ url: redisUrl, socket: socketOptions() });
+      publisher = createClient({ url: redisUrl, socket: socketOptions() });
+    } catch (err) {
+      // ★ URL 写错（比如 `not-a-url`）时 createClient 是**同步抛**的：不接住的话模块 require
+      //   就会把整个进程带崩 —— 而配置写错本该只是「跨实例推送关掉」，轮询退路照常。
+      try {
+        subscriber?.destroy();
+      } catch {
+        // 没建起来的客户端，关不关都无所谓
+      }
+      subscriber = null;
+      publisher = null;
+      degrade(`Redis 客户端创建失败（${err?.message || err}）`);
+      return;
+    }
 
     subscriber.on("error", (err) => {
       subscriberReady = false;

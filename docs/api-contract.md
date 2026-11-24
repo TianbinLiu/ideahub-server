@@ -4116,11 +4116,12 @@ data: {"reason":"lifetime"}
 选型：**supertest + 真实流读取**（`app.listen(0)` + 原生 `fetch` 的 `ReadableStream`），
 不是直接调 handler —— 响应头、429 状态码、客户端断开后的清理只有走真实 HTTP 才测得到。
 
-`server/tests/gameRoomBusRedis.spec.js`（5 条）：两个独立 bus（各自一条 Redis 订阅连接）
-A publish → B 订阅者收到、A 自己的只收到一次（回环去重）；退订 / 归零后不再收到；没人订阅时
-消息直接丢；无 Redis 时退回进程内 + `/api/ark/health` 的 `gameRoomStreamShared=false`；
-指向不可用端口只 warn 一次。**需要 Redis**（`REDIS_TEST_URL`，缺省 `redis://127.0.0.1:6379`），
-连不上时跳过并打印原因（CI 的 jest 带 Redis service，会真跑）。
+`server/tests/gameRoomBusRedis.spec.js`（6 条）：两个独立 bus（各自一条 Redis 订阅连接）
+A publish → B 订阅者收到、A 自己的只收到一次（回环去重）；发布方本进程没人订阅也照发 Redis；
+退订 / 归零后不再收到；没人订阅时消息直接丢；无 Redis 时退回进程内 + `/api/ark/health` 的
+`gameRoomStreamShared=false`；REDIS_URL 写错 / 指向不可用端口只 warn 一次、进程不崩。
+**需要 Redis**（`REDIS_TEST_URL`，缺省 `redis://127.0.0.1:6379`），连不上时跳过并打印原因
+（CI 的 jest 带 Redis service，会真跑）。
 
 ## 客户端接入约定
 
