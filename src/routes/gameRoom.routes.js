@@ -7,14 +7,18 @@
  *
  * 设计来源：app 仓 `docs/workshop-game-design.md` §三「服务端房间协议」与 §四 G5「联机」、
  * `docs/g2-game-ui.md` 的大厅需求（4 人匹配 / 8 人匹配 / 自定义房间邀请）。
- * ★ **HTTP 轮询版**：客户端每 2~5 秒轮询一次快照 / 队列状态。WebSocket 推送是下一步，
- *   到时候这些端点的形状**不用改**（推送只是把轮询的结果主动塞过去）。
+ * ★ **轮询 + SSE 推送**（2026-11-23）：房间 / 回合的变化走 `GET /api/game/rooms/:code/stream`
+ *   （实现在 `services/gameRoomStream.service.js`），一条长连接就能收到 snapshot / update /
+ *   ping / error / end。轮询端点**全部保留**，它们是跨实例与断线的退路 —— pm2 cluster 下推送
+ *   只覆盖同一进程（见 gameRoomBus 文件头的 ★★）。推送只是把轮询的结果主动塞过去，
+ *   这些端点的形状**不用改**。
  *
  * | 方法 | 路径 | 鉴权 | 说明 |
  * |---|---|---|---|
  * | POST   | /api/game/rooms                | 登录 | 建房 `{mode, seats?}` → 201 `{ room }` |
  * | POST   | /api/game/rooms/join           | 登录 | 进房 `{code}` → `{ room }` |
  * | GET    | /api/game/rooms/:code          | 登录 | 快照（成员 / 座位 / ready / 状态 / 时间） |
+ * | GET    | /api/game/rooms/:code/stream   | 登录（Bearer 或 `?token=`） | SSE 推送（建连即 snapshot，之后 update / ping / error / end） |
  * | POST   | /api/game/rooms/:code/leave    | 登录 | 退房（房主自动转移；最后一人退房 = 房间删除） |
  * | POST   | /api/game/rooms/:code/ready    | 登录 | 准备 `{ready:boolean}` |
  * | POST   | /api/game/rooms/:code/start    | **仅房主** | 开局（人数达标 + 全员 ready） |
@@ -56,11 +60,36 @@ const { requireAuth } = require("../middleware/auth");
 const { userRateLimit } = require("../middleware/rateLimit");
 const gameRoom = require("../services/gameRoom.service");
 const gameRound = require("../services/gameRound.service");
+// SSE 推送：变化的广播口（进程内总线）与整条流的行为（帧 / 心跳 / 寿命 / 连接上限）
+const gameRoomBus = require("../services/gameRoomBus");
+const gameRoomStream = require("../services/gameRoomStream.service");
 const config = require("../config/gameRoom");
 const roundConfig = require("../config/gameRound");
 const eventConfig = require("../config/gameEvent");
 
 const router = express.Router();
+
+// ─────────────────────────────────────────────────────────────────────
+// SSE 推送（2026-11-23）：一条长连接收「房间 / 回合变了」
+// ★ 这一条**必须注册在下面 requireGameRoomsOn 之前**：总开关关着时，其它端点回 JSON 503，
+//   而流要回 `event: error` + `GAME_ROOMS_OFF`（客户端读的是流，不是 JSON）。闸仍然生效 ——
+//   处理器自己判 config.enabled()（services/gameRoomStream.handler 的第一段）。
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 流的鉴权：`Authorization: Bearer` 优先，`?token=` 兜底（**同一套 requireAuth**）。
+ * ★ 为什么允许 query token：App 用 fetch + ReadableStream 能带头（推荐这么用），但 EventSource /
+ *   原生播放器带不了头；而 URL 会进 nginx access log / Referer，所以能带头的客户端一律带头，
+ *   query 只作兜底（短期 token 即可）。
+ * ★ 不要把这条规则搬进 middleware/auth：那等于所有端点都接受 URL 里的 token。
+ */
+function streamAuth(req, res, next) {
+  const raw = typeof req.query?.token === "string" ? req.query.token.trim() : "";
+  if (raw && !req.headers.authorization) req.headers.authorization = `Bearer ${raw}`;
+  return requireAuth(req, res, next);
+}
+
+router.get("/rooms/:code/stream", streamAuth, gameRoomStream.handler);
 
 /**
  * 总开关（`GAME_ROOMS=off`）。
@@ -131,6 +160,30 @@ function reply(res, result, okStatus = 200) {
 }
 
 /**
+ * 「这间房变了」的**唯一广播口**（SSE 推送）。
+ * ★ 所有写路由都经过 `replyWrite`，不要自己在路由里 emit：多一个出口就有一条路径忘记推，
+ *   症状是「有的操作实时、有的要等下一次轮询」—— 在客户端看起来像偶发 bug，很难查。
+ * ★ 失败不推：`NOT_HOST` / `WRONG_PHASE` 这类回包什么都没改（**唯一例外**是 `next` 的
+ *   `GAME_OVER`：它虽然回 409，却把房间落成了 over，见那边的调用处）。
+ */
+function bumpRoom(code) {
+  if (!code) return 0;
+  return gameRoomBus.publish(code);
+}
+
+/**
+ * 写操作的统一回包：`reply` + 成功时广播。
+ * @param {string} [code] 这间房的码（房间内的端点传 `req.params.code`；建房 / 进房从回包里取）
+ * @param {{ okStatus?: number, bumpCodes?: string[] }} [opts] `bumpCodes` = 「失败但落了库」的码
+ */
+function replyWrite(res, result, code, { okStatus = 200, bumpCodes = [] } = {}) {
+  reply(res, result, okStatus);
+  if (result.ok || bumpCodes.includes(result.code)) {
+    bumpRoom(code || result.room?.code || result.code);
+  }
+}
+
+/**
  * POST /api/game/rooms —— 建房
  *
  * 请求体：`{ mode: "match4"|"match8"|"custom", seats?: 2..8 }`
@@ -160,7 +213,7 @@ router.post("/rooms", requireAuth, createLimit, async (req, res, next) => {
 router.post("/rooms/join", requireAuth, joinLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(res, await gameRoom.joinRoom({ userId: req.user._id, code: body.code }));
+    replyWrite(res, await gameRoom.joinRoom({ userId: req.user._id, code: body.code }));
   } catch (err) {
     next(err);
   }
@@ -194,7 +247,7 @@ router.get("/rooms/:code", requireAuth, pollLimit, async (req, res, next) => {
  */
 router.post("/rooms/:code/leave", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRoom.leaveRoom({ userId: req.user._id, code: req.params.code }));
+    replyWrite(res, await gameRoom.leaveRoom({ userId: req.user._id, code: req.params.code }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -207,7 +260,7 @@ router.post("/rooms/:code/leave", requireAuth, actLimit, async (req, res, next) 
 router.post("/rooms/:code/ready", requireAuth, actLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(res, await gameRoom.setReady({ userId: req.user._id, code: req.params.code, ready: body.ready }));
+    replyWrite(res, await gameRoom.setReady({ userId: req.user._id, code: req.params.code, ready: body.ready }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -220,7 +273,7 @@ router.post("/rooms/:code/ready", requireAuth, actLimit, async (req, res, next) 
  */
 router.post("/rooms/:code/start", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRoom.startRoom({ userId: req.user._id, code: req.params.code }));
+    replyWrite(res, await gameRoom.startRoom({ userId: req.user._id, code: req.params.code }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -233,7 +286,7 @@ router.post("/rooms/:code/start", requireAuth, actLimit, async (req, res, next) 
 router.post("/rooms/:code/kick", requireAuth, actLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(res, await gameRoom.kickMember({ userId: req.user._id, code: req.params.code, targetId: body.userId }));
+    replyWrite(res, await gameRoom.kickMember({ userId: req.user._id, code: req.params.code, targetId: body.userId }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -295,7 +348,7 @@ router.delete("/queue", requireAuth, joinLimit, async (req, res, next) => {
  */
 router.post("/rooms/:code/rounds/start", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRound.startRound({ userId: req.user._id, code: req.params.code }));
+    replyWrite(res, await gameRound.startRound({ userId: req.user._id, code: req.params.code }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -311,7 +364,11 @@ router.post("/rooms/:code/rounds/start", requireAuth, actLimit, async (req, res,
  */
 router.post("/rooms/:code/rounds/entries", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRound.submitEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }));
+    replyWrite(
+      res,
+      await gameRound.submitEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }),
+      req.params.code,
+    );
   } catch (err) {
     next(err);
   }
@@ -345,7 +402,11 @@ router.get("/rooms/:code/rounds/current", requireAuth, pollLimit, async (req, re
 router.post("/rooms/:code/rounds/phase", requireAuth, actLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(res, await gameRound.setPhase({ userId: req.user._id, code: req.params.code, phase: body.phase }));
+    replyWrite(
+      res,
+      await gameRound.setPhase({ userId: req.user._id, code: req.params.code, phase: body.phase }),
+      req.params.code,
+    );
   } catch (err) {
     next(err);
   }
@@ -360,7 +421,11 @@ router.post("/rooms/:code/rounds/phase", requireAuth, actLimit, async (req, res,
 router.post("/rooms/:code/rounds/like", requireAuth, actLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(res, await gameRound.likeEntry({ userId: req.user._id, code: req.params.code, targetId: body.targetUserId }));
+    replyWrite(
+      res,
+      await gameRound.likeEntry({ userId: req.user._id, code: req.params.code, targetId: body.targetUserId }),
+      req.params.code,
+    );
   } catch (err) {
     next(err);
   }
@@ -374,7 +439,11 @@ router.post("/rooms/:code/rounds/like", requireAuth, actLimit, async (req, res, 
  */
 router.post("/rooms/:code/rounds/vote", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRound.voteEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }));
+    replyWrite(
+      res,
+      await gameRound.voteEntry({ userId: req.user._id, code: req.params.code, body: req.body || {} }),
+      req.params.code,
+    );
   } catch (err) {
     next(err);
   }
@@ -391,7 +460,7 @@ router.post("/rooms/:code/rounds/vote", requireAuth, actLimit, async (req, res, 
  */
 router.post("/rooms/:code/rounds/settle", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRound.settle({ userId: req.user._id, code: req.params.code }));
+    replyWrite(res, await gameRound.settle({ userId: req.user._id, code: req.params.code }), req.params.code);
   } catch (err) {
     next(err);
   }
@@ -430,9 +499,10 @@ router.get("/rooms/:code/rounds/events", requireAuth, pollLimit, async (req, res
 router.post("/rooms/:code/rounds/events/choice", requireAuth, actLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    reply(
+    replyWrite(
       res,
       await gameRound.chooseRoundEvent({ userId: req.user._id, code: req.params.code, optionId: body.optionId }),
+      req.params.code,
     );
   } catch (err) {
     next(err);
@@ -447,10 +517,14 @@ router.post("/rooms/:code/rounds/events/choice", requireAuth, actLimit, async (r
  *   任何人 `GET /api/game/rooms/:code` 都读得到（平局 = `winners: []`）。
  * 错误码：403 `NOT_HOST` / 404 `ROUND_NOT_FOUND` / 409 `ROUND_NOT_SETTLED` /
  *        409 `GAME_OVER`（带 `winners`，胜者可能是空数组 = 同归于尽）
+ * ★ `GAME_OVER` 虽然回 409，但它是**改了库**的（房间 → over）：必须 bump（`bumpCodes`），
+ *   否则订阅者要等下一次轮询才知道「结束了」—— 结局正是最不能晚到的一帧。
  */
 router.post("/rooms/:code/rounds/next", requireAuth, actLimit, async (req, res, next) => {
   try {
-    reply(res, await gameRound.nextRound({ userId: req.user._id, code: req.params.code }));
+    replyWrite(res, await gameRound.nextRound({ userId: req.user._id, code: req.params.code }), req.params.code, {
+      bumpCodes: ["GAME_OVER"],
+    });
   } catch (err) {
     next(err);
   }

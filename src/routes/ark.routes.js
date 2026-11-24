@@ -197,6 +197,12 @@ router.get("/health", (_req, res) => {
   //   · gameRoomModes：这台服务器认哪几种模式（match4 / match8 / custom）。App 照它摆几个键，
   //     不在本机写死 —— 哪天只开 4 人匹配，服务端收窄这一个数组就够了。
   //   · gameRoomMaxSeats：自定义房间最多几座（今天 8）。同上，不在 App 里抄一份。
+  // 2026-11-23 的能力位（工坊对局的 SSE 推送，api-contract「工坊对局：推送（SSE）」）：
+  //   · gameRoomStream：这台服务器有 GET /api/game/rooms/:code/stream（建连即 snapshot，之后
+  //     update / ping / error / end）。读不到这一位 = 老服务端，App 只能轮询。
+  //     ★★ 它说的是「有这条流」，**不是「跨实例实时」**：pm2 cluster 下推送只覆盖同一进程，
+  //     另一个实例上的写收不到 —— App 的轮询退路必须留着，别拿到 true 就把轮询删掉。
+  //     判据与 gameRooms 同一个总开关（GAME_ROOMS=off 时 false）。
   // 2026-11-23 的能力位（工坊对局的回合引擎，api-contract「工坊对局：回合引擎」）：
   //   · gameRounds：这台服务器有 /api/game/rooms/:code/rounds*（开回合 / 交片 / 展映 / 点赞 / 投票 / 结算 / 下一回合）。
   //     `GAME_ROUNDS=off` 急停时 false；**房间本身还开着**（gameRooms 仍为 true），两件事分开报。
@@ -235,6 +241,8 @@ router.get("/health", (_req, res) => {
     gameRooms: gameRoom.enabled(),
     gameRoomModes: gameRoom.enabled() ? gameRoom.MODES.slice() : [],
     gameRoomMaxSeats: gameRoom.MAX_SEATS,
+    // SSE 推送（2026-11-23）：有 /api/game/rooms/:code/stream；单实例语义见上面的 ★★
+    gameRoomStream: gameRoom.enabled(),
     // 工坊对局的回合引擎（2026-11-23）：能力位见上面那一段注释
     gameRounds: gameRoom.enabled() && gameRound.enabled(),
     // 回合间事件（2026-11-23）：三选一由服务端出题；关掉时退回本机事件（跨端会对不上，所以独立一位）

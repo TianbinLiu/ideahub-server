@@ -3504,10 +3504,11 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 设计正本在 app 仓：`docs/workshop-game-design.md` §三「服务端房间协议」与 §四 G5「联机」、
 `docs/g2-game-ui.md` 的大厅需求（**4 人匹配 / 8 人匹配 / 自定义房间邀请**）。
 
-**这是 HTTP 轮询版**：客户端每 2~5 秒轮询一次房间快照 / 队列状态（`playing` 之后轮询回合快照），
-服务端不主动推任何东西。WebSocket 推送是下一步，届时这些端点的形状**不用改**（推送只是把轮询的结果
-主动塞过来）。`status: "playing"` 之后由**回合引擎**推进（见下一节「工坊对局：回合引擎」）；
-阶段推进仍然靠房主点 / 全员交齐 / 全员投完，服务端不自己往前推。
+**轮询 + SSE 推送**（2026-11-23）：所有读写端点照旧；另外有一条长连接
+`GET /api/game/rooms/:code/stream`（见「工坊对局：推送（SSE）」），建连即下发快照，之后房间 / 回合
+有变化就推。★ 推送是**单实例**的（进程内事件总线，pm2 cluster 的两个实例各推各的），客户端
+每 2~5 秒的轮询**必须保留**当作跨实例与断线的退路。`status: "playing"` 之后由**回合引擎**推进
+（见下一节「工坊对局：回合引擎」）；阶段推进仍然靠房主点 / 全员交齐 / 全员投完，服务端不自己往前推。
 
 ### 两张表
 
@@ -3529,6 +3530,7 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 | POST | `/api/game/rooms` | 登录 | 建房 `{ mode, seats? }` → **201** `{ ok, room }` |
 | POST | `/api/game/rooms/join` | 登录 | 进房 `{ code }` → `{ ok, room }` |
 | GET | `/api/game/rooms/:code` | 登录 | 快照 → `{ ok, room }`（任何登录用户都能看：邀请链接要先能预览） |
+| GET | `/api/game/rooms/:code/stream` | 登录（`Authorization: Bearer` 或 `?token=`） | **SSE 推送**：建连即 `snapshot`，之后 `update` / `ping` / `error` / `end`（见「工坊对局：推送（SSE）」） |
 | POST | `/api/game/rooms/:code/leave` | 登录 | 退房 → `{ ok, left, closed, code, roomId, hostId, hostTransferred, room }` |
 | POST | `/api/game/rooms/:code/ready` | 登录 | 准备 `{ ready: true\|false }` → `{ ok, room }` |
 | POST | `/api/game/rooms/:code/start` | **仅房主** | 开局 → `{ ok, room }`（`room.status` = `playing`） |
@@ -3704,12 +3706,17 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | `gameRooms` | 有 `/api/game/rooms*` 与 `/api/game/queue`。**读不到这一位 = 老服务端，App 不摆大厅入口** |
 | `gameRoomModes` | 这台服务器认哪几种模式（今天 `["match4","match8","custom"]`；`GAME_ROOMS=off` 时是 `[]`） |
 | `gameRoomMaxSeats` | 自定义房间最多几座（8）。App 只照服务端下发的摆，不在本机写死 |
+| `gameRoomStream` | 有 `GET /api/game/rooms/:code/stream`（SSE 推送，2026-11-23）。`GAME_ROOMS=off` 时 false。**读不到这一位 = 老服务端，App 只能轮询**；★ 它为 true 也**不代表跨实例实时**（见「推送」的 ★★），轮询退路不能删 |
 | `gameRounds` | 有 `/api/game/rooms/:code/rounds*`（回合引擎）。`GAME_ROUNDS=off` 时 false，房间端点不受影响。**读不到这一位 = 老服务端，App 在 `playing` 后不摆回合按钮** |
 | `gameEvents` | 有 `GET / POST /api/game/rooms/:code/rounds/events[/choice]`（回合间事件由服务端出题，2026-11-23）。`GAME_EVENTS_API=off` 时 false，回合引擎不受影响。**读不到这一位 = 老服务端，App 退回本机事件**（跨端会对不上） |
 
 ### 还没做（别当成已做）
 
-- **WebSocket / SSE 推送**：现在是轮询。真做的时候这一批端点的形状不变，只是多一条连接；
+- **跨实例推送**：SSE 已经上了，但广播只在**本进程**（`services/gameRoomBus` 是 EventEmitter）——
+  pm2 cluster 的另一个实例上的写不会推过来，靠客户端轮询兜底。要做跨实例得引 Redis pub/sub
+  （接口不用改，换 bus 的实现即可）；
+- **断线续帧 / `Last-Event-ID`**：重连只拿最新 `snapshot`，不补断线期间漏掉的帧（客户端拿到的是一份
+  完整快照，够用；真要做补帧得在服务端存一小时的帧缓冲，不值）；
 - **回合引擎的历史回合读取**：回合数据都留在 `rounds[]`，但没有读第 N 回合的端点（复盘 / 分享还没做）；
 - **跨服**：没有分片、没有共享队列。撮合是「本进程 + 本库」的，多实例靠 Mongo 的唯一索引与条件更新
   （两个 pm2 实例同时撮合是安全的，见上「撮合」第 4 步）；
@@ -3719,7 +3726,8 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
   加密票据（自定义房间靠房号本身保密，知道码的人就能进）；
 - **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）。
 
-回归测试：`server/tests/gameRoom.spec.js`（45 条）。
+回归测试：`server/tests/gameRoom.spec.js`（45 条）。SSE 推送见「工坊对局：推送（SSE）」与
+`server/tests/gameRoomStream.spec.js`（16 条）。
 
 ## 工坊对局：回合引擎（GameRound，2026-11-23）
 
@@ -3968,12 +3976,133 @@ App 只负责**应用交给它的效果**。
 - **断线重连 / 托管投票**：成员没有心跳，掉线的人不会自动跳过（与房间那块的已知缺口同一个）；
 - **总回合上限**：App 单机版打满 8 回合结束；服务端今天只按「剩到胜者名额」结束，没有 8 回合硬闸
   （所以第 2/4/6 回合之外不会再有事件 —— 事件回合是固定的三个）；
-- **推送**：仍然轮询（2~5 秒一次），WebSocket 接上时这些端点形状不变；
+- **推送**：回合 / 房间变化已经走 SSE（见「工坊对局：推送（SSE）」），但它是**单实例**的、也没有
+  断线续帧；客户端轮询仍是退路；
 - **观看 / 回放历史回合**：`rounds[]` 都留着，但没有读历史回合的端点（复盘 / 分享是下一步）；
 - **事件选择的审计读取**：`eventPicks` 落在 `rounds[]` 里，但没有「谁选了什么」的对外端点
   （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）。
 
 回归测试：`server/tests/gameRound.spec.js`（29 条）+ `server/tests/gameEvent.spec.js`（10 条）。
+
+## 工坊对局：推送（SSE，2026-11-23）
+
+把 App 的 2 秒轮询换成服务端推送：一条长连接就能收到「房间 / 回合 / 事件 / 结束」的变化，
+轮询作为**跨实例与断线时的退路**保留。服务端实现：`src/services/gameRoomStream.service.js`
+（帧 / 快照 / 心跳 / 寿命 / 连接上限 / 清理）、`src/services/gameRoomBus.js`（进程内广播）、
+`src/routes/gameRoom.routes.js`（一条路由 + `bumpRoom` 收口）。
+
+### 端点与鉴权
+
+```
+GET /api/game/rooms/:code/stream
+```
+
+| 项 | 说明 |
+|---|---|
+| 鉴权 | `Authorization: Bearer <jwt>`（**推荐**，App 用 `fetch` + `ReadableStream`）或 `?token=<jwt>`（同一套校验；EventSource / 原生播放器带不了头时兜底） |
+| 响应 | `200` + `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache, no-transform`、`X-Accel-Buffering: no`（nginx 不缓冲） |
+| 建立失败的两种形态 | **鉴权失败**（没 token / token 过期 / 封禁）在建立连接**之前**回普通 JSON `401/403`；**业务失败**（房号不存在 / 不是成员 / 总开关关着）连接已建立，走 `event: error` 帧再关闭 |
+| 每用户并发上限 | **2 条**（手机 + 平板，或换设备时新旧连接短暂重叠）。超出回 **HTTP 429** `TOO_MANY_STREAMS`（`details.max` / `details.active`），客户端应停止重试而不是重连 |
+| 单条连接寿命 | **30 分钟**（`GAME_STREAM_MAX_SEC`，缺省 1800）：到期推 `event: end` 再关闭，客户端重连即可 |
+| 心跳 | 每 **20 秒** `event: ping`（`GAME_STREAM_HEARTBEAT_SEC`），防 nginx / Cloudflare 掐空闲连接 |
+
+★ App 的请求头 / token 用法与其它端点完全相同：**没有为推送新开一种登录方式**。`?token=` 只是把
+同一个 JWT 放进 URL 的兜底形态（URL 会进 nginx access log / Referer，所以能带头的客户端一律带头、
+短期 token 即可）。
+
+### 帧格式
+
+一帧 = `event: <name>\ndata: <JSON>\n\n`（原生 `res.write` 拼，不引依赖）。
+**`ping` 的 data 是空串**（`event: ping\ndata: \n\n`），其它事件的 data 是 JSON。
+
+| event | 什么时候 | data |
+|---|---|---|
+| `snapshot` | 建立连接后**立刻**一帧 | `{ room, round }`（`round` 没有回合时为 `null`） |
+| `update` | 房间 / 回合数据**有变化就推** | 同上（`{ room, round }`，总是**完整快照**，不是增量） |
+| `ping` | 每 20 秒 | 空串 |
+| `error` | 业务失败（见下表） | `{ ok:false, code, message, ... }`，**发完就关闭连接** |
+| `end` | 单条连接活满 30 分钟 | `{ reason: "lifetime" }`，**发完就关闭连接**（客户端应重连） |
+
+```text
+event: snapshot
+data: {"room":{"code":"K7M2QX","state":"waiting",…},"round":null}
+
+event: update
+data: {"room":{"code":"K7M2QX","state":"playing",…},"round":{"round":1,"phase":"creating","entries":[],…}}
+
+event: ping
+data:
+
+event: error
+data: {"ok":false,"code":"ROOM_NOT_FOUND","message":"no room with this code (wrong code, or it has expired)"}
+
+event: end
+data: {"reason":"lifetime"}
+```
+
+### `snapshot` / `update` 的 data
+
+- `room`：与 `GET /api/game/rooms/:code` 的 `room` **逐字段同形**（含 `state` / `winners` /
+  `finishedAt` / `members[].hp`，见「工坊对局：房间与匹配」的快照一节），**看的人视角**
+  （`canStart` 只对房主为 true）。
+- `round`：与 `GET /api/game/rooms/:code/rounds/current` 的 body **同形**（去掉 `ok`：`round` /
+  `phase` / `entries[]` / `allSubmitted` / `likesPending` / `votesPending`，`likedByMe` /
+  `votedByMe` 也是看的人视角），见「工坊对局：回合引擎」的回合快照。**没有回合时为 `null`**
+  （还没开第一回合是正常状态，不是错误 —— 与 `GET rounds/current` 的 404 不同）。
+- `update` 与 `snapshot` 同形：**永远下发整份快照**，客户端直接替换本地状态即可，不用合并增量。
+- 事件本身（`GET rounds/events`）**不单独推**：`round.phase` 变成 `settled` 就是「该读事件了」的
+  信号，客户端照旧读一次（服务端没有把事件塞进流里，避免把「谁选了什么」混进房间广播）。
+- 结束：房间落成 `over` 时 `room.state = "over"` + `winners` / `finishedAt`，推一帧 `update`；
+  **最后一个人退房 / 房间过期被删** → 推 `event: error`（`ROOM_NOT_FOUND`）再关闭。
+
+### `error` 帧的错误码
+
+| HTTP（建立前） | `code` | 什么时候 |
+|---|---|---|
+| 401 | `UNAUTHORIZED` | 没带 / 带错 / 过期的 token（**JSON 回包**，不是 error 帧） |
+| 403 | `BANNED` | 被平台封禁（同上，JSON 回包） |
+| 429 | `TOO_MANY_STREAMS` | 同一个账号已经有 2 条流（JSON 回包；`details.max`=2、`details.active`） |
+| 200 | `GAME_ROOMS_OFF` | 这台服务器 `GAME_ROOMS=off`（error 帧；流已经建立） |
+| 200 | `ROOM_NOT_FOUND` | 房号形状不对 / 不存在 / 已过期（与 `GET /rooms/:code` 同一句话） |
+| 200 | `NOT_IN_ROOM` | 不是这间房的成员（带 `roomCode`）—— 回合数据只给成员看 |
+| 200 | `TOO_MANY_STREAMS` | 这间房在本进程的订阅者达到上限（64，8 人 × 2 条 × 4 倍余量；极端情况） |
+| 200 | `STREAM_ERROR` | 服务端读库 / 写流失败（罕见）；客户端应**回退轮询**并等下一轮重连 |
+
+**收到 `error` 或 `end` 之后连接不可再用**（服务端已关闭），客户端按自己的退避策略重连；
+重连**不保证**补上断线期间的帧，但第一帧 `snapshot` 就是最新状态，够用。
+
+### ★★ 单实例限制（务必写清，别按「全服实时」用）
+
+- 广播走**进程内** `EventEmitter`（`services/gameRoomBus.js`）：**只覆盖同一个 Node 进程里的连接**。
+  线上是 pm2 cluster（2 实例）+ nginx，nginx 不粘会话 —— A 上的写只会推给连在 A 上的订阅者，
+  连在 B 上的客户端收不到，**必须靠它自己的轮询兜底**。
+- `/api/ark/health` 的 `gameRoomStream: true` 只表示「这台服务器有这条流」，**不表示跨实例实时**。
+- 为什么不做跨实例：要跨进程就得引 Redis pub/sub（本次不新增依赖）。以后要做只换 bus 的实现
+  （`publish` / `subscribe` 签名不变），路由与帧格式都不用动。
+- 单实例内也有上限：每条连接都是一个 listener，同一间房超过 64 个订阅者会被拒（`TOO_MANY_STREAMS`），
+  正常一桌 8 人 × 2 条 = 16，够用。
+- 「每用户 2 条」与「每间房 64 个订阅者」的计数也都是**进程内**的：cluster 下同一个账号在不同实例上
+  各可开 2 条（总 4 条）。客户端本来就该只保留一条连接，这里是防泄漏 / 防刷的软闸，不是计费闸。
+
+### 服务端收口：`bumpRoom()` 与 `replyWrite()`
+
+- 写操作成功后统一走 `routes/gameRoom.routes.js` 的 `replyWrite()` → `bumpRoom(code)`
+  （**唯一一处** `gameRoomBus.publish`）：join / leave / ready / start / kick、
+  rounds start / entries / phase / like / vote / settle / next、events choice。
+- 失败**不推**（`NOT_HOST` / `WRONG_PHASE` 什么都没改）。唯一例外：`rounds/next` 的 `GAME_OVER`
+  虽然回 409，但它把房间落成了 `over`（`winners` / `finishedAt`），必须推。
+- 连接断开 / 超时 / 房间被删 / 服务端 error：`res` 的 `close` 事件统一清理（退订 + 清心跳与寿命
+  定时器 + 释放每用户名额），这些都是幂等的，重复调用无副作用。
+- 连接期间每 60 秒给房间续一次命（`lastSeenAt`）：有了推送之后客户端不再轮询，不续命的话
+  `playing` 房超过 120 分钟会被懒清理删掉。
+
+### 测试
+
+`server/tests/gameRoomStream.spec.js`（16 条）：建连即 snapshot、写操作链每一步推 update、
+失败不推、心跳帧格式、寿命 `end`、三类 error 后关闭、`?token=` 与 401、2 条连接上限与释放、
+客户端断开 / 房间被删 / 建连失败三种清理、bus 上限与退订、帧格式纯函数。
+选型：**supertest + 真实流读取**（`app.listen(0)` + 原生 `fetch` 的 `ReadableStream`），
+不是直接调 handler —— 响应头、429 状态码、客户端断开后的清理只有走真实 HTTP 才测得到。
 
 ## 客户端接入约定
 

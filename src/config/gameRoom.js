@@ -164,6 +164,39 @@ function ttlMsFor(status) {
   return status === "playing" ? PLAYING_ROOM_TTL_MS : ROOM_TTL_MS;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// SSE 推送（2026-11-23，docs/api-contract.md「工坊对局：推送（SSE）」）
+// ★ 只有「寿命 / 心跳」这一类运维旋钮走环境变量；「每人最多几条连接」是产品口径，写死常量。
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 每用户**同时**最多几条 SSE 连接。
+ * ★ 2 = 手机 + 平板（或一条旧连接还没被网络层判定掉线时重连的那一条）。不是「每分钟几条」：
+ *   一条流能活 30 分钟，按请求数限流对长连接不起作用（判据在 services/gameRoomStream）。
+ * ★ 计数是**进程内**的：pm2 cluster 下同一账号每个实例各可开 2 条。它是防泄漏 / 防刷的软闸，
+ *   不是计费闸（与 bus 的 64/房间同一口径）。
+ */
+const STREAM_MAX_PER_USER = 2;
+
+/**
+ * 心跳间隔（毫秒；缺省 20 秒）。
+ * ★ 客户端**不要**依赖它的精确值：它只是让 nginx / Cloudflare 不把空闲连接掐掉（CF 的读超时是
+ *   100 秒级，20 秒留了三倍余量）。环境变量 `GAME_STREAM_HEARTBEAT_SEC` 夹 1~120 秒。
+ */
+function streamHeartbeatMs() {
+  return readSeconds("GAME_STREAM_HEARTBEAT_SEC", 20, 1, 120);
+}
+
+/**
+ * 单条连接寿命（毫秒；缺省 30 分钟）。
+ * ★ 到期服务端推 `event: end` 再关，让客户端主动重连：移动网络换 NAT / 中间层换绑之后，
+ *   旧连接可能已经死了而两边都不知道，定期重建是唯一可靠的自愈方式。
+ *   环境变量 `GAME_STREAM_MAX_SEC` 夹 1~7200 秒。
+ */
+function streamMaxLifetimeMs() {
+  return readSeconds("GAME_STREAM_MAX_SEC", 1800, 1, 7200);
+}
+
 module.exports = {
   MODES,
   QUEUE_MODES,
@@ -180,6 +213,7 @@ module.exports = {
   QUEUE_HEARTBEAT_MS,
   MATCH_TTL_MS,
   ETA_PER_MISSING_SLOT_SEC,
+  STREAM_MAX_PER_USER,
   enabled,
   isMode,
   isQueueMode,
@@ -187,4 +221,6 @@ module.exports = {
   requiredPlayersOf,
   capacityOf,
   ttlMsFor,
+  streamHeartbeatMs,
+  streamMaxLifetimeMs,
 };
