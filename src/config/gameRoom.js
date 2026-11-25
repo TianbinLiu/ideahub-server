@@ -110,6 +110,55 @@ function enabled() {
   return String(process.env.GAME_ROOMS ?? "").trim().toLowerCase() !== "off";
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 公开房 + 观战（2026-11-24，docs/api-contract.md「工坊对局：公开房列表与观战」）
+// ★ 三个数都是**产品口径 / 房间文档的硬上限**，写死常量（与 config/gameTicket 同一条纪律）；
+//   只有两个急停开关走环境变量（运维旋钮，缺省开）。
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 一间房最多几个观众。
+ * ★ 观众席是「看别人打」的地方，不是第二个大厅：一条房间文档里几百行观众会让**每个轮询者**
+ *   （8 个玩家 + 所有观众）都为别人的围观多读几十 KB。20 ≈ 一间 8 人局在朋友之间传播的量级。
+ * ★ 超出回 429 `TOO_MANY_SPECTATORS`（**不是** 409：这是「现在满了，等有人走」的资源上限）。
+ */
+const MAX_SPECTATORS = 20;
+
+/** 公开房列表的缺省页大小 / 允许的最大页大小（客户端可以传小一点，不许传更大） */
+const PUBLIC_ROOM_PAGE_SIZE = 20;
+const PUBLIC_ROOM_PAGE_SIZE_MAX = 50;
+
+/**
+ * 公开房列表的缺省状态：只列**还在等人**的房（大厅上那一屏就是「能进的房」）。
+ * ★ `state` 可以显式传 `playing` / `over`（复盘 / 围观用），但这时每行的 `joinable` 是 false
+ *   —— 列表默认只为「能进去坐下」服务，与契约的「过期 / 满员 / 已开局不列」同一条口径。
+ */
+const PUBLIC_ROOM_DEFAULT_STATE = "waiting";
+
+/**
+ * 公开房列表的急停（`GAME_PUBLIC_ROOMS=off`）。
+ * ★ 关着时 `GET /api/game/rooms` 回 503 `GAME_PUBLIC_ROOMS_OFF`，`/api/ark/health` 的
+ *   `gamePublicRooms` 报 false（App 不摆「公开房」那一栏）。
+ * ★ **不**关建房的 `visibility` 参数：关掉的只是「把房间摆到大厅上」这条读路径。
+ *   已经建出来的公开房留在库里，开关打开就又能看到（列表是实时查询，没有缓存）。
+ */
+function publicRoomsEnabled() {
+  return String(process.env.GAME_PUBLIC_ROOMS ?? "").trim().toLowerCase() !== "off";
+}
+
+/**
+ * 观战的急停（`GAME_SPECTATORS=off`）。
+ * ★ 关着时 `POST /api/game/rooms/:code/spectate` 与 `.../spectate/leave` 回 503
+ *   `GAME_SPECTATORS_OFF`，`/api/ark/health` 的 `gameSpectators` 报 false。
+ * ★ **已经在观众席上的人读取照旧**（房间快照 / 当前回合 / 历史 / SSE）：急停要停的是「新的人
+ *   涌进来」，把正在看的人一脚踢出去只会在客户端留下一屏 403，而且他们手里的 userId 已经在
+ *   `spectators[]` 里 —— 再关也关不掉那条数据，只是把读路径也堵上。
+ * ★ 与 `GAME_ROOMS` 的关系：`GAME_ROOMS=off` 时整棵 `/api/game/rooms*` 先回 `GAME_ROOMS_OFF`。
+ */
+function spectatorsEnabled() {
+  return String(process.env.GAME_SPECTATORS ?? "").trim().toLowerCase() !== "off";
+}
+
 function intFromEnv(name, fallback, min, max, scale) {
   const raw = String(process.env[name] ?? "").trim();
   const n = raw ? Number.parseInt(raw, 10) : fallback;
@@ -214,7 +263,13 @@ module.exports = {
   MATCH_TTL_MS,
   ETA_PER_MISSING_SLOT_SEC,
   STREAM_MAX_PER_USER,
+  MAX_SPECTATORS,
+  PUBLIC_ROOM_PAGE_SIZE,
+  PUBLIC_ROOM_PAGE_SIZE_MAX,
+  PUBLIC_ROOM_DEFAULT_STATE,
   enabled,
+  publicRoomsEnabled,
+  spectatorsEnabled,
   isMode,
   isQueueMode,
   seatsFor,

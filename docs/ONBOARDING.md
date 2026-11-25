@@ -77,6 +77,19 @@ cp .env.example .env
 端点、状态机、错误码、能力位（`/api/ark/health` 的 `gameRooms`）见 `docs/api-contract.md`
 「工坊对局：房间与匹配」。⚠ 还没做的：跨服、房间里的人的断线重连。
 
+**工坊对局 · 公开房列表 + 观战（可选，缺省开，2026-11-24）**：建房带
+`visibility: "public" | "private"`（**缺省 private**），`GET /api/game/rooms` 只列 public、
+`createdAt` 倒序、分页；过期 / 0 人 / 满员（缺省 `state=waiting` 时）**不列**。
+观战走 `POST /api/game/rooms/:code/spectate`（**不占座**、只写 `spectators[]`、上限 20 =
+代码常量 `MAX_SPECTATORS`）与 `.../spectate/leave`（只拉观众行，**与玩家 leave 分开**）；
+观众可读房间快照 / `rounds/current` / `rounds/history` / SSE，写操作统一 403
+`SPECTATOR_NOT_ALLOWED`（判据 `gameRoom.service.spectatorWriteDenial` 一处）。
+两个急停：`GAME_PUBLIC_ROOMS=off`（只关列表 → 503 `GAME_PUBLIC_ROOMS_OFF`）、
+`GAME_SPECTATORS=off`（只关进 / 出观众席 → 503 `GAME_SPECTATORS_OFF`，已在席上的人读取照旧）；
+能力位是 `/api/ark/health` 的 `gamePublicRooms` / `gameSpectators`。契约见
+`docs/api-contract.md`「工坊对局：公开房列表与观战」。⚠ 还没做的：观众聊天 / 礼物 / 打赏、
+公开房筛选进阶（人数 / 档位 / 好友 / 游标分页）、观战回放（依赖历史持久化）。
+
 **工坊对局 · SSE 推送（可选，缺省开，2026-11-23）**：`GET /api/game/rooms/:code/stream` 一条长连接
 收「房间 / 回合 / 事件 / 结束」的变化：建连即 `snapshot`，之后有变化推 `update`，每 20 秒
 `ping` 心跳，错误走 `error`、30 分钟寿命到期走 `end`（都是推完就关）。鉴权支持

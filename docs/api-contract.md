@@ -3602,11 +3602,15 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 
 | 集合 | 键 | 说明 |
 |---|---|---|
-| `gamerooms` | `code` **唯一** / `status + lastSeenAt` / `members.userId` | 一间房：`code`（6 位房号）、`mode`（`match4` / `match8` / `custom`）、`seats`、`hostId`、`status`（`waiting` / `playing` / `over`；`closed` 是历史遗留值、今天没有写入方）、`members[{ userId, ready, hp, joinedAt }]`（**数组顺序就是座位顺序**，`seat` 是派生量、不落库；`hp` 开局 100、0 = 淘汰）、`rounds[]`（回合历史，见下一节）、`winners[]` / `finishedAt`（打完一局时由 `next` 落库）、`origin`（`create` / `match`）、`startedAt`、`lastSeenAt` |
+| `gamerooms` | `code` **唯一** / `status + lastSeenAt` / `members.userId` / `visibility + status + createdAt` | 一间房：`code`（6 位房号）、`mode`（`match4` / `match8` / `custom`）、`seats`、`hostId`、`status`（`waiting` / `playing` / `over`；`closed` 是历史遗留值、今天没有写入方）、`members[{ userId, ready, hp, joinedAt }]`（**数组顺序就是座位顺序**，`seat` 是派生量、不落库；`hp` 开局 100、0 = 淘汰）、`rounds[]`（回合历史，见下一节）、`winners[]` / `finishedAt`（打完一局时由 `next` 落库）、`origin`（`create` / `match`）、`visibility`（`public` / `private`，**缺省 private**，2026-11-24）、`spectators[{ userId, joinedAt }]`（观众席，最多 20，2026-11-24）、`startedAt`、`lastSeenAt` |
 | `gamequeues` | `userId` **唯一** / `mode + status + enqueuedAt` / `status + lastSeenAt` | 一行 = 一个人（**同时只能在一个池子里**）。`status`（`waiting` / `matched`）、`enqueuedAt`（排队顺序，**续队不动它**）、`lastSeenAt`（心跳）、`matchedAt` / `roomId` / `code`（撮合成功之后才有） |
 
 ★ **不存敏感信息**：两张表里只有 ObjectId。用户名 / 头像在读快照时按 `members.userId` 现拼（一次 `$in`），
 所以改昵称后队友屏幕上立刻是新名字，删号之后也不留副本。
+★ **观众与成员是两张互斥名单**（2026-11-24）：`spectators` 里不占座、没有 `ready` / `hp`，也不参与回合的
+「全员已交片 / 全员已点赞 / 全员已投票」（那三处只数 `members`）；`join` 会把同一个人从观众席里拉出来。
+观众的进 / 出各一个端点（见「工坊对局：公开房列表与观战」）；房间过期被懒清理时删的是整份文档，
+观众行一起没 —— **没有第二处要级联**。
 ★ 两张表都**不设 Mongo TTL**：过期走懒清理（见下）。TTL 只认一个绝对时间点 —— 删不掉「0 个人的房」
 这种结构化条件，也没法给 `waiting` 与 `playing` 两种寿命，而且 `code` 唯一索引的行被 TTL 删掉之后，
 房号可能被下一间房重新分配（客户端手里那个码会静默指到另一间房）。
@@ -3615,11 +3619,14 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | `/api/game/rooms` | 登录 | 建房 `{ mode, seats? }` → **201** `{ ok, room }` |
+| POST | `/api/game/rooms` | 登录 | 建房 `{ mode, seats?, visibility? }` → **201** `{ ok, room }`（`visibility` 缺省 `private`） |
+| GET | `/api/game/rooms` | 登录 | **公开房列表**（2026-11-24）：`?visibility=public&state=waiting&mode=&page=1&limit=20` → 见「工坊对局：公开房列表与观战」 |
 | POST | `/api/game/rooms/join` | 登录 | 进房 `{ code }` → `{ ok, room }` |
-| GET | `/api/game/rooms/:code` | 登录 | 快照 → `{ ok, room }`（任何登录用户都能看：邀请链接要先能预览） |
-| GET | `/api/game/rooms/:code/stream` | 登录（`Authorization: Bearer` 或 `?token=`） | **SSE 推送**：建连即 `snapshot`，之后 `update` / `ping` / `error` / `end`（见「工坊对局：推送（SSE）」） |
-| POST | `/api/game/rooms/:code/leave` | 登录 | 退房 → `{ ok, left, closed, code, roomId, hostId, hostTransferred, room }` |
+| GET | `/api/game/rooms/:code` | 登录 | 快照 → `{ ok, room }`（任何登录用户都能看：邀请链接要先能预览；**观众也可读**） |
+| GET | `/api/game/rooms/:code/stream` | 登录（`Authorization: Bearer` 或 `?token=`） | **SSE 推送**：建连即 `snapshot`，之后 `update` / `ping` / `error` / `end`（见「工坊对局：推送（SSE）」；**观众也可连**） |
+| POST | `/api/game/rooms/:code/leave` | 登录 | 退房（**玩家**的离开）→ `{ ok, left, closed, code, roomId, hostId, hostTransferred, room }` |
+| POST | `/api/game/rooms/:code/spectate` | 登录 | **观战**进观众席（2026-11-24）：不占座、上限 20 → 见「工坊对局：公开房列表与观战」 |
+| POST | `/api/game/rooms/:code/spectate/leave` | 登录 | **出观众席**（与玩家 leave 分开：只拉 `spectators`，不碰 `members`） |
 | POST | `/api/game/rooms/:code/ready` | 登录 | 准备 `{ ready: true\|false }` → `{ ok, room }` |
 | POST | `/api/game/rooms/:code/start` | **仅房主** | 开局 → `{ ok, room }`（`room.status` = `playing`） |
 | POST | `/api/game/rooms/:code/kick` | **仅房主** | 踢人 `{ userId }` → `{ ok, kicked, room }` |
@@ -3641,7 +3648,8 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 { "ok": true, "room": {
   "code": "K7M2QX", "roomId": "…", "mode": "custom", "seats": 8,
   "status": "waiting", "state": "waiting",
-  "origin": "create", "hostId": "…", "requiredPlayers": 2, "memberCount": 3,
+  "origin": "create", "visibility": "public", "hostId": "…", "requiredPlayers": 2, "memberCount": 3,
+  "spectators": { "count": 1 },
   "members": [{ "userId": "…", "username": "…", "avatarUrl": null, "seat": 0,
                 "ready": true, "hp": 100, "isHost": true, "joinedAt": "2026-11-23T…" }],
   "canStart": false, "startBlockedBy": "not-all-ready",
@@ -3652,6 +3660,10 @@ app 那份是【报价】（按下按钮前给用户看的），server 这份是
 
 - `state` 是 App 认的三态：`waiting` / `playing` / `over`（`status` 保留给老包，含历史遗留的 `closed`；
   `closed` 在 `state` 里归到 `over`）。**判结束只看 `state`**，不要拿 `status` 的枚举去猜。
+- `visibility`（2026-11-24）：`public` / `private`。**老房间没有这一格 → 按 `private` 读**（判据只有
+  `gameRoom.service.visibilityOf` 一处）；只影响「会不会出现在公开房列表里」，房号本身仍是进入凭据。
+- `spectators`（2026-11-24）：**只给计数、不给名单**（观众是谁与玩法无关）。没有观众时 `{"count":0}`；
+  观众不占座、不在 `members` 里，也不参与回合的「全员已交片 / 已点赞 / 已投票」。
 - `over` 时：`winners` 是 **userId 数组**（按 hp 降序、同血按 userId，与 settle / `GAME_OVER` 同一串），
   **空数组 = 平局（全员同归于尽）**，不是「还没算」；`finishedAt` 是结束时间；每个成员的 `hp` 照旧给
   （0 = 淘汰）。没结束时 `winners` / `finishedAt` 都是 `null`（稳定形状，App 不用先判字段在不在）。
@@ -3704,10 +3716,17 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | 动作 | 允许的状态 | 谁 | 被拒时的码 |
 |---|---|---|---|
 | `join` | `waiting` | 任何登录用户（一人只能在一间房） | 404 `ROOM_NOT_FOUND` / 409 `ROOM_ALREADY_STARTED` / 409 `ROOM_FULL` / 409 `ALREADY_IN_ROOM` |
+| `spectate`（2026-11-24） | **任何活着的房**（`waiting` / `playing` / `over`） | 任何登录用户（**不占座**；一人可同时是别的房的玩家） | 404 `ROOM_NOT_FOUND` / 409 `ALREADY_IN_ROOM`（你已经是这间房的玩家）/ 429 `TOO_MANY_SPECTATORS` / 409 `SPECTATE_CONFLICT` |
+| `spectate/leave`（2026-11-24） | 任何状态 | 观众席上的人（幂等：不在席上也回 200 `left:false`） | 404 `ROOM_NOT_FOUND` |
 | `ready` | `waiting` | 房里的成员 | 409 `NOT_IN_ROOM` / 409 `ROOM_ALREADY_STARTED` |
 | `start` | `waiting` | **仅房主** | 403 `NOT_HOST` / 409 `NOT_ENOUGH_PLAYERS`（`need`/`have`）/ 409 `NOT_ALL_READY`（`waitingOn`）/ 409 `ROOM_ALREADY_STARTED` |
 | `kick` | `waiting` | **仅房主**，不能踢自己 | 403 `NOT_HOST` / 400 `CANNOT_KICK_SELF` / 404 `MEMBER_NOT_FOUND` / 409 `ROOM_ALREADY_STARTED` |
 | `leave` | **任何状态** | 房里的成员 | 409 `NOT_IN_ROOM` |
+
+★ **观众**（`spectate`）不在上表的「谁」里出现：它进的是**另一张名单**（`spectators[]`）。观众碰任何
+玩家动作（交片 / 点赞 / 投票 / 推进阶段 / 开局 / 踢人 / 准备 / 结算 / next / 选事件）一律
+**403 `SPECTATOR_NOT_ALLOWED`**（判据只有 `gameRoom.service.spectatorWriteDenial` 一处，
+见「工坊对局：公开房列表与观战」的权限矩阵）。
 
 - **全员 ready 才算达标**：`start` 的原子更新把「还在等 + 人数够 + 没有 `ready:false` 的成员」写进同一个条件 ——
   否则两个人同时点开局、或者点开局的同时有人取消准备，会出现「少一个人也开了」。
@@ -3771,18 +3790,25 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | 400 | `SEATS_LOCKED` | match4 / match8 带了与模式不符的 `seats`（**不静默忽略**） |
 | 400 | `BAD_READY` | `ready` 不是布尔 |
 | 400 | `BAD_USER` | 踢人时 `userId` 不是合法账号 id |
+| 400 | `BAD_VISIBILITY` | 建房时 `visibility` 不是 `public` / `private`（2026-11-24；**不静默当 private**） |
+| 400 | `BAD_STATE` / `BAD_PAGE` / `BAD_LIMIT` | 公开房列表：`state` 不是三态 / `page` 不是 ≥1 的整数 / `limit` 不是 1~50 的整数（2026-11-24） |
 | 404 | `ROOM_NOT_FOUND` | 房号不对 / 已过期（**同一个码**：不告诉猜码的人「这个码存在但过期了」） |
 | 404 | `MEMBER_NOT_FOUND` | 要踢的人不在这间房里 |
 | 403 | `NOT_HOST` | 不是房主却想开局 / 踢人（带 `hostId`） |
+| 403 | `SPECTATOR_NOT_ALLOWED` | 观众想做玩家的写操作（交片 / 点赞 / 投票 / 推进阶段 / 开局 / 踢人 / 准备 / 结算 / next / 选事件；2026-11-24，带 `roomCode`） |
 | 409 | `ROOM_FULL` | 满员（带 `seats` / `memberCount`） |
 | 409 | `ROOM_ALREADY_STARTED` | 已经开局（进房 / 准备 / 开局 / 踢人） |
-| 409 | `ALREADY_IN_ROOM` | 已经在这间/别的房里（带 `roomCode` / `roomId`；重复进房时还带快照） |
-| 409 | `NOT_IN_ROOM` | 不在房里却想准备 / 退房 |
+| 409 | `ALREADY_IN_ROOM` | 已经在这间/别的房里（带 `roomCode` / `roomId`；重复进房时还带快照）；**或**已是这间房的玩家却想观战（2026-11-24） |
+| 409 | `NOT_IN_ROOM` | 不在房里却想准备 / 退房（**观众**退房也走这一条：他不占座位，见 `spectate/leave`） |
 | 409 | `NOT_ENOUGH_PLAYERS` | 人数没到开局线（带 `need` / `have`） |
 | 409 | `NOT_ALL_READY` | 有人没准备（带 `waitingOn` = 还没准备的人） |
 | 409 | `CANNOT_KICK_SELF` | 房主想踢自己（该走 `leave`） |
 | 409 | `QUEUE_MODE_CONFLICT` | 已经在另一个池子里（带 `queuedMode`）；先 `DELETE /api/game/queue` |
+| 409 | `SPECTATE_CONFLICT` | 观战进席的原子更新两次都没匹配上（并发，重试即可；2026-11-24） |
+| 429 | `TOO_MANY_SPECTATORS` | 这间房的观众席已满（带 `max`=20 / `count`；等有人离席，2026-11-24） |
 | 503 | `GAME_ROOMS_OFF` | 这台服务器 `GAME_ROOMS=off` |
+| 503 | `GAME_PUBLIC_ROOMS_OFF` | 这台服务器 `GAME_PUBLIC_ROOMS=off`（只关公开房列表这一条读路径，2026-11-24） |
+| 503 | `GAME_SPECTATORS_OFF` | 这台服务器 `GAME_SPECTATORS=off`（只关进 / 出观众席，2026-11-24） |
 
 ★ **错误的 `code` 与房间码不会撞车**：房间码在错误回包里叫 `roomCode`（成功回包里叫 `code`）——
 两个都叫 `code` 的话，`fail()` 展开时房间码会把错误码盖掉，客户端拿到的是一串房号。
@@ -3800,6 +3826,8 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | `gameEvents` | 有 `GET / POST /api/game/rooms/:code/rounds/events[/choice]`（回合间事件由服务端出题，2026-11-23）。`GAME_EVENTS_API=off` 时 false，回合引擎不受影响。**读不到这一位 = 老服务端，App 退回本机事件**（跨端会对不上） |
 | `gameReports` | 举报端点认 `targetType: "user"` / `"game-entry"`（工坊对局里的玩家本人与回合投稿，2026-11-24；见「举报 · 对局里的两类对象」）。**读不到这一位 = 老服务端，App 不摆那两格举报键**（那两格递上去会 400）。静态为 true，与 `GAME_ROOMS` 开关无关 |
 | `gameHistory` | 有 `GET /api/game/rooms/:code/rounds/history`（历史回合 + 战绩，2026-11-24；见「历史回合与战绩」）。`GAME_HISTORY=off` 或 `GAME_ROUNDS=off` 时 false（历史闸在回合闸之后）。**读不到这一位 = 老服务端，App 不摆「战绩 / 回放」** |
+| `gamePublicRooms` | 有 `GET /api/game/rooms`（公开房列表）与建房参数 `visibility`（2026-11-24；见「工坊对局：公开房列表与观战」）。`GAME_PUBLIC_ROOMS=off` 时 false。**读不到这一位 = 老服务端，App 不摆「公开房」那一栏** |
+| `gameSpectators` | 有 `POST /api/game/rooms/:code/spectate[/leave]`（观战，2026-11-24；见「工坊对局：公开房列表与观战」）。`GAME_SPECTATORS=off` 时 false。**读不到这一位 = 老服务端，App 不摆「观战」键**（点了会 404） |
 
 ### 还没做（别当成已做）
 
@@ -3819,12 +3847,169 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
   所以「僵尸成员」今天只能靠房主 `kick`、队友等他等到房间过期；
 - **房号枚举**：6 位 × 32 字符 ≈ 10.7 亿种，进房限流 30 次/分钟；没有「房号只对邀请者可见」的
   加密票据（自定义房间靠房号本身保密，知道码的人就能进）；
-- **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）；
+- **观战 / 补位 / 房主转让给别人**（今天只有「自动转移给最早进房的人」）：**观战已做**（2026-11-24，
+  见「工坊对局：公开房列表与观战」），**观众聊天 / 送礼物 / 打赏 / 补位**都还没做；
 - **对局 UGC 举报的后台处置**（2026-11-24 只做了"受理 + 人工核实"）：`user` 的封禁仍走
   `POST /api/admin/branch/users/:id/ban`，`game-entry` 没有删除 / 下架入口（删一条会打乱回合判定）。
 
 回归测试：`server/tests/gameRoom.spec.js`（45 条）。SSE 推送见「工坊对局：推送（SSE）」与
 `server/tests/gameRoomStream.spec.js`（16 条）、跨实例见 `server/tests/gameRoomBusRedis.spec.js`（5 条）。
+公开房列表与观战见下一节（`server/tests/gameSpectate.spec.js`，24 条）。
+
+## 工坊对局：公开房列表与观战（2026-11-24）
+
+设计正本在 app 仓（大厅「公开房」那一栏与「观战」屏）；服务端实现：
+`src/services/gameRoom.service.js`（`listPublicRooms` / `spectate` / `leaveSpectate` /
+`spectatorWriteDenial`，判据唯一实现）、`src/models/GameRoom.js`（`visibility` / `spectators[]` 字段与索引）、
+`src/config/gameRoom.js`（`MAX_SPECTATORS` / 分页 / 两个开关）、`src/routes/gameRoom.routes.js`
+（三条路由 + 两道闸 + 限流）、`src/services/gameRound.service.js`（观众可读的三项 + 写操作的统一拒绝）。
+
+### 公开房：建房带 `visibility`
+
+`POST /api/game/rooms` 的请求体多一位：`{ mode, seats?, visibility?: "public" | "private" }`。
+
+- **缺省 private**：不带这一位 / `null` / 空串都算没给。老客户端建出来的还是私人房 ——
+  反过来的话，每个老版本用户的自定义房都会静默地摆到大厅上；
+- `"public"` 才会出现在列表里；`"private"` 与撮合出来的房（`origin: "match"`）永远不出现；
+- 别的值 → **400 `BAD_VISIBILITY`**（不静默当 private：客户端以为建了公开房、大厅里却找不到，一句错都没有）；
+- 老房间（这一版之前建的）没有这一格：**读的时候按 private**（`visibilityOf` 一处判），不写迁移；
+- 快照里多一位 `visibility`（见「房间快照」）。
+
+### 公开房列表：`GET /api/game/rooms`
+
+| 查询参数 | 缺省 | 说明 |
+|---|---|---|
+| `visibility` | `public` | **只认 `public`**（别的值 400 `BAD_VISIBILITY`：不悄悄回空列表） |
+| `state` | `waiting` | `waiting` / `playing` / `over`（别的值 400 `BAD_STATE`；`over` 含历史遗留的 `closed`） |
+| `mode` | 全部 | `match4` / `match8` / `custom`（别的值 400 `BAD_MODE`） |
+| `page` | `1` | ≥ 1 的整数（否则 400 `BAD_PAGE`） |
+| `limit` | `20` | 1~50 的整数（否则 400 `BAD_LIMIT`；缺省 / 最大页大小都是**服务端常量**，客户端只能传小） |
+
+```json
+{ "ok": true, "visibility": "public", "state": "waiting", "mode": null,
+  "page": 1, "limit": 20, "total": 3, "hasMore": false,
+  "rooms": [
+    { "code": "K7M2QX", "mode": "custom", "seats": 6, "members": 2,
+      "hostName": "…", "createdAt": "2026-11-24T08:00:00.000Z",
+      "state": "waiting", "joinable": true }
+  ] }
+```
+
+**「能进的房」的判据（★ 择一：不列，而不是列出来标 `joinable:false`）**：
+
+- 只查 `visibility: "public"`；
+- **过期的不列**：`lastSeenAt` 在按状态给的寿命内（`ttlMsFor`：`waiting` / `over` 30 分钟、`playing` 120 分钟），
+  而且**至少还有 1 个成员**（0 人的房立刻算过期，与 `isExpired` 同一口径）；
+- `state=waiting`（缺省）时**满员的不列**（`members.length < seats`）—— 大厅那一屏就是「点进去就能坐下」
+  的房，摆一个满员的只会让人点进去吃 `ROOM_FULL`；
+- `state=playing` / `over` 是**显式**请求（围观 / 复盘），这时 `joinable` 恒 `false`（字段永远在，
+  客户端不用先判 `state` 再判字段）。
+- 排序 `createdAt` **倒序**（同秒按 `_id` 兜底，翻页不会同一条出现两次）；`total` 是**符合条件的总数**
+  （不是本页条数），`hasMore = page × limit < total`。
+- `members` 是**人数**（数字，不是成员数组）；`hostName` 按现拼（`members` 只存 id 同一条纪律），
+  查不到（删号）时是 `null`。
+- **每次现查、不缓存**：开关一开 / 一关必须是下一拍就生效（大厅每 2~5 秒轮询一次）。
+
+错误码：400 `BAD_VISIBILITY` / `BAD_STATE` / `BAD_MODE` / `BAD_PAGE` / `BAD_LIMIT`；403 没有（登录即可读）；
+503 `GAME_ROOMS_OFF`（总闸在前）/ 503 `GAME_PUBLIC_ROOMS_OFF`（公开房急停）。
+
+### 观战：进 / 出观众席
+
+**`POST /api/game/rooms/:code/spectate`**（进；登录；限流 60/分钟）
+
+```json
+{ "ok": true, "spectating": true, "already": false,
+  "code": "K7M2QX", "roomId": "…", "joinedAt": "2026-11-24T08:01:00.000Z",
+  "spectators": { "count": 1 },
+  "room": { …与 GET /rooms/:code 的 room 同形（含 spectators.count）… } }
+```
+
+- **不占座、不写 `members`**：只往 `spectators[]` 里加一行 `{ userId, joinedAt }`；
+- **任何活着的房都能观战**（`waiting` / `playing` / `over`）—— 观战最需要的恰恰是已经开打 / 已经结束的那两种；
+- **幂等**：本来就在席上 → `already: true`，不重复占位、不写库；
+- **上限 20**：满了 → **429 `TOO_MANY_SPECTATORS`**（`max`=20、`count`、`roomCode`）；等有人离席再来。
+  容量判定写进同一个原子更新（20 个人同时点观战只有第 20 个能进去）；
+- **已经是这间房的玩家** → **409 `ALREADY_IN_ROOM`**（两张名单互斥；`join` 会把同一个人从观众席拉出来）；
+- 一人可以同时是**别的房**的玩家（观战不占座，不参与「一人一间房」的检查）；
+- 观众进席**不给房间续命**（不写 `lastSeenAt`）：房间寿命按成员的活跃度算，过期时观众一并被清掉；
+- 回包里顺手带一份快照，App 点完就能直接画观战屏。
+
+**`POST /api/game/rooms/:code/spectate/leave`**（出；登录）
+
+回包 `{ ok, left, spectating: false, code, roomId, spectators: { count } }`。
+
+- **只**从 `spectators[]` 里拉掉自己，**不碰 `members`** —— 观众的「离开」绝不能把玩家（或自己的）座位退掉。
+  玩家退房走 `POST /rooms/:code/leave`（两个端点分开）；观众调玩家那条 leave → 409 `NOT_IN_ROOM`；
+- 幂等：本来不是观众也回 200 `left:false`；参加观战后再进房（`join`）时也会被自动从观众席拉出来；
+- 房间已过期 → 404 `ROOM_NOT_FOUND`；
+- 出席也不写 `lastSeenAt`。
+
+### 观众权限矩阵（★ 判据只有一处）
+
+| 类别 | 端点 | 观众 |
+|---|---|---|
+| **读** ① | `GET /api/game/rooms/:code`（房间快照） | ✅ 可读（本来就对任何登录用户开放） |
+| **读** ② | `GET /api/game/rooms/:code/rounds/current` | ✅ 可读 |
+| **读** ③ | `GET /api/game/rooms/:code/rounds/history` | ✅ 可读 |
+| **读** ④ | `GET /api/game/rooms/:code/stream`（SSE） | ✅ 可连（建连即 `snapshot`） |
+| **写** | `rounds/entries`（交片） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/like`（点赞） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/vote`（投票） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/phase`（推进阶段） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rooms/:code/start`（开局） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rooms/:code/kick`（踢人） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rooms/:code/ready`（准备） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/settle`（结算） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/next`（下一回合） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+| **写** | `rounds/events/choice`（选事件） | ❌ 403 `SPECTATOR_NOT_ALLOWED` |
+
+- **判据唯一实现**：`gameRoom.service.spectatorWriteDenial(room, userId)`（所有写端点读完房间的第一件事
+  就是问它）。散在十来个地方各写一遍 `if` 会漏一处 —— 漏掉的那一处不会报错，会让观众的一票真的算进结算。
+- **顺序**：先问观众、再问房主 / 阶段 / 人数。观众撞上任何写端点都拿到 `SPECTATOR_NOT_ALLOWED`，
+  而不是「你不是房主」或「现在不是这个阶段」（那两句话会让人以为换个时机就能做）。
+- **不是成员也不是观众**：保持原来的行为（读：`rounds/current` 409 `NOT_IN_ROOM`、
+  `rounds/history` 403 `NOT_IN_ROOM`、SSE `error: NOT_IN_ROOM`）。
+- 观众**不参与**回合的三个汇总数：`allSubmitted` / `likesPending` / `votesPending` 只数 `members`
+  —— 所以观众既不阻止开局，也不会让「全员已交片」永远凑不齐。
+- 观众看不到别人的私有信息：现有快照本来就只给计数（`likes` / `votes` / `likedByMe` 是「看的人」视角），
+  `spectators` 也只给 `count`，因此**不需要给观众另做一份投影**。
+
+### 数据落点与上限
+
+| 项 | 落点 / 值 |
+|---|---|
+| 公开标记 | 房间文档 `visibility`（`public` / `private`；老文档缺省按 private 读） |
+| 观众席 | 房间文档 `spectators[{ userId, joinedAt }]` —— **不占座、不写 members**，只存 id（昵称 / 头像现拼） |
+| 上限 | **20**（`config/gameRoom.MAX_SPECTATORS`，代码常量；超出 429 `TOO_MANY_SPECTATORS`） |
+| 原子闸 | `members.userId: {$ne}` + `spectators.userId: {$ne}` + `$expr: {$lt: [{$size: spectators}, 20]}` 写进同一个 `findOneAndUpdate` |
+| 过期级联 | 房间过期被懒清理删的是**整份文档**，观众行一起没（没有第二张表要级联） |
+| 续命 | 观众进席 / 出席 / 读快照 / 读回合 / 连 SSE **都不写 `lastSeenAt`**；只有成员读才续命 |
+| 索引 | `{ visibility, status, createdAt: -1 }`（大厅固定查询，三格一起才不用回表排序） |
+
+### 开关与能力位
+
+- `GAME_PUBLIC_ROOMS=off` 急停：**只关** `GET /api/game/rooms`，回 503 `GAME_PUBLIC_ROOMS_OFF`，
+  `/api/ark/health` 的 `gamePublicRooms` 报 false（App 不摆「公开房」那一栏）。
+  建房的 `visibility` 参数照旧认、已经建出来的公开房留在库里 —— 开关打开就又能看到（列表实时查询，无缓存）。
+- `GAME_SPECTATORS=off` 急停：**只关**进 / 出观众席两个端点，回 503 `GAME_SPECTATORS_OFF`，
+  `/api/ark/health` 的 `gameSpectators` 报 false（App 不摆「观战」键）。
+  **已经在观众席上的人的读照旧**（快照 / 当前回合 / 历史 / SSE）—— 急停要停的是「新的人涌进来」，
+  把正在看的人一脚踢出去只会在客户端留下一屏 403，而且他们已经在 `spectators[]` 里了。
+- 两个开关都注册在 `GAME_ROOMS` 总闸**之后**：`GAME_ROOMS=off` 时先回 503 `GAME_ROOMS_OFF`。
+- 读不到 `gamePublicRooms` / `gameSpectators` = 老服务端，App 不摆对应的入口（拿不准就藏起来，
+  与 `gameRooms` / `gameTickets` 同一条口径）。
+
+### 还没做（别当成已做）
+
+- **观众聊天 / 弹幕 / 送礼物 / 打赏**：观众席今天只是「只读的一张名单」，没有任何互动信道；
+- **公开房筛选进阶**：按人数区间 / 档位 / 好友房 / 标签筛选、游标分页（今天是 page / limit）、
+  房主手动关闭「可加入」、`joinable:false` 的显式列表模式（今天选的是**不列**）；
+- **观众人数可配 / 更细的权限**（比如只允许房主邀请观战、观众隐藏血量）：上限 20 是代码常量；
+- **观战历史回放**：依赖「历史回合持久化」这个更大的缺口（房间过期 = 回合数据一起没，见上一节）。
+
+回归测试：`server/tests/gameSpectate.spec.js`（24 条：公开房缺省 private / 只列 public / 倒序 / 分页 /
+满员不列 / 过期不列 / 参数校验 / 观战不占座 / 幂等 / 上限 429 / 观战与 join 互斥 / 观众 leave 与玩家
+leave 分开 / 过期级联 / 观众读不续命 / 读写权限矩阵 / 观众不阻止开局 / 两个能力位与两个急停）。
 
 ## 工坊对局：回合引擎（GameRound，2026-11-23）
 
@@ -3863,8 +4048,8 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 |---|---|---|---|
 | POST | `/api/game/rooms/:code/rounds/start` | **仅房主** | 开第 1 回合（房间 `playing` 且还没有回合）→ 回合快照 |
 | POST | `/api/game/rooms/:code/rounds/entries` | 房间成员 | 交片（一人一条、重复覆盖；只在 `creating`）→ 回合快照 |
-| GET | `/api/game/rooms/:code/rounds/current` | 房间成员 | 当前回合快照（展映 / 投票屏轮询；成员读续命） |
-| GET | `/api/game/rooms/:code/rounds/history` | 房间成员 | 历史回合 + 战绩（**全部**回合、按 round 升序；只读，见「历史回合与战绩」） |
+| GET | `/api/game/rooms/:code/rounds/current` | 房间成员 / **观众**（2026-11-24） | 当前回合快照（展映 / 投票屏轮询；**成员**读续命，观众读不续命） |
+| GET | `/api/game/rooms/:code/rounds/history` | 房间成员 / **观众**（2026-11-24） | 历史回合 + 战绩（**全部**回合、按 round 升序；只读，见「历史回合与战绩」） |
 | POST | `/api/game/rooms/:code/rounds/phase` | **仅房主** | `{ phase: "screening" \| "voting" }` 推进阶段 |
 | POST | `/api/game/rooms/:code/rounds/like` | 房间成员 | `{ targetUserId }` 点赞（只在 `screening`）→ 回合快照 |
 | POST | `/api/game/rooms/:code/rounds/vote` | 房间成员 | `{ targetUserId: string \| null }` 投票 / 弃权（只在 `voting`）→ 回合快照 |
@@ -3872,6 +4057,12 @@ waiting ──(房主 start：人数达标 + 全员 ready)──▶ playing ─�
 | GET | `/api/game/rooms/:code/rounds/events` | 房间成员 | 第 2/4/6 回合结算后的**待选事件**（服务端出题，同房间同回合同一个） |
 | POST | `/api/game/rooms/:code/rounds/events/choice` | 房间成员 | `{ optionId }` 记下我的选择（幂等，第一选作数）→ `{ myChoice, allChosen }` |
 | POST | `/api/game/rooms/:code/rounds/next` | **仅房主** | 回合 +1、`creating`；保留历史回合；到胜者名额 → 落库 `over` + 409 `GAME_OVER` |
+
+★ **观众**（2026-11-24）：上表的写端点（start / entries / phase / like / vote / settle / next /
+events/choice）对观众一律 **403 `SPECTATOR_NOT_ALLOWED`**（判据只有 `gameRoom.service.spectatorWriteDenial`
+一处，完整矩阵见「工坊对局：公开房列表与观战」）。读端点里只有 `current` / `history` 对观众开放；
+`GET rounds/events` **不在**观众可读范围（照旧 409 `NOT_IN_ROOM`）。观众不参与
+`allSubmitted` / `likesPending` / `votesPending` 的计数（那三处只数 `members`）。
 
 **交片请求体**：`{ prompt: string, cardNames?: string[], videoUrl?: string, posterUrl?: string,
 placeholder?: boolean, modelTier?: string }`
@@ -4041,7 +4232,7 @@ App 的「战绩 + 每回合影片回放」用它一次读全：房间文档 `ro
 实现：`src/services/gameRound.service.js` 的 `getHistory`（**唯一实现**，统计口径也只在它的文件头与
 这一节）、`src/config/gameHistory.js`（急停开关）、`src/routes/gameRoom.routes.js`（一条路由 + 闸）。
 
-**GET `/api/game/rooms/:code/rounds/history`**（**房间成员**；轮询档限流 240/分钟）
+**GET `/api/game/rooms/:code/rounds/history`**（**房间成员 / 观众**；轮询档限流 240/分钟）
 
 ```json
 { "ok": true,
@@ -4076,9 +4267,9 @@ App 的「战绩 + 每回合影片回放」用它一次读全：房间文档 `ro
   `entryId` 老投稿没有时如实回 `null`（与快照同一口径）。
 - `room`：`code` / `state`（三态，与房间快照同一个 `stateOf` 映射）/ `winners` / `finishedAt`。
   没结束时 `winners` / `finishedAt` 是 `null`；结束时空数组 = 平局（与房间快照同一条）。
-- **权限**：只有房间成员能读；不是成员 → **403 `NOT_IN_ROOM`**（读接口用 403；回合写接口那条
-  409 `NOT_IN_ROOM` 说的是「状态冲突」）。成员读一次也给房间续命（`lastSeenAt`，与
-  `rounds/current` 同一条）。
+- **权限**：房间成员**或观众**能读（2026-11-24 起观众可读；见「工坊对局：公开房列表与观战」的权限矩阵）；
+  两者都不是 → **403 `NOT_IN_ROOM`**（读接口用 403；回合写接口那条 409 `NOT_IN_ROOM` 说的是「状态冲突」）。
+  **成员**读一次给房间续命（`lastSeenAt`，与 `rounds/current` 同一条）；**观众读不续命**。
 - **过期**：房间被懒清理删掉 → 404 `ROOM_NOT_FOUND`（回合数据内嵌在房间文档里，没有第二份）。
 
 **summary 的统计口径**（与 App 战绩屏逐条同口径；改这里要同步 App，别让客户端再算一遍）：
@@ -4112,7 +4303,8 @@ App 的「战绩 + 每回合影片回放」用它一次读全：房间文档 `ro
 | 400 | `BAD_PHASE` | 阶段参数不是 `screening` / `voting` |
 | 400 | `BAD_OPTION` | 事件选择：`optionId` 不是这个事件的选项（带可选 `options`） |
 | 403 | `NOT_HOST` | 非房主调 start / phase / next；**或**未全员投票时非房主调 settle（带 `votesPending`） |
-| 403 | `NOT_IN_ROOM` | **历史回合端点**：不是这间房的成员（读接口用 403；回合写接口那条「不是成员」在下面 409 那一行 —— 那是状态冲突） |
+| 403 | `NOT_IN_ROOM` | **历史回合端点**：不是这间房的成员**也不是观众**（读接口用 403；回合写接口那条「不是成员」在下面 409 那一行 —— 那是状态冲突） |
+| 403 | `SPECTATOR_NOT_ALLOWED` | **观众**调任何回合写端点（交片 / 点赞 / 投票 / 推进阶段 / 结算 / next / 选事件；2026-11-24，带 `roomCode`；判据只有 `gameRoom.service.spectatorWriteDenial` 一处） |
 | 404 | `ROOM_NOT_FOUND` | 房号不对 / 已过期（与房间端点同一个码） |
 | 404 | `TARGET_NOT_IN_ROOM` | 点赞 / 投票的对象不在这回合（非成员或已淘汰） |
 | 404 | `ROUND_NOT_FOUND` | 这间房还没开始任何回合 |
@@ -4155,7 +4347,8 @@ App 的「战绩 + 每回合影片回放」用它一次读全：房间文档 `ro
   没有时退回单实例；**没有断线续帧**，客户端轮询仍是断线退路；
 - **历史持久化 / 观战回放**：读历史回合的端点已有（见「历史回合与战绩」），但回合数据仍内嵌在
   房间文档里 —— 房间过期（over 房 30 分钟）被懒清理后历史一起没；跨房间的持久战绩、公开回放、
-  观战都需要把历史另存一份到独立集合（本轮不做）；
+  **观战回放**都需要把历史另存一份到独立集合（本轮不做）。★ 注意与「观战」区分：观战本身
+  2026-11-24 已做（只读**实时**房间，见「工坊对局：公开房列表与观战」），回放（房间没了还能看）还没做；
 - **事件选择的审计读取**：`eventPicks` 落在 `rounds[]` 里，但没有「谁选了什么」的对外端点
   （快照只给 `myChoice` / `allChosen`，不暴露别人的选项 —— 与点赞 / 投票同一条口径）；
 - **对局 UGC 举报的后台处置**：`user` / `game-entry` 两类举报本轮只做受理（见「举报 · 对局里的
@@ -4183,7 +4376,7 @@ GET /api/game/rooms/:code/stream
 |---|---|
 | 鉴权 | `Authorization: Bearer <jwt>`（**推荐**，App 用 `fetch` + `ReadableStream`）或 `?token=<jwt>`（同一套校验；EventSource / 原生播放器带不了头时兜底） |
 | 响应 | `200` + `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache, no-transform`、`X-Accel-Buffering: no`（nginx 不缓冲） |
-| 建立失败的两种形态 | **鉴权失败**（没 token / token 过期 / 封禁）在建立连接**之前**回普通 JSON `401/403`；**业务失败**（房号不存在 / 不是成员 / 总开关关着）连接已建立，走 `event: error` 帧再关闭 |
+| 建立失败的两种形态 | **鉴权失败**（没 token / token 过期 / 封禁）在建立连接**之前**回普通 JSON `401/403`；**业务失败**（房号不存在 / 不是成员也不是观众 / 总开关关着）连接已建立，走 `event: error` 帧再关闭 |
 | 每用户并发上限 | **2 条**（手机 + 平板，或换设备时新旧连接短暂重叠）。超出回 **HTTP 429** `TOO_MANY_STREAMS`（`details.max` / `details.active`），客户端应停止重试而不是重连 |
 | 单条连接寿命 | **30 分钟**（`GAME_STREAM_MAX_SEC`，缺省 1800）：到期推 `event: end` 再关闭，客户端重连即可 |
 | 心跳 | 每 **20 秒** `event: ping`（`GAME_STREAM_HEARTBEAT_SEC`），防 nginx / Cloudflare 掐空闲连接 |
@@ -4225,8 +4418,10 @@ data: {"reason":"lifetime"}
 ### `snapshot` / `update` 的 data
 
 - `room`：与 `GET /api/game/rooms/:code` 的 `room` **逐字段同形**（含 `state` / `winners` /
-  `finishedAt` / `members[].hp`，见「工坊对局：房间与匹配」的快照一节），**看的人视角**
-  （`canStart` 只对房主为 true）。
+  `finishedAt` / `members[].hp` / `visibility` / `spectators.count`，见「工坊对局：房间与匹配」的
+  快照一节），**看的人视角**（`canStart` 只对房主为 true）。
+- **观众也可连**（2026-11-24）：判据是「成员**或**观众」，两者都不是仍然是 `error: NOT_IN_ROOM`；
+  观众连接只是**看**，不给房间续命（见下「服务端收口」）。
 - `round`：与 `GET /api/game/rooms/:code/rounds/current` 的 body **同形**（去掉 `ok`：`round` /
   `phase` / `entries[]` / `allSubmitted` / `likesPending` / `votesPending`，`likedByMe` /
   `votedByMe` 也是看的人视角），见「工坊对局：回合引擎」的回合快照。**没有回合时为 `null`**
@@ -4246,7 +4441,7 @@ data: {"reason":"lifetime"}
 | 429 | `TOO_MANY_STREAMS` | 同一个账号已经有 2 条流（JSON 回包；`details.max`=2、`details.active`） |
 | 200 | `GAME_ROOMS_OFF` | 这台服务器 `GAME_ROOMS=off`（error 帧；流已经建立） |
 | 200 | `ROOM_NOT_FOUND` | 房号形状不对 / 不存在 / 已过期（与 `GET /rooms/:code` 同一句话） |
-| 200 | `NOT_IN_ROOM` | 不是这间房的成员（带 `roomCode`）—— 回合数据只给成员看 |
+| 200 | `NOT_IN_ROOM` | 不是这间房的成员、也**不是观众**（带 `roomCode`）—— 回合数据只给这两种人看 |
 | 200 | `TOO_MANY_STREAMS` | 这间房在本进程的订阅者达到上限（64，8 人 × 2 条 × 4 倍余量；极端情况） |
 | 200 | `STREAM_ERROR` | 服务端读库 / 写流失败（罕见）；客户端应**回退轮询**并等下一轮重连 |
 
@@ -4284,7 +4479,11 @@ data: {"reason":"lifetime"}
 - 连接断开 / 超时 / 房间被删 / 服务端 error：`res` 的 `close` 事件统一清理（退订 + 清心跳与寿命
   定时器 + 释放每用户名额），这些都是幂等的，重复调用无副作用。
 - 连接期间每 60 秒给房间续一次命（`lastSeenAt`）：有了推送之后客户端可能不再高频轮询，
-  不续命的话 `playing` 房超过 120 分钟会被懒清理删掉。
+  不续命的话 `playing` 房超过 120 分钟会被懒清理删掉。★ **观众连接不续命**（2026-11-24）：
+  只发心跳、不 touch —— 房间寿命按成员的活跃度算，过期时观众一并被清掉。
+- 观战进 / 出观众席（`POST /spectate` / `POST /spectate/leave`）**不走** `replyWrite`，也就是**不广播**：
+  观众人数变化不值得给房里每个连接各重读一次库；玩家看到的 `spectators.count` 在下一次轮询 /
+  下一次房间变化时刷新（2026-11-24）。
 
 ### 测试
 

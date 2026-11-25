@@ -15,11 +15,14 @@
  *
  * | 方法 | 路径 | 鉴权 | 说明 |
  * |---|---|---|---|
- * | POST   | /api/game/rooms                | 登录 | 建房 `{mode, seats?}` → 201 `{ room }` |
+ * | POST   | /api/game/rooms                | 登录 | 建房 `{mode, seats?, visibility?}` → 201 `{ room }`（visibility 缺省 private） |
+ * | GET    | /api/game/rooms                | 登录 | **公开房列表**（2026-11-24）`?visibility=public&state=waiting&mode=&page=&limit=` |
  * | POST   | /api/game/rooms/join           | 登录 | 进房 `{code}` → `{ room }` |
- * | GET    | /api/game/rooms/:code          | 登录 | 快照（成员 / 座位 / ready / 状态 / 时间） |
- * | GET    | /api/game/rooms/:code/stream   | 登录（Bearer 或 `?token=`） | SSE 推送（建连即 snapshot，之后 update / ping / error / end） |
- * | POST   | /api/game/rooms/:code/leave    | 登录 | 退房（房主自动转移；最后一人退房 = 房间删除） |
+ * | GET    | /api/game/rooms/:code          | 登录 | 快照（成员 / 座位 / ready / 状态 / 时间；**观众也可读**） |
+ * | GET    | /api/game/rooms/:code/stream   | 登录（Bearer 或 `?token=`） | SSE 推送（建连即 snapshot，之后 update / ping / error / end；**观众也可连**） |
+ * | POST   | /api/game/rooms/:code/leave    | 登录 | 退房（房主自动转移；最后一人退房 = 房间删除）——**玩家**的离开 |
+ * | POST   | /api/game/rooms/:code/spectate       | 登录 | **观战**（2026-11-24）进观众席：不占座、上限 20 |
+ * | POST   | /api/game/rooms/:code/spectate/leave | 登录 | 出观众席（与玩家 leave 分开：不碰 members） |
  * | POST   | /api/game/rooms/:code/ready    | 登录 | 准备 `{ready:boolean}` |
  * | POST   | /api/game/rooms/:code/start    | **仅房主** | 开局（人数达标 + 全员 ready） |
  * | POST   | /api/game/rooms/:code/kick     | **仅房主** | 踢人 `{userId}` |
@@ -158,11 +161,50 @@ function requireGameEventsOn(req, res, next) {
 }
 router.use("/rooms/:code/rounds/events", requireGameEventsOn);
 
+/**
+ * 公开房列表的急停（`GAME_PUBLIC_ROOMS=off`，2026-11-24）。
+ * ★ 只关 `GET /rooms`（把房间摆到大厅上这条**读**路径）：建房的 `visibility: "public"` 照旧认，
+ *   已经建出来的公开房也留在库里 —— 开关打开就又能看到（列表是实时查询，没有缓存）。
+ * ★ 注册在 `GAME_ROOMS` 那条总闸之后：整块对局关掉时先回 `GAME_ROOMS_OFF`。
+ */
+function requireGamePublicRoomsOn(req, res, next) {
+  if (config.publicRoomsEnabled()) return next();
+  return res.status(503).json({
+    ok: false,
+    code: "GAME_PUBLIC_ROOMS_OFF",
+    message: "public room listing is turned off on this server",
+  });
+}
+
+/**
+ * 观战的急停（`GAME_SPECTATORS=off`，2026-11-24）。
+ * ★ 只挂在**进 / 出观众席**两个端点上：已经在席上的人的读（房间快照 / 当前回合 / 历史 / SSE）
+ *   照旧 —— 急停要停的是「新的人涌进来」，把正在看的人一脚踢出去只会在客户端留下一屏 403，
+ *   而且他们已经在 `spectators[]` 里了，关不关开关都还占着那一格。
+ * ★ 注册在 `GAME_ROOMS` 之后：整块对局关掉时先回 `GAME_ROOMS_OFF`。
+ */
+function requireGameSpectatorsOn(req, res, next) {
+  if (config.spectatorsEnabled()) return next();
+  return res.status(503).json({
+    ok: false,
+    code: "GAME_SPECTATORS_OFF",
+    message: "spectating is turned off on this server",
+  });
+}
+router.use("/rooms/:code/spectate", requireGameSpectatorsOn);
+
 const createLimit = userRateLimit({ max: 20, scope: "game-room-create" });
 const joinLimit = userRateLimit({ max: 30, scope: "game-room-join" });
 const actLimit = userRateLimit({ max: 120, scope: "game-room-act" });
 const pollLimit = userRateLimit({ max: 240, scope: "game-room-poll" });
 const queueLimit = userRateLimit({ max: 120, scope: "game-queue" });
+/** 公开房列表：大厅每 2~5 秒轮询一次，与快照同一档 */
+const listLimit = userRateLimit({ max: 240, scope: "game-room-list" });
+/**
+ * 观战进席：比 actLimit 紧一点（每一发都带一份房间快照，且要拼成员 / 房主名字）。
+ * 60 次/分钟 = 一秒一次，正常点「观战」远远用不到。
+ */
+const spectateLimit = userRateLimit({ max: 60, scope: "game-spectate" });
 
 /**
  * 把 service 的结果原样回出去。
@@ -205,18 +247,58 @@ function replyWrite(res, result, code, { okStatus = 200, bumpCodes = [] } = {}) 
 /**
  * POST /api/game/rooms —— 建房
  *
- * 请求体：`{ mode: "match4"|"match8"|"custom", seats?: 2..8 }`
+ * 请求体：`{ mode: "match4"|"match8"|"custom", seats?: 2..8, visibility?: "public"|"private" }`
  * 回包 201：`{ ok:true, room }`（房间快照，形状见下方 GET）
  *
+ * ★ `visibility`（2026-11-24）：缺省 **private**（老客户端不带这一位 → 还是私人房）；
+ *   `"public"` 才会出现在 `GET /api/game/rooms` 的公开房列表里。别的值 → 400 `BAD_VISIBILITY`
+ *   （不静默当 private：客户端以为建了公开房、大厅里却找不到，一句错都没有）。
  * 400 `BAD_MODE` / `BAD_SEATS`（custom 的座位不是 2~8 的整数）/ `SEATS_LOCKED`
- *     （match4 给了 6 座：座位数由模式锁死，**不静默忽略**）
+ *     （match4 给了 6 座：座位数由模式锁死，**不静默忽略**）/ `BAD_VISIBILITY`
  * 409 `ALREADY_IN_ROOM`（已经在别的房里，带那间房的 `code`）
  */
 router.post("/rooms", requireAuth, createLimit, async (req, res, next) => {
   try {
     const body = req.body || {};
-    const result = await gameRoom.createRoom({ userId: req.user._id, mode: body.mode, seats: body.seats });
+    const result = await gameRoom.createRoom({
+      userId: req.user._id,
+      mode: body.mode,
+      seats: body.seats,
+      visibility: body.visibility,
+    });
     reply(res, result, 201);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/game/rooms —— **公开房列表**（2026-11-24；大厅上「能进的房」那一屏）
+ *
+ * 查询：`visibility`（只认 `public`，缺省）、`state`（`waiting` 缺省 / `playing` / `over`）、
+ *      `mode`（`match4` / `match8` / `custom`，缺省全部）、`page`（1 起）、`limit`（缺省 20、最大 50）
+ * 回包：`{ ok, visibility, state, mode, page, limit, total, hasMore,
+ *   rooms: [{ code, mode, seats, members, hostName, createdAt, state, joinable }] }`
+ * ★ 只列 **public**；`private` 房（含老客户端建的、撮合出来的）永远不出现。
+ * ★ 过期 / 0 人 / 满员 的房**不列**（不摆出来再标 joinable:false；见 service.listPublicRooms 的 ★★）；
+ *   缺省那一屏（state=waiting）每一行都是能直接 `join` 的，`joinable` 仍然总是给。
+ * ★ 按 `createdAt` 倒序；`total` 是符合条件的**总数**（不是本页条数）。
+ * 错误码：400 `BAD_VISIBILITY` / `BAD_STATE` / `BAD_MODE` / `BAD_PAGE` / `BAD_LIMIT`；
+ *        503 `GAME_ROOMS_OFF`（总闸在前）/ 503 `GAME_PUBLIC_ROOMS_OFF`（公开房急停）。
+ */
+router.get("/rooms", requireGamePublicRoomsOn, requireAuth, listLimit, async (req, res, next) => {
+  try {
+    const q = req.query || {};
+    reply(
+      res,
+      await gameRoom.listPublicRooms({
+        visibility: q.visibility,
+        state: q.state,
+        mode: q.mode,
+        page: q.page,
+        limit: q.limit,
+      }),
+    );
   } catch (err) {
     next(err);
   }
@@ -241,14 +323,18 @@ router.post("/rooms/join", requireAuth, joinLimit, async (req, res, next) => {
 /**
  * GET /api/game/rooms/:code —— 房间快照（大厅 / 对局里都用它轮询）
  *
- * 回包：`{ ok:true, room: { code, roomId, mode, seats, status, state, origin, hostId, requiredPlayers,
- *   memberCount, members:[{userId, username, avatarUrl, seat, ready, hp, isHost, joinedAt}],
+ * 回包：`{ ok:true, room: { code, roomId, mode, seats, status, state, origin, visibility, hostId,
+ *   requiredPlayers, memberCount, spectators:{count},
+ *   members:[{userId, username, avatarUrl, seat, ready, hp, isHost, joinedAt}],
  *   canStart, startBlockedBy, winners, finishedAt, createdAt, updatedAt, startedAt, lastSeenAt, expiresAt } }`
  * ★ 座位是**派生量**（数组下标），迟到 / 退房之后自然重排，不落库。
  * ★ `updatedAt` = 最后一次**状态变化**；成员轮询只刷 `lastSeenAt`（它才是过期判据）。
  * ★ `state` 是 App 认的三态（`waiting` / `playing` / `over`；`status` 保留给老包，另有历史遗留的 `closed`）。
  *   `state: "over"` 时 `winners` 是 userId 数组（**空数组 = 平局**）、`finishedAt` 是结束时间；
  *   没结束时这两项是 `null`（稳定的形状，App 不用先判字段在不在）。每个人身上的 `hp` 照旧给。
+ * ★ 观众（2026-11-24）读到的也是这一份：快照本来就只给计数（别人的 `likedByMe` 之类是「看的人」
+ *   视角），没有私有信息要投影掉；`spectators.count` 是观众人数（**只给数，不给名单**）。
+ * ★ 读快照不给房间续命（只有成员读才续），所以观众也不会把一间没人管的房留在库里。
  */
 router.get("/rooms/:code", requireAuth, pollLimit, async (req, res, next) => {
   try {
@@ -259,14 +345,54 @@ router.get("/rooms/:code", requireAuth, pollLimit, async (req, res, next) => {
 });
 
 /**
- * POST /api/game/rooms/:code/leave —— 退房
+ * POST /api/game/rooms/:code/leave —— 退房（**玩家**的离开）
  * 回包：`{ ok:true, left:true, closed, code, roomId, hostId, hostTransferred, room }`
  * ★ 房主走了 → 房主自动转移给最早进房的人（`hostTransferred:true` + 新的 `hostId`）；
  *   最后一个人走了 → `closed:true`、`room:null`、房间当场删掉。
+ * ★ **不是观众离开**：观众退出走下面的 `/spectate/leave`。观众调这一条会拿 409 `NOT_IN_ROOM`
+ *   （他不在 members 里），而不是把谁的座位退掉。
  */
 router.post("/rooms/:code/leave", requireAuth, actLimit, async (req, res, next) => {
   try {
     replyWrite(res, await gameRoom.leaveRoom({ userId: req.user._id, code: req.params.code }), req.params.code);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/spectate —— **进观众席**（2026-11-24）
+ *
+ * 不占座、不写 `members`：只往 `spectators[]` 里加一行（上限 20）。
+ * 回包：`{ ok, spectating:true, already, code, roomId, joinedAt, spectators:{count}, room:{…快照…} }`
+ *   · `already:true` = 本来就在席上（幂等，不重复占位）；
+ *   · `room` 与 `GET /rooms/:code` 同一份形状，App 点完就能画观战屏。
+ * 错误码：404 `ROOM_NOT_FOUND` / 409 `ALREADY_IN_ROOM`（你已经是这间房的**玩家**）/
+ *        429 `TOO_MANY_SPECTATORS`（带 `max` / `count`；等有人离席再试）/ 409 `SPECTATE_CONFLICT`（并发，重试）/
+ *        503 `GAME_ROOMS_OFF` / 503 `GAME_SPECTATORS_OFF`。
+ * ★ 一人可以同时是**别的房**的玩家（观战不占座，不参与「一人一间房」的检查）。
+ */
+router.post("/rooms/:code/spectate", requireGameSpectatorsOn, requireAuth, spectateLimit, async (req, res, next) => {
+  try {
+    // ★ 用 `reply`（不是 replyWrite）：观众人数变化不值得给房里每个连接各重读一次库；
+    //   玩家那边的 `spectators.count` 下一次轮询 / 下一次房间变化就会刷新。
+    reply(res, await gameRoom.spectate({ userId: req.user._id, code: req.params.code }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/game/rooms/:code/spectate/leave —— **出观众席**（2026-11-24）
+ *
+ * 只从 `spectators[]` 里拉掉自己，**不碰 `members`** —— 观众的「离开」绝不能把玩家座位退掉
+ * （玩家退房走 `POST /rooms/:code/leave`，两个端点分开）。
+ * 回包：`{ ok, left, spectating:false, code, roomId, spectators:{count} }`（幂等：本来不是观众 → `left:false`）。
+ * 错误码：404 `ROOM_NOT_FOUND` / 503 `GAME_ROOMS_OFF` / 503 `GAME_SPECTATORS_OFF`。
+ */
+router.post("/rooms/:code/spectate/leave", requireGameSpectatorsOn, requireAuth, actLimit, async (req, res, next) => {
+  try {
+    reply(res, await gameRoom.leaveSpectate({ userId: req.user._id, code: req.params.code }));
   } catch (err) {
     next(err);
   }
