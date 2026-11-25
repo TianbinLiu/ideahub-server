@@ -232,6 +232,16 @@ router.get("/health", (_req, res) => {
   //     `GAME_HISTORY=off` 急停时 false；★ 回合引擎关着（`GAME_ROUNDS=off`）时也是 false ——
   //     历史端点在那条闸之后注册（见 routes/gameRoom.routes.js），只关历史时 `gameRounds` 仍为 true。
   //     读不到这一位 = 老服务端，App 不摆「战绩 / 回放」。
+  // 2026-11-24 的能力位（工坊对局的公开房列表与观战，api-contract「工坊对局：公开房列表与观战」）：
+  //   · gamePublicRooms：这台服务器有 `GET /api/game/rooms`（公开房列表，只列 visibility=public）
+  //     与建房参数 `visibility: "public"|"private"`（缺省 private）。`GAME_PUBLIC_ROOMS=off` 急停时
+  //     false —— **只关列表这条读路径**（建房照旧认 visibility，开关打开就又能看到）。
+  //     读不到这一位 = 老服务端，App 不摆「公开房」那一栏（与 gameRooms 同一条口径：拿不准就藏）。
+  //   · gameSpectators：这台服务器有 `POST /api/game/rooms/:code/spectate[/leave]`（不占座、上限 20；
+  //     观众可读快照 / 当前回合 / 历史 / SSE，写操作统一 403 SPECTATOR_NOT_ALLOWED）。
+  //     `GAME_SPECTATORS=off` 急停时 false —— **只关进 / 出观众席**，已经在席上的人读取照旧。
+  //     读不到这一位 = 老服务端，App 不摆「观战」键（点了会 404）。
+  //     ★ 与 gameRooms 的关系：整块对局关掉（GAME_ROOMS=off）时两位都是 false（路由总闸在前）。
   res.json({
     ok: true,
     ark: arkConfigured(),
@@ -274,6 +284,10 @@ router.get("/health", (_req, res) => {
     gameReports: true,
     // 历史回合 / 战绩（2026-11-24）：有 GET /api/game/rooms/:code/rounds/history（能力位见上面那一段）
     gameHistory: gameRoom.enabled() && gameRound.enabled() && gameHistory.enabled(),
+    // 公开房列表（2026-11-24）：有 GET /api/game/rooms（只列 public）；GAME_PUBLIC_ROOMS=off 急停时 false
+    gamePublicRooms: gameRoom.enabled() && gameRoom.publicRoomsEnabled(),
+    // 观战（2026-11-24）：有 POST /api/game/rooms/:code/spectate[/leave]；GAME_SPECTATORS=off 急停时 false
+    gameSpectators: gameRoom.enabled() && gameRoom.spectatorsEnabled(),
   });
 });
 

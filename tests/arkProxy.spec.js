@@ -1277,6 +1277,12 @@ describe("健康端点", () => {
       // 历史回合 / 战绩（2026-11-24，tests/gameHistory.spec.js）：有 GET /api/game/rooms/:code/rounds/history
       // （App 的「战绩 + 每回合影片回放」）。GAME_HISTORY=off 或 GAME_ROUNDS=off 时 false
       gameHistory: true,
+      // 公开房列表（2026-11-24，tests/gameSpectate.spec.js）：有 GET /api/game/rooms（只列 public）
+      // 与建房参数 visibility。GAME_PUBLIC_ROOMS=off 时 false（App 不摆「公开房」那一栏）
+      gamePublicRooms: true,
+      // 观战（2026-11-24，tests/gameSpectate.spec.js）：有 POST /api/game/rooms/:code/spectate[/leave]。
+      // GAME_SPECTATORS=off 时 false（App 不摆「观战」键）
+      gameSpectators: true,
     });
     expect(JSON.stringify(res.body)).not.toMatch(/sk-|Bearer/i);
   });

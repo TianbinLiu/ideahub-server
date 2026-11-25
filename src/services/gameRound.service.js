@@ -310,6 +310,10 @@ function entryInputOf(body = {}) {
 async function startRound({ userId, code, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能写（判据唯一一处：gameRoom.spectatorWriteDenial；排在 NOT_HOST 之前，
+  // 免得观众看到「你不是房主」以为换个时机就能点）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const hostId = gameRoom.hostIdOf(room);
   if (!sameId(hostId, userId)) return fail("NOT_HOST", 403, "only the host can start the round", { hostId: hostId ? String(hostId) : null });
   if (!memberOf(room, userId)) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
@@ -354,6 +358,10 @@ async function startRound({ userId, code, now = Date.now() }) {
 async function submitEntry({ userId, code, body, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能交片（唯一判据）；写完这一条再判「在不在房里」—— 观众不在 members 里，
+  // 落到 NOT_IN_ROOM 就变成一句「换个时机再试」的误导。
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const member = memberOf(room, userId);
   if (!member) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   if (hpOf(member) <= 0) return fail("PLAYER_ELIMINATED", 409, "eliminated players cannot submit entries");
@@ -457,8 +465,13 @@ async function submitEntry({ userId, code, body, now = Date.now() }) {
 async function getCurrent({ userId, code, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
-  if (!memberOf(room, userId)) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
-  await gameRoom.touch(room, now);
+  const member = memberOf(room, userId);
+  // ★ 观众可读（2026-11-24）：当前回合正是观战要看的那一屏；观众读**续命**吗？不续
+  //   （与房间快照同一条：只有成员读才给房续命，见 gameRoom.getRoom 的注释）。
+  if (!member && !gameRoom.isSpectatorOf(room, userId)) {
+    return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
+  }
+  if (member) await gameRoom.touch(room, now);
   const round = currentRoundOf(room);
   if (!round) return fail("ROUND_NOT_FOUND", 404, "this room has no active round");
   return { ok: true, ...(await snapshotOf(room, round, { viewerId: userId })) };
@@ -501,10 +514,14 @@ async function getCurrent({ userId, code, now = Date.now() }) {
 async function getHistory({ userId, code, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
-  if (!memberOf(room, userId)) {
+  const member = memberOf(room, userId);
+  // ★ 观众可读（2026-11-24）：历史回合也是观战的一屏（「这一局从头到尾发生了什么」）。
+  //   非成员非观众仍然是 403 NOT_IN_ROOM（读接口用 403，写接口那条 409 说的是状态冲突）；
+  //   观众读**不续命**（与 getCurrent / 房间快照同一条：只有成员读才给房续命）。
+  if (!member && !gameRoom.isSpectatorOf(room, userId)) {
     return fail("NOT_IN_ROOM", 403, "only players in this room can read its round history", { roomCode: room.code });
   }
-  await gameRoom.touch(room, now);
+  if (member) await gameRoom.touch(room, now);
 
   const seatIndex = seatIndexOf(room);
   const rounds = (room.rounds || []).slice().sort((a, b) => (Number(a.round) || 0) - (Number(b.round) || 0));
@@ -621,6 +638,9 @@ async function setPhase({ userId, code, phase, now = Date.now() }) {
   }
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能推进阶段（唯一判据；排在成员 / 房主判定之前）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   if (!memberOf(room, userId)) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   const hostId = gameRoom.hostIdOf(room);
   if (!sameId(hostId, userId)) {
@@ -690,6 +710,9 @@ async function phaseConflict(roomId, userId, roundNo, target) {
 async function likeEntry({ userId, code, targetId, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能点赞（唯一判据；排在成员 / 阶段判定之前）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const member = memberOf(room, userId);
   if (!member) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   if (hpOf(member) <= 0) return fail("PLAYER_ELIMINATED", 409, "eliminated players cannot like entries");
@@ -751,6 +774,9 @@ async function likeEntry({ userId, code, targetId, now = Date.now() }) {
 async function voteEntry({ userId, code, body, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能投票（唯一判据；排在成员 / 阶段判定之前）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const member = memberOf(room, userId);
   if (!member) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   if (hpOf(member) <= 0) return fail("PLAYER_ELIMINATED", 409, "eliminated players cannot vote");
@@ -828,6 +854,9 @@ function competitionRank(counts, index) {
 async function settle({ userId, code, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能结算（唯一判据；排在成员判定之前）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   if (!memberOf(room, userId)) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   const round = currentRoundOf(room);
   if (!round) return fail("ROUND_NOT_FOUND", 404, "this room has no active round");
@@ -957,6 +986,9 @@ async function settle({ userId, code, now = Date.now() }) {
 async function nextRound({ userId, code, now = Date.now() }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能推进下一回合（唯一判据；排在成员 / 房主判定之前）
+  const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   if (!memberOf(room, userId)) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
   const hostId = gameRoom.hostIdOf(room);
   if (!sameId(hostId, userId)) {
@@ -1070,10 +1102,18 @@ function eventPayloadOf(room, round, event, viewerId) {
  * 这局还没结束 → 这一回合确实是事件回合。
  * ★ 顺序是刻意的：先回答「你能不能玩」（404 / 409 NOT_IN_ROOM / PLAYER_ELIMINATED），再回答
  *   「现在能不能读」（ROUND_NOT_SETTLED），最后才是「这一回合有没有事件」（NO_EVENT）。
+ * ★ `forWrite`（2026-11-24）：写入口（选事件）先问一次「是不是观众」—— 观众在这里要拿到
+ *   `SPECTATOR_NOT_ALLOWED`（统一判据还在 gameRoom.spectatorWriteDenial），而不是 NOT_IN_ROOM。
+ *   读入口不传它：事件**不在观众可读的那四项里**（房间快照 / 当前回合 / 历史 / SSE），
+ *   观众来读事件就照旧落到 NOT_IN_ROOM。
  */
-async function eventContextOf({ code, userId, now }) {
+async function eventContextOf({ code, userId, now, forWrite = false }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return { error: fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)") };
+  if (forWrite) {
+    const spectatorDenied = gameRoom.spectatorWriteDenial(room, userId);
+    if (spectatorDenied) return { error: spectatorDenied };
+  }
   const member = memberOf(room, userId);
   if (!member) return { error: fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code }) };
   if (hpOf(member) <= 0) return { error: fail("PLAYER_ELIMINATED", 409, "eliminated players do not get events") };
@@ -1138,7 +1178,8 @@ async function getRoundEvent({ userId, code, now = Date.now() }) {
  *   写选择（那已经是「翻篇」了；GET 那边由「当前回合必须 settled」挡住）。
  */
 async function chooseRoundEvent({ userId, code, optionId, now = Date.now() }) {
-  const ctx = await eventContextOf({ code, userId, now });
+  // forWrite：观众在这里先被拦成 SPECTATOR_NOT_ALLOWED（见 eventContextOf 的 ★）
+  const ctx = await eventContextOf({ code, userId, now, forWrite: true });
   if (ctx.error) return ctx.error;
   const { room, member, round, event } = ctx;
 

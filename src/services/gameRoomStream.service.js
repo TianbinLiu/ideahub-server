@@ -125,22 +125,31 @@ function activeCountOf(userId) {
 
 /**
  * 这一帧要发给「他」的那份数据。
- * · 房间快照与 `GET /rooms/:code` 的 `room` **同形**（含 `state` / `winners` / `finishedAt` / `members[].hp`）；
+ * · 房间快照与 `GET /rooms/:code` 的 `room` **同形**（含 `state` / `winners` / `finishedAt` /
+ *   `members[].hp` / `spectators.count`）；
  * · 回合快照与 `GET rounds/current` 的 body **同形**（去掉回包的 `ok`），没有回合时为 `null`；
- * · `touch` = 给房间续命（`lastSeenAt`，见 gameRoom.service.touch 的 ★）。
+ * · `touch` = 给房间续命（`lastSeenAt`，见 gameRoom.service.touch 的 ★），**只有成员**才续：
+ *   观众连一条流也是在「看」，但房间的寿命按成员的活跃度算（房间过期时观众一并清，见
+ *   gameRoom.service.spectate 的 ★）。
+ * · `member` 一起回给调用方：心跳那边要拿它决定「这一拍要不要 touch」，不然一条观众连接
+ *   每次心跳都白读一次库。
+ *
+ * ★ 观众也可连（2026-11-24）：判据是「成员 **或** 观众」；两者都不是仍然 `NOT_IN_ROOM`
+ *   （发完 error 帧就关，与以前一模一样）。
  */
 async function buildSnapshot({ code, viewerId, now = Date.now(), touch = false }) {
   const room = await gameRoom.loadRoom(code, now);
   if (!room) return { error: roomNotFound() };
   const member = room.members.some((item) => gameRoom.sameId(item.userId, viewerId));
-  if (!member) return { error: notInRoom(room.code) };
-  if (touch) await gameRoom.touch(room, now);
+  const spectator = gameRoom.isSpectatorOf(room, viewerId);
+  if (!member && !spectator) return { error: notInRoom(room.code) };
+  if (touch && member) await gameRoom.touch(room, now);
   const payload = { room: await gameRoom.snapshotOf(room, { viewerId, now }), round: null };
   const round = gameRound.currentRoundOf(room);
   // 没有回合时是 null（稳定形状：App 不用先判字段在不在），与 GET rounds/current 的 404 语义不同 ——
   // 这里「还没开始第一回合」是正常状态，不该让整条流断掉。
   if (round) payload.round = await gameRound.snapshotOf(room, round, { viewerId });
-  return { payload };
+  return { payload, member };
 }
 
 /**
@@ -185,6 +194,8 @@ async function handler(req, res) {
   const heartbeatMs = config.streamHeartbeatMs();
   const lifetimeMs = config.streamMaxLifetimeMs();
   let lastTouchAt = 0;
+  /** 这一条连接的人是不是**成员**（null = 还没读到第一份快照）。观众连接不给房间续命 */
+  let memberViewer = null;
   let ended = false;
   let cleaned = false;
   let pushing = false;
@@ -223,11 +234,12 @@ async function handler(req, res) {
 
   async function emitSnapshot(kind) {
     const now = Date.now();
-    const touch = now - lastTouchAt >= TOUCH_EVERY_MS;
+    const touch = memberViewer !== false && now - lastTouchAt >= TOUCH_EVERY_MS;
     const result = await buildSnapshot({ code, viewerId, now, touch });
     if (ended) return;
     if (result.error) return failWith(result.error);
-    if (touch) lastTouchAt = now;
+    if (typeof result.member === "boolean") memberViewer = result.member;
+    if (result.member) lastTouchAt = now;
     if (!send(kind, result.payload)) endStream();
   }
 
@@ -273,6 +285,8 @@ async function handler(req, res) {
   function heartbeat() {
     if (ended) return;
     send("ping");
+    // ★ 观众连接：只发心跳，不给房间续命（房间寿命按成员的活跃度算；观众连着的房照样会过期）
+    if (memberViewer === false) return;
     const now = Date.now();
     if (now - lastTouchAt < TOUCH_EVERY_MS) return;
     gameRoom
@@ -280,6 +294,12 @@ async function handler(req, res) {
       .then((room) => {
         if (ended) return;
         if (!room) return failWith(roomNotFound());
+        // memberViewer 还是 null 时（第一份快照没读完）按库里的实际身份判，别给观众续命
+        const isMember = room.members.some((item) => gameRoom.sameId(item.userId, viewerId));
+        if (!isMember) {
+          memberViewer = false;
+          return undefined;
+        }
         return gameRoom.touch(room, now).then(() => {
           lastTouchAt = Date.now();
         });

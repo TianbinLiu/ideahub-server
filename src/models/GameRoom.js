@@ -37,6 +37,13 @@
 //   座位 = `members` 数组里的下标（加入顺序）。存成字段就要在「有人离开」时重排
 //   （否则座位号会留洞、下一个人的座号算出来是空的），一次改动两个写库点必然漂移。
 //   派生量的代价只有一处：快照里现算 `seat: index`（service.snapshotOf）。
+// ══ 公开房与观众席（2026-11-24）═════════════════════════════════════════════════════
+//   · `visibility` 是**房间属性**（缺省 private）：大厅列表只查 public；老文档缺这一格 = private。
+//     判据只在 services/gameRoom.service.visibilityOf 一处（读的时候现判，不写迁移）。
+//   · `spectators` 与 `members` 是**两张互斥名单**：观众不占座、没有 ready / hp，也不参与回合的
+//     「全员交片 / 全员点赞 / 全员投票」（那几处只数 members）；进出各一个端点（观战 / 观战离开），
+//     玩家 leave 不动观众席。上限 20 在 config/gameRoom.MAX_SPECTATORS，原子条件防超卖。
+//   · 过期懒清理删的是整份文档，观众行跟着一起没 —— 没有第二处要级联。
 const mongoose = require("mongoose");
 const { MODES, MIN_CUSTOM_SEATS, MAX_SEATS } = require("../config/gameRoom");
 const { START_HP } = require("../config/gameRound");
@@ -197,6 +204,23 @@ const roundSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/**
+ * 一个**观众**（2026-11-24，观战）。
+ * ★ 与 `members` 是两张名单：观众**不占座、不 ready、没有 hp**，也不参与回合的
+ *   `allSubmitted` / `likesPending` / `votesPending`（那几处只数 `members`）。
+ * ★ 只存 id + 进席时间：昵称 / 头像在读的时候现拼（与成员同一条纪律），不落库。
+ * ★ 上限 20（config/gameRoom.MAX_SPECTATORS）：观众席是「看别人打」的地方，不是第二个大厅；
+ *   一条房间文档里塞几百行观众会让每个轮询者都为别人的围观多读几十 KB。
+ * ★ 房间过期被懒清理时 `deleteOne` 删的是整份文档 —— 观众行跟着一起没，没有第二处要清。
+ */
+const spectatorSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    joinedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 const gameRoomSchema = new mongoose.Schema(
   {
     /**
@@ -211,6 +235,15 @@ const gameRoomSchema = new mongoose.Schema(
     /** 房主。★ 只在「退房 / 踢人」时看它；判据是 service.hostIdOf（房主不在房里时自动落到最早进房的人） */
     hostId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     /**
+     * 公开 / 私人房（2026-11-24，公开房列表）。
+     * ★ **缺省 private**：老客户端建房不带这一位，建出来的必须是「只有拿到房号的人能看见」——
+     *   反过来（缺省公开）会把每一个老版本用户的自定义房都摆到大厅上，而且没有任何提示。
+     * ★ 老房间（这一版之前建的）没有这一格：读的时候按 private 处理（`gameRoom.service.visibilityOf`
+     *   一处判），不为此写迁移 —— 房间本来就最多活 2 小时，老文档自然过期完。
+     * ★ 撮合出来的房（`origin: "match"`）一律 private：它已经有确定的一桌人，不需要被别人找到。
+     */
+    visibility: { type: String, enum: ["public", "private"], default: "private" },
+    /**
      * 房间状态机：`waiting` → `playing`（房主开局）→ `over`（打完一局：`POST /rounds/next` 在
      * `GAME_OVER` 那一刻落库，见 services/gameRound.service.nextRound）。
      * ★ `closed` 是早先留的值（今天没有任何东西写它）；留着是为了老数据不触发 enum 校验，
@@ -220,6 +253,13 @@ const gameRoomSchema = new mongoose.Schema(
     status: { type: String, required: true, enum: ["waiting", "playing", "over", "closed"], default: "waiting" },
     /** 房间成员，**数组顺序就是座位顺序**（文件头 ★）。最多 8 个（8 人匹配） */
     members: { type: [memberSchema], default: [] },
+    /**
+     * 观众席（2026-11-24，观战）：只读整间房，不占座、不写 `members`。
+     * ★ 上限见 config/gameRoom.MAX_SPECTATORS；进出都在 service（原子条件防超卖）。
+     * ★ 与 `members` 互斥：进房（join）那一路会把同一个人从观众席里拉出来，
+     *   房间离开（玩家 leave）与观众 leave 是**两个端点**（见 routes 的 ★）。
+     */
+    spectators: { type: [spectatorSchema], default: [] },
     /**
      * 这一局的回合历史（**只追加**：next 时 push 一条新回合，旧的点赞 / 投票 / 榜单都留着）。
      * ★ 当前回合 = 数组最后一条（service.currentRoundOf 一处读它，不另存 currentRound 指针 ——
@@ -262,6 +302,13 @@ gameRoomSchema.index({ code: 1 }, { unique: true });
  *   （waiting 30 分钟、playing 2 小时），带上前缀才能各扫各的那一段。
  */
 gameRoomSchema.index({ status: 1, lastSeenAt: 1 });
+
+/**
+ * 公开房大厅的扫描键（2026-11-24，`GET /api/game/rooms`）。
+ * ★ 查询固定是「public + 某个 status + createdAt 倒序 + 分页」，三格一起才不用回表排序：
+ *   大厅每 2~5 秒被每个在线的人轮询一次，缺了它就是对所有房间做一次内存排序。
+ */
+gameRoomSchema.index({ visibility: 1, status: 1, createdAt: -1 });
 
 /**
  * 「这个人现在在哪间房」：进房 / 排队 / 建房之前先查一遍，**一个人同时只能在一间房里**

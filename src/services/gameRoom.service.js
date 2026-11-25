@@ -16,7 +16,9 @@
  * | `setReady`    | 准备 / 取消准备（只在 waiting 阶段） |
  * | `startRoom`   | 开局（**仅房主**；人数达标 + 全员 ready）→ `playing` |
  * | `kickMember`  | 踢人（**仅房主**；不能踢自己） |
- * | `getRoom`     | 快照（成员 / 座位 / ready / 状态 / 时间）。成员读一次算一次「有人在看」 |
+ * | `getRoom`     | 快照（成员 / 座位 / ready / 状态 / 时间 / 观众数）。成员读一次算一次「有人在看」 |
+ * | `listPublicRooms` | 公开房列表（2026-11-24：只列 public、按创建时间倒序、分页） |
+ * | `spectate` / `leaveSpectate` | 观战进 / 出（**不占座、不写 members**；上限 20；与玩家 leave 分开） |
  * | `enqueue`     | 进队 / 续队 + **就地撮合**（够了就建房，把房号写进两边的队列行） |
  * | `queueStatus` | 我的排队状态（排队人数 / 还差几个 / 预计等待）+ 两个池子的现状 |
  * | `dequeue`     | 离队 |
@@ -101,6 +103,43 @@ function hostIdOf(room) {
   if (host) return host.userId;
   const oldest = members.slice().sort((a, b) => new Date(a.joinedAt || 0) - new Date(b.joinedAt || 0))[0];
   return oldest ? oldest.userId : null;
+}
+
+/**
+ * 这间房公开不公开（**唯一判据**）。
+ * ★ 缺省 private：老房间没有 `visibility` 这一格（这一版之前建的），读的时候按 private 处理，
+ *   不为此写迁移 —— 房间最多活 2 小时，老文档自然过期完。
+ * ★ 非法值（理论上进不来，enum 挡在建房）也当 private：**拿不准就别公开**。
+ */
+function visibilityOf(room) {
+  return room?.visibility === "public" ? "public" : "private";
+}
+
+/** 这个人是这间房的**观众**吗（唯一判据；`members` 不算，两张名单互斥） */
+function isSpectatorOf(room, userId) {
+  if (!userId) return false;
+  return (room?.spectators || []).some((spectator) => sameId(spectator.userId, userId));
+}
+
+/**
+ * 观众做**写操作**时的统一拒绝（2026-11-24，**唯一判据**）。
+ *
+ * ★★ 为什么是一个函数而不是在每个 service 里各写一遍 `if`：观众能做的读（快照 / 当前回合 /
+ *   历史 / SSE）与不能做的写（交片 / 点赞 / 投票 / 推进阶段 / 开局 / 踢人 / 结算 / next /
+ *   事件选择 / 准备）是**同一条规则的两面**，散在十来个地方写就会漏一处 —— 而漏掉的那一处
+ *   不会报错，会让观众的一票真的算进结算（症状是「名次莫名其妙变了」）。
+ *   所以判据只在这里，所有写端点在读完房间之后的第一件事就是问它。
+ * ★ 顺序：**先问观众，再问别的**（房主 / 阶段 / 人数）。观众撞上任何一条写端点都应该拿到
+ *   `SPECTATOR_NOT_ALLOWED`，而不是「你不是房主」或「现在不是这个阶段」—— 那两句话会让人以为
+ *   换个时机就能做。读端点的 `NOT_IN_ROOM` 不受影响（它们不走这里）。
+ * ★ 观战的急停（`GAME_SPECTATORS=off`）**不影响**这条：已经在席上的人照样不能写，
+ *   只是新的人进不来（见 config/gameRoom.spectatorsEnabled）。
+ */
+function spectatorWriteDenial(room, userId) {
+  if (!isSpectatorOf(room, userId)) return null;
+  return fail("SPECTATOR_NOT_ALLOWED", 403, "spectators cannot do this in the room", {
+    roomCode: room?.code || null,
+  });
 }
 
 /**
@@ -256,9 +295,19 @@ async function snapshotOf(room, { viewerId = null, now = Date.now() } = {}) {
     status: room.status,
     state: stateOf(room),
     origin: room.origin,
+    /**
+     * 公开 / 私人（2026-11-24，公开房列表）。★ 缺省 private（老房间没有这一格，见 visibilityOf）。
+     * 给出来是为了让「公开房」在房间内屏上也能标明；不等于「房号对谁都可见」（房号本来就是凭据）。
+     */
+    visibility: visibilityOf(room),
     hostId: hostId ? String(hostId) : null,
     requiredPlayers: config.requiredPlayersOf(room),
     memberCount: members.length,
+    /**
+     * 观众（2026-11-24）：**只给计数**，不给名单（与成员列表同一层纪律：观众是谁与玩法无关，
+     * 而每人身上的 `likedByMe` 之类都是成员视角）。`count` 永远是一个数（没有观众时 0）。
+     */
+    spectators: { count: (room.spectators || []).length },
     members: members.map((m, index) => {
       const user = byId.get(String(m.userId));
       return {
@@ -316,16 +365,28 @@ async function createRoomDoc(doc) {
 /**
  * POST /api/game/rooms
  *
- * `{ mode: "match4"|"match8"|"custom", seats?: 2..8 }`
+ * `{ mode: "match4"|"match8"|"custom", seats?: 2..8, visibility?: "public"|"private" }`
  * · match4 / match8：座位数由模式锁死（4 / 8）。带了 `seats` 且不是那个数 → 400 `SEATS_LOCKED`
  *   （**不静默忽略**：客户端以为建了 6 人局、服务端给 4 座，这种错一句都没有还查不出来）；
  * · custom：必须给 2~8 的整数。
+ * · visibility：2026-11-24 起接受 `"public"` / `"private"`，**缺省 private**（老客户端不带这一位 →
+ *   建出来的还是私人房；缺省 public 会把每个老用户的自定义房都摆到大厅上）。别的值 → 400
+ *   `BAD_VISIBILITY`（不静默当 private：客户端以为建了公开房、结果大厅里找不到，一句错都没有）。
  * · 一个人同时只能在一间房里 → 已经在别的房时 409 `ALREADY_IN_ROOM` + 那间房的码。
  */
-async function createRoom({ userId, mode, seats, now = Date.now() }) {
+async function createRoom({ userId, mode, seats, visibility, now = Date.now() }) {
   const m = String(mode ?? "").trim();
   if (!config.isMode(m)) {
     return fail("BAD_MODE", 400, `mode must be one of ${config.MODES.join(" / ")}`, { modes: config.MODES.slice() });
+  }
+  // ★ 缺省 private（`undefined` / `null` / 空串都算没给）；显式给别的值整句拒，不猜。
+  const rawVisibility = visibility === undefined || visibility === null ? "" : String(visibility).trim();
+  let roomVisibility = "private";
+  if (rawVisibility) {
+    if (rawVisibility !== "public" && rawVisibility !== "private") {
+      return fail("BAD_VISIBILITY", 400, "visibility must be public or private", { visibilities: ["public", "private"] });
+    }
+    roomVisibility = rawVisibility;
   }
   let capacity;
   if (m === "custom") {
@@ -351,6 +412,7 @@ async function createRoom({ userId, mode, seats, now = Date.now() }) {
     hostId: userId,
     status: "waiting",
     origin: "create",
+    visibility: roomVisibility,
     // ★ 房主建完房自己就是 ready（他按下「建房」就是在说「我要玩」）；客人进来默认没准备
     members: [{ userId, ready: true, joinedAt: atOf(now) }],
     lastSeenAt: atOf(now),
@@ -393,6 +455,8 @@ async function joinRoom({ userId, code: rawCode, now = Date.now() }) {
   }
   // ★ 容量与「没在里面」都写进**同一个**带条件的原子更新：两个人同时点进最后一个空位时，
   //   只有一个能成功（另一个落到下面的重新判因）。先查后写会两个人一起进去 = 5/4 人。
+  // ★ 同一次更新里把自己从**观众席**拉出来（2026-11-24）：两张名单互斥 —— 先观战再看入局
+  //   的人不能同时占着观众席（否则观众计数 +1、而他本人已经坐在座位上）。
   const updated = await GameRoom.findOneAndUpdate(
     {
       _id: room._id,
@@ -400,7 +464,11 @@ async function joinRoom({ userId, code: rawCode, now = Date.now() }) {
       "members.userId": { $ne: userId },
       $expr: { $lt: [{ $size: "$members" }, config.capacityOf(room)] },
     },
-    { $push: { members: { userId, ready: false, joinedAt: atOf(now) } }, $set: { lastSeenAt: atOf(now) } },
+    {
+      $push: { members: { userId, ready: false, joinedAt: atOf(now) } },
+      $pull: { spectators: { userId } },
+      $set: { lastSeenAt: atOf(now) },
+    },
     { returnDocument: "after" },
   );
   if (!updated) {
@@ -438,7 +506,9 @@ async function leaveRoom({ userId, code: rawCode, now = Date.now() }) {
   }
   const updated = await GameRoom.findOneAndUpdate(
     { _id: room._id, "members.userId": userId },
-    { $pull: { members: { userId } }, $set: { lastSeenAt: atOf(now) } },
+    // ★ 顺手把自己从观众席也拉掉（2026-11-24）：留着的话「这个人已经走了」却仍占一个观众席位。
+    //   正常情况下两者互斥（join 会把观众行拉出来），这里是兜底。
+    { $pull: { members: { userId }, spectators: { userId } }, $set: { lastSeenAt: atOf(now) } },
     { returnDocument: "after" },
   );
   if (!updated) return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
@@ -468,6 +538,9 @@ async function setReady({ userId, code: rawCode, ready, now = Date.now() }) {
   if (typeof ready !== "boolean") return fail("BAD_READY", 400, "ready must be true or false");
   const room = await loadRoom(rawCode, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能写（唯一判据，见 spectatorWriteDenial）
+  const spectatorDenied = spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   if (room.status !== "waiting") return fail("ROOM_ALREADY_STARTED", 409, "this room has already started", { roomCode: room.code });
   if (!room.members.some((m) => sameId(m.userId, userId))) {
     return fail("NOT_IN_ROOM", 409, "you are not in this room", { roomCode: room.code });
@@ -495,6 +568,10 @@ async function setReady({ userId, code: rawCode, ready, now = Date.now() }) {
 async function startRoom({ userId, code: rawCode, now = Date.now() }) {
   const room = await loadRoom(rawCode, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能开局（**排在 NOT_HOST 之前**：观众本来就不是房主，报「你不是房主」会让人以为
+  // 换个时机 / 换个人就能点，而事实是观众这一整类动作都不允许）
+  const spectatorDenied = spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const hostId = hostIdOf(room);
   if (!sameId(hostId, userId)) {
     return fail("NOT_HOST", 403, "only the host can start the game", { hostId: hostId ? String(hostId) : null });
@@ -527,6 +604,9 @@ async function startRoom({ userId, code: rawCode, now = Date.now() }) {
 async function kickMember({ userId, code: rawCode, targetId, now = Date.now() }) {
   const room = await loadRoom(rawCode, now);
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  // 观众不能踢人（同一判据；排在 NOT_HOST 之前，理由同 startRoom）
+  const spectatorDenied = spectatorWriteDenial(room, userId);
+  if (spectatorDenied) return spectatorDenied;
   const hostId = hostIdOf(room);
   if (!sameId(hostId, userId)) return fail("NOT_HOST", 403, "only the host can kick players", { hostId: hostId ? String(hostId) : null });
   if (room.status !== "waiting") return fail("ROOM_ALREADY_STARTED", 409, "this room has already started", { roomCode: room.code });
@@ -544,7 +624,11 @@ async function kickMember({ userId, code: rawCode, targetId, now = Date.now() })
 
 /**
  * GET /api/game/rooms/:code —— 快照（任何登录用户都能看：邀请链接要先能看到房间长什么样）
- * ★ 只有**成员**读才给房续命：路人点开邀请看一眼不该让一间没人管的房活着。
+ * ★ 只有**成员**读才给房续命：路人 / 观众看一眼不该让一间没人管的房活着（2026-11-24 观战沿用
+ *   这条：观众进席与读快照都不写 lastSeenAt，房间过期时观众一并清掉）。
+ * ★ 观众读到的快照与成员读到的是**同一份形状**：现有快照本来就只给计数（成员身上的
+ *   `likedByMe` / 回合里的 `votedByMe` 是「看的人」视角，不是别人的私有信息），所以不用给
+ *   观众另做一份投影。观众自己的 `spectators.count` 也在这里。
  */
 async function getRoom({ userId, code: rawCode, now = Date.now() }) {
   await sweepExpired({ now });
@@ -552,6 +636,232 @@ async function getRoom({ userId, code: rawCode, now = Date.now() }) {
   if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
   if (userId && room.members.some((m) => sameId(m.userId, userId))) await touch(room, now);
   return { ok: true, room: await snapshotOf(room, { viewerId: userId, now }) };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 观战（2026-11-24）：进 / 出观众席
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/game/rooms/:code/spectate —— 进观众席（2026-11-24）
+ *
+ * 不占座、不写 `members`：只往 `spectators[]` 里加一行 `{ userId, joinedAt }`，上限 20。
+ * · 允许的房间状态：**任何活着的房**（`waiting` / `playing` / `over` 都能看 —— 观战最需要的
+ *   恰恰是已经开打 / 已经结束的那两种；`over` 的房在过期之前还能看结算）；
+ * · 已在房里的**玩家**不能观战自己的房 → 409 `ALREADY_IN_ROOM`（两张名单互斥）；
+ * · 已经在观众席上 → **幂等成功**（`already: true`，不重复占位、不写库）；
+ * · 满 20 → 429 `TOO_MANY_SPECTATORS`（带 `max` / `count`）。
+ *
+ * ★ 一人可以同时是**别的房**的玩家：观战不占座、也不参与「一人一间房」的检查（那条只数
+ *   `members`，见 findActiveRoomOf）—— 「看着朋友打、自己在另一间等人」是正常需求。
+ * ★ 观众进席**不给房间续命**（不写 lastSeenAt）：房间按成员的活跃度过期，过期时观众一并被
+ *   清掉（删的是整份文档）。否则一间全员掉线的房会被围观的人永远钉在库里。
+ * ★ 容量判定写进**同一个**原子更新的条件里（与 join 的容量闸同一条纪律）：20 个人同时点观战，
+ *   只有第 20 个能进去；条件里还带 `members.userId: {$ne}` 与 `spectators.userId: {$ne}`，
+ *   所以「先观战再入局」「双击观战」都只有一发落库。
+ */
+async function spectate({ userId, code: rawCode, now = Date.now() }) {
+  await sweepExpired({ now });
+  const room = await loadRoom(rawCode, now);
+  if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  const at = atOf(now);
+
+  let updated = null;
+  for (let attempt = 0; attempt < 2 && !updated; attempt += 1) {
+    if (attempt > 0) {
+      const fresh = await GameRoom.findById(room._id);
+      if (!fresh) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+      if (fresh.members.some((m) => sameId(m.userId, userId))) {
+        return fail("ALREADY_IN_ROOM", 409, "you are already playing in this room", {
+          roomCode: fresh.code,
+          roomId: String(fresh._id),
+        });
+      }
+      const mine = (fresh.spectators || []).find((spectator) => sameId(spectator.userId, userId));
+      if (mine) return spectatorResult(fresh, mine, true);
+      if ((fresh.spectators || []).length >= config.MAX_SPECTATORS) return tooManySpectators(fresh);
+    }
+    updated = await GameRoom.findOneAndUpdate(
+      {
+        _id: room._id,
+        "members.userId": { $ne: userId },
+        "spectators.userId": { $ne: userId },
+        $expr: { $lt: [{ $size: { $ifNull: ["$spectators", []] } }, config.MAX_SPECTATORS] },
+      },
+      { $push: { spectators: { userId, joinedAt: at } } },
+      { returnDocument: "after" },
+    );
+  }
+  if (!updated) return fail("SPECTATE_CONFLICT", 409, "could not take a spectator seat, please retry");
+  const mine = (updated.spectators || []).find((spectator) => sameId(spectator.userId, userId));
+  return spectatorResult(updated, mine || { userId, joinedAt: at }, false);
+}
+
+/** 429 的统一形状（上限由 config/gameRoom.MAX_SPECTATORS 一处给） */
+function tooManySpectators(room) {
+  return fail("TOO_MANY_SPECTATORS", 429, `this room already has ${config.MAX_SPECTATORS} spectators`, {
+    max: config.MAX_SPECTATORS,
+    count: (room.spectators || []).length,
+    roomCode: room.code,
+  });
+}
+
+/** 观战成功的回包（`already` = 本来就在席上，不是这次挤进去的） */
+async function spectatorResult(room, spectatorRow, already, now = Date.now()) {
+  return {
+    ok: true,
+    spectating: true,
+    already: Boolean(already),
+    code: room.code,
+    roomId: String(room._id),
+    joinedAt: isoOf(spectatorRow?.joinedAt),
+    spectators: { count: (room.spectators || []).length },
+    // ★ 顺手给一份快照：App 点完「观战」直接就能画那一屏，不用再打一次 GET。
+    //   形状与 GET /rooms/:code 的 room 同一份（见 snapshotOf）。
+    room: await snapshotOf(room, { viewerId: spectatorRow?.userId ?? null, now }),
+  };
+}
+
+/**
+ * POST /api/game/rooms/:code/spectate/leave —— 出观众席（2026-11-24）
+ *
+ * **只**从 `spectators[]` 里拉掉自己：不碰 `members` —— 观众按的这个「离开」绝不能把
+ * 别人的（或自己的）玩家座位退掉（玩家退房走 `POST /rooms/:code/leave`，两个端点分开）。
+ * 幂等：本来就不是观众也回 200 `left:false`（换设备 / 重复点击 / 房间已经把自己清掉的兜底）。
+ * 房间已经过期 → 404 `ROOM_NOT_FOUND`（与玩家 leave 同一口径：房间不存在就没什么可离开的）。
+ * ★ 出席也不写 lastSeenAt（不为一个观众的离开续命）。
+ */
+async function leaveSpectate({ userId, code: rawCode, now = Date.now() }) {
+  const room = await loadRoom(rawCode, now);
+  if (!room) return fail("ROOM_NOT_FOUND", 404, "no room with this code (wrong code, or it has expired)");
+  const updated = await GameRoom.findOneAndUpdate(
+    { _id: room._id, "spectators.userId": userId },
+    { $pull: { spectators: { userId } } },
+    { returnDocument: "after" },
+  );
+  const fresh = updated || room;
+  return {
+    ok: true,
+    left: Boolean(updated),
+    spectating: false,
+    code: room.code,
+    roomId: String(room._id),
+    spectators: { count: (fresh.spectators || []).length },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 公开房列表（2026-11-24）：大厅上「能进的房」
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/game/rooms —— 公开房列表（2026-11-24）
+ *
+ * 查询：`visibility`（只认 `public`，缺省 public）、`state`（`waiting` 缺省 / `playing` / `over`）、
+ * `mode`（`match4` / `match8` / `custom`，缺省全部）、`page`（1 起，缺省 1）、`limit`（缺省 20、最大 50）。
+ * 回包：`{ ok, visibility, state, mode, page, limit, total, rooms: [{ code, mode, seats, members,
+ *   hostName, createdAt, state, joinable }] }`。
+ *
+ * ★★ 「能进的房」的判据（**择一：不列，而不是列出来标 joinable:false**；契约里写明）：
+ *   · 只查 `visibility: "public"` —— private 房（含老客户端建的、撮合出来的）**永远不出现**；
+ *   · 过期的不列：`lastSeenAt` 在按状态给的寿命内、而且至少还有 1 个成员（0 人的房立刻过期）；
+ *   · `state=waiting`（缺省）时要**没满员**（`members.length < seats`）的房：大厅那一屏就是
+ *     「点进去就能坐下」的房，摆一个满员的只会让人点进去吃 `ROOM_FULL`；
+ *   · `state=playing` / `over` 是**显式**请求（围观 / 复盘），这时每行 `joinable: false` 仍然给 ——
+ *     字段永远在，客户端不用先判 state 再判字段。
+ * ★ 排序 `createdAt` 倒序（同秒按 `_id` 兜底，翻页不会同一条出现两次）；`total` 是**符合条件的
+ *   总数**（不是本页条数），分页算得出来。
+ * ★ 每次都现查（不缓存）：开关一开 / 一关必须是下一拍就生效；大厅每 2~5 秒轮询一次，一间房
+ *   最多几十字节一行，20 行一拍。
+ */
+async function listPublicRooms({ visibility, state, mode, page, limit, now = Date.now() } = {}) {
+  const wantVisibility = String(visibility ?? "").trim() || "public";
+  if (wantVisibility !== "public") {
+    // ★ 不悄悄回空列表：那会让「按 visibility 筛选」看起来像是「这一类房一间都没有」。
+    return fail("BAD_VISIBILITY", 400, "only public rooms can be listed", { visibilities: ["public"] });
+  }
+  const wantState = String(state ?? "").trim() || config.PUBLIC_ROOM_DEFAULT_STATE;
+  if (wantState !== "waiting" && wantState !== "playing" && wantState !== "over") {
+    return fail("BAD_STATE", 400, "state must be one of waiting / playing / over", {
+      states: ["waiting", "playing", "over"],
+    });
+  }
+  const wantMode = String(mode ?? "").trim();
+  if (wantMode && !config.isMode(wantMode)) {
+    return fail("BAD_MODE", 400, `mode must be one of ${config.MODES.join(" / ")}`, { modes: config.MODES.slice() });
+  }
+  const pageNum = page === undefined || page === null || page === "" ? 1 : Number(page);
+  if (!Number.isInteger(pageNum) || pageNum < 1) {
+    return fail("BAD_PAGE", 400, "page must be an integer >= 1");
+  }
+  const limitNum = limit === undefined || limit === null || limit === "" ? config.PUBLIC_ROOM_PAGE_SIZE : Number(limit);
+  if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > config.PUBLIC_ROOM_PAGE_SIZE_MAX) {
+    return fail("BAD_LIMIT", 400, `limit must be an integer between 1 and ${config.PUBLIC_ROOM_PAGE_SIZE_MAX}`);
+  }
+
+  await sweepExpired({ now });
+
+  /**
+   * 过期判据与 isExpired 同一口径（`lastSeenAt` + 按状态的寿命）：Mongo 查不了「0 个人」之外的
+   * 过期条件里的 0 人（$size 为 0 的房虽然 lastSeenAt 可能还新，但 isExpired 立刻算过期），
+   * 所以再补一条「至少有一个成员」。
+   */
+  const query = {
+    visibility: "public",
+    status: wantState === "over" ? { $in: ["over", "closed"] } : wantState,
+    "members.0": { $exists: true },
+    lastSeenAt: { $gte: atOf(now - config.ttlMsFor(wantState)) },
+  };
+  if (wantMode) query.mode = wantMode;
+  if (wantState === "waiting") {
+    // ★ 用**落库的 seats**（它本来就是「能坐几个人」，见 models 的字段注释）：满员的不列。
+    //   不在查询里重写一遍 capacityOf 的规则 —— 那份规则（match 模式锁死 / custom 自选）
+    //   只在 config 一处，Mongo 里再写一遍就是第二个真相。
+    query.$expr = { $lt: [{ $size: "$members" }, { $ifNull: ["$seats", config.MIN_CUSTOM_SEATS] }] };
+  }
+
+  const [total, rows] = await Promise.all([
+    GameRoom.countDocuments(query),
+    GameRoom.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
+      .select("code mode seats members hostId status visibility createdAt")
+      .lean(),
+  ]);
+
+  const hostIds = [...new Set(rows.map((room) => hostIdOf(room)).filter(Boolean).map((id) => String(id)))];
+  const users = hostIds.length ? await User.find({ _id: { $in: hostIds } }).select("_id username").lean() : [];
+  const nameById = new Map(users.map((user) => [String(user._id), user.username || null]));
+
+  return {
+    ok: true,
+    visibility: "public",
+    state: wantState,
+    mode: wantMode || null,
+    page: pageNum,
+    limit: limitNum,
+    total,
+    hasMore: pageNum * limitNum < total,
+    rooms: rows.map((room) => {
+      const state = stateOf(room);
+      const seatCount = config.capacityOf(room);
+      const memberCount = (room.members || []).length;
+      const hostId = hostIdOf(room);
+      return {
+        code: room.code,
+        mode: room.mode,
+        seats: seatCount,
+        /** 成员**人数**（不是成员数组）：大厅卡片只写「2/4 人」，名单要进房 / 进观众席才看 */
+        members: memberCount,
+        hostName: hostId ? nameById.get(String(hostId)) || null : null,
+        createdAt: isoOf(room.createdAt),
+        state,
+        /** 能不能直接 `join` 进去（缺省那一屏恒 true；显式查 playing / over 时恒 false） */
+        joinable: state === "waiting" && memberCount < seatCount,
+      };
+    }),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -791,6 +1101,11 @@ module.exports = {
   startRoom,
   kickMember,
   getRoom,
+  // 公开房列表（2026-11-24）
+  listPublicRooms,
+  // 观战（2026-11-24）：进 / 出观众席（与玩家 leave 分开）
+  spectate,
+  leaveSpectate,
   // 队列
   enqueue,
   queueStatus,
@@ -800,6 +1115,9 @@ module.exports = {
   sweepExpired,
   // 判据（测试与回合引擎用；**别再实现一遍**）
   hostIdOf,
+  visibilityOf,
+  isSpectatorOf,
+  spectatorWriteDenial,
   isExpired,
   normalizeCode,
   startBlockedByOf,
